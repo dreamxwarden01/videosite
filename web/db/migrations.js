@@ -1,0 +1,476 @@
+const { getPool } = require('../config/database');
+
+/**
+ * Run all pending migrations on startup.
+ * Each migration checks if it needs to run before executing.
+ */
+async function runMigrations() {
+    const pool = getPool();
+
+    try {
+        // Ensure migrations tracking table exists
+        await pool.execute(`
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                migration_id   VARCHAR(100) PRIMARY KEY,
+                applied_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        `);
+
+        const migrations = [
+            {
+                id: '001_fix_worker_key_column_sizes',
+                up: async () => {
+                    // worker_access_keys.key_id: VARCHAR(32) -> VARCHAR(64)
+                    await pool.execute(`ALTER TABLE worker_access_keys MODIFY key_id VARCHAR(64) NOT NULL`);
+                    // processing_queue.worker_key_id: VARCHAR(32) -> VARCHAR(64)
+                    await pool.execute(`ALTER TABLE processing_queue MODIFY worker_key_id VARCHAR(64) DEFAULT NULL`);
+                }
+            },
+            {
+                id: '002_worker_pending_abort_transcoding',
+                up: async () => {
+                    // Add 'pending' and 'aborted' to processing_queue status enum
+                    await pool.execute(`
+                        ALTER TABLE processing_queue
+                        MODIFY COLUMN status ENUM('queued','pending','leased','processing','completed','error','aborted')
+                        NOT NULL DEFAULT 'queued'
+                    `);
+                    // Add pending_until for check-then-lease protocol
+                    await pool.execute(`
+                        ALTER TABLE processing_queue
+                        ADD COLUMN pending_until DATETIME DEFAULT NULL AFTER last_heartbeat
+                    `);
+                    // Add abort_requested flag for deletion-triggered abort
+                    await pool.execute(`
+                        ALTER TABLE processing_queue
+                        ADD COLUMN abort_requested TINYINT(1) NOT NULL DEFAULT 0 AFTER pending_until
+                    `);
+                    // Add cleared flag for transcoding status page soft-clear
+                    await pool.execute(`
+                        ALTER TABLE processing_queue
+                        ADD COLUMN cleared TINYINT(1) NOT NULL DEFAULT 0 AFTER abort_requested
+                    `);
+                    // Add error_at timestamp for transcoding status page sorting
+                    await pool.execute(`
+                        ALTER TABLE processing_queue
+                        ADD COLUMN error_at DATETIME DEFAULT NULL AFTER cleared
+                    `);
+                }
+            },
+            {
+                id: '003_add_encryption_key',
+                up: async () => {
+                    // Add encryption_key column for HLS AES-128 encryption
+                    await pool.execute(`
+                        ALTER TABLE videos
+                        ADD COLUMN encryption_key VARBINARY(16) DEFAULT NULL AFTER r2_source_key
+                    `);
+                }
+            },
+            {
+                id: '004_drop_abort_requested',
+                up: async () => {
+                    // abort_requested is replaced by 404-based abort detection:
+                    // when a job is deleted, worker API calls return 404
+                    await pool.execute(`
+                        ALTER TABLE processing_queue
+                        DROP COLUMN abort_requested
+                    `);
+                }
+            },
+            {
+                id: '005_registration_tables',
+                up: async () => {
+                    // Pending registrations — one active registration per email
+                    await pool.execute(`
+                        CREATE TABLE IF NOT EXISTS pending_registrations (
+                            email           VARCHAR(255) NOT NULL PRIMARY KEY,
+                            token           VARCHAR(128) NOT NULL,
+                            invitation_code VARCHAR(12)  DEFAULT NULL,
+                            created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            last_sent_at    DATETIME     NOT NULL,
+                            INDEX idx_token (token),
+                            INDEX idx_expires (created_at)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    `);
+
+                    // Email rate limiting for registration
+                    await pool.execute(`
+                        CREATE TABLE IF NOT EXISTS registration_email_limits (
+                            email      VARCHAR(255) PRIMARY KEY,
+                            first_sent DATETIME     NOT NULL,
+                            last_sent  DATETIME     NOT NULL,
+                            total_sent INT UNSIGNED NOT NULL DEFAULT 0
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    `);
+
+                    // Invitation codes
+                    await pool.execute(`
+                        CREATE TABLE IF NOT EXISTS invitation_codes (
+                            code       VARCHAR(12)  PRIMARY KEY,
+                            created_by INT UNSIGNED DEFAULT NULL,
+                            created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            expires_at DATETIME     NOT NULL,
+                            FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    `);
+
+                    // Add inviteUser permission to superadmin and admin
+                    await pool.execute(`
+                        INSERT IGNORE INTO role_permissions (role_id, permission_key, granted)
+                        VALUES (0, 'inviteUser', 1), (1, 'inviteUser', 1)
+                    `);
+
+                    // Add registration site settings defaults
+                    await pool.execute(`
+                        INSERT IGNORE INTO site_settings (setting_key, setting_value)
+                        VALUES ('enable_registration', 'false'),
+                               ('require_invitation_code', 'true'),
+                               ('registration_token_validity_minutes', '30'),
+                               ('registration_default_role', '2')
+                    `);
+                }
+            },
+            {
+                id: '006_mfa_system',
+                up: async () => {
+                    // Add MFA columns to users table
+                    await pool.execute(`
+                        ALTER TABLE users
+                        ADD COLUMN mfa_enabled TINYINT(1) NOT NULL DEFAULT 0 AFTER email
+                    `);
+                    await pool.execute(`
+                        ALTER TABLE users
+                        ADD COLUMN password_changed_at DATETIME DEFAULT NULL AFTER password_hash
+                    `);
+
+                    // MFA methods (TOTP, passkey, email)
+                    await pool.execute(`
+                        CREATE TABLE IF NOT EXISTS user_mfa_methods (
+                            id                   INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                            user_id              INT UNSIGNED NOT NULL,
+                            method_type          ENUM('email','authenticator','passkey') NOT NULL,
+                            label                VARCHAR(100) DEFAULT NULL,
+                            totp_secret_encrypted VARCHAR(512) DEFAULT NULL,
+                            credential_id        VARCHAR(512) DEFAULT NULL,
+                            public_key           TEXT DEFAULT NULL,
+                            sign_count           INT UNSIGNED DEFAULT 0,
+                            transports           TEXT DEFAULT NULL,
+                            is_active            TINYINT(1) NOT NULL DEFAULT 1,
+                            created_at           DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            UNIQUE KEY uq_credential (credential_id),
+                            INDEX idx_user_method (user_id, method_type),
+                            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    `);
+
+                    // Pre-auth sessions (before MFA is verified at login)
+                    await pool.execute(`
+                        CREATE TABLE IF NOT EXISTS mfa_preauth_sessions (
+                            id           VARCHAR(64) PRIMARY KEY,
+                            user_id      INT UNSIGNED NOT NULL,
+                            challenge_id VARCHAR(64) DEFAULT NULL,
+                            ip_address   VARCHAR(45) DEFAULT NULL,
+                            user_agent   TEXT DEFAULT NULL,
+                            created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            expires_at   DATETIME NOT NULL,
+                            INDEX idx_user_expires (user_id, expires_at),
+                            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    `);
+
+                    // MFA challenges (OTP, passkey, etc.)
+                    await pool.execute(`
+                        CREATE TABLE IF NOT EXISTS mfa_challenges (
+                            id                VARCHAR(64) PRIMARY KEY,
+                            user_id           INT UNSIGNED NOT NULL,
+                            context_type      ENUM('sid','preauth') NOT NULL,
+                            context_id        VARCHAR(128) NOT NULL,
+                            approved_endpoint VARCHAR(255) DEFAULT NULL,
+                            allowed_methods   VARCHAR(100) NOT NULL DEFAULT 'email,authenticator,passkey',
+                            mfa_level         TINYINT UNSIGNED NOT NULL DEFAULT 0,
+                            message_type      ENUM('login','password_reset','mfa_change','admin_operation','email_verification') NOT NULL,
+                            message_operation VARCHAR(255) DEFAULT NULL,
+                            status            ENUM('pending','verified','consumed','expired') NOT NULL DEFAULT 'pending',
+                            can_reuse         TINYINT(1) NOT NULL DEFAULT 0,
+                            used_count        INT UNSIGNED NOT NULL DEFAULT 0,
+                            otp_hash          VARCHAR(255) DEFAULT NULL,
+                            otp_attempts      INT UNSIGNED NOT NULL DEFAULT 0,
+                            otp_sent_at       DATETIME DEFAULT NULL,
+                            webauthn_challenge VARCHAR(255) DEFAULT NULL,
+                            verified_method   ENUM('email','authenticator','passkey') DEFAULT NULL,
+                            verified_at       DATETIME DEFAULT NULL,
+                            created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            expires_at        DATETIME NOT NULL,
+                            INDEX idx_user_context (user_id, context_type, context_id),
+                            INDEX idx_status_expires (status, expires_at),
+                            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    `);
+
+                    // OTP rate limiting per user
+                    await pool.execute(`
+                        CREATE TABLE IF NOT EXISTS mfa_otp_rate_limits (
+                            user_id    INT UNSIGNED PRIMARY KEY,
+                            first_sent DATETIME     NOT NULL,
+                            last_sent  DATETIME     NOT NULL,
+                            total_sent INT UNSIGNED NOT NULL DEFAULT 0,
+                            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    `);
+
+                    // Add MFA permissions to superadmin and admin
+                    await pool.execute(`
+                        INSERT IGNORE INTO role_permissions (role_id, permission_key, granted)
+                        VALUES (0, 'requireMFA', 1), (1, 'requireMFA', 1),
+                               (0, 'manageSiteMFA', 1)
+                    `);
+
+                    // Add MFA site settings defaults
+                    await pool.execute(`
+                        INSERT IGNORE INTO site_settings (setting_key, setting_value)
+                        VALUES ('mfa_pending_challenge_timeout_seconds', '900'),
+                               ('mfa_otp_timeout_seconds', '300'),
+                               ('mfa_level_0_timeout_seconds', '604800'),
+                               ('mfa_level_1_timeout_seconds', '3600'),
+                               ('mfa_level_2_timeout_seconds', '600'),
+                               ('mfa_policy_login', '{"enabled":false,"level":0,"scope":"W","reuse":"persistent"}'),
+                               ('mfa_policy_course', '{"enabled":false,"level":0,"scope":"W","reuse":"persistent"}'),
+                               ('mfa_policy_enrollment', '{"enabled":false,"level":0,"scope":"W","reuse":"persistent"}'),
+                               ('mfa_policy_user', '{"enabled":false,"level":0,"scope":"W","reuse":"persistent"}'),
+                               ('mfa_policy_invitation_codes', '{"enabled":false,"level":0,"scope":"W","reuse":"persistent"}'),
+                               ('mfa_policy_roles', '{"enabled":false,"level":0,"scope":"W","reuse":"persistent"}'),
+                               ('mfa_policy_playback_stats', '{"enabled":false,"level":0,"scope":"W","reuse":"persistent"}'),
+                               ('mfa_policy_transcoding', '{"enabled":false,"level":0,"scope":"W","reuse":"persistent"}'),
+                               ('mfa_policy_settings', '{"enabled":false,"level":0,"scope":"W","reuse":"persistent"}'),
+                               ('mfa_policy_mfa', '{"enabled":false,"level":0,"scope":"W","reuse":"persistent"}')
+                    `);
+                }
+            },
+            {
+                id: '007_mfa_email_verification_type',
+                up: async () => {
+                    await pool.execute(`
+                        ALTER TABLE mfa_challenges
+                        MODIFY COLUMN message_type ENUM('login','password_reset','mfa_change','admin_operation','email_verification') NOT NULL
+                    `);
+                }
+            },
+            {
+                id: '008_webauthn_challenge_column',
+                up: async () => {
+                    await pool.execute(`
+                        ALTER TABLE mfa_challenges
+                        ADD COLUMN webauthn_challenge VARCHAR(255) DEFAULT NULL AFTER otp_sent_at
+                    `);
+                }
+            },
+            {
+                id: '009_mfa_methods_last_used',
+                up: async () => {
+                    await pool.execute(`
+                        ALTER TABLE user_mfa_methods
+                        ADD COLUMN last_used_at DATETIME DEFAULT NULL AFTER created_at
+                    `);
+                }
+            },
+            {
+                id: '010_mfa_totp_rate_limits',
+                up: async () => {
+                    await pool.execute(`
+                        CREATE TABLE IF NOT EXISTS mfa_totp_rate_limits (
+                            user_id          INT UNSIGNED PRIMARY KEY,
+                            attempt_count    INT UNSIGNED NOT NULL DEFAULT 0,
+                            first_attempt_at DATETIME NOT NULL,
+                            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    `);
+                }
+            },
+            {
+                id: '011_unique_user_email',
+                up: async () => {
+                    await pool.execute(`ALTER TABLE users ADD UNIQUE INDEX uq_users_email (email)`);
+                }
+            },
+            {
+                id: '012_password_reset',
+                up: async () => {
+                    await pool.execute(`
+                        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                            token      VARCHAR(128) NOT NULL PRIMARY KEY,
+                            user_id    INT UNSIGNED NOT NULL,
+                            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            used       TINYINT(1) NOT NULL DEFAULT 0,
+                            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+                            INDEX idx_user_id (user_id),
+                            INDEX idx_created_at (created_at)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    `);
+                    await pool.execute(`
+                        CREATE TABLE IF NOT EXISTS password_reset_email_limits (
+                            email      VARCHAR(255) PRIMARY KEY,
+                            first_sent DATETIME NOT NULL,
+                            last_sent  DATETIME NOT NULL,
+                            total_sent INT UNSIGNED NOT NULL DEFAULT 0
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    `);
+                    await pool.execute(`
+                        UPDATE site_settings
+                        SET setting_key = 'emailed_link_validity_minutes'
+                        WHERE setting_key = 'registration_token_validity_minutes'
+                    `);
+                }
+            },
+            {
+                id: '013_user_role_permission_level_10',
+                up: async () => {
+                    // Change the default "user" role permission_level from 2 to 10
+                    // This targets any server still using the original default level
+                    await pool.execute(`
+                        UPDATE roles SET permission_level = 10 WHERE permission_level = 2
+                    `);
+                }
+            },
+            {
+                id: '014_bmfa_tokens',
+                up: async () => {
+                    // Browser MFA identity tokens — replaces mfa_preauth_sessions
+                    await pool.execute(`
+                        CREATE TABLE IF NOT EXISTS bmfa_tokens (
+                            token       VARCHAR(128) NOT NULL PRIMARY KEY,
+                            ip_address  VARCHAR(45)  DEFAULT NULL,
+                            user_agent  TEXT         DEFAULT NULL,
+                            created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            expires_at  DATETIME     NOT NULL,
+                            INDEX idx_expires (expires_at)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    `);
+
+                    // Add 'bmfa' to context_type ENUM on mfa_challenges
+                    await pool.execute(`
+                        ALTER TABLE mfa_challenges
+                        MODIFY COLUMN context_type ENUM('sid','preauth','bmfa') NOT NULL
+                    `);
+
+                    // Drop preauth sessions table — no longer needed
+                    await pool.execute(`DROP TABLE IF EXISTS mfa_preauth_sessions`);
+                }
+            },
+            {
+                id: '015_mfa_reuse_session_to_persistent',
+                up: async () => {
+                    // Rename reuse policy value 'session' → 'persistent' in stored JSON
+                    await pool.execute(`
+                        UPDATE site_settings
+                        SET setting_value = REPLACE(setting_value, '"reuse":"session"', '"reuse":"persistent"')
+                        WHERE setting_key LIKE 'mfa_policy_%'
+                          AND setting_value LIKE '%"reuse":"session"%'
+                    `);
+                }
+            },
+            {
+                id: '016_remove_hashed_course_id',
+                up: async () => {
+                    await pool.execute(`ALTER TABLE courses DROP COLUMN hashed_course_id`);
+                }
+            },
+            {
+                id: '017_upload_sessions',
+                up: async () => {
+                    await pool.execute(`
+                        CREATE TABLE IF NOT EXISTS upload_sessions (
+                            upload_id         VARCHAR(12)  PRIMARY KEY,
+                            video_id          INT UNSIGNED DEFAULT NULL,
+                            course_id         CHAR(6)      NOT NULL,
+                            title             VARCHAR(255) DEFAULT NULL,
+                            week              VARCHAR(20)  DEFAULT NULL,
+                            lecture_date      DATE         DEFAULT NULL,
+                            description       TEXT         DEFAULT NULL,
+                            r2_upload_id      VARCHAR(1024) NOT NULL,
+                            object_key        VARCHAR(500) NOT NULL,
+                            original_filename VARCHAR(255) NOT NULL,
+                            file_size_bytes   BIGINT UNSIGNED NOT NULL,
+                            total_parts       INT UNSIGNED NOT NULL,
+                            status            ENUM('active','completing','completed','aborted') NOT NULL DEFAULT 'active',
+                            last_heartbeat    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            created_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            completed_at      DATETIME     DEFAULT NULL,
+                            created_by        INT UNSIGNED NOT NULL,
+                            INDEX idx_video_active (video_id, status),
+                            INDEX idx_heartbeat (status, last_heartbeat),
+                            FOREIGN KEY (course_id) REFERENCES courses(course_id) ON DELETE CASCADE,
+                            FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE CASCADE
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    `);
+                }
+            },
+            {
+                id: '018_widen_r2_upload_id',
+                up: async () => {
+                    await pool.execute(`ALTER TABLE upload_sessions MODIFY r2_upload_id VARCHAR(1024) NOT NULL`);
+                }
+            },
+            {
+                id: '020_remove_r2_turnstile_from_settings',
+                up: async () => {
+                    await pool.execute(`
+                        DELETE FROM site_settings WHERE setting_key IN (
+                            'r2_endpoint', 'r2_bucket_name', 'r2_access_key_id',
+                            'r2_secret_access_key', 'r2_public_domain',
+                            'turnstile_site_key', 'turnstile_secret_key'
+                        )
+                    `);
+                }
+            },
+            {
+                id: '019_course_id_to_int',
+                up: async () => {
+                    // Find and drop all FK constraints referencing courses.course_id
+                    const [fks] = await pool.execute(`
+                        SELECT TABLE_NAME, CONSTRAINT_NAME
+                        FROM information_schema.KEY_COLUMN_USAGE
+                        WHERE REFERENCED_TABLE_SCHEMA = DATABASE()
+                          AND REFERENCED_TABLE_NAME = 'courses'
+                          AND REFERENCED_COLUMN_NAME = 'course_id'
+                    `);
+                    for (const fk of fks) {
+                        await pool.execute(`ALTER TABLE \`${fk.TABLE_NAME}\` DROP FOREIGN KEY \`${fk.CONSTRAINT_NAME}\``);
+                    }
+
+                    // Convert all course_id columns from CHAR(6) to INT UNSIGNED
+                    await pool.execute(`ALTER TABLE courses MODIFY course_id INT UNSIGNED NOT NULL AUTO_INCREMENT`);
+                    await pool.execute(`ALTER TABLE enrollments MODIFY course_id INT UNSIGNED NOT NULL`);
+                    await pool.execute(`ALTER TABLE videos MODIFY course_id INT UNSIGNED NOT NULL`);
+                    await pool.execute(`ALTER TABLE upload_sessions MODIFY course_id INT UNSIGNED NOT NULL`);
+
+                    // Re-add FK constraints
+                    await pool.execute(`ALTER TABLE enrollments ADD FOREIGN KEY (course_id) REFERENCES courses(course_id) ON DELETE CASCADE`);
+                    await pool.execute(`ALTER TABLE videos ADD FOREIGN KEY (course_id) REFERENCES courses(course_id) ON DELETE CASCADE`);
+                    await pool.execute(`ALTER TABLE upload_sessions ADD FOREIGN KEY (course_id) REFERENCES courses(course_id) ON DELETE CASCADE`);
+                }
+            }
+        ];
+
+        for (const migration of migrations) {
+            const [rows] = await pool.execute(
+                'SELECT 1 FROM schema_migrations WHERE migration_id = ?',
+                [migration.id]
+            );
+            if (rows.length === 0) {
+                console.log(`Running migration: ${migration.id}`);
+                await migration.up();
+                await pool.execute(
+                    'INSERT INTO schema_migrations (migration_id) VALUES (?)',
+                    [migration.id]
+                );
+                console.log(`Migration ${migration.id} applied successfully`);
+            }
+        }
+    } catch (err) {
+        console.error('Migration error:', err.message);
+        // Don't crash the app – log and continue
+    }
+}
+
+module.exports = { runMigrations };

@@ -1,0 +1,59 @@
+const express = require('express');
+const router = express.Router();
+const { getPool } = require('../../config/database');
+const { resolvePermissions } = require('../../services/permissionService');
+
+// GET /api/me — current session user + permissions
+router.get('/me', async (req, res) => {
+    const user = res.locals.user;
+    if (!user) {
+        return res.json({ user: null });
+    }
+
+    res.json({
+        user: {
+            user_id: user.user_id,
+            username: user.username,
+            display_name: user.display_name,
+            role_id: user.role_id,
+            permissions: user.permissions,
+            permission_level: user.permission_level,
+        }
+    });
+});
+
+// GET /api/settings/public — public site settings (no auth required)
+router.get('/settings/public', async (req, res) => {
+    try {
+        const pool = getPool();
+        const [rows] = await pool.execute(
+            `SELECT setting_key, setting_value FROM site_settings
+             WHERE setting_key IN ('site_name', 'enable_registration', 'require_invitation_code')`
+        );
+
+        const settings = {};
+        for (const row of rows) {
+            settings[row.setting_key] = row.setting_value;
+        }
+
+        // Turnstile site key from env (not secret key)
+        const turnstileSiteKey = process.env.TURNSTILE_SITE_KEY || '';
+
+        res.json({
+            siteName: settings.site_name || 'VideoSite',
+            turnstileSiteKey,
+            registrationEnabled: settings.enable_registration === 'true',
+            invitationRequired: settings.require_invitation_code !== 'false',
+        });
+    } catch (err) {
+        console.error('Failed to load public settings:', err);
+        res.json({
+            siteName: 'VideoSite',
+            turnstileSiteKey: '',
+            registrationEnabled: false,
+            invitationRequired: true,
+        });
+    }
+});
+
+module.exports = router;

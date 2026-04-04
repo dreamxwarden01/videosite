@@ -1,0 +1,39 @@
+# Dependencies
+web/node_modules/
+web/client/node_modules/
+
+# Built assets
+web/client/dist/
+
+# Compiled binaries
+worker/videosite-worker
+worker/videosite-worker.exe
+
+# Runtime config (contains secrets)
+worker/config.json
+worker/capabilities.json
+
+# OS junk
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# Old working files (not part of the project)
+web-old/
+worker-old/
+worker-macos/
+worker-windows/
+*.md
+!web/README.md
+!worker/CLAUDE.md
+
+# Environment / secrets
+.env
+.env.*
