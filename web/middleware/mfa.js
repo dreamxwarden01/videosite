@@ -52,7 +52,7 @@ function requireMfaForScenario(scenario, options) {
             // 4. Check X-MFA-Challenge header
             const challengeId = req.headers['x-mfa-challenge'];
             if (challengeId) {
-                const result = await validateChallenge(challengeId, user.user_id, bmfaToken, policy.level);
+                const result = await validateChallenge(challengeId, user.user_id, bmfaToken, policy.level, req.originalUrl);
                 if (result.valid) {
                     await consumeChallenge(challengeId);
                     await rotateBmfaIfNeeded(req, res, bmfaToken);

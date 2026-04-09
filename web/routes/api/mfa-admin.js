@@ -38,6 +38,7 @@ router.get('/admin/mfa/settings', requireMfaForScenario('mfa'), async (req, res)
 
     const general = {
       mfa_pending_challenge_timeout_seconds: parseInt(allSettings.mfa_pending_challenge_timeout_seconds || '900', 10),
+      mfa_onetime_challenge_timeout_seconds: parseInt(allSettings.mfa_onetime_challenge_timeout_seconds || '600', 10),
       mfa_otp_timeout_seconds: parseInt(allSettings.mfa_otp_timeout_seconds || '300', 10),
     };
 
@@ -76,14 +77,21 @@ router.get('/admin/mfa/settings', requireMfaForScenario('mfa'), async (req, res)
 // ---------------------------------------------------------------------------
 router.put('/admin/mfa/settings/general', requireMfaForScenario('mfa'), async (req, res) => {
   try {
-    const { mfa_pending_challenge_timeout_seconds, mfa_otp_timeout_seconds } = req.body;
+    const { mfa_pending_challenge_timeout_seconds, mfa_onetime_challenge_timeout_seconds, mfa_otp_timeout_seconds } = req.body;
 
     const challengeTimeout = parseInt(mfa_pending_challenge_timeout_seconds, 10);
+    const onetimeTimeout = parseInt(mfa_onetime_challenge_timeout_seconds, 10);
     const otpTimeout = parseInt(mfa_otp_timeout_seconds, 10);
 
     // Validate ranges
     if (isNaN(challengeTimeout) || challengeTimeout < 600 || challengeTimeout > 7200) {
       return res.status(400).json({ error: 'Challenge timeout must be between 600 and 7200 seconds (10-120 minutes)' });
+    }
+    if (isNaN(onetimeTimeout) || onetimeTimeout < 60 || onetimeTimeout > 3600) {
+      return res.status(400).json({ error: 'One-time challenge timeout must be between 60 and 3600 seconds (1-60 minutes)' });
+    }
+    if (onetimeTimeout > challengeTimeout) {
+      return res.status(400).json({ error: 'One-time challenge timeout must not exceed the pending challenge timeout' });
     }
     if (isNaN(otpTimeout) || otpTimeout < 180 || otpTimeout > 3600) {
       return res.status(400).json({ error: 'OTP timeout must be between 180 and 3600 seconds (3-60 minutes)' });
@@ -93,6 +101,7 @@ router.put('/admin/mfa/settings/general', requireMfaForScenario('mfa'), async (r
     }
 
     await upsertSetting('mfa_pending_challenge_timeout_seconds', challengeTimeout);
+    await upsertSetting('mfa_onetime_challenge_timeout_seconds', onetimeTimeout);
     await upsertSetting('mfa_otp_timeout_seconds', otpTimeout);
 
     res.status(204).end();
@@ -109,16 +118,26 @@ router.put('/admin/mfa/settings/levels', requireMfaForScenario('mfa'), async (re
   try {
     const { level_0, level_1, level_2 } = req.body;
 
-    for (const [label, val] of [['Level 0', level_0], ['Level 1', level_1], ['Level 2', level_2]]) {
+    const parsedLevels = {};
+    for (const [label, key, val] of [['Level 0', 'level_0', level_0], ['Level 1', 'level_1', level_1], ['Level 2', 'level_2', level_2]]) {
       const parsed = parseInt(val, 10);
       if (isNaN(parsed) || parsed < 60 || parsed > 31536000) {
         return res.status(400).json({ error: `${label} timeout must be between 60 and 31536000 seconds` });
       }
+      parsedLevels[key] = parsed;
     }
 
-    await upsertSetting('mfa_level_0_timeout_seconds', parseInt(level_0, 10));
-    await upsertSetting('mfa_level_1_timeout_seconds', parseInt(level_1, 10));
-    await upsertSetting('mfa_level_2_timeout_seconds', parseInt(level_2, 10));
+    // Higher verification levels must have shorter or equal timeouts
+    if (parsedLevels.level_1 > parsedLevels.level_0) {
+      return res.status(400).json({ error: 'Level 1 timeout must not exceed Level 0 timeout' });
+    }
+    if (parsedLevels.level_2 > parsedLevels.level_1) {
+      return res.status(400).json({ error: 'Level 2 timeout must not exceed Level 1 timeout' });
+    }
+
+    await upsertSetting('mfa_level_0_timeout_seconds', parsedLevels.level_0);
+    await upsertSetting('mfa_level_1_timeout_seconds', parsedLevels.level_1);
+    await upsertSetting('mfa_level_2_timeout_seconds', parsedLevels.level_2);
 
     res.status(204).end();
   } catch (err) {
@@ -191,7 +210,7 @@ router.put('/admin/mfa/settings/policy/:scenario', requireMfaForScenario('mfa'),
         const bmfaToken = await ensureBmfa(req, res);
         const challengeId = req.headers['x-mfa-challenge'];
         if (challengeId) {
-          const result = await validateChallenge(challengeId, userId, bmfaToken, challengeLevel);
+          const result = await validateChallenge(challengeId, userId, bmfaToken, challengeLevel, req.originalUrl);
           if (!result.valid) {
             return res.status(403).json({ error: 'Invalid or expired verification', requireMFA: true });
           }

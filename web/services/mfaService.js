@@ -137,7 +137,7 @@ async function getChallenge(challengeId) {
     return row || null;
 }
 
-async function validateChallenge(challengeId, userId, contextId, requiredLevel) {
+async function validateChallenge(challengeId, userId, contextId, requiredLevel, currentEndpoint) {
     const challenge = await getChallenge(challengeId);
 
     if (!challenge) {
@@ -155,6 +155,10 @@ async function validateChallenge(challengeId, userId, contextId, requiredLevel) 
     if (challenge.status !== 'verified') {
         return { valid: false, reason: 'Challenge not verified' };
     }
+    // One-time challenges must match the exact endpoint they were approved for
+    if (currentEndpoint && !challenge.can_reuse && challenge.approved_endpoint !== currentEndpoint) {
+        return { valid: false, reason: 'Endpoint mismatch' };
+    }
 
     return { valid: true, challenge };
 }
@@ -164,13 +168,21 @@ async function markChallengeVerified(challengeId, method) {
     const challenge = await getChallenge(challengeId);
     if (!challenge) return;
 
-    const levelTimeout = await getLevelTimeoutSeconds(challenge.mfa_level);
+    let timeout;
+    if (!challenge.can_reuse) {
+        // One-time challenge: use shorter dedicated TTL
+        timeout = parseInt(await getSetting('mfa_onetime_challenge_timeout_seconds', '600'), 10) || 600;
+    } else {
+        // Reusable challenge: use level-based TTL
+        timeout = await getLevelTimeoutSeconds(challenge.mfa_level);
+    }
+
     await pool.execute(
         `UPDATE mfa_challenges
          SET status = 'verified', verified_method = ?, verified_at = NOW(),
              expires_at = DATE_ADD(NOW(), INTERVAL ? SECOND)
          WHERE id = ?`,
-        [method, levelTimeout, challengeId]
+        [method, timeout, challengeId]
     );
 }
 

@@ -424,6 +424,15 @@ async function runMigrations() {
                 }
             },
             {
+                id: '021_mfa_onetime_challenge_timeout',
+                up: async () => {
+                    await pool.execute(`
+                        INSERT IGNORE INTO site_settings (setting_key, setting_value)
+                        VALUES ('mfa_onetime_challenge_timeout_seconds', '600')
+                    `);
+                }
+            },
+            {
                 id: '019_course_id_to_int',
                 up: async () => {
                     // Find and drop all FK constraints referencing courses.course_id

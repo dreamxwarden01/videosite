@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useSite } from '../../context/SiteContext';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
@@ -65,15 +65,26 @@ export default function MfaSettingsPage() {
   const [savingGeneral, setSavingGeneral] = useState(false);
   const [savingLevels, setSavingLevels] = useState(false);
 
-  // General settings
-  const [challengeTimeoutMin, setChallengeTimeoutMin] = useState(15);
-  const [otpTimeoutMin, setOtpTimeoutMin] = useState(5);
+  // General settings (stored as strings to avoid "0" flash on empty input)
+  const [challengeTimeoutMin, setChallengeTimeoutMin] = useState('15');
+  const [onetimeTimeoutMin, setOnetimeTimeoutMin] = useState('10');
+  const [otpTimeoutMin, setOtpTimeoutMin] = useState('5');
 
-  // Level timeouts — stored as { value, unit } for each level
+  // Original values for dirty tracking
+  const originalGeneral = useRef({});
+  const originalLevelSeconds = useRef({});
+
+  // Validation state
+  const [generalErrors, setGeneralErrors] = useState({});
+  const [generalTouched, setGeneralTouched] = useState({});
+  const [levelErrors, setLevelErrors] = useState({});
+  const [levelTouched, setLevelTouched] = useState({});
+
+  // Level timeouts — stored as { value (string), unit } for each level
   const [levelValues, setLevelValues] = useState({
-    level_0: { value: 7, unit: 'days' },
-    level_1: { value: 1, unit: 'hours' },
-    level_2: { value: 10, unit: 'minutes' },
+    level_0: { value: '7', unit: 'days' },
+    level_1: { value: '1', unit: 'hours' },
+    level_2: { value: '10', unit: 'minutes' },
   });
 
   // Policies — each row: { enabled, level, scope, reuse }
@@ -104,18 +115,23 @@ export default function MfaSettingsPage() {
       const { data, ok } = await mfaPageFetch('/api/admin/mfa/settings');
       if (ok && data) {
         // General
-        // mfa_login_enabled removed — login MFA controlled via policy table
-        setChallengeTimeoutMin(Math.round(data.general.mfa_pending_challenge_timeout_seconds / 60));
-        setOtpTimeoutMin(Math.round(data.general.mfa_otp_timeout_seconds / 60));
+        const ct = Math.round(data.general.mfa_pending_challenge_timeout_seconds / 60);
+        const ot = Math.round(data.general.mfa_onetime_challenge_timeout_seconds / 60);
+        const otp = Math.round(data.general.mfa_otp_timeout_seconds / 60);
+        setChallengeTimeoutMin(String(ct));
+        setOnetimeTimeoutMin(String(ot));
+        setOtpTimeoutMin(String(otp));
+        originalGeneral.current = { challengeTimeoutMin: String(ct), onetimeTimeoutMin: String(ot), otpTimeoutMin: String(otp) };
 
         // Levels
         const lvl = {};
         for (const key of ['level_0', 'level_1', 'level_2']) {
           const secs = data.levels[key];
           const unit = bestUnit(secs);
-          lvl[key] = { value: toDisplay(secs, unit), unit };
+          lvl[key] = { value: String(toDisplay(secs, unit)), unit };
         }
         setLevelValues(lvl);
+        originalLevelSeconds.current = { ...data.levels };
 
         // Policies
         const p = {};
@@ -124,6 +140,12 @@ export default function MfaSettingsPage() {
         }
         setPolicies(p);
         setOriginalPolicies(JSON.parse(JSON.stringify(p)));
+
+        // Reset validation state
+        setGeneralTouched({});
+        setGeneralErrors({});
+        setLevelTouched({});
+        setLevelErrors({});
       }
     } catch {
       showToast('Failed to load MFA settings.');
@@ -142,23 +164,71 @@ export default function MfaSettingsPage() {
 
   if (loading) return <LoadingSpinner />;
 
-  // ---- General ----
+  // ---- Digit-only input handlers ----
 
-  const otpExceedsChallenge = otpTimeoutMin > challengeTimeoutMin;
+  const handleDigitOnly = (e) => {
+    if (e.ctrlKey || e.metaKey || ['Backspace', 'Delete', 'Tab', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+    if (!/^\d$/.test(e.key)) e.preventDefault();
+  };
+  const handleDigitPaste = (setter) => (e) => {
+    e.preventDefault();
+    const text = (e.clipboardData || window.clipboardData).getData('text');
+    const digits = text.replace(/\D/g, '');
+    if (digits) setter(digits);
+  };
+
+  // ---- General validation ----
+
+  const validateGeneral = (ct = challengeTimeoutMin, ot = onetimeTimeoutMin, otp = otpTimeoutMin) => {
+    const errs = {};
+    const ctVal = parseInt(ct, 10);
+    const otVal = parseInt(ot, 10);
+    const otpVal = parseInt(otp, 10);
+
+    if (!ct || isNaN(ctVal) || ctVal < 10 || ctVal > 120) errs.challengeTimeout = 'Must be 10-120 minutes';
+    if (!ot || isNaN(otVal) || otVal < 1 || otVal > 60) errs.onetimeTimeout = 'Must be 1-60 minutes';
+    if (!otp || isNaN(otpVal) || otpVal < 3 || otpVal > 60) errs.otpTimeout = 'Must be 3-60 minutes';
+
+    if (!errs.onetimeTimeout && !errs.challengeTimeout && otVal > ctVal) {
+      errs.onetimeTimeout = 'Must not exceed Pending Challenge Timeout';
+    }
+    if (!errs.otpTimeout && !errs.challengeTimeout && otpVal > ctVal) {
+      errs.otpTimeout = 'Must not exceed Pending Challenge Timeout';
+    }
+
+    setGeneralErrors(errs);
+    return Object.keys(errs).length === 0;
+  };
+
+  const handleGeneralBlur = (field) => () => {
+    setGeneralTouched(prev => ({ ...prev, [field]: true }));
+    validateGeneral();
+  };
+
+  const hasGeneralErrors = Object.values(generalErrors).some(Boolean);
+  const isGeneralDirty = challengeTimeoutMin !== originalGeneral.current.challengeTimeoutMin
+    || onetimeTimeoutMin !== originalGeneral.current.onetimeTimeoutMin
+    || otpTimeoutMin !== originalGeneral.current.otpTimeoutMin;
 
   const handleSaveGeneral = async (e) => {
     e.preventDefault();
-    if (otpExceedsChallenge) return;
+    // Touch all fields so errors show
+    setGeneralTouched({ challengeTimeout: true, onetimeTimeout: true, otpTimeout: true });
+    if (!validateGeneral()) return;
     setSavingGeneral(true);
     try {
       const { ok, data } = await mfaFetch('/api/admin/mfa/settings/general', {
         method: 'PUT', body: {
-          mfa_pending_challenge_timeout_seconds: challengeTimeoutMin * 60,
-          mfa_otp_timeout_seconds: otpTimeoutMin * 60,
+          mfa_pending_challenge_timeout_seconds: parseInt(challengeTimeoutMin, 10) * 60,
+          mfa_onetime_challenge_timeout_seconds: parseInt(onetimeTimeoutMin, 10) * 60,
+          mfa_otp_timeout_seconds: parseInt(otpTimeoutMin, 10) * 60,
         }
       });
       if (ok) {
         showToast('General MFA settings saved.', 'success');
+        originalGeneral.current = { challengeTimeoutMin, onetimeTimeoutMin, otpTimeoutMin };
+        setGeneralTouched({});
+        setGeneralErrors({});
       } else {
         showToast(data?.error || 'Failed to save general settings.');
       }
@@ -169,7 +239,53 @@ export default function MfaSettingsPage() {
     }
   };
 
-  // ---- Levels ----
+  // ---- Levels validation ----
+
+  const validateLevels = (vals = levelValues) => {
+    const errs = {};
+    const secs = {};
+    for (const key of ['level_0', 'level_1', 'level_2']) {
+      const v = parseInt(vals[key].value, 10);
+      if (!vals[key].value || isNaN(v) || v < 1) {
+        errs[key] = 'Value must be at least 1';
+        secs[key] = 0;
+        continue;
+      }
+      const s = toSeconds(v, vals[key].unit);
+      secs[key] = s;
+      if (s < 60 || s > 31536000) {
+        errs[key] = 'Must be between 1 minute and 365 days';
+      }
+    }
+    // Ordering: level_2 <= level_1 <= level_0
+    if (!errs.level_1 && !errs.level_0 && secs.level_1 > secs.level_0) {
+      errs.level_1 = 'Must not exceed Level 0 timeout';
+    }
+    if (!errs.level_2 && !errs.level_1 && secs.level_2 > secs.level_1) {
+      errs.level_2 = 'Must not exceed Level 1 timeout';
+    }
+    if (!errs.level_2 && !errs.level_0 && secs.level_2 > secs.level_0) {
+      errs.level_2 = 'Must not exceed Level 0 timeout';
+    }
+
+    setLevelErrors(errs);
+    return Object.keys(errs).length === 0;
+  };
+
+  const handleLevelBlur = (key) => () => {
+    setLevelTouched(prev => ({ ...prev, [key]: true }));
+    validateLevels();
+  };
+
+  const hasLevelErrors = Object.values(levelErrors).some(Boolean);
+  const currentLevelSeconds = {
+    level_0: toSeconds(parseInt(levelValues.level_0.value, 10) || 0, levelValues.level_0.unit),
+    level_1: toSeconds(parseInt(levelValues.level_1.value, 10) || 0, levelValues.level_1.unit),
+    level_2: toSeconds(parseInt(levelValues.level_2.value, 10) || 0, levelValues.level_2.unit),
+  };
+  const isLevelsDirty = currentLevelSeconds.level_0 !== originalLevelSeconds.current.level_0
+    || currentLevelSeconds.level_1 !== originalLevelSeconds.current.level_1
+    || currentLevelSeconds.level_2 !== originalLevelSeconds.current.level_2;
 
   const handleLevelValueChange = (key, val) => {
     setLevelValues(prev => ({
@@ -181,28 +297,32 @@ export default function MfaSettingsPage() {
   const handleLevelUnitChange = (key, newUnit) => {
     setLevelValues(prev => {
       const cur = prev[key];
-      const converted = convertUnit(cur.value, cur.unit, newUnit);
-      return { ...prev, [key]: { value: converted, unit: newUnit } };
+      const converted = convertUnit(parseInt(cur.value, 10) || 0, cur.unit, newUnit);
+      return { ...prev, [key]: { value: String(converted), unit: newUnit } };
     });
+    // Re-validate after unit change if any field has been touched
+    if (Object.keys(levelTouched).length > 0) {
+      setTimeout(() => validateLevels(), 0);
+    }
   };
 
   const handleSaveLevels = async (e) => {
     e.preventDefault();
+    // Touch all fields
+    setLevelTouched({ level_0: true, level_1: true, level_2: true });
+    if (!validateLevels()) return;
     setSavingLevels(true);
     try {
       const body = {};
       for (const key of ['level_0', 'level_1', 'level_2']) {
-        const secs = toSeconds(levelValues[key].value, levelValues[key].unit);
-        if (secs < 60 || secs > 31536000) {
-          showToast(`${LEVEL_LABELS[key.slice(-1)]} timeout must be between 1 minute and 365 days.`);
-          setSavingLevels(false);
-          return;
-        }
-        body[key] = secs;
+        body[key] = toSeconds(parseInt(levelValues[key].value, 10), levelValues[key].unit);
       }
       const { ok, data } = await mfaFetch('/api/admin/mfa/settings/levels', { method: 'PUT', body });
       if (ok) {
         showToast('Level timeouts saved.', 'success');
+        originalLevelSeconds.current = { ...body };
+        setLevelTouched({});
+        setLevelErrors({});
       } else {
         showToast(data?.error || 'Failed to save level timeouts.');
       }
@@ -269,39 +389,61 @@ export default function MfaSettingsPage() {
           <div className="form-group">
             <label htmlFor="challengeTimeout">Pending Challenge Timeout (minutes)</label>
             <input
-              type="number"
+              type="text" inputMode="numeric"
               id="challengeTimeout"
-              className="form-control"
+              className={`form-control${generalTouched.challengeTimeout && generalErrors.challengeTimeout ? ' input-error' : ''}`}
               value={challengeTimeoutMin}
-              onChange={e => setChallengeTimeoutMin(parseInt(e.target.value, 10) || 0)}
-              min={10}
-              max={120}
+              onChange={e => setChallengeTimeoutMin(e.target.value)}
+              onKeyDown={handleDigitOnly}
+              onPaste={handleDigitPaste(setChallengeTimeoutMin)}
+              onBlur={handleGeneralBlur('challengeTimeout')}
               style={{ maxWidth: '200px' }}
             />
             <small className="text-muted" style={{ display: 'block' }}>Range: 10-120 minutes</small>
+            {generalTouched.challengeTimeout && generalErrors.challengeTimeout && (
+              <div className="field-error" style={{ marginTop: '4px' }}>{generalErrors.challengeTimeout}</div>
+            )}
+          </div>
+
+          <div className="form-group">
+            <label htmlFor="onetimeTimeout">One-Time Challenge Timeout (minutes)</label>
+            <input
+              type="text" inputMode="numeric"
+              id="onetimeTimeout"
+              className={`form-control${generalTouched.onetimeTimeout && generalErrors.onetimeTimeout ? ' input-error' : ''}`}
+              value={onetimeTimeoutMin}
+              onChange={e => setOnetimeTimeoutMin(e.target.value)}
+              onKeyDown={handleDigitOnly}
+              onPaste={handleDigitPaste(setOnetimeTimeoutMin)}
+              onBlur={handleGeneralBlur('onetimeTimeout')}
+              style={{ maxWidth: '200px' }}
+            />
+            <small className="text-muted" style={{ display: 'block' }}>Range: 1-60 minutes</small>
+            {generalTouched.onetimeTimeout && generalErrors.onetimeTimeout && (
+              <div className="field-error" style={{ marginTop: '4px' }}>{generalErrors.onetimeTimeout}</div>
+            )}
           </div>
 
           <div className="form-group">
             <label htmlFor="otpTimeout">OTP Code Timeout (minutes)</label>
             <input
-              type="number"
+              type="text" inputMode="numeric"
               id="otpTimeout"
-              className="form-control"
+              className={`form-control${generalTouched.otpTimeout && generalErrors.otpTimeout ? ' input-error' : ''}`}
               value={otpTimeoutMin}
-              onChange={e => setOtpTimeoutMin(parseInt(e.target.value, 10) || 0)}
-              min={3}
-              max={60}
+              onChange={e => setOtpTimeoutMin(e.target.value)}
+              onKeyDown={handleDigitOnly}
+              onPaste={handleDigitPaste(setOtpTimeoutMin)}
+              onBlur={handleGeneralBlur('otpTimeout')}
               style={{ maxWidth: '200px' }}
             />
             <small className="text-muted" style={{ display: 'block' }}>Range: 3-60 minutes</small>
-            {otpExceedsChallenge && (
-              <div className="field-error" style={{ marginTop: '4px' }}>
-                OTP timeout must not exceed the challenge timeout.
-              </div>
+            {generalTouched.otpTimeout && generalErrors.otpTimeout && (
+              <div className="field-error" style={{ marginTop: '4px' }}>{generalErrors.otpTimeout}</div>
             )}
           </div>
 
-          <button type="submit" className="btn btn-primary" disabled={savingGeneral || otpExceedsChallenge}>
+          <button type="submit" className="btn btn-primary" disabled={savingGeneral || !isGeneralDirty || hasGeneralErrors}>
             {savingGeneral ? 'Saving...' : 'Save General Settings'}
           </button>
         </form>
@@ -315,22 +457,25 @@ export default function MfaSettingsPage() {
         <div style={{ maxWidth: '600px' }}>
           <p className="text-muted" style={{ marginBottom: '16px' }}>
             After a user completes MFA verification, the approval is remembered for the duration specified here.
-            Higher levels require stronger methods and typically have shorter timeouts.
+            Higher levels require stronger methods and must have shorter or equal timeouts.
           </p>
           <form onSubmit={handleSaveLevels}>
             {['level_0', 'level_1', 'level_2'].map(key => {
               const lvl = levelValues[key];
               const levelNum = key.slice(-1);
+              const showError = levelTouched[key] && levelErrors[key];
               return (
                 <div className="form-group" key={key}>
                   <label>{LEVEL_LABELS[levelNum]}</label>
                   <div style={{ display: 'flex', gap: '8px', maxWidth: '300px' }}>
                     <input
-                      type="number"
-                      className="form-control"
+                      type="text" inputMode="numeric"
+                      className={`form-control${showError ? ' input-error' : ''}`}
                       value={lvl.value}
-                      onChange={e => handleLevelValueChange(key, parseInt(e.target.value, 10) || 0)}
-                      min={1}
+                      onChange={e => handleLevelValueChange(key, e.target.value)}
+                      onKeyDown={handleDigitOnly}
+                      onPaste={handleDigitPaste((v) => handleLevelValueChange(key, v))}
+                      onBlur={handleLevelBlur(key)}
                       style={{ flex: 1 }}
                     />
                     <select
@@ -344,10 +489,13 @@ export default function MfaSettingsPage() {
                       ))}
                     </select>
                   </div>
+                  {showError && (
+                    <div className="field-error" style={{ marginTop: '4px' }}>{levelErrors[key]}</div>
+                  )}
                 </div>
               );
             })}
-            <button type="submit" className="btn btn-primary" disabled={savingLevels}>
+            <button type="submit" className="btn btn-primary" disabled={savingLevels || !isLevelsDirty || hasLevelErrors}>
               {savingLevels ? 'Saving...' : 'Save Level Timeouts'}
             </button>
           </form>
