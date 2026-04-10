@@ -9,7 +9,7 @@ import Turnstile from '../components/Turnstile';
 import PasswordRules, { checkPasswordComplexity } from '../components/PasswordRules';
 
 export default function RegisterCompletePage() {
-  const { refresh } = useAuth();
+  const { user, refresh } = useAuth();
   const { siteName, turnstileSiteKey } = useSite();
   const { showToast } = useToast();
   const navigate = useNavigate();
@@ -38,6 +38,10 @@ export default function RegisterCompletePage() {
   // Page state
   const [pageError, setPageError] = useState(null);
   const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (user) navigate('/profile', { replace: true });
+  }, [user, navigate]);
 
   useEffect(() => {
     document.title = `Complete Registration - ${siteName}`;

@@ -18,6 +18,10 @@ function isValidEmail(email) {
 // ---------------------------------------------------------------------------
 router.post('/api/password-reset/request', async (req, res) => {
     try {
+        if (res.locals.user) {
+            return res.status(400).json({ success: false, message: 'Already logged in.' });
+        }
+
         const { email, turnstileToken } = req.body;
         const ip = getClientIp(req);
 

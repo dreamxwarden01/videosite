@@ -3,8 +3,6 @@ import { apiGet, apiPost, setAuthFailureHandler } from '../api';
 
 const AuthContext = createContext(null);
 
-const AUTH_PAGES = ['/login', '/register'];
-
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -29,15 +27,7 @@ export function AuthProvider({ children }) {
   useEffect(() => {
     // Register auth failure handler so apiFetch 401s clear user state
     setAuthFailureHandler(clearUser);
-
-    // Skip /api/me on auth pages — session is irrelevant there
-    const path = window.location.pathname;
-    if (AUTH_PAGES.some(p => path.startsWith(p))) {
-      setLoading(false);
-    } else {
-      refresh();
-    }
-
+    refresh();
     return () => setAuthFailureHandler(null);
   }, [refresh, clearUser]);
 

@@ -22,6 +22,10 @@ function isValidEmail(email) {
 // POST /api/register/start — step 1 submit
 router.post('/api/register/start', async (req, res) => {
     try {
+        if (res.locals.user) {
+            return res.status(400).json({ success: false, message: 'Already logged in.' });
+        }
+
         const { email, invitationCode, turnstileToken } = req.body;
         const ip = getClientIp(req);
 

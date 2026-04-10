@@ -42,7 +42,7 @@ export default function LoginPage() {
 
   // If already logged in, redirect
   useEffect(() => {
-    if (user) navigate('/', { replace: true });
+    if (user) navigate('/profile', { replace: true });
   }, [user, navigate]);
 
 

@@ -9,7 +9,7 @@ import MfaChallengeUI from '../components/MfaChallengeUI';
 import PasswordRules, { checkPasswordComplexity } from '../components/PasswordRules';
 
 export default function ResetPasswordConfirmPage() {
-  const { refresh } = useAuth();
+  const { user, refresh } = useAuth();
   const { siteName } = useSite();
   const { showToast } = useToast();
   const navigate = useNavigate();
@@ -29,6 +29,10 @@ export default function ResetPasswordConfirmPage() {
 
   // MFA state
   const [mfaData, setMfaData] = useState(null);
+
+  useEffect(() => {
+    if (user) navigate('/profile', { replace: true });
+  }, [user, navigate]);
 
   useEffect(() => {
     document.title = `Reset Password - ${siteName}`;

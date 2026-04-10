@@ -49,7 +49,7 @@ export default function RegisterPage() {
   }, [siteName]);
 
   useEffect(() => {
-    if (user) navigate('/', { replace: true });
+    if (user) navigate('/profile', { replace: true });
   }, [user, navigate]);
 
   // Update invitation code validity when invitationRequired changes

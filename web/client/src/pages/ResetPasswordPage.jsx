@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
 import { useSite } from '../context/SiteContext';
 import { useToast } from '../context/ToastContext';
 import { apiPost } from '../api';
@@ -7,8 +8,10 @@ import Header from '../components/Header';
 import Turnstile from '../components/Turnstile';
 
 export default function ResetPasswordPage() {
+  const { user } = useAuth();
   const { siteName } = useSite();
   const { showToast } = useToast();
+  const navigate = useNavigate();
 
   const [email, setEmail] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -19,6 +22,10 @@ export default function ResetPasswordPage() {
   // Turnstile
   const [turnstileToken, setTurnstileToken] = useState(null);
   const resetRef = useRef(null);
+
+  useEffect(() => {
+    if (user) navigate('/profile', { replace: true });
+  }, [user, navigate]);
 
   useEffect(() => {
     document.title = `Reset Password - ${siteName}`;

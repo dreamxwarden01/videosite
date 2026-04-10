@@ -17,6 +17,10 @@ function sanitizeReturnTo(returnTo) {
 // POST /api/login
 router.post('/api/login', async (req, res) => {
     try {
+        if (res.locals.user) {
+            return res.status(400).json({ success: false, message: 'Already logged in.' });
+        }
+
         const { username, password, returnTo } = req.body;
         const safeReturnTo = sanitizeReturnTo(returnTo);
 
