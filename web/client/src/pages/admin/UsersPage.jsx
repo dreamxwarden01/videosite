@@ -1,21 +1,21 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useSite } from '../../context/SiteContext';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
-import { useConfirm } from '../../components/ConfirmModal';
 import useMfaPageGuard from '../../hooks/useMfaPageGuard';
 import useMfaChallenge from '../../hooks/useMfaChallenge';
 import MfaPageGuard, { MfaSetupRequiredModal } from '../../components/MfaPageGuard';
 import MfaChallengeUI from '../../components/MfaChallengeUI';
 import Pagination from '../../components/Pagination';
 import LoadingSpinner from '../../components/LoadingSpinner';
+import AddUserModal from '../../components/AddUserModal';
 
 export default function UsersPage() {
   const { siteName } = useSite();
   const { user } = useAuth();
   const { showToast } = useToast();
-  const confirm = useConfirm();
+  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
 
   const { mfaBlock, mfaSetupBlock, autoShowModal, mfaPageFetch, handlePageMfaSuccess, handlePageMfaCancel, retryVerification, mfaVerifiedKey } = useMfaPageGuard();
@@ -29,10 +29,8 @@ export default function UsersPage() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
-  // Activity modal
-  const [activityUser, setActivityUser] = useState(null);
-  const [sessions, setSessions] = useState([]);
-  const [sessionsLoading, setSessionsLoading] = useState(false);
+  // Add user modal
+  const [showAddModal, setShowAddModal] = useState(false);
 
   useEffect(() => {
     document.title = `User Management - ${siteName}`;
@@ -63,55 +61,6 @@ export default function UsersPage() {
     return <p className="text-muted">Permission denied.</p>;
   }
 
-  const handleDelete = async (userId, username) => {
-    if (!await confirm(`Delete user '${username}'?`)) return;
-    try {
-      const { ok, data } = await mfaFetch(`/api/admin/users/${userId}`, { method: 'DELETE' });
-      if (ok) {
-        showToast('User deleted.', 'success');
-        fetchUsers();
-      } else {
-        showToast(data?.error || 'Failed to delete user.');
-      }
-    } catch (err) {
-      showToast(err.message);
-    }
-  };
-
-  const openActivityModal = async (u) => {
-    setActivityUser(u);
-    setSessions([]);
-    setSessionsLoading(true);
-
-    try {
-      const { data, ok } = await mfaFetch(`/api/admin/users/${u.user_id}/sessions`, { method: 'GET' });
-      if (ok && data) {
-        setSessions(data.sessions || []);
-      }
-    } catch (err) {
-      showToast('Failed to load sessions: ' + err.message);
-    } finally {
-      setSessionsLoading(false);
-    }
-  };
-
-  const handleTerminateAll = async () => {
-    if (!activityUser) return;
-    if (!await confirm('Terminate all sessions for this user? They will be signed out everywhere.')) return;
-
-    try {
-      const { ok, data } = await mfaFetch(`/api/admin/users/${activityUser.user_id}/sessions/terminate-all`, { method: 'POST' });
-      if (ok) {
-        showToast('All sessions terminated.', 'success');
-        setSessions([]);
-      } else {
-        showToast('Failed: ' + (data?.error || 'Unknown error'));
-      }
-    } catch (err) {
-      showToast('Failed: ' + err.message);
-    }
-  };
-
   const handlePageChange = (newPage) => {
     setPage(newPage);
     setSearchParams({ page: newPage });
@@ -132,7 +81,7 @@ export default function UsersPage() {
         <div className="flex-between mb-3">
           <h1>User Management</h1>
           {user.permissions.addUser && (
-            <Link to="/admin/users/new" className="btn btn-primary">Add User</Link>
+            <button className="btn btn-primary" onClick={() => setShowAddModal(true)}>Add User</button>
           )}
         </div>
 
@@ -146,12 +95,15 @@ export default function UsersPage() {
                   <th>Role</th>
                   <th>Status</th>
                   <th>Created</th>
-                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {users.map(u => (
-                  <tr key={u.user_id}>
+                  <tr
+                    key={u.user_id}
+                    className="clickable-row"
+                    onClick={() => navigate(`/admin/users/${u.user_id}/edit`)}
+                  >
                     <td>{u.username}</td>
                     <td>{u.display_name}</td>
                     <td>{u.role_name}</td>
@@ -161,32 +113,11 @@ export default function UsersPage() {
                       </span>
                     </td>
                     <td>{new Date(u.created_at).toLocaleDateString()}</td>
-                    <td>
-                      {user.permissions.changeUser && (
-                        <>
-                          <Link to={`/admin/users/${u.user_id}/edit`} className="btn btn-secondary btn-sm">Edit</Link>
-                          <button
-                            className="btn btn-secondary btn-sm"
-                            onClick={() => openActivityModal(u)}
-                          >
-                            Activity
-                          </button>
-                        </>
-                      )}
-                      {user.permissions.deleteUser && (
-                        <button
-                          className="btn btn-danger btn-sm"
-                          onClick={() => handleDelete(u.user_id, u.username)}
-                        >
-                          Delete
-                        </button>
-                      )}
-                    </td>
                   </tr>
                 ))}
                 {users.length === 0 && (
                   <tr>
-                    <td colSpan="6" className="text-muted" style={{ textAlign: 'center', padding: '20px' }}>
+                    <td colSpan="5" className="text-muted" style={{ textAlign: 'center', padding: '20px' }}>
                       No users found
                     </td>
                   </tr>
@@ -205,61 +136,14 @@ export default function UsersPage() {
             itemLabel="user"
           />
         </div>
-
-        {/* Activity / Sessions Modal */}
-        {activityUser && (
-          <div className="modal-overlay active" onClick={() => setActivityUser(null)}>
-            <div className="modal" style={{ maxWidth: '640px' }} onClick={e => e.stopPropagation()}>
-              <div className="modal-header">
-                <h3>Sessions &mdash; {activityUser.username}</h3>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  {sessions.length > 0 && (
-                    <button className="btn btn-danger btn-sm" onClick={handleTerminateAll}>Terminate All</button>
-                  )}
-                  <button className="modal-close" onClick={() => setActivityUser(null)}>&times;</button>
-                </div>
-              </div>
-              <div className="modal-body" style={{ padding: 0 }}>
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Device</th>
-                        <th>IP Address</th>
-                        <th>Last Activity</th>
-                        <th>Signed In</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {sessionsLoading && (
-                        <tr>
-                          <td colSpan="4" className="text-muted" style={{ textAlign: 'center', padding: '16px' }}>Loading...</td>
-                        </tr>
-                      )}
-                      {!sessionsLoading && sessions.length === 0 && (
-                        <tr>
-                          <td colSpan="4" className="text-muted" style={{ textAlign: 'center', padding: '16px' }}>No active sessions</td>
-                        </tr>
-                      )}
-                      {!sessionsLoading && sessions.map((s, i) => (
-                        <tr key={i}>
-                          <td>{s.deviceName || 'Unknown'}</td>
-                          <td>{s.ip_address || 'Unknown'}</td>
-                          <td>{new Date(s.last_activity).toLocaleString()}</td>
-                          <td>{new Date(s.last_sign_in).toLocaleString()}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-              <div className="modal-footer" style={{ justifyContent: 'flex-end' }}>
-                <button className="btn btn-secondary" onClick={() => setActivityUser(null)}>OK</button>
-              </div>
-            </div>
-          </div>
-        )}
       </div>
+
+      <AddUserModal
+        isOpen={showAddModal}
+        onClose={() => setShowAddModal(false)}
+        onCreated={(userId) => { setShowAddModal(false); navigate(`/admin/users/${userId}/edit`); }}
+        mfaFetch={mfaFetch}
+      />
 
       {mfaState && (
         <MfaChallengeUI isModal={true}

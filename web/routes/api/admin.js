@@ -306,7 +306,10 @@ router.get('/admin/users', requireAuth, checkPermission('manageUser'), requireMf
 router.get('/admin/users/new', requireAuth, checkPermission('addUser'), requireMfaForScenario('user'), async (req, res) => {
     try {
         const roles = await getAssignableRoles(res.locals.user.permission_level);
-        res.json({ roles, allPermissions: ALL_PERMISSIONS, adminPermissions: res.locals.user.permissions });
+        const pool = getPool();
+        const [[row]] = await pool.execute("SELECT setting_value FROM site_settings WHERE setting_key = 'registration_default_role'");
+        const defaultRoleId = row ? row.setting_value : '2';
+        res.json({ roles, defaultRoleId });
     } catch (err) {
         console.error('API new user form error:', err);
         res.status(500).json({ error: 'Failed to load form.' });
@@ -363,8 +366,8 @@ router.post('/admin/users', requireAuth, checkPermission('addUser'), requireMfaF
             return res.status(403).json({ error: 'Cannot assign that role' });
         }
 
-        await createUser(trimmedUsername, trimmedDisplayName, password, selectedRole, email ? email.trim() : null);
-        res.status(204).end();
+        const userId = await createUser(trimmedUsername, trimmedDisplayName, password, selectedRole, email ? email.trim() : null);
+        res.status(201).json({ userId });
     } catch (err) {
         console.error('API create user error:', err);
         res.status(500).json({ error: 'Failed to create user: ' + err.message });
@@ -528,7 +531,7 @@ router.put('/admin/users/:id/permissions', requireAuth, checkPermission('changeU
 });
 
 // DELETE /api/admin/users/:id — delete
-router.delete('/admin/users/:id', requireAuth, checkPermission('deleteUser'), requireMfaForScenario('user'), checkPermissionLevel, async (req, res) => {
+router.delete('/admin/users/:id', requireAuth, checkPermission('deleteUser'), requireMfaForScenario('user', { mandatory: true }), checkPermissionLevel, async (req, res) => {
     try {
         if (blockSelfTarget(req, res)) return;
         await deleteUserSessions(parseInt(req.params.id));

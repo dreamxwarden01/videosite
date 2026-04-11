@@ -63,7 +63,6 @@ export default function App() {
                   <Route path="/admin/videos" element={<VideoManagementPage />} />
                   <Route path="/admin/videos/:courseId" element={<VideoListPage />} />
                   <Route path="/admin/users" element={<UsersPage />} />
-                  <Route path="/admin/users/new" element={<UserEditPage />} />
                   <Route path="/admin/users/:id/edit" element={<UserEditPage />} />
                   <Route path="/admin/enrollment" element={<EnrollmentPage />} />
                   <Route path="/admin/roles" element={<RolesPage />} />
