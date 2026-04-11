@@ -94,6 +94,13 @@ type Job struct {
 	Manager        *Manager
 	Progress       *progress.Tracker
 
+	// Server-provided transcoding config (per-course or global defaults).
+	OutputProfiles            []config.OutputProfile
+	AudioNormalization        bool
+	AudioNormalizationTarget  float64
+	AudioNormalizationPeak    float64
+	AudioNormalizationMaxGain float64
+
 	ctx            context.Context
 	cancel         context.CancelFunc
 	failedTypes    map[string]bool
@@ -110,7 +117,8 @@ type Job struct {
 // from the worker context. This means the worker can cancel its own poll loop
 // (w.cancel) without affecting active jobs; jobs are cancelled individually
 // via job.Cancel() when the worker needs to abort them.
-func NewJob(jobID string, videoID int, downloadURL string, encryptionKey string, initialEncoder config.Encoder, mgr *Manager, tracker *progress.Tracker) *Job {
+func NewJob(jobID string, videoID int, downloadURL string, encryptionKey string, initialEncoder config.Encoder, mgr *Manager, tracker *progress.Tracker,
+	outputProfiles []config.OutputProfile, audioNorm bool, audioNormTarget, audioNormPeak, audioNormMaxGain float64) *Job {
 	jobCtx, cancel := context.WithCancel(context.Background())
 	j := &Job{
 		JobID:          jobID,
@@ -119,6 +127,13 @@ func NewJob(jobID string, videoID int, downloadURL string, encryptionKey string,
 		EncryptionKey:  encryptionKey,
 		Manager:        mgr,
 		Progress:       tracker,
+
+		OutputProfiles:            outputProfiles,
+		AudioNormalization:        audioNorm,
+		AudioNormalizationTarget:  audioNormTarget,
+		AudioNormalizationPeak:    audioNormPeak,
+		AudioNormalizationMaxGain: audioNormMaxGain,
+
 		ctx:            jobCtx,
 		cancel:         cancel,
 		failedTypes:    make(map[string]bool),
@@ -718,8 +733,7 @@ func (j *Job) prepareEncryption() (string, error) {
 // enabled in config. Returns the loudnorm filter string for pass 2, or "" if
 // normalization is disabled or the source has no audio stream.
 func (j *Job) analyzeLoudness(probe *transcoder.ProbeResult) (string, error) {
-	cfg := config.Get()
-	if !cfg.AudioNormalization {
+	if !j.AudioNormalization {
 		return "", nil
 	}
 	if probe.AudioCodec == "" {
@@ -774,21 +788,20 @@ func (j *Job) analyzeLoudness(probe *transcoder.ProbeResult) (string, error) {
 		return "", nil
 	}
 
-	gainRequired := cfg.AudioNormalizationTarget - stats.InputI
+	gainRequired := j.AudioNormalizationTarget - stats.InputI
 	fmt.Printf("[%s] audio: measured %.1f LUFS, target %.1f LUFS, gain required %.1f dB (max %.1f dB)\n",
-		j.JobID, stats.InputI, cfg.AudioNormalizationTarget, gainRequired, cfg.AudioNormalizationMaxGain)
+		j.JobID, stats.InputI, j.AudioNormalizationTarget, gainRequired, j.AudioNormalizationMaxGain)
 
 	filter := transcoder.BuildLoudnormFilter(stats,
-		cfg.AudioNormalizationTarget,
-		cfg.AudioNormalizationPeak,
-		cfg.AudioNormalizationMaxGain,
+		j.AudioNormalizationTarget,
+		j.AudioNormalizationPeak,
+		j.AudioNormalizationMaxGain,
 	)
 	return filter, nil
 }
 
 func (j *Job) transcode(probe *transcoder.ProbeResult, loudnormFilter string) ([]transcoder.FilteredProfile, error) {
-	cfg := config.Get()
-	profiles := transcoder.FilterProfiles(probe, cfg.OutputProfiles)
+	profiles := transcoder.FilterProfiles(probe, j.OutputProfiles)
 	profiles = transcoder.ApplyBitrateCaps(j.JobID, profiles, probe.Height, probe.VideoBitrateKbps)
 
 	if len(profiles) == 0 {

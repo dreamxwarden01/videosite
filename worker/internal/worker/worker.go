@@ -138,7 +138,8 @@ func (w *Worker) poll() {
 	slog.Info("Launching job", "job", lease.JobID, "video", result.VideoID,
 		"encoder", encoder.EncoderType, "device", encoder.DeviceIndex)
 
-	job := slot.NewJob(lease.JobID, result.VideoID, lease.DownloadURL, lease.EncryptionKey, encoder, w.manager, w.tracker)
+	job := slot.NewJob(lease.JobID, result.VideoID, lease.DownloadURL, lease.EncryptionKey, encoder, w.manager, w.tracker,
+		lease.OutputProfiles, lease.AudioNormalization, lease.AudioNormalizationTarget, lease.AudioNormalizationPeak, lease.AudioNormalizationMaxGain)
 	w.manager.RegisterJob(lease.JobID, job)
 
 	w.wg.Add(1)

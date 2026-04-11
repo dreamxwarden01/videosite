@@ -314,7 +314,7 @@ export default function WatchPage() {
           <h2>{video.title}</h2>
           <p className="text-muted text-sm mt-1">
             {video.week && <>Week {video.week} &middot; </>}
-            {video.lecture_date && <>{new Date(video.lecture_date).toLocaleDateString()} &middot; </>}
+            {video.lecture_date && <>{video.lecture_date.slice(0, 10)} &middot; </>}
             {video.duration_seconds > 0 && (
               <>{Math.floor(video.duration_seconds / 3600)}h {Math.floor((video.duration_seconds % 3600) / 60)}m</>
             )}

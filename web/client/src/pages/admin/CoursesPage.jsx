@@ -1,21 +1,21 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useSite } from '../../context/SiteContext';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
-import { useConfirm } from '../../components/ConfirmModal';
 import useMfaPageGuard from '../../hooks/useMfaPageGuard';
 import useMfaChallenge from '../../hooks/useMfaChallenge';
 import MfaPageGuard, { MfaSetupRequiredModal } from '../../components/MfaPageGuard';
 import MfaChallengeUI from '../../components/MfaChallengeUI';
 import Pagination from '../../components/Pagination';
 import LoadingSpinner from '../../components/LoadingSpinner';
+import AddCourseModal from '../../components/AddCourseModal';
 
 export default function CoursesPage() {
+  const navigate = useNavigate();
   const { siteName } = useSite();
   const { user } = useAuth();
   const { showToast } = useToast();
-  const confirm = useConfirm();
   const [searchParams, setSearchParams] = useSearchParams();
 
   const { mfaBlock, mfaSetupBlock, autoShowModal, mfaPageFetch, handlePageMfaSuccess, handlePageMfaCancel, retryVerification, mfaVerifiedKey } = useMfaPageGuard();
@@ -28,6 +28,7 @@ export default function CoursesPage() {
   const [limit, setLimit] = useState(10);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [showAddModal, setShowAddModal] = useState(false);
 
   useEffect(() => {
     document.title = `Course Management - ${siteName}`;
@@ -58,21 +59,6 @@ export default function CoursesPage() {
     return <p className="text-muted">Permission denied.</p>;
   }
 
-  const handleDelete = async (courseId, courseName) => {
-    if (!await confirm('Delete this course and all its videos?')) return;
-    try {
-      const { ok, data } = await mfaFetch(`/api/admin/courses/${courseId}`, { method: 'DELETE' });
-      if (ok) {
-        showToast('Course deleted.', 'success');
-        fetchCourses();
-      } else {
-        showToast(data?.error || 'Failed to delete course.');
-      }
-    } catch (err) {
-      showToast(err.message);
-    }
-  };
-
   const handlePageChange = (newPage) => {
     setPage(newPage);
     setSearchParams({ page: newPage });
@@ -93,7 +79,7 @@ export default function CoursesPage() {
         <div className="flex-between mb-3">
           <h1>Course Management</h1>
           {user.permissions.addCourse && (
-            <Link to="/admin/courses/new" className="btn btn-primary">Add Course</Link>
+            <button className="btn btn-primary" onClick={() => setShowAddModal(true)}>Add Course</button>
           )}
         </div>
 
@@ -107,12 +93,15 @@ export default function CoursesPage() {
                   <th>Videos</th>
                   <th>Status</th>
                   <th>Created</th>
-                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {courses.map(course => (
-                  <tr key={course.course_id}>
+                  <tr
+                    key={course.course_id}
+                    className="clickable-row"
+                    onClick={() => navigate(`/admin/courses/${course.course_id}/edit`)}
+                  >
                     <td>{course.course_id}</td>
                     <td>{course.course_name}</td>
                     <td>{course.video_count || 0}</td>
@@ -122,24 +111,11 @@ export default function CoursesPage() {
                       </span>
                     </td>
                     <td>{new Date(course.created_at).toLocaleDateString()}</td>
-                    <td>
-                      {user.permissions.changeCourse && (
-                        <Link to={`/admin/courses/${course.course_id}/edit`} className="btn btn-secondary btn-sm">Edit</Link>
-                      )}
-                      {user.permissions.deleteCourse && (
-                        <button
-                          className="btn btn-danger btn-sm"
-                          onClick={() => handleDelete(course.course_id, course.course_name)}
-                        >
-                          Delete
-                        </button>
-                      )}
-                    </td>
                   </tr>
                 ))}
                 {courses.length === 0 && (
                   <tr>
-                    <td colSpan="6" className="text-muted" style={{ textAlign: 'center', padding: '20px' }}>
+                    <td colSpan="5" className="text-muted" style={{ textAlign: 'center', padding: '20px' }}>
                       No courses yet
                     </td>
                   </tr>
@@ -159,6 +135,16 @@ export default function CoursesPage() {
           />
         </div>
       </div>
+
+      <AddCourseModal
+        isOpen={showAddModal}
+        onClose={() => setShowAddModal(false)}
+        mfaFetch={mfaFetch}
+        onCreated={(courseId) => {
+          setShowAddModal(false);
+          navigate(`/admin/courses/${courseId}/edit`);
+        }}
+      />
 
       {mfaState && (
         <MfaChallengeUI isModal={true}

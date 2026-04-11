@@ -118,26 +118,10 @@ func Load() (*Config, error) {
 		needsSave = true
 		migrated = append(migrated, "useSystemProxies=false")
 	}
-	if _, ok := raw["audio_normalization"]; !ok {
-		cfg.AudioNormalization = true
-		needsSave = true
-		migrated = append(migrated, "audio_normalization=true")
-	}
-	if _, ok := raw["audio_normalization_target"]; !ok {
-		cfg.AudioNormalizationTarget = -20
-		needsSave = true
-		migrated = append(migrated, "audio_normalization_target=-20")
-	}
-	if _, ok := raw["audio_normalization_peak"]; !ok {
-		cfg.AudioNormalizationPeak = -2
-		needsSave = true
-		migrated = append(migrated, "audio_normalization_peak=-2")
-	}
-	if _, ok := raw["audio_normalization_max_gain"]; !ok {
-		cfg.AudioNormalizationMaxGain = 20
-		needsSave = true
-		migrated = append(migrated, "audio_normalization_max_gain=20")
-	}
+	// Note: output_profiles and audio_normalization_* are now provided by the
+	// server per-job via the lease response. Local config values are ignored.
+	// Existing fields are kept for backward compatibility (they parse without
+	// error but are never read during transcoding).
 
 	mu.Lock()
 	current = &cfg
@@ -192,26 +176,11 @@ func Reload() (string, error) {
 		if old.UseSystemProxy != newCfg.UseSystemProxy {
 			changes = append(changes, fmt.Sprintf("useSystemProxies: %v -> %v", old.UseSystemProxy, newCfg.UseSystemProxy))
 		}
-		if len(old.OutputProfiles) != len(newCfg.OutputProfiles) {
-			changes = append(changes, fmt.Sprintf("output_profiles: %d -> %d profiles", len(old.OutputProfiles), len(newCfg.OutputProfiles)))
-		}
 		if old.ConcurrentUploads != newCfg.ConcurrentUploads {
 			changes = append(changes, fmt.Sprintf("concurrent_uploads: %d -> %d", old.ConcurrentUploads, newCfg.ConcurrentUploads))
 		}
 		if old.ConcurrentDownloads != newCfg.ConcurrentDownloads {
 			changes = append(changes, fmt.Sprintf("concurrent_downloads: %d -> %d", old.ConcurrentDownloads, newCfg.ConcurrentDownloads))
-		}
-		if old.AudioNormalization != newCfg.AudioNormalization {
-			changes = append(changes, fmt.Sprintf("audio_normalization: %v -> %v", old.AudioNormalization, newCfg.AudioNormalization))
-		}
-		if old.AudioNormalizationTarget != newCfg.AudioNormalizationTarget {
-			changes = append(changes, fmt.Sprintf("audio_normalization_target: %.2f -> %.2f", old.AudioNormalizationTarget, newCfg.AudioNormalizationTarget))
-		}
-		if old.AudioNormalizationPeak != newCfg.AudioNormalizationPeak {
-			changes = append(changes, fmt.Sprintf("audio_normalization_peak: %.2f -> %.2f", old.AudioNormalizationPeak, newCfg.AudioNormalizationPeak))
-		}
-		if old.AudioNormalizationMaxGain != newCfg.AudioNormalizationMaxGain {
-			changes = append(changes, fmt.Sprintf("audio_normalization_max_gain: %.2f -> %.2f", old.AudioNormalizationMaxGain, newCfg.AudioNormalizationMaxGain))
 		}
 	}
 
@@ -254,14 +223,8 @@ func RunFirstSetup() (*Config, error) {
 		SiteHostname:        strings.TrimSpace(hostname),
 		AccessKeyID:         strings.TrimSpace(keyID),
 		AccessKeySecret:     strings.TrimSpace(keySecret),
-		OutputProfiles:      DefaultProfiles(),
 		ConcurrentUploads:   10,
 		ConcurrentDownloads: 5,
-
-		AudioNormalization:        true,
-		AudioNormalizationTarget:  -20,
-		AudioNormalizationPeak:    -2,
-		AudioNormalizationMaxGain: 20,
 	}
 
 	if err := Save(cfg); err != nil {

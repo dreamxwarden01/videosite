@@ -395,8 +395,31 @@ async function leaseTask(videoId, workerKeyId) {
     const command = new GetObjectCommand({ Bucket: bucket, Key: task.r2_source_key });
     const downloadUrl = await getSignedUrl(r2, command, { expiresIn: 3600 });
 
+    // Fetch transcoding profiles and audio normalization for this course
+    const { getEffectiveProfiles, getAudioNormalizationSettings } = require('./transcodingProfileService');
+    const [courseRows] = await pool.execute(
+        'SELECT audio_normalization FROM courses WHERE course_id = ?',
+        [task.course_id]
+    );
+    const courseAudioNorm = courseRows.length > 0 ? courseRows[0].audio_normalization === 1 : true;
+
+    const profiles = await getEffectiveProfiles(task.course_id);
+    const normSettings = await getAudioNormalizationSettings();
+
     startStaleTimer(jobId);
-    return { isLeaseSuccess: true, jobId, downloadUrl, videoId: task.video_id, encryptionKey: encryptionKey.toString('hex') };
+    return {
+        isLeaseSuccess: true, jobId, downloadUrl, videoId: task.video_id, encryptionKey: encryptionKey.toString('hex'),
+        outputProfiles: profiles.map(p => ({
+            name: p.name, width: p.width, height: p.height,
+            video_bitrate_kbps: p.video_bitrate_kbps, audio_bitrate_kbps: p.audio_bitrate_kbps,
+            codec: p.codec, profile: p.profile, preset: p.preset,
+            segment_duration: p.segment_duration, gop_size: p.gop_size
+        })),
+        audioNormalization: courseAudioNorm,
+        audioNormalizationTarget: parseFloat(normSettings.target),
+        audioNormalizationPeak: parseFloat(normSettings.peak),
+        audioNormalizationMaxGain: parseFloat(normSettings.maxGain)
+    };
 }
 
 // Map file extension to the correct MIME type for R2 storage.

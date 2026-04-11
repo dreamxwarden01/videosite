@@ -1356,3 +1356,140 @@ a.pagination-btn:hover {
 /* === Clickable Table Rows === */
 tr.clickable-row { cursor: pointer; }
 tr.clickable-row:hover { background-color: #f9fafb; }
+
+/* === Toggle Switch === */
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 44px;
+  height: 24px;
+  flex-shrink: 0;
+}
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background-color: #d1d5db;
+  border-radius: 24px;
+  transition: background-color 0.2s;
+}
+.toggle-slider::before {
+  content: "";
+  position: absolute;
+  height: 18px;
+  width: 18px;
+  left: 3px;
+  bottom: 3px;
+  background-color: white;
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+.toggle-switch input:checked + .toggle-slider {
+  background-color: #1a73e8;
+}
+.toggle-switch input:checked + .toggle-slider::before {
+  transform: translateX(20px);
+}
+
+/* === Course Edit Page — Sidebar Layout === */
+.course-edit-card {
+  padding: 0 !important;
+  overflow: hidden;
+}
+.course-edit-layout {
+  display: flex;
+  min-height: 400px;
+}
+.course-edit-sidebar {
+  width: 200px;
+  flex-shrink: 0;
+  border-right: 1px solid #e5e7eb;
+  display: flex;
+  flex-direction: column;
+  padding: 8px 0;
+  background: #fafbfc;
+}
+.course-edit-sidebar-item {
+  display: block;
+  width: 100%;
+  padding: 10px 16px;
+  border: none;
+  background: none;
+  text-align: left;
+  font-size: 14px;
+  color: #374151;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+.course-edit-sidebar-item:hover {
+  background-color: #f3f4f6;
+}
+.course-edit-sidebar-item.active {
+  background-color: #e8f0fe;
+  color: #1a73e8;
+  font-weight: 500;
+}
+.course-edit-sidebar-delete {
+  color: #dc2626;
+  margin-top: auto;
+  border-top: 1px solid #e5e7eb;
+}
+.course-edit-sidebar-delete:hover {
+  background-color: #fee2e2;
+}
+.course-edit-content {
+  flex: 1;
+  padding: 24px;
+  min-width: 0;
+}
+.course-edit-mobile-tabs {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  .course-edit-layout {
+    flex-direction: column;
+  }
+  .course-edit-sidebar {
+    display: none;
+  }
+  .course-edit-mobile-tabs {
+    display: flex;
+    border-bottom: 1px solid #e5e7eb;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    background: #fafbfc;
+  }
+  .course-edit-mobile-tabs::-webkit-scrollbar {
+    display: none;
+  }
+  .course-edit-mobile-tab {
+    padding: 10px 16px;
+    border: none;
+    background: none;
+    font-size: 13px;
+    color: #6b7280;
+    cursor: pointer;
+    white-space: nowrap;
+    border-bottom: 2px solid transparent;
+    flex-shrink: 0;
+  }
+  .course-edit-mobile-tab.active {
+    color: #1a73e8;
+    border-bottom-color: #1a73e8;
+    font-weight: 500;
+  }
+  .course-edit-mobile-delete {
+    color: #dc2626;
+    margin-left: auto;
+  }
+  .course-edit-content {
+    padding: 16px;
+  }
+}

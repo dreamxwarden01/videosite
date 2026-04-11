@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"fmt"
+
+	"videosite-worker/internal/config"
 )
 
 // AvailableResponse is the response from GET /api/worker/tasks/available.
@@ -18,6 +20,13 @@ type LeaseResponse struct {
 	DownloadURL    string `json:"downloadUrl"`
 	EncryptionKey  string `json:"encryptionKey"` // hex-encoded 16-byte AES-128 key
 	VideoID        int    `json:"videoId"`
+
+	// Server-provided transcoding config (per-course or global defaults).
+	OutputProfiles            []config.OutputProfile `json:"outputProfiles,omitempty"`
+	AudioNormalization        bool                   `json:"audioNormalization,omitempty"`
+	AudioNormalizationTarget  float64                `json:"audioNormalizationTarget,omitempty"`
+	AudioNormalizationPeak    float64                `json:"audioNormalizationPeak,omitempty"`
+	AudioNormalizationMaxGain float64                `json:"audioNormalizationMaxGain,omitempty"`
 }
 
 // CheckAvailable polls the server for an available task.

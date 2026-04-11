@@ -8,6 +8,7 @@ import useMfaChallenge from '../../hooks/useMfaChallenge';
 import MfaPageGuard, { MfaSetupRequiredModal } from '../../components/MfaPageGuard';
 import MfaChallengeUI from '../../components/MfaChallengeUI';
 import LoadingSpinner from '../../components/LoadingSpinner';
+import ProfileEditModal from '../../components/ProfileEditModal';
 
 export default function SettingsPage() {
   const { siteName } = useSite();
@@ -62,6 +63,18 @@ export default function SettingsPage() {
   const [wkKeyIdCopyLabel, setWkKeyIdCopyLabel] = useState('Copy');
   const [wkSecretCopyLabel, setWkSecretCopyLabel] = useState('Copy');
 
+  // Transcoding profiles
+  const [transcodingProfiles, setTranscodingProfiles] = useState([]);
+  const [audioNormTarget, setAudioNormTarget] = useState('-20');
+  const [audioNormPeak, setAudioNormPeak] = useState('-2');
+  const [audioNormMaxGain, setAudioNormMaxGain] = useState('20');
+  const [savingTranscoding, setSavingTranscoding] = useState(false);
+  const [showProfileModal, setShowProfileModal] = useState(false);
+  const [editingProfileIdx, setEditingProfileIdx] = useState(null);
+  const originalTranscoding = useRef({});
+  const [transcodingErrors, setTranscodingErrors] = useState({});
+  const [transcodingTouched, setTranscodingTouched] = useState({});
+
   useEffect(() => {
     document.title = `Site Settings - ${siteName}`;
   }, [siteName]);
@@ -98,6 +111,21 @@ export default function SettingsPage() {
           registration_default_role: s.registration_default_role || '2',
         };
         setErrors({});
+
+        // Transcoding profiles
+        setTranscodingProfiles(data.transcodingProfiles || []);
+        const an = data.audioNormalization || {};
+        setAudioNormTarget(an.target || '-20');
+        setAudioNormPeak(an.peak || '-2');
+        setAudioNormMaxGain(an.maxGain || '20');
+        originalTranscoding.current = {
+          profiles: JSON.stringify(data.transcodingProfiles || []),
+          target: an.target || '-20',
+          peak: an.peak || '-2',
+          maxGain: an.maxGain || '20'
+        };
+        setTranscodingErrors({});
+        setTranscodingTouched({});
       }
     } catch {
       showToast('Failed to load settings.');
@@ -550,6 +578,168 @@ export default function SettingsPage() {
         </form>
       </div>
 
+      {/* Transcoding Profiles */}
+      <div className="card mt-3">
+        <div className="card-header">
+          <h2>Transcoding Profiles</h2>
+        </div>
+        <div>
+          <p className="text-muted" style={{ marginBottom: '16px' }}>
+            Default encoding profiles for all courses. Individual courses can override these.
+          </p>
+
+          <div className="table-wrap" style={{ marginBottom: '16px' }}>
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Resolution</th>
+                  <th>Video Bitrate</th>
+                  <th>Audio Bitrate</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {transcodingProfiles.map((p, idx) => (
+                  <tr key={p.profile_id || idx}>
+                    <td>{p.name}</td>
+                    <td>{p.width}x{p.height}</td>
+                    <td>{p.video_bitrate_kbps} kbps</td>
+                    <td>{p.audio_bitrate_kbps} kbps</td>
+                    <td>
+                      <button className="btn btn-secondary btn-sm" onClick={() => { setEditingProfileIdx(idx); setShowProfileModal(true); }}>Edit</button>
+                      <button className="btn btn-danger btn-sm" style={{ marginLeft: '4px' }} onClick={async () => {
+                        if (!await confirm('Delete this profile?')) return;
+                        setTranscodingProfiles(prev => prev.filter((_, i) => i !== idx));
+                      }}>Delete</button>
+                    </td>
+                  </tr>
+                ))}
+                {transcodingProfiles.length === 0 && (
+                  <tr><td colSpan="5" className="text-muted" style={{ textAlign: 'center', padding: '16px' }}>No profiles configured</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <button className="btn btn-secondary" style={{ marginBottom: '20px' }}
+            onClick={() => { setEditingProfileIdx(null); setShowProfileModal(true); }}>
+            Add Profile
+          </button>
+
+          <h3 style={{ marginBottom: '12px' }}>Audio Normalization Defaults</h3>
+          <p className="text-muted text-sm" style={{ marginBottom: '12px' }}>
+            Audio normalization is enabled by default for new courses. Individual courses can disable it.
+          </p>
+
+          <div style={{ maxWidth: '400px' }}>
+            <div className="form-group">
+              <label>Target Loudness (LUFS)</label>
+              <input type="text" inputMode="numeric" className={`form-control${transcodingTouched.target && transcodingErrors.target ? ' input-error' : ''}`}
+                value={audioNormTarget}
+                onChange={e => { setAudioNormTarget(e.target.value.replace(/[^0-9.-]/g, '')); }}
+                onBlur={() => {
+                  setTranscodingTouched(t => ({ ...t, target: true }));
+                  const v = parseFloat(audioNormTarget);
+                  setTranscodingErrors(e => {
+                    const n = { ...e };
+                    if (isNaN(v) || v < -50 || v > 0) n.target = 'Must be -50 to 0';
+                    else delete n.target;
+                    return n;
+                  });
+                }}
+              />
+              {transcodingTouched.target && transcodingErrors.target && <span className="field-error">{transcodingErrors.target}</span>}
+            </div>
+            <div className="form-group">
+              <label>True Peak Ceiling (dBFS)</label>
+              <input type="text" inputMode="numeric" className={`form-control${transcodingTouched.peak && transcodingErrors.peak ? ' input-error' : ''}`}
+                value={audioNormPeak}
+                onChange={e => { setAudioNormPeak(e.target.value.replace(/[^0-9.-]/g, '')); }}
+                onBlur={() => {
+                  setTranscodingTouched(t => ({ ...t, peak: true }));
+                  const v = parseFloat(audioNormPeak);
+                  setTranscodingErrors(e => {
+                    const n = { ...e };
+                    if (isNaN(v) || v < -20 || v > 0) n.peak = 'Must be -20 to 0';
+                    else delete n.peak;
+                    return n;
+                  });
+                }}
+              />
+              {transcodingTouched.peak && transcodingErrors.peak && <span className="field-error">{transcodingErrors.peak}</span>}
+            </div>
+            <div className="form-group">
+              <label>Max Upward Gain (dB)</label>
+              <input type="text" inputMode="numeric" className={`form-control${transcodingTouched.maxGain && transcodingErrors.maxGain ? ' input-error' : ''}`}
+                value={audioNormMaxGain}
+                onChange={e => { setAudioNormMaxGain(e.target.value.replace(/[^0-9.-]/g, '')); }}
+                onBlur={() => {
+                  setTranscodingTouched(t => ({ ...t, maxGain: true }));
+                  const v = parseFloat(audioNormMaxGain);
+                  setTranscodingErrors(e => {
+                    const n = { ...e };
+                    if (isNaN(v) || v < 0 || v > 40) n.maxGain = 'Must be 0 to 40';
+                    else delete n.maxGain;
+                    return n;
+                  });
+                }}
+              />
+              {transcodingTouched.maxGain && transcodingErrors.maxGain && <span className="field-error">{transcodingErrors.maxGain}</span>}
+            </div>
+          </div>
+
+          <button className="btn btn-primary" style={{ marginTop: '8px' }}
+            disabled={savingTranscoding || Object.keys(transcodingErrors).length > 0 || (
+              JSON.stringify(transcodingProfiles) === originalTranscoding.current.profiles
+              && audioNormTarget === originalTranscoding.current.target
+              && audioNormPeak === originalTranscoding.current.peak
+              && audioNormMaxGain === originalTranscoding.current.maxGain
+            )}
+            onClick={async () => {
+              if (transcodingProfiles.length === 0) { showToast('At least one profile is required.'); return; }
+              setSavingTranscoding(true);
+              try {
+                const { ok, data } = await mfaFetch('/api/admin/settings/transcoding-profiles', {
+                  method: 'PUT',
+                  body: {
+                    profiles: transcodingProfiles,
+                    audioNormalization: { target: audioNormTarget, peak: audioNormPeak, maxGain: audioNormMaxGain }
+                  }
+                });
+                if (ok) {
+                  showToast('Transcoding settings saved.', 'success');
+                  originalTranscoding.current = {
+                    profiles: JSON.stringify(transcodingProfiles),
+                    target: audioNormTarget, peak: audioNormPeak, maxGain: audioNormMaxGain
+                  };
+                } else {
+                  showToast(data?.error || 'Failed to save.');
+                }
+              } catch (err) { showToast(err.message); }
+              finally { setSavingTranscoding(false); }
+            }}
+          >
+            {savingTranscoding ? 'Saving...' : 'Save Transcoding Settings'}
+          </button>
+        </div>
+      </div>
+
+      <ProfileEditModal
+        isOpen={showProfileModal}
+        profile={editingProfileIdx !== null ? transcodingProfiles[editingProfileIdx] : null}
+        onClose={() => { setShowProfileModal(false); setEditingProfileIdx(null); }}
+        onSave={(profile) => {
+          if (editingProfileIdx !== null) {
+            setTranscodingProfiles(prev => prev.map((p, i) => i === editingProfileIdx ? profile : p));
+          } else {
+            setTranscodingProfiles(prev => [...prev, profile]);
+          }
+          setShowProfileModal(false);
+          setEditingProfileIdx(null);
+        }}
+      />
+
       {/* HMAC */}
       <div className="card mt-3">
         <div className="card-header">
@@ -561,7 +751,7 @@ export default function SettingsPage() {
           </p>
 
           <div className="form-group">
-            <label className="toggle-switch" style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
               <span style={{ fontSize: '14px', fontWeight: 500 }}>
                 {hmacEnabled ? 'Enabled' : 'Disabled'}
               </span>

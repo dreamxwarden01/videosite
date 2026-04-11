@@ -59,7 +59,6 @@ export default function App() {
 
                   {/* Admin */}
                   <Route path="/admin/courses" element={<CoursesPage />} />
-                  <Route path="/admin/courses/new" element={<CourseEditPage />} />
                   <Route path="/admin/courses/:courseId/edit" element={<CourseEditPage />} />
                   <Route path="/admin/videos" element={<VideoManagementPage />} />
                   <Route path="/admin/videos/:courseId" element={<VideoListPage />} />

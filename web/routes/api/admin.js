@@ -28,6 +28,9 @@ const { getPool } = require('../../config/database');
 const { generateWorkerKeyPair, revokeWorkerKey, deleteWorkerKey, listWorkerKeys } = require('../../services/workerAuthService');
 const { generateSecretKey, isHmacConfigured, setSetting } = require('../../services/tokenService');
 
+// Services - Transcoding Profiles
+const { getGlobalProfiles, getCourseProfiles, saveGlobalProfiles, saveCourseProfiles, deleteCourseProfiles, getAudioNormalizationSettings, saveAudioNormalizationSettings, validateProfile } = require('../../services/transcodingProfileService');
+
 // Services - Invitations
 const { generateInvitationCode, listInvitationCodes, removeInvitationCode } = require('../../services/registrationService');
 
@@ -137,7 +140,7 @@ router.get('/admin/courses/:courseId', requireAuth, checkPermission('changeCours
     }
 });
 
-// GET /api/admin/courses/:courseId/edit — alias for edit page
+// GET /api/admin/courses/:courseId/edit — course + profiles + audio normalization
 router.get('/admin/courses/:courseId/edit', requireAuth, checkPermission('changeCourse'), requireMfaForScenario('course'), requireCourseAccess, async (req, res) => {
     try {
         const course = await getCourseById(req.params.courseId);
@@ -145,7 +148,10 @@ router.get('/admin/courses/:courseId/edit', requireAuth, checkPermission('change
             return res.status(404).json({ error: 'Course not found.' });
         }
         const videoResult = await listCourseVideos(req.params.courseId, 1, 100);
-        res.json({ course, videos: videoResult.videos.map(sanitizeAdminVideo) });
+        const globalProfiles = await getGlobalProfiles();
+        const courseProfiles = course.use_custom_profiles ? await getCourseProfiles(req.params.courseId) : [];
+        const audioNormalization = await getAudioNormalizationSettings();
+        res.json({ course, videos: videoResult.videos.map(sanitizeAdminVideo), globalProfiles, courseProfiles, audioNormalization });
     } catch (err) {
         console.error('API get course edit error:', err);
         res.status(500).json({ error: 'Failed to load course.' });
@@ -155,12 +161,15 @@ router.get('/admin/courses/:courseId/edit', requireAuth, checkPermission('change
 // PUT /api/admin/courses/:courseId — update
 router.put('/admin/courses/:courseId', requireAuth, checkPermission('changeCourse'), requireMfaForScenario('course'), requireCourseAccess, async (req, res) => {
     try {
-        const { courseName, description, is_active } = req.body;
-        await updateCourse(req.params.courseId, {
+        const { courseName, description, is_active, use_custom_profiles, audio_normalization } = req.body;
+        const updates = {
             course_name: courseName,
             description,
             is_active: is_active === '1' || is_active === true || is_active === 1 ? 1 : 0
-        });
+        };
+        if (use_custom_profiles !== undefined) updates.use_custom_profiles = use_custom_profiles ? 1 : 0;
+        if (audio_normalization !== undefined) updates.audio_normalization = audio_normalization ? 1 : 0;
+        await updateCourse(req.params.courseId, updates);
         res.status(204).end();
     } catch (err) {
         console.error('API update course error:', err);
@@ -176,6 +185,54 @@ router.delete('/admin/courses/:courseId', requireAuth, checkPermission('deleteCo
     } catch (err) {
         console.error('API delete course error:', err);
         res.status(500).json({ error: 'Failed to delete course' });
+    }
+});
+
+// PUT /api/admin/courses/:courseId/transcoding-profiles — save course profiles
+router.put('/admin/courses/:courseId/transcoding-profiles', requireAuth, checkPermission('changeCourse'), requireMfaForScenario('course'), requireCourseAccess, async (req, res) => {
+    try {
+        const course = await getCourseById(req.params.courseId);
+        if (!course) return res.status(404).json({ error: 'Course not found' });
+        if (!course.use_custom_profiles) return res.status(400).json({ error: 'Course is using global profiles' });
+
+        const { profiles } = req.body;
+        if (!Array.isArray(profiles) || profiles.length === 0) {
+            return res.status(400).json({ error: 'At least one profile is required' });
+        }
+        for (let i = 0; i < profiles.length; i++) {
+            const p = profiles[i];
+            const parsed = {
+                name: (p.name || '').trim(),
+                width: parseInt(p.width, 10),
+                height: parseInt(p.height, 10),
+                video_bitrate_kbps: parseInt(p.video_bitrate_kbps, 10),
+                audio_bitrate_kbps: parseInt(p.audio_bitrate_kbps, 10),
+                segment_duration: p.segment_duration !== undefined ? parseInt(p.segment_duration, 10) : 6,
+                gop_size: p.gop_size !== undefined ? parseInt(p.gop_size, 10) : 48
+            };
+            const errors = validateProfile(parsed);
+            if (errors.length > 0) {
+                return res.status(400).json({ error: `Profile ${i + 1}: ${errors.join(', ')}` });
+            }
+            profiles[i] = { ...p, ...parsed };
+        }
+
+        await saveCourseProfiles(req.params.courseId, profiles);
+        res.status(204).end();
+    } catch (err) {
+        console.error('API save course profiles error:', err);
+        res.status(500).json({ error: 'Failed to save course profiles' });
+    }
+});
+
+// DELETE /api/admin/courses/:courseId/transcoding-profiles — reset to global
+router.delete('/admin/courses/:courseId/transcoding-profiles', requireAuth, checkPermission('changeCourse'), requireMfaForScenario('course'), requireCourseAccess, async (req, res) => {
+    try {
+        await deleteCourseProfiles(req.params.courseId);
+        res.status(204).end();
+    } catch (err) {
+        console.error('API delete course profiles error:', err);
+        res.status(500).json({ error: 'Failed to reset course profiles' });
     }
 });
 
@@ -822,7 +879,10 @@ router.get('/admin/settings', requireAuth, checkPermission('manageSite'), requir
             return rest;
         });
 
-        res.json({ settings: settingsMap, workerKeys: sanitizedWorkerKeys, roles, hmacKeyConfigured, r2PublicDomain: process.env.R2_PUBLIC_DOMAIN || '' });
+        const transcodingProfiles = await getGlobalProfiles();
+        const audioNormalization = await getAudioNormalizationSettings();
+
+        res.json({ settings: settingsMap, workerKeys: sanitizedWorkerKeys, roles, hmacKeyConfigured, r2PublicDomain: process.env.R2_PUBLIC_DOMAIN || '', transcodingProfiles, audioNormalization });
     } catch (err) {
         console.error('API settings error:', err);
         res.status(500).json({ error: 'Failed to load settings.' });
@@ -960,6 +1020,53 @@ router.put('/admin/settings', requireAuth, checkPermission('manageSite'), requir
     } catch (err) {
         console.error('API save settings error:', err);
         res.status(500).json({ error: 'Failed to save settings' });
+    }
+});
+
+// PUT /api/admin/settings/transcoding-profiles — save global profiles + audio normalization
+router.put('/admin/settings/transcoding-profiles', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+    try {
+        const { profiles, audioNormalization } = req.body;
+
+        // Validate profiles
+        if (!Array.isArray(profiles) || profiles.length === 0) {
+            return res.status(400).json({ error: 'At least one profile is required' });
+        }
+        for (let i = 0; i < profiles.length; i++) {
+            const p = profiles[i];
+            const parsed = {
+                name: (p.name || '').trim(),
+                width: parseInt(p.width, 10),
+                height: parseInt(p.height, 10),
+                video_bitrate_kbps: parseInt(p.video_bitrate_kbps, 10),
+                audio_bitrate_kbps: parseInt(p.audio_bitrate_kbps, 10),
+                segment_duration: p.segment_duration !== undefined ? parseInt(p.segment_duration, 10) : 6,
+                gop_size: p.gop_size !== undefined ? parseInt(p.gop_size, 10) : 48
+            };
+            const errors = validateProfile(parsed);
+            if (errors.length > 0) {
+                return res.status(400).json({ error: `Profile ${i + 1}: ${errors.join(', ')}` });
+            }
+            profiles[i] = { ...p, ...parsed };
+        }
+
+        await saveGlobalProfiles(profiles);
+
+        // Save audio normalization settings if provided
+        if (audioNormalization) {
+            const target = parseFloat(audioNormalization.target);
+            const peak = parseFloat(audioNormalization.peak);
+            const maxGain = parseFloat(audioNormalization.maxGain);
+            if (isNaN(target) || target < -50 || target > 0) return res.status(400).json({ error: 'Target loudness must be between -50 and 0' });
+            if (isNaN(peak) || peak < -20 || peak > 0) return res.status(400).json({ error: 'True peak must be between -20 and 0' });
+            if (isNaN(maxGain) || maxGain < 0 || maxGain > 40) return res.status(400).json({ error: 'Max gain must be between 0 and 40' });
+            await saveAudioNormalizationSettings({ target: String(target), peak: String(peak), maxGain: String(maxGain) });
+        }
+
+        res.status(204).end();
+    } catch (err) {
+        console.error('API save transcoding profiles error:', err);
+        res.status(500).json({ error: 'Failed to save transcoding profiles' });
     }
 });
 

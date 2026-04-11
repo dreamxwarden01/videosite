@@ -458,6 +458,52 @@ async function runMigrations() {
                     await pool.execute(`ALTER TABLE videos ADD FOREIGN KEY (course_id) REFERENCES courses(course_id) ON DELETE CASCADE`);
                     await pool.execute(`ALTER TABLE upload_sessions ADD FOREIGN KEY (course_id) REFERENCES courses(course_id) ON DELETE CASCADE`);
                 }
+            },
+            {
+                id: '022_transcoding_profiles',
+                up: async () => {
+                    // Transcoding profiles table (NULL course_id = global default)
+                    await pool.execute(`
+                        CREATE TABLE IF NOT EXISTS transcoding_profiles (
+                            profile_id         INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                            course_id          INT UNSIGNED DEFAULT NULL,
+                            name               VARCHAR(100) NOT NULL,
+                            width              INT UNSIGNED NOT NULL,
+                            height             INT UNSIGNED NOT NULL,
+                            video_bitrate_kbps INT UNSIGNED NOT NULL,
+                            audio_bitrate_kbps INT UNSIGNED NOT NULL,
+                            codec              VARCHAR(20)  NOT NULL DEFAULT 'h264',
+                            profile            VARCHAR(20)  NOT NULL DEFAULT 'high',
+                            preset             VARCHAR(20)  NOT NULL DEFAULT 'medium',
+                            segment_duration   INT UNSIGNED NOT NULL DEFAULT 6,
+                            gop_size           INT UNSIGNED NOT NULL DEFAULT 48,
+                            sort_order         TINYINT UNSIGNED NOT NULL DEFAULT 0,
+                            created_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            updated_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                            INDEX idx_course (course_id),
+                            FOREIGN KEY (course_id) REFERENCES courses(course_id) ON DELETE CASCADE
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    `);
+
+                    // Per-course transcoding overrides
+                    await pool.execute(`ALTER TABLE courses ADD COLUMN use_custom_profiles TINYINT(1) NOT NULL DEFAULT 0 AFTER description`);
+                    await pool.execute(`ALTER TABLE courses ADD COLUMN audio_normalization TINYINT(1) NOT NULL DEFAULT 1 AFTER use_custom_profiles`);
+
+                    // Seed default global profiles
+                    await pool.execute(`
+                        INSERT INTO transcoding_profiles (course_id, name, width, height, video_bitrate_kbps, audio_bitrate_kbps, codec, profile, preset, segment_duration, gop_size, sort_order)
+                        VALUES (NULL, '1080p', 1920, 1080, 3500, 192, 'h264', 'high', 'medium', 6, 48, 0),
+                               (NULL, '720p',  1280, 720,  2000, 128, 'h264', 'main', 'medium', 6, 48, 1)
+                    `);
+
+                    // Audio normalization global defaults
+                    await pool.execute(`
+                        INSERT IGNORE INTO site_settings (setting_key, setting_value)
+                        VALUES ('audio_normalization_target', '-20'),
+                               ('audio_normalization_peak', '-2'),
+                               ('audio_normalization_max_gain', '20')
+                    `);
+                }
             }
         ];
 
