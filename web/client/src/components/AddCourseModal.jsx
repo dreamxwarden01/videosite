@@ -41,7 +41,7 @@ export default function AddCourseModal({ isOpen, onClose, onCreated, mfaFetch: e
 
   return (
     <>
-      <div className="modal-overlay active" onClick={onClose}>
+      <div className="modal-overlay active" onClick={() => {}}>
         <div className="upload-modal" onClick={e => e.stopPropagation()}>
           <div className="modal-header">
             <h3>Add Course</h3>

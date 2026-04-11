@@ -873,6 +873,13 @@ router.get('/admin/settings', requireAuth, checkPermission('manageSite'), requir
         // Never send secrets to client
         delete settingsMap.hmac_secret_key;
 
+        // Strip keys managed by other pages / returned separately
+        for (const key of Object.keys(settingsMap)) {
+            if (key.startsWith('mfa_') || key.startsWith('audio_normalization_')) {
+                delete settingsMap[key];
+            }
+        }
+
         // Strip key_secret from worker keys list (only shown once at creation)
         const sanitizedWorkerKeys = workerKeys.map(k => {
             const { key_secret, ...rest } = k;

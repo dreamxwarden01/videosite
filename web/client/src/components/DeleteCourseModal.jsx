@@ -29,7 +29,7 @@ export default function DeleteCourseModal({ isOpen, courseName, courseId, onClos
   };
 
   return (
-    <div className="modal-overlay active" onClick={onClose}>
+    <div className="modal-overlay active" onClick={() => {}}>
       <div className="upload-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '440px' }}>
         <div className="modal-header">
           <h3>Delete Course</h3>

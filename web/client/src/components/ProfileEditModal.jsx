@@ -95,7 +95,7 @@ export default function ProfileEditModal({ isOpen, profile, onClose, onSave }) {
   };
 
   return (
-    <div className="modal-overlay active" onClick={onClose}>
+    <div className="modal-overlay active" onClick={() => {}}>
       <div className="upload-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '480px' }}>
         <div className="modal-header">
           <h3>{profile ? 'Edit Profile' : 'Add Profile'}</h3>
