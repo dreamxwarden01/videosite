@@ -38,9 +38,10 @@ export default function RegisterCompletePage() {
   // Page state
   const [pageError, setPageError] = useState(null);
   const [loading, setLoading] = useState(true);
+  const registrationCompleted = useRef(false);
 
   useEffect(() => {
-    if (user) navigate('/profile', { replace: true });
+    if (user && !registrationCompleted.current) navigate('/profile', { replace: true });
   }, [user, navigate]);
 
   useEffect(() => {
@@ -140,6 +141,7 @@ export default function RegisterCompletePage() {
       });
 
       if (ok && data) {
+        registrationCompleted.current = true;
         await refresh();
         navigate(data.redirectTo || '/profile', { replace: true });
         return;

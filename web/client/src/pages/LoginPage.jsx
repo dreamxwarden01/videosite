@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Link, useSearchParams, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { useSite } from '../context/SiteContext';
@@ -17,6 +17,9 @@ export default function LoginPage() {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
+
+  // Tracks whether login was completed on this page (prevents useEffect redirect race)
+  const loginCompleted = useRef(false);
 
   // Phase: 'credentials' | 'mfa-verify' | 'enrollment-loading' | 'enrollment-email' | 'enrollment-email-verify' | 'enrollment-verify'
   const [phase, setPhase] = useState('credentials');
@@ -40,9 +43,9 @@ export default function LoginPage() {
     document.title = `Sign In - ${siteName}`;
   }, [siteName]);
 
-  // If already logged in, redirect
+  // If already logged in (not from a login just completed on this page), redirect
   useEffect(() => {
-    if (user) navigate('/profile', { replace: true });
+    if (user && !loginCompleted.current) navigate('/profile', { replace: true });
   }, [user, navigate]);
 
 
@@ -87,6 +90,7 @@ export default function LoginPage() {
         }
 
         // Normal login — no MFA
+        loginCompleted.current = true;
         await refresh();
         navigate(data.returnTo || '/', { replace: true });
         return;
@@ -102,6 +106,7 @@ export default function LoginPage() {
 
   // ---- MFA Verify (existing users with MFA) ----
   const handleMfaSuccess = async () => {
+    loginCompleted.current = true;
     await refresh();
     navigate(mfaData?.returnTo || '/', { replace: true });
   };
@@ -190,6 +195,7 @@ export default function LoginPage() {
 
       if (ok && data?.success) {
         showToast('Email verified and MFA enabled.', 'success');
+        loginCompleted.current = true;
         await refresh();
         navigate(returnTo, { replace: true });
         return;
@@ -239,6 +245,7 @@ export default function LoginPage() {
   // ---- Enrollment: MFA challenge verify (user has email/methods) ----
   const handleEnrollmentVerifySuccess = async () => {
     showToast('MFA enabled successfully.', 'success');
+    loginCompleted.current = true;
     await refresh();
     navigate(returnTo, { replace: true });
   };
