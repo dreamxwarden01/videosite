@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { useToast } from '../context/ToastContext';
+import { useConfirm } from './ConfirmModal';
 import { apiPost } from '../api';
 
 const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB
@@ -10,8 +11,9 @@ function getExtension(filename) {
   return dot >= 0 ? filename.substring(dot).toLowerCase() : '';
 }
 
-export default function UploadMaterialModal({ isOpen, onClose, courses, preselectedCourseId, preselectedCourseName, onUploadComplete }) {
+export default function UploadMaterialModal({ isOpen, onClose, courses, preselectedCourseId, preselectedCourseName, existingMaterials, onUploadComplete }) {
   const { showToast } = useToast();
+  const confirm = useConfirm();
   const fileInputRef = useRef(null);
   const dropdownRef = useRef(null);
 
@@ -128,6 +130,17 @@ export default function UploadMaterialModal({ isOpen, onClose, courses, preselec
 
   async function handleUpload() {
     if (!canUpload) return;
+
+    // Check for duplicate (same filename, week, and size)
+    if (existingMaterials?.length) {
+      const dup = existingMaterials.find(m =>
+        m.filename === filename.trim() && m.week === week.trim() && m.file_size === file.size
+      );
+      if (dup) {
+        const ok = await confirm(`A file with the same name, week, and size already exists. Upload anyway?`);
+        if (!ok) return;
+      }
+    }
 
     setUploading(true);
     setFailed(false);

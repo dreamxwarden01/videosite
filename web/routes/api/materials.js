@@ -161,7 +161,8 @@ router.get('/materials/:materialId/download', requireAuth, checkPermission('acce
             return res.status(403).json({ error: 'You are not enrolled in this course.' });
         }
 
-        const downloadUrl = await getPresignedDownloadUrl(material.object_key, material.filename);
+        const inline = req.query.mode === 'view';
+        const downloadUrl = await getPresignedDownloadUrl(material.object_key, material.filename, { inline });
         res.json({ downloadUrl });
     } catch (err) {
         console.error('Material download error:', err);

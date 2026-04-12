@@ -32,13 +32,14 @@ async function getPresignedUploadUrl(objectKey, contentType) {
     return getSignedUrl(r2, command, { expiresIn: 3600 });
 }
 
-async function getPresignedDownloadUrl(objectKey, filename) {
+async function getPresignedDownloadUrl(objectKey, filename, { inline = false } = {}) {
     const r2 = getR2Client();
     const bucket = getR2BucketName();
 
     // RFC 5987 encoding for UTF-8 filenames
     const encoded = encodeURIComponent(filename).replace(/['()]/g, escape).replace(/\*/g, '%2A');
-    const disposition = `attachment; filename="${filename}"; filename*=UTF-8''${encoded}`;
+    const type = inline ? 'inline' : 'attachment';
+    const disposition = `${type}; filename="${filename}"; filename*=UTF-8''${encoded}`;
 
     const command = new GetObjectCommand({
         Bucket: bucket,
@@ -84,7 +85,7 @@ async function getMaterialsByCourse(courseId) {
     const [rows] = await pool.execute(
         `SELECT material_id, course_id, filename, file_size, content_type, week, uploaded_by, created_at, updated_at
          FROM course_materials WHERE course_id = ? AND status = 'active'
-         ORDER BY week DESC, created_at DESC, filename ASC`,
+         ORDER BY CAST(week AS UNSIGNED) DESC, created_at DESC, filename ASC`,
         [courseId]
     );
     return rows;

@@ -59,16 +59,19 @@ export default function MaterialListPage() {
 
   const perms = user?.permissions || {};
 
-  const handleDownload = async (materialId) => {
+  const handleDownload = async (materialId, mode) => {
     try {
-      const { data, ok } = await apiGet(`/api/materials/${materialId}/download`);
+      const url = mode === 'view'
+        ? `/api/materials/${materialId}/download?mode=view`
+        : `/api/materials/${materialId}/download`;
+      const { data, ok } = await apiGet(url);
       if (ok && data?.downloadUrl) {
         window.open(data.downloadUrl, '_blank');
       } else {
         showToast(data?.error || 'Failed to get download link.');
       }
     } catch (err) {
-      showToast('Download failed.');
+      showToast(mode === 'view' ? 'Failed to open file.' : 'Download failed.');
     }
   };
 
@@ -136,8 +139,16 @@ export default function MaterialListPage() {
                   <td>{new Date(m.created_at).toLocaleDateString()}</td>
                   <td>
                     <div style={{ display: 'flex', gap: '6px' }}>
+                      {m.filename.toLowerCase().endsWith('.pdf') && (
+                        <button
+                          className="btn btn-primary btn-sm"
+                          onClick={() => handleDownload(m.material_id, 'view')}
+                        >
+                          View
+                        </button>
+                      )}
                       <button
-                        className="btn btn-primary btn-sm"
+                        className={`btn btn-sm ${m.filename.toLowerCase().endsWith('.pdf') ? 'btn-secondary' : 'btn-primary'}`}
                         onClick={() => handleDownload(m.material_id)}
                       >
                         Download
@@ -190,6 +201,7 @@ export default function MaterialListPage() {
           courses={[{ course_id: parseInt(courseId), course_name: courseName }]}
           preselectedCourseId={courseId}
           preselectedCourseName={courseName}
+          existingMaterials={materials}
           onClose={() => setShowUploadModal(false)}
           onUploadComplete={() => { setShowUploadModal(false); fetchMaterials(); }}
         />
