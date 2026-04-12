@@ -33,6 +33,8 @@ import PlaybackStatsPage from './pages/admin/PlaybackStatsPage';
 import MfaSettingsPage from './pages/admin/MfaSettingsPage';
 import VideoManagementPage from './pages/admin/VideoManagementPage';
 import VideoListPage from './pages/admin/VideoListPage';
+import MaterialsPage from './pages/MaterialsPage';
+import MaterialListPage from './pages/MaterialListPage';
 
 export default function App() {
   return (
@@ -60,6 +62,8 @@ export default function App() {
                   {/* Admin */}
                   <Route path="/admin/courses" element={<CoursesPage />} />
                   <Route path="/admin/courses/:courseId/edit" element={<CourseEditPage />} />
+                  <Route path="/admin/materials" element={<MaterialsPage />} />
+                  <Route path="/admin/materials/:courseId" element={<MaterialListPage />} />
                   <Route path="/admin/videos" element={<VideoManagementPage />} />
                   <Route path="/admin/videos/:courseId" element={<VideoListPage />} />
                   <Route path="/admin/users" element={<UsersPage />} />

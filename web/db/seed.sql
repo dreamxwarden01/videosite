@@ -28,7 +28,10 @@ INSERT INTO role_permissions (role_id, permission_key, granted) VALUES
     (0, 'manageRoles', 1),
     (0, 'inviteUser', 1),
     (0, 'requireMFA', 1),
-    (0, 'manageSiteMFA', 1);
+    (0, 'manageSiteMFA', 1),
+    (0, 'accessAttachments', 1),
+    (0, 'uploadAttachments', 1),
+    (0, 'deleteAttachments', 1);
 
 -- Admin permissions (no delete, no superadmin-level perms)
 INSERT INTO role_permissions (role_id, permission_key, granted) VALUES
@@ -46,12 +49,16 @@ INSERT INTO role_permissions (role_id, permission_key, granted) VALUES
     (1, 'changeUser', 1),
     (1, 'viewPlaybackStat', 1),
     (1, 'inviteUser', 1),
-    (1, 'requireMFA', 1);
+    (1, 'requireMFA', 1),
+    (1, 'accessAttachments', 1),
+    (1, 'uploadAttachments', 1),
+    (1, 'deleteAttachments', 1);
 
 -- User permissions (basic)
 INSERT INTO role_permissions (role_id, permission_key, granted) VALUES
     (2, 'allowPlayback', 1),
-    (2, 'changeOwnPassword', 1);
+    (2, 'changeOwnPassword', 1),
+    (2, 'accessAttachments', 1);
 
 -- Default site settings
 INSERT INTO site_settings (setting_key, setting_value) VALUES
@@ -86,4 +93,8 @@ INSERT INTO schema_migrations (migration_id) VALUES
     ('017_upload_sessions'),
     ('018_widen_r2_upload_id'),
     ('019_course_id_to_int'),
-    ('020_remove_r2_turnstile_from_settings');
+    ('020_remove_r2_turnstile_from_settings'),
+    ('021_mfa_onetime_challenge_timeout'),
+    ('022_transcoding_profiles'),
+    ('023_course_materials'),
+    ('024_drop_material_original_filename');

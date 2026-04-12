@@ -504,6 +504,66 @@ async function runMigrations() {
                                ('audio_normalization_max_gain', '20')
                     `);
                 }
+            },
+            {
+                id: '023_course_materials',
+                up: async () => {
+                    await pool.execute(`
+                        CREATE TABLE IF NOT EXISTS course_materials (
+                            material_id       INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                            course_id         INT UNSIGNED NOT NULL,
+                            object_key        VARCHAR(255) NOT NULL,
+                            filename          VARCHAR(255) NOT NULL,
+                            file_size         BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                            content_type      VARCHAR(100) NOT NULL DEFAULT 'application/octet-stream',
+                            week              VARCHAR(20) DEFAULT NULL,
+                            status            ENUM('uploading','active','aborted') NOT NULL DEFAULT 'uploading',
+                            uploaded_by       INT UNSIGNED NOT NULL,
+                            created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            updated_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                            FOREIGN KEY (course_id) REFERENCES courses(course_id) ON DELETE CASCADE,
+                            FOREIGN KEY (uploaded_by) REFERENCES users(user_id) ON DELETE CASCADE,
+                            INDEX idx_course_materials_course (course_id),
+                            INDEX idx_course_materials_status (status)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    `);
+
+                    // Grant all 3 to superadmin
+                    await pool.execute(`
+                        INSERT IGNORE INTO role_permissions (role_id, permission_key, granted) VALUES
+                            (0, 'accessAttachments', 1),
+                            (0, 'uploadAttachments', 1),
+                            (0, 'deleteAttachments', 1)
+                    `);
+
+                    // Grant accessAttachments to all other roles
+                    await pool.execute(`
+                        INSERT IGNORE INTO role_permissions (role_id, permission_key, granted)
+                        SELECT role_id, 'accessAttachments', 1 FROM roles WHERE role_id > 0
+                    `);
+
+                    // Grant upload + delete to admin-level roles (permission_level <= 1)
+                    await pool.execute(`
+                        INSERT IGNORE INTO role_permissions (role_id, permission_key, granted)
+                        SELECT role_id, 'uploadAttachments', 1 FROM roles WHERE permission_level <= 1 AND role_id > 0
+                    `);
+                    await pool.execute(`
+                        INSERT IGNORE INTO role_permissions (role_id, permission_key, granted)
+                        SELECT role_id, 'deleteAttachments', 1 FROM roles WHERE permission_level <= 1 AND role_id > 0
+                    `);
+                }
+            },
+            {
+                id: '024_drop_material_original_filename',
+                up: async () => {
+                    const [cols] = await pool.execute(
+                        `SELECT 1 FROM information_schema.COLUMNS
+                         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'course_materials' AND COLUMN_NAME = 'original_filename'`
+                    );
+                    if (cols.length > 0) {
+                        await pool.execute(`ALTER TABLE course_materials DROP COLUMN original_filename`);
+                    }
+                }
             }
         ];
 

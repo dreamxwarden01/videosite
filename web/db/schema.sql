@@ -301,6 +301,24 @@ CREATE TABLE IF NOT EXISTS bmfa_tokens (
     INDEX idx_expires (expires_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS course_materials (
+    material_id       INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    course_id         INT UNSIGNED NOT NULL,
+    object_key        VARCHAR(255) NOT NULL,
+    filename          VARCHAR(255) NOT NULL,
+    file_size         BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    content_type      VARCHAR(100) NOT NULL DEFAULT 'application/octet-stream',
+    week              VARCHAR(20) DEFAULT NULL,
+    status            ENUM('uploading','active','aborted') NOT NULL DEFAULT 'uploading',
+    uploaded_by       INT UNSIGNED NOT NULL,
+    created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (course_id) REFERENCES courses(course_id) ON DELETE CASCADE,
+    FOREIGN KEY (uploaded_by) REFERENCES users(user_id) ON DELETE CASCADE,
+    INDEX idx_course_materials_course (course_id),
+    INDEX idx_course_materials_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS schema_migrations (
     migration_id   VARCHAR(100) PRIMARY KEY,
     applied_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP

@@ -54,9 +54,9 @@ async function deleteCourse(courseId) {
     const { cleanR2Prefix } = require('./videoService');
     const { clearStaleTimer } = require('./processingService');
 
-    // 1. Get all videos with hashed IDs and status (need status for delayed cleanup)
+    // 1. Get all videos with hashed IDs, source key, and status (need for R2 cleanup)
     const [videos] = await pool.execute(
-        'SELECT video_id, hashed_video_id, status FROM videos WHERE course_id = ?',
+        'SELECT video_id, hashed_video_id, r2_source_key, status FROM videos WHERE course_id = ?',
         [courseId]
     );
 
@@ -82,10 +82,13 @@ async function deleteCourse(courseId) {
     for (const video of videos) {
         const isProcessing = processingStatuses.includes(video.status);
 
-        // Source file: always clean immediately
-        cleanR2Prefix(`source/${video.hashed_video_id}/`).catch(err => {
-            console.error(`R2 source cleanup failed for video ${video.video_id}:`, err.message);
-        });
+        // Source file: always clean immediately (extract directory from r2_source_key)
+        if (video.r2_source_key) {
+            const sourceDir = video.r2_source_key.substring(0, video.r2_source_key.lastIndexOf('/') + 1);
+            cleanR2Prefix(sourceDir).catch(err => {
+                console.error(`R2 source cleanup failed for video ${video.video_id}:`, err.message);
+            });
+        }
 
         if (isProcessing) {
             // HLS output: delay 2 minutes for worker to stop uploading
@@ -103,6 +106,12 @@ async function deleteCourse(courseId) {
             });
         }
     }
+
+    // 7. Clean all course material files from R2 (fire-and-forget)
+    // DB records already removed by FK CASCADE on course_materials.course_id
+    cleanR2Prefix(`attachments/${courseId}/`).catch(err => {
+        console.error(`R2 materials cleanup failed for course ${courseId}:`, err.message);
+    });
 }
 
 async function listCourses(page = 1, limit = 10) {

@@ -24,7 +24,10 @@ const ALL_PERMISSIONS = [
     'manageRoles',
     'inviteUser',
     'requireMFA',
-    'manageSiteMFA'
+    'manageSiteMFA',
+    'accessAttachments',
+    'uploadAttachments',
+    'deleteAttachments'
 ];
 
 // Resolve effective permissions for a user

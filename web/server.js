@@ -43,6 +43,7 @@ const mfaAuthRoutes = require('./routes/mfa-auth');
 const apiMfaAdminRoutes = require('./routes/api/mfa-admin');
 const apiMfaRoutes = require('./routes/api/mfa');
 const passwordResetRoutes = require('./routes/password-reset');
+const apiMaterialRoutes = require('./routes/api/materials');
 
 app.use(installRoutes);
 app.use(authRoutes);
@@ -57,6 +58,7 @@ app.use('/api', apiVideoRoutes);
 app.use('/api', apiWorkerRoutes);
 app.use('/api', apiMfaAdminRoutes);
 app.use('/api', apiMfaRoutes);
+app.use('/api', apiMaterialRoutes);
 
 // SPA fallback — serve React app for non-API routes
 const spaIndexPath = path.join(__dirname, 'client', 'dist', 'index.html');
@@ -128,6 +130,21 @@ app.listen(PORT, async () => {
     setInterval(() => {
         cleanupExpiredResetTokens();
         cleanupExpiredResetRateLimits();
+    }, 60 * 60 * 1000);
+
+    // Clean stale material uploads every hour
+    const { cleanupStaleMaterials, deleteR2Object } = require('./services/materialService');
+    setInterval(async () => {
+        try {
+            const staleKeys = await cleanupStaleMaterials();
+            for (const key of staleKeys) {
+                deleteR2Object(key).catch(err => {
+                    console.error(`R2 material cleanup failed for ${key}:`, err.message);
+                });
+            }
+        } catch (err) {
+            console.error('Material cleanup error:', err.message);
+        }
     }, 60 * 60 * 1000);
 
     // Sweep stale upload sessions on startup and restart their timers

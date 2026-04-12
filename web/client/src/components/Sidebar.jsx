@@ -3,6 +3,7 @@ import { useAuth } from '../context/AuthContext';
 
 const links = [
   { to: '/profile', label: 'Profile', icon: '\u{1F464}', permission: null },
+  { to: '/admin/materials', label: 'Materials', icon: '\u{1F5C2}\uFE0F', permission: 'accessAttachments' },
   { to: '/admin/videos', label: 'Videos', icon: '\u{1F3AC}', permissionAny: ['uploadVideo', 'changeVideo'] },
   { to: '/admin/courses', label: 'Courses', icon: '\u{1F4DA}', permission: 'manageCourse' },
   { to: '/admin/enrollment', label: 'Enrollment', icon: '\u{1F4CB}', permission: 'manageEnrolment' },
