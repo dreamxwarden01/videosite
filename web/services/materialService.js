@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { PutObjectCommand, GetObjectCommand, DeleteObjectCommand, CopyObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { getR2Client, getR2BucketName } = require('../config/r2');
 const { getPool } = require('../config/database');
@@ -73,11 +73,31 @@ async function createMaterialRecord(courseId, objectKey, filename, fileSize, con
 
 async function confirmUpload(materialId, userId) {
     const pool = getPool();
-    const [result] = await pool.execute(
-        `UPDATE course_materials SET status = 'active' WHERE material_id = ? AND status = 'uploading' AND uploaded_by = ?`,
+    const [rows] = await pool.execute(
+        `SELECT object_key, content_type FROM course_materials WHERE material_id = ? AND status = 'uploading' AND uploaded_by = ?`,
         [materialId, userId]
     );
-    return result.affectedRows > 0;
+    if (!rows.length) return false;
+
+    const [result] = await pool.execute(
+        `UPDATE course_materials SET status = 'active' WHERE material_id = ?`,
+        [materialId]
+    );
+    if (result.affectedRows === 0) return false;
+
+    // Set Cache-Control metadata server-side via copy-to-self
+    const r2 = getR2Client();
+    const bucket = getR2BucketName();
+    await r2.send(new CopyObjectCommand({
+        Bucket: bucket,
+        Key: rows[0].object_key,
+        CopySource: `${bucket}/${rows[0].object_key}`,
+        ContentType: rows[0].content_type,
+        CacheControl: 'public, max-age=31536000, immutable',
+        MetadataDirective: 'REPLACE',
+    }));
+
+    return true;
 }
 
 async function getMaterialsByCourse(courseId) {
