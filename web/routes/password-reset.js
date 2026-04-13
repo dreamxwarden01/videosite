@@ -34,7 +34,12 @@ router.post('/api/password-reset/request', async (req, res) => {
             });
         }
 
-        // 2. Validate email format
+        // 2. Reject spaces
+        if (email && /\s/.test(email)) {
+            return res.status(422).json({ success: false, errors: { email: 'Spaces are not allowed.' } });
+        }
+
+        // 3. Validate email format
         if (!email || !isValidEmail(email)) {
             return res.status(422).json({
                 success: false,
@@ -111,7 +116,12 @@ router.post('/api/password-reset/confirm', async (req, res) => {
 
         const userId = tokenResult.userId;
 
-        // 2. Validate passwords
+        // 2. Reject spaces in password
+        if ((password && /\s/.test(password)) || (confirmPassword && /\s/.test(confirmPassword))) {
+            return res.status(422).json({ success: false, errors: { password: 'Spaces are not allowed.' } });
+        }
+
+        // 3. Validate passwords
         if (password !== confirmPassword) {
             return res.status(422).json({
                 success: false,

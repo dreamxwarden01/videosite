@@ -46,7 +46,15 @@ router.post('/api/register/start', async (req, res) => {
             });
         }
 
-        // 3. Validate email format
+        // 3. Reject spaces
+        if (email && /\s/.test(email)) {
+            return res.status(422).json({ success: false, errors: { email: 'Spaces are not allowed.' } });
+        }
+        if (invitationCode && /\s/.test(invitationCode)) {
+            return res.status(422).json({ success: false, errors: { invitationCode: 'Spaces are not allowed.' } });
+        }
+
+        // 4. Validate email format
         if (!email || !isValidEmail(email)) {
             return res.status(422).json({
                 success: false,
@@ -185,6 +193,9 @@ router.post('/api/register/complete', async (req, res) => {
                 success: false,
                 message: 'Missing required fields.'
             });
+        }
+        if ((username && /\s/.test(username)) || (password && /\s/.test(password))) {
+            return res.status(422).json({ success: false, errors: { username: 'Spaces are not allowed.' } });
         }
 
         // 4. Password confirmation

@@ -115,7 +115,7 @@ export default function RegisterCompletePage() {
   };
 
   // Block spacebar in password fields
-  const blockSpace = (e) => { if (e.key === ' ') e.preventDefault(); };
+
 
   const allValid = validity.username && validity.displayName && validity.password && validity.confirmPassword;
   const registerEnabled = allValid && (turnstileToken || !turnstileSiteKey) && !submitting;
@@ -226,7 +226,7 @@ export default function RegisterCompletePage() {
                 id="regUsername"
                 className={`form-control${errors.username ? ' input-error' : ''}`}
                 value={username}
-                onChange={(e) => { const v = e.target.value; setUsername(v); setFieldError('username', ''); setFieldValid('username', v.trim().length >= 3 && v.trim().length <= 20 && /^[A-Za-z0-9_-]+$/.test(v.trim())); }}
+                onChange={(e) => { const v = e.target.value.replace(/\s/g, ''); setUsername(v); setFieldError('username', ''); setFieldValid('username', v.trim().length >= 3 && v.trim().length <= 20 && /^[A-Za-z0-9_-]+$/.test(v.trim())); }}
                 onBlur={handleUsernameBlur}
                 autoFocus
               />
@@ -253,9 +253,8 @@ export default function RegisterCompletePage() {
                 id="regPassword"
                 className={`form-control${errors.password ? ' input-error' : ''}`}
                 value={password}
-                onChange={(e) => { const v = e.target.value; setPassword(v); setFieldError('password', ''); const { error } = checkPasswordComplexity(v); setFieldValid('password', !error); }}
+                onChange={(e) => { const v = e.target.value.replace(/\s/g, ''); setPassword(v); setFieldError('password', ''); const { error } = checkPasswordComplexity(v); setFieldValid('password', !error); }}
                 onBlur={handlePasswordBlur}
-                onKeyDown={blockSpace}
               />
               <PasswordRules password={password} />
             </div>
@@ -267,9 +266,8 @@ export default function RegisterCompletePage() {
                 id="regConfirmPassword"
                 className={`form-control${errors.confirmPassword ? ' input-error' : ''}`}
                 value={confirmPassword}
-                onChange={(e) => { setConfirmPassword(e.target.value); setFieldError('confirmPassword', ''); setFieldValid('confirmPassword', e.target.value.length > 0 && e.target.value === password); }}
+                onChange={(e) => { const v = e.target.value.replace(/\s/g, ''); setConfirmPassword(v); setFieldError('confirmPassword', ''); setFieldValid('confirmPassword', v.length > 0 && v === password); }}
                 onBlur={handleConfirmBlur}
-                onKeyDown={blockSpace}
               />
               {errors.confirmPassword && <span className="field-error">{errors.confirmPassword}</span>}
             </div>

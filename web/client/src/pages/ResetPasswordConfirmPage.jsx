@@ -192,9 +192,8 @@ export default function ResetPasswordConfirmPage() {
                       autoFocus
                       autoComplete="new-password"
                       value={password}
-                      onChange={(e) => setPassword(e.target.value)}
+                      onChange={(e) => setPassword(e.target.value.replace(/\s/g, ''))}
                       onBlur={handlePasswordBlur}
-                      onKeyDown={(e) => { if (e.key === ' ') e.preventDefault(); }}
                     />
                     <PasswordRules password={password} />
                     {errors.password && (
@@ -209,9 +208,8 @@ export default function ResetPasswordConfirmPage() {
                       className={`form-control${touched.confirmPassword && confirmError ? ' input-error' : ''}`}
                       autoComplete="new-password"
                       value={confirmPassword}
-                      onChange={(e) => setConfirmPassword(e.target.value)}
+                      onChange={(e) => setConfirmPassword(e.target.value.replace(/\s/g, ''))}
                       onBlur={handleConfirmBlur}
-                      onKeyDown={(e) => { if (e.key === ' ') e.preventDefault(); }}
                     />
                     {touched.confirmPassword && (confirmError || errors.confirmPassword) && (
                       <div className="field-error" style={{ marginTop: '4px' }}>{confirmError || errors.confirmPassword}</div>

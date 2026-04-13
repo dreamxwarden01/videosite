@@ -71,7 +71,7 @@ export default function RegisterPage() {
 
   // Invitation code input
   const handleCodeInput = (e) => {
-    const val = e.target.value.toUpperCase();
+    const val = e.target.value.replace(/\s/g, '').toUpperCase();
     setCode(val);
     setCodeError('');
     setCodeValid(/^[A-Z0-9]{12}$/.test(val));
@@ -263,7 +263,7 @@ export default function RegisterPage() {
                     id="email"
                     className={`form-control${emailError ? ' input-error' : ''}`}
                     value={email}
-                    onChange={(e) => { setEmail(e.target.value); setEmailError(''); setEmailValid(isValidEmail(e.target.value.trim())); }}
+                    onChange={(e) => { const v = e.target.value.replace(/\s/g, ''); setEmail(v); setEmailError(''); setEmailValid(isValidEmail(v.trim())); }}
                     onBlur={handleEmailBlur}
                     autoFocus
                   />

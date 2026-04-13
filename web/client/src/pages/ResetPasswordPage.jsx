@@ -107,7 +107,7 @@ export default function ResetPasswordPage() {
                       autoFocus
                       autoComplete="email"
                       value={email}
-                      onChange={(e) => { setEmail(e.target.value); setEmailError(''); }}
+                      onChange={(e) => { setEmail(e.target.value.replace(/\s/g, '')); setEmailError(''); }}
                       placeholder="you@example.com"
                     />
                     {emailError && (

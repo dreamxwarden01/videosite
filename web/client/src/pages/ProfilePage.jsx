@@ -443,7 +443,7 @@ export default function ProfilePage() {
                 <input type="password"
                   className={`form-control${pwTouched.current && !currentPassword ? ' input-error' : ''}`}
                   value={currentPassword}
-                  onChange={(e) => setCurrentPassword(e.target.value)}
+                  onChange={(e) => setCurrentPassword(e.target.value.replace(/\s/g, ''))}
                   onBlur={() => setPwTouched(prev => ({ ...prev, current: true }))}
                 />
                 {pwTouched.current && !currentPassword && <span className="field-error">Current password is required.</span>}
@@ -453,9 +453,8 @@ export default function ProfilePage() {
                 <input type="password"
                   className={`form-control${pwTouched.newPw && newPwError ? ' input-error' : ''}`}
                   value={newPassword}
-                  onChange={(e) => setNewPassword(e.target.value)}
+                  onChange={(e) => setNewPassword(e.target.value.replace(/\s/g, ''))}
                   onBlur={() => { setPwTouched(prev => ({ ...prev, newPw: true })); if (confirmPassword) setPwTouched(prev => ({ ...prev, confirm: true })); }}
-                  onKeyDown={(e) => { if (e.key === ' ') e.preventDefault(); }}
                 />
                 <PasswordRules password={newPassword} />
               </div>
@@ -464,9 +463,8 @@ export default function ProfilePage() {
                 <input type="password"
                   className={`form-control${pwTouched.confirm && pwConfirmError ? ' input-error' : ''}`}
                   value={confirmPassword}
-                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  onChange={(e) => setConfirmPassword(e.target.value.replace(/\s/g, ''))}
                   onBlur={() => setPwTouched(prev => ({ ...prev, confirm: true }))}
-                  onKeyDown={(e) => { if (e.key === ' ') e.preventDefault(); }}
                 />
                 {pwTouched.confirm && pwConfirmError && <span className="field-error">{pwConfirmError}</span>}
               </div>
@@ -575,7 +573,7 @@ export default function ProfilePage() {
                       type="email"
                       className="form-control"
                       value={newEmail}
-                      onChange={(e) => setNewEmail(e.target.value)}
+                      onChange={(e) => setNewEmail(e.target.value.replace(/\s/g, ''))}
                       required
                       autoFocus
                     />
@@ -587,7 +585,7 @@ export default function ProfilePage() {
                         type="password"
                         className="form-control"
                         value={emailPassword}
-                        onChange={(e) => setEmailPassword(e.target.value)}
+                        onChange={(e) => setEmailPassword(e.target.value.replace(/\s/g, ''))}
                         required
                       />
                     </div>

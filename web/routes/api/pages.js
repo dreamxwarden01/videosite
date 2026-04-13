@@ -295,6 +295,9 @@ router.post('/profile/password', requireAuth, async (req, res) => {
         if (!currentPassword || !newPassword || !confirmPassword) {
             return res.status(422).json({ error: 'All fields are required' });
         }
+        if (/\s/.test(currentPassword) || /\s/.test(newPassword) || /\s/.test(confirmPassword)) {
+            return res.status(422).json({ error: 'Spaces are not allowed in passwords' });
+        }
         if (newPassword !== confirmPassword) {
             return res.status(422).json({ error: 'New passwords do not match' });
         }
@@ -455,6 +458,9 @@ router.post('/profile/email/start', requireAuth, async (req, res) => {
         // Validate email format
         if (!email || typeof email !== 'string') {
             return res.status(422).json({ error: 'Email is required' });
+        }
+        if (/\s/.test(email)) {
+            return res.status(422).json({ error: 'Spaces are not allowed in email' });
         }
         const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
         if (!emailRegex.test(email)) {

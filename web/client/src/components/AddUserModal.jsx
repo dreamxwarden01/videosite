@@ -101,7 +101,7 @@ export default function AddUserModal({ isOpen, onClose, onCreated, mfaFetch: ext
     else { setFieldError('confirmPassword', ''); setFieldValid('confirmPassword', true); }
   };
 
-  const blockSpace = (e) => { if (e.key === ' ') e.preventDefault(); };
+
 
   const emailValid = !email || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
   const allValid = validity.username && validity.displayName && validity.password && validity.confirmPassword && emailValid && roleId;
@@ -155,7 +155,7 @@ export default function AddUserModal({ isOpen, onClose, onCreated, mfaFetch: ext
                   type="text" id="adm_ident"
                   className={`form-control${errors.username ? ' input-error' : ''}`}
                   value={username}
-                  onChange={e => { const v = e.target.value; setUsername(v); setFieldError('username', ''); setFieldValid('username', v.trim().length >= 3 && v.trim().length <= 20 && /^[A-Za-z0-9_-]+$/.test(v.trim())); }}
+                  onChange={e => { const v = e.target.value.replace(/\s/g, ''); setUsername(v); setFieldError('username', ''); setFieldValid('username', v.trim().length >= 3 && v.trim().length <= 20 && /^[A-Za-z0-9_-]+$/.test(v.trim())); }}
                   onBlur={handleUsernameBlur}
                   maxLength={20} autoFocus autoComplete="one-time-code"
                 />
@@ -183,7 +183,7 @@ export default function AddUserModal({ isOpen, onClose, onCreated, mfaFetch: ext
                   type="text" id="adm_contact"
                   className={`form-control${errors.email ? ' input-error' : ''}`}
                   value={email}
-                  onChange={e => { setEmail(e.target.value); setFieldError('email', ''); }}
+                  onChange={e => { setEmail(e.target.value.replace(/\s/g, '')); setFieldError('email', ''); }}
                   onBlur={handleEmailBlur}
                   autoComplete="one-time-code"
                 />
@@ -208,9 +208,9 @@ export default function AddUserModal({ isOpen, onClose, onCreated, mfaFetch: ext
                   className={`form-control${errors.password ? ' input-error' : ''}`}
                   style={{ WebkitTextSecurity: 'disc', textSecurity: 'disc' }}
                   value={password}
-                  onChange={e => { const v = e.target.value; setPassword(v); setFieldError('password', ''); const { error } = checkPasswordComplexity(v); setFieldValid('password', !error); }}
+                  onChange={e => { const v = e.target.value.replace(/\s/g, ''); setPassword(v); setFieldError('password', ''); const { error } = checkPasswordComplexity(v); setFieldValid('password', !error); }}
                   onBlur={handlePasswordBlur}
-                  onKeyDown={blockSpace} autoComplete="off"
+                  autoComplete="off"
                 />
                 <PasswordRules password={password} />
               </div>
@@ -222,9 +222,9 @@ export default function AddUserModal({ isOpen, onClose, onCreated, mfaFetch: ext
                   className={`form-control${errors.confirmPassword ? ' input-error' : ''}`}
                   style={{ WebkitTextSecurity: 'disc', textSecurity: 'disc' }}
                   value={confirmPassword}
-                  onChange={e => { setConfirmPassword(e.target.value); setFieldError('confirmPassword', ''); setFieldValid('confirmPassword', e.target.value.length > 0 && e.target.value === password); }}
+                  onChange={e => { const v = e.target.value.replace(/\s/g, ''); setConfirmPassword(v); setFieldError('confirmPassword', ''); setFieldValid('confirmPassword', v.length > 0 && v === password); }}
                   onBlur={handleConfirmBlur}
-                  onKeyDown={blockSpace} autoComplete="off"
+                  autoComplete="off"
                 />
                 {errors.confirmPassword && <span className="field-error">{errors.confirmPassword}</span>}
               </div>

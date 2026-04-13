@@ -286,7 +286,7 @@ export default function LoginPage() {
                       autoFocus
                       autoComplete="username"
                       value={username}
-                      onChange={(e) => setUsername(e.target.value)}
+                      onChange={(e) => setUsername(e.target.value.replace(/\s/g, ''))}
                     />
                   </div>
                   <div className="form-group">
@@ -302,7 +302,7 @@ export default function LoginPage() {
                       className="form-control"
                       required
                       value={password}
-                      onChange={(e) => setPassword(e.target.value)}
+                      onChange={(e) => setPassword(e.target.value.replace(/\s/g, ''))}
                     />
                   </div>
                   <button

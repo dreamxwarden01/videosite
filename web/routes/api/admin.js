@@ -324,6 +324,9 @@ router.post('/admin/users', requireAuth, checkPermission('addUser'), requireMfaF
         if (!username || !password || !displayName) {
             return res.status(400).json({ error: 'Username, display name, and password are required' });
         }
+        if (/\s/.test(username)) return res.status(422).json({ error: 'Spaces are not allowed in username' });
+        if (/\s/.test(password)) return res.status(422).json({ error: 'Spaces are not allowed in password' });
+        if (email && /\s/.test(email)) return res.status(422).json({ error: 'Spaces are not allowed in email' });
 
         // Username: 3-20 chars, letters/digits/dashes/underscores
         const trimmedUsername = username.trim();
@@ -439,6 +442,9 @@ router.put('/admin/users/:id', requireAuth, checkPermission('changeUser'), requi
         const { displayName, email, roleId, password, is_active } = req.body;
         const targetUserId = parseInt(req.params.id);
         const updates = {};
+
+        if (email !== undefined && email && /\s/.test(email)) return res.status(422).json({ error: 'Spaces are not allowed in email' });
+        if (password && /\s/.test(password)) return res.status(422).json({ error: 'Spaces are not allowed in password' });
 
         // Display name: 1-30 chars, letters/digits/spaces
         if (displayName) {

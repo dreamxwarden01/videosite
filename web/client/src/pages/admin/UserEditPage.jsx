@@ -182,7 +182,7 @@ export default function UserEditPage() {
     else { setFieldError('confirmPassword', ''); setFieldValid('confirmPassword', true); }
   };
 
-  const blockSpace = (e) => { if (e.key === ' ') e.preventDefault(); };
+
 
   // ---- Save handlers ----
   const handleSaveDetails = async (e) => {
@@ -369,10 +369,10 @@ export default function UserEditPage() {
                   <div className="form-group">
                     <label htmlFor="email">Email</label>
                     <input
-                      type="email" id="email"
+                      type="text" id="email"
                       className={`form-control${errors.email ? ' input-error' : ''}`}
                       value={email}
-                      onChange={e => { setEmail(e.target.value); setFieldError('email', ''); setFieldValid('email', !e.target.value || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e.target.value.trim())); }}
+                      onChange={e => { const v = e.target.value.replace(/\s/g, ''); setEmail(v); setFieldError('email', ''); setFieldValid('email', !v || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim())); }}
                       onBlur={handleEmailBlur}
                       disabled={mfaEnabled}
                     />
@@ -426,9 +426,8 @@ export default function UserEditPage() {
                         className={`form-control${errors.password ? ' input-error' : ''}`}
                         style={{ WebkitTextSecurity: 'disc', textSecurity: 'disc' }}
                         value={password}
-                        onChange={e => { const v = e.target.value; setPassword(v); setFieldError('password', ''); const { error } = checkPasswordComplexity(v); setFieldValid('password', !error); if (confirmPassword) { const match = confirmPassword === v; setFieldValid('confirmPassword', match); } }}
+                        onChange={e => { const v = e.target.value.replace(/\s/g, ''); setPassword(v); setFieldError('password', ''); const { error } = checkPasswordComplexity(v); setFieldValid('password', !error); if (confirmPassword) { const match = confirmPassword === v; setFieldValid('confirmPassword', match); } }}
                         onBlur={handlePasswordBlur}
-                        onKeyDown={blockSpace}
                         placeholder="Leave blank to keep current"
                         autoComplete="off"
                       />
@@ -443,9 +442,8 @@ export default function UserEditPage() {
                           className={`form-control${errors.confirmPassword ? ' input-error' : ''}`}
                           style={{ WebkitTextSecurity: 'disc', textSecurity: 'disc' }}
                           value={confirmPassword}
-                          onChange={e => { setConfirmPassword(e.target.value); setFieldError('confirmPassword', ''); setFieldValid('confirmPassword', e.target.value.length > 0 && e.target.value === password); }}
+                          onChange={e => { const v = e.target.value.replace(/\s/g, ''); setConfirmPassword(v); setFieldError('confirmPassword', ''); setFieldValid('confirmPassword', v.length > 0 && v === password); }}
                           onBlur={handleConfirmBlur}
-                          onKeyDown={blockSpace}
                           autoComplete="off"
                         />
                         {errors.confirmPassword && <span className="field-error">{errors.confirmPassword}</span>}

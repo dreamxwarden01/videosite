@@ -31,6 +31,9 @@ router.post('/api/login', async (req, res) => {
                 message: 'Username or email and password are required'
             });
         }
+        if (/\s/.test(username) || /\s/.test(password)) {
+            return res.status(422).json({ success: false, returnTo: null, message: 'Spaces are not allowed in credentials' });
+        }
 
         // Try username first, then email
         let user = await getUserByUsername(username);
