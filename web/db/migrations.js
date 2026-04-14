@@ -564,6 +564,26 @@ async function runMigrations() {
                         await pool.execute(`ALTER TABLE course_materials DROP COLUMN original_filename`);
                     }
                 }
+            },
+            {
+                id: '025_worker_sessions',
+                up: async () => {
+                    // Bearer-token sessions for the worker. IP-bound, 1-hour inactivity expiry,
+                    // one active session per worker_access_keys row (re-auth revokes prior).
+                    await pool.execute(`
+                        CREATE TABLE IF NOT EXISTS worker_sessions (
+                            session_id     VARCHAR(32)  NOT NULL PRIMARY KEY,
+                            worker_key_id  VARCHAR(64)  NOT NULL,
+                            bearer_token   VARCHAR(128) NOT NULL UNIQUE,
+                            ip_address     VARCHAR(64)  NOT NULL,
+                            last_seen      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (worker_key_id) REFERENCES worker_access_keys(key_id) ON DELETE CASCADE,
+                            INDEX idx_worker_sessions_key (worker_key_id),
+                            INDEX idx_worker_sessions_last_seen (last_seen)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    `);
+                }
             }
         ];
 

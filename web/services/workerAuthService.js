@@ -68,26 +68,55 @@ async function listWorkerKeys() {
     return rows;
 }
 
-// Middleware for worker API routes
-async function requireWorkerAuth(req, res, next) {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('WorkerKey ')) {
-        return res.status(401).json({ error: 'Missing worker authentication' });
-    }
+// Create a new bearer-token session for a worker key. Revokes any prior sessions
+// for the same key first (one active session per key). Returns { bearerToken,
+// expiresInSeconds } — the token is plaintext, shown once to the worker and
+// stored plaintext in the DB (same model as the user `sessions` table).
+const SESSION_TTL_SECONDS = 60 * 60; // 1 hour inactivity
+const SESSION_ID_BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
-    const parts = authHeader.slice(10).split(':');
-    if (parts.length !== 2) {
-        return res.status(401).json({ error: 'Invalid authorization format' });
-    }
+function generateSessionId() {
+    // 16 random bytes → 16 base62 chars
+    const buf = crypto.randomBytes(16);
+    let out = '';
+    for (let i = 0; i < 16; i++) out += SESSION_ID_BASE62[buf[i] % 62];
+    return out;
+}
 
-    const [keyId, secret] = parts;
-    const valid = await validateWorkerKey(keyId, secret);
-    if (!valid) {
-        return res.status(401).json({ error: 'Invalid or revoked worker key' });
-    }
+async function createWorkerSession(keyId, ipAddress) {
+    const pool = getPool();
 
-    req.workerKeyId = keyId;
-    next();
+    // Revoke any existing sessions for this key (one active session per key).
+    await pool.execute(
+        'DELETE FROM worker_sessions WHERE worker_key_id = ?',
+        [keyId]
+    );
+
+    const sessionId = generateSessionId();
+    const bearerToken = crypto.randomBytes(64).toString('base64url');
+
+    await pool.execute(
+        `INSERT INTO worker_sessions (session_id, worker_key_id, bearer_token, ip_address)
+         VALUES (?, ?, ?, ?)`,
+        [sessionId, keyId, bearerToken, ipAddress || '']
+    );
+
+    await pool.execute(
+        'UPDATE worker_access_keys SET last_used_at = NOW() WHERE key_id = ?',
+        [keyId]
+    );
+
+    return { bearerToken, expiresInSeconds: SESSION_TTL_SECONDS };
+}
+
+// Delete worker sessions whose last_seen is older than 1 hour.
+// Called hourly from server.js alongside the other session/token cleanups.
+async function cleanupExpiredWorkerSessions() {
+    const pool = getPool();
+    const [result] = await pool.execute(
+        'DELETE FROM worker_sessions WHERE last_seen < NOW() - INTERVAL 1 HOUR'
+    );
+    return result.affectedRows;
 }
 
 module.exports = {
@@ -96,5 +125,7 @@ module.exports = {
     revokeWorkerKey,
     deleteWorkerKey,
     listWorkerKeys,
-    requireWorkerAuth
+    createWorkerSession,
+    cleanupExpiredWorkerSessions,
+    SESSION_TTL_SECONDS
 };

@@ -19,6 +19,19 @@ import (
 	"videosite-worker/internal/worker/progress"
 )
 
+// pollInterval is the cadence of the lease-polling main loop.
+// Kept at 5 s so idle workers don't hammer /tasks/available.
+const pollInterval = 5 * time.Second
+
+// statusInterval is the cadence of the batched /task/status reporter.
+const statusInterval = 2 * time.Second
+
+// statusSilenceAbort is how long the status loop tolerates consecutive failures
+// before giving up on the in-flight jobs. Kills all ffmpeg processes, resets
+// the slot count, and returns control to the polling loop. 60 s as a real
+// wall-clock window (not a tick count) — ticks drift under CPU pressure.
+const statusSilenceAbort = 60 * time.Second
+
 // Worker is the main transcoding worker.
 type Worker struct {
 	manager   *slot.Manager
@@ -29,6 +42,9 @@ type Worker struct {
 	cancel    context.CancelFunc
 	stopping  atomic.Bool
 
+	// statusOnce guards lazy startup of the status loop: we only need it
+	// once the first job is running. Subsequent leases find it already live.
+	statusOnce sync.Once
 }
 
 // New creates a new worker.
@@ -59,8 +75,8 @@ func (w *Worker) Run() {
 	// Start console command reader
 	go w.readConsoleCommands()
 
-	// Main poll loop
-	ticker := time.NewTicker(5 * time.Second)
+	// Main poll loop (lease cadence)
+	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -74,12 +90,16 @@ func (w *Worker) Run() {
 	}
 }
 
+// poll runs one iteration of the lease-polling main loop. If there are free
+// slots and the server has queued work, it reserves (atomic queued→pending)
+// and then leases (atomic pending→processing) up to the available count.
 func (w *Worker) poll() {
 	if w.stopping.Load() {
 		return // Don't pick up new work during shutdown
 	}
 
-	if !w.manager.HasFreeSlot() {
+	free := w.manager.FreeSlots()
+	if free <= 0 {
 		return
 	}
 
@@ -89,74 +109,163 @@ func (w *Worker) poll() {
 		return
 	}
 
-	// Check for available task
-	result, err := api.CheckAvailable(w.ctx)
+	// 1. Reserve up to `free` tasks (server flips queued→pending atomically).
+	videoIDs, err := api.AvailableTasks(w.ctx, free)
 	if err != nil {
 		if errors.Is(err, api.ErrAuthFailed) {
 			w.handleAuthFailure()
 			return
 		}
-		slog.Debug("Poll error", "err", err)
+		slog.Debug("AvailableTasks error", "err", err)
+		return
+	}
+	if len(videoIDs) == 0 {
 		return
 	}
 
-	if !result.HasAvailableTask {
+	// Blocklist filter: skip videos the worker has previously failed to process.
+	// Reserving them was harmless — server hold expires in 10 s.
+	filtered := videoIDs[:0]
+	for _, vid := range videoIDs {
+		if w.blocklist.IsBlocked(vid) {
+			slog.Debug("Skipping blocked video", "video", vid)
+			continue
+		}
+		filtered = append(filtered, vid)
+	}
+	if len(filtered) == 0 {
 		return
 	}
 
-	// Check blocklist
-	if w.blocklist.IsBlocked(result.VideoID) {
-		slog.Debug("Skipping blocked video", "video", result.VideoID)
-		return
-	}
-
-	// Lease the task
-	lease, err := api.Lease(w.ctx, result.VideoID)
+	// 2. Lease the reserved tasks (pending→processing, server assigns jobId).
+	results, err := api.LeaseTasks(w.ctx, filtered)
 	if err != nil {
 		if errors.Is(err, api.ErrAuthFailed) {
 			w.handleAuthFailure()
 			return
 		}
-		slog.Warn("Lease failed", "video", result.VideoID, "err", err)
+		slog.Warn("LeaseTasks failed", "err", err)
 		return
 	}
 
-	if !lease.IsLeaseSuccess {
-		slog.Debug("Lease not successful (task may have been taken)", "video", result.VideoID)
-		return
+	// 3. Start one goroutine per successfully leased task.
+	for _, r := range results {
+		if r.Status != "leased" {
+			slog.Debug("Lease did not succeed", "video", r.VideoID, "status", r.Status)
+			continue
+		}
+		w.launchJob(r)
 	}
+}
 
+// launchJob acquires a slot and starts the job goroutine for a leased task.
+// The first successful launch lazily starts the status-reporting loop.
+func (w *Worker) launchJob(r api.LeaseResult) {
 	// Acquire a slot — this marks the job as active and selects the preferred encoder.
-	// The full Encoder (type + device index) is passed into the job so FFmpeg
-	// can target the correct GPU for both decode and encode.
-	encoder, err := w.manager.AcquireSlot(lease.JobID, nil)
+	encoder, err := w.manager.AcquireSlot(r.JobID, nil)
 	if err != nil {
-		slog.Warn("No slot available", "err", err)
+		slog.Warn("No slot available despite lease", "job", r.JobID, "err", err)
+		// Queue an aborted status so the server can requeue promptly rather
+		// than waiting for its own processing-timeout.
+		w.manager.RecordTerminal(api.JobStatus{
+			JobID:        r.JobID,
+			Status:       "aborted",
+			ErrorMessage: "no slot available",
+		})
 		return
 	}
 
-	slog.Info("Launching job", "job", lease.JobID, "video", result.VideoID,
+	slog.Info("Launching job", "job", r.JobID, "video", r.VideoID,
 		"encoder", encoder.EncoderType, "device", encoder.DeviceIndex)
 
-	job := slot.NewJob(lease.JobID, result.VideoID, lease.DownloadURL, lease.EncryptionKey, encoder, w.manager, w.tracker,
-		lease.OutputProfiles, lease.AudioNormalization, lease.AudioNormalizationTarget, lease.AudioNormalizationPeak, lease.AudioNormalizationMaxGain)
-	w.manager.RegisterJob(lease.JobID, job)
+	job := slot.NewJob(r.JobID, r.VideoID, r.DownloadURL, r.EncryptionKey, encoder, w.manager, w.tracker,
+		r.OutputProfiles, r.AudioNormalization, r.AudioNormalizationTarget, r.AudioNormalizationPeak, r.AudioNormalizationMaxGain)
+	w.manager.RegisterJob(r.JobID, job)
 
+	// Lazily start the status loop on the first job we accept.
+	w.statusOnce.Do(func() {
+		go w.statusLoop()
+	})
+
+	videoID := r.VideoID
+	jobID := r.JobID
 	w.wg.Add(1)
 	go func() {
 		defer w.wg.Done()
 
 		if err := job.Run(); err != nil {
-			// Check if FFmpeg binary went missing — fatal, shut down the worker
+			// FFmpeg binary went missing — fatal, shut down the worker.
 			if errors.Is(err, slot.ErrFFmpegFatal) {
 				w.handleFFmpegMissing()
 				return
 			}
-
-			w.blocklist.Add(result.VideoID)
-			slog.Error("Job failed, video blocked", "job", lease.JobID, "video", result.VideoID, "err", err)
+			w.blocklist.Add(videoID)
+			slog.Error("Job failed, video blocked", "job", jobID, "video", videoID, "err", err)
 		}
 	}()
+}
+
+// statusLoop is the 2-second batched /task/status reporter.
+//
+// It runs for the lifetime of the worker once started (lazy via statusOnce).
+// On each tick:
+//   - Collect per-job "running" entries + queued terminal statuses via SnapshotStatuses.
+//   - POST them in a single batch.
+//   - Drop any jobs the server ack:false'd (unknown to server anymore).
+//   - Track wall-clock time since last 2xx response. After 60 s of silence,
+//     abort every active job locally so ffmpeg processes stop eating CPU
+//     while the server believes they've been requeued by its own timeout.
+func (w *Worker) statusLoop() {
+	ticker := time.NewTicker(statusInterval)
+	defer ticker.Stop()
+
+	lastSuccess := time.Now()
+	aborted := false // true once we've triggered AbortAll this silence window
+
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		jobs := w.manager.SnapshotStatuses()
+		if len(jobs) == 0 {
+			// No in-flight work to report. Keep the silence timer fresh so
+			// a long idle stretch doesn't look like a server outage.
+			lastSuccess = time.Now()
+			aborted = false
+			continue
+		}
+
+		// Per-request timeout: shorter than the status interval so a hanging
+		// server doesn't stall the next tick.
+		reqCtx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+		acks, err := api.ReportStatus(reqCtx, jobs)
+		cancel()
+
+		if err != nil {
+			if errors.Is(err, api.ErrAuthFailed) {
+				w.handleAuthFailure()
+				return
+			}
+			// Any other error counts as silence. Retry next tick.
+			if !aborted && time.Since(lastSuccess) >= statusSilenceAbort {
+				slog.Warn("Status reporting silent for 60s — aborting active jobs",
+					"silent", time.Since(lastSuccess).Truncate(time.Second))
+				w.manager.AbortAll("status silence")
+				aborted = true
+			}
+			continue
+		}
+
+		lastSuccess = time.Now()
+		aborted = false
+
+		// Drop any jobs the server no longer recognises — HandleAcks cancels
+		// them so their goroutines exit and slots free up.
+		w.manager.HandleAcks(acks)
+	}
 }
 
 func (w *Worker) readConsoleCommands() {
@@ -261,6 +370,9 @@ func (w *Worker) handleFFmpegMissing() {
 	w.cancel() // exit poll loop
 }
 
+// handleAuthFailure is reached only when re-auth itself returned 401 —
+// the shared Session already tried to renew and got a second 401, which
+// means the key has been revoked or rotated. Shut the worker down.
 func (w *Worker) handleAuthFailure() {
 	if w.stopping.Swap(true) {
 		return // another goroutine already handling this
@@ -279,8 +391,6 @@ func (w *Worker) handleAuthFailure() {
 	w.cancel() // exit poll loop
 }
 
-
-
 func (w *Worker) shutdown() {
 	fmt.Printf("%s Shutting down... waiting for active jobs\n", util.Ts())
 
@@ -298,6 +408,13 @@ func (w *Worker) shutdown() {
 		slog.Warn("Shutdown timeout — some jobs may not have completed")
 	}
 
+	// Final status flush: w.ctx is already cancelled by the time we get here,
+	// so the status loop exited without reporting the aborted/failed entries
+	// that accumulated during the shutdown window. Push them now with a fresh
+	// context so the server can requeue / mark-failed immediately instead of
+	// waiting for its own processing-timeout.
+	w.flushShutdownStatuses()
+
 	// Cleanup temp directories
 	util.CleanupAllTemp()
 
@@ -311,4 +428,23 @@ func (w *Worker) shutdown() {
 	}
 
 	fmt.Printf("%s Worker stopped.\n", util.Ts())
+}
+
+// flushShutdownStatuses pushes any queued terminal statuses (aborted/failed)
+// that accumulated during shutdown. The regular status loop exits on
+// w.ctx.Done before it can report them, so we send one final batch here
+// with a detached 10 s context. Without this, the server waits out its own
+// processing-timeout before requeueing jobs the worker already gave up on.
+func (w *Worker) flushShutdownStatuses() {
+	statuses := w.manager.SnapshotStatuses()
+	if len(statuses) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := api.ReportStatus(ctx, statuses); err != nil {
+		slog.Warn("Final status flush failed", "err", err, "count", len(statuses))
+		return
+	}
+	slog.Info("Final status flush sent", "count", len(statuses))
 }

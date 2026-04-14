@@ -3,25 +3,34 @@ package api
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"time"
 
 	"videosite-worker/internal/config"
 )
 
-// AvailableResponse is the response from GET /api/worker/tasks/available.
-type AvailableResponse struct {
-	HasAvailableTask bool `json:"hasAvailableTask"`
-	VideoID          int  `json:"videoId"`
+// ErrCompleteRetriesExhausted is returned when /task/complete failed 5× with
+// non-fatal errors. The uploaded R2 output is fine — the server's processing
+// timeout will eventually requeue on its own.
+var ErrCompleteRetriesExhausted = fmt.Errorf("complete retries exhausted")
+
+// AvailableTasksResponse mirrors `GET /api/worker/tasks/available?availableSlot=N`.
+type AvailableTasksResponse struct {
+	Tasks []struct {
+		VideoID int `json:"videoId"`
+	} `json:"tasks"`
 }
 
-// LeaseResponse is the response from POST /api/worker/tasks/lease.
-type LeaseResponse struct {
-	IsLeaseSuccess bool   `json:"isLeaseSuccess"`
-	JobID          string `json:"jobId"`
-	DownloadURL    string `json:"downloadUrl"`
-	EncryptionKey  string `json:"encryptionKey"` // hex-encoded 16-byte AES-128 key
-	VideoID        int    `json:"videoId"`
+// LeaseResult is one entry in the response to `POST /api/worker/tasks/lease`.
+// Status is "leased" (with full spec), "taken" (row lost the race), or "notfound".
+type LeaseResult struct {
+	VideoID int    `json:"videoId"`
+	Status  string `json:"status"`
 
-	// Server-provided transcoding config (per-course or global defaults).
+	// Populated only when Status == "leased".
+	JobID                     string                 `json:"jobId,omitempty"`
+	DownloadURL               string                 `json:"downloadUrl,omitempty"`
+	EncryptionKey             string                 `json:"encryptionKey,omitempty"`
 	OutputProfiles            []config.OutputProfile `json:"outputProfiles,omitempty"`
 	AudioNormalization        bool                   `json:"audioNormalization,omitempty"`
 	AudioNormalizationTarget  float64                `json:"audioNormalizationTarget,omitempty"`
@@ -29,111 +38,159 @@ type LeaseResponse struct {
 	AudioNormalizationMaxGain float64                `json:"audioNormalizationMaxGain,omitempty"`
 }
 
-// CheckAvailable polls the server for an available task.
-func CheckAvailable(ctx context.Context) (*AvailableResponse, error) {
-	resp, err := doRequest(ctx, "GET", "/api/worker/tasks/available", nil)
+type leaseResultsResponse struct {
+	Results []LeaseResult `json:"results"`
+}
+
+// JobStatus is one entry in the `POST /api/worker/task/status` batch.
+// Status is "running", "failed", or "aborted".
+// For "running", Stage + Progress are required.
+// For "failed", ErrorMessage is required.
+// Duration is NOT carried here — it's sent exactly once with /task/complete
+// so videos.duration_seconds receives a single write per job.
+type JobStatus struct {
+	JobID        string  `json:"jobId"`
+	Status       string  `json:"status"`
+	Stage        string  `json:"stage,omitempty"`
+	Progress     float64 `json:"progress,omitempty"`
+	ErrorMessage string  `json:"errorMessage,omitempty"`
+}
+
+// JobAck is the per-job response from /task/status.
+// Ack:false means the server does not recognize this jobId — worker should drop it.
+type JobAck struct {
+	JobID string `json:"jobId"`
+	Ack   bool   `json:"ack"`
+}
+
+type statusResponse struct {
+	Results []JobAck `json:"results"`
+}
+
+// AvailableTasks reserves up to `slots` queued tasks (queued → pending, 10s hold)
+// and returns their videoIds. Returns an empty slice when nothing is queued.
+func AvailableTasks(ctx context.Context, slots int) ([]int, error) {
+	if slots <= 0 {
+		return nil, nil
+	}
+	path := fmt.Sprintf("/api/worker/tasks/available?availableSlot=%d", slots)
+	resp, err := doRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	var result AvailableResponse
-	if err := decodeJSON(resp, &result); err != nil {
-		return nil, fmt.Errorf("decode available response: %w", err)
+	var out AvailableTasksResponse
+	if err := decodeJSON(resp, &out); err != nil {
+		return nil, fmt.Errorf("decode available tasks: %w", err)
 	}
-	return &result, nil
+
+	ids := make([]int, 0, len(out.Tasks))
+	for _, t := range out.Tasks {
+		ids = append(ids, t.VideoID)
+	}
+	return ids, nil
 }
 
-// Lease requests to lease a specific video's task.
-func Lease(ctx context.Context, videoID int) (*LeaseResponse, error) {
-	body := map[string]interface{}{
-		"videoId": videoID,
+// LeaseTasks finalises the reservation for each videoId atomically (pending → leased).
+// Per-videoId status in the result: "leased" (full spec), "taken", or "notfound".
+func LeaseTasks(ctx context.Context, videoIDs []int) ([]LeaseResult, error) {
+	if len(videoIDs) == 0 {
+		return nil, nil
 	}
-
-	resp, err := doRequest(ctx, "POST", "/api/worker/tasks/lease", body)
+	body := map[string]interface{}{"videoIds": videoIDs}
+	resp, err := doRequest(ctx, http.MethodPost, "/api/worker/tasks/lease", body)
 	if err != nil {
 		return nil, err
 	}
 
-	var result LeaseResponse
-	if err := decodeJSON(resp, &result); err != nil {
-		return nil, fmt.Errorf("decode lease response: %w", err)
+	var out leaseResultsResponse
+	if err := decodeJSON(resp, &out); err != nil {
+		return nil, fmt.Errorf("decode lease results: %w", err)
 	}
-	return &result, nil
+	return out.Results, nil
 }
 
-// UpdateStatus reports job status to the server.
-// Returns ErrJobNotFound if the job no longer exists (404-based abort signal).
-func UpdateStatus(ctx context.Context, jobID, status string, progress int, videoStatus string, durationSeconds float64) error {
-	body := map[string]interface{}{
-		"status":   status,
-		"progress": progress,
+// ReportStatus sends a batched status report. Returns per-job acks so the worker
+// can drop jobs the server no longer recognises (ack:false).
+func ReportStatus(ctx context.Context, jobs []JobStatus) ([]JobAck, error) {
+	if len(jobs) == 0 {
+		return nil, nil
 	}
-	if videoStatus != "" {
-		body["videoStatus"] = videoStatus
-	}
-	if durationSeconds > 0 {
-		body["durationSeconds"] = durationSeconds
-	}
-
-	resp, err := doRequest(ctx, "POST", fmt.Sprintf("/api/worker/task/%s/status", jobID), body)
+	body := map[string]interface{}{"jobs": jobs}
+	resp, err := doRequest(ctx, http.MethodPost, "/api/worker/task/status", body)
 	if err != nil {
-		return err // includes ErrJobNotFound from doRequest
+		return nil, err
 	}
-	resp.Body.Close()
 
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("status update returned %d", resp.StatusCode)
+	var out statusResponse
+	if err := decodeJSON(resp, &out); err != nil {
+		return nil, fmt.Errorf("decode status response: %w", err)
 	}
-	return nil
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("status returned %d", resp.StatusCode)
+	}
+	return out.Results, nil
 }
 
-// Complete marks a job as completed.
-func Complete(ctx context.Context, jobID string, durationSeconds float64) error {
-	body := map[string]interface{}{}
-	if durationSeconds > 0 {
-		body["durationSeconds"] = durationSeconds
-	}
+// completeRetryDelays is the fixed backoff schedule for /task/complete:
+// 0s, 1s, 2s, 3s, 4s between attempts (5 attempts total, ~10s cumulative wait).
+var completeRetryDelays = []time.Duration{0, 1 * time.Second, 2 * time.Second, 3 * time.Second, 4 * time.Second}
 
-	resp, err := doRequest(ctx, "POST", fmt.Sprintf("/api/worker/task/%s/complete", jobID), body)
-	if err != nil {
-		return err
-	}
-	resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("complete returned status %d", resp.StatusCode)
-	}
-	return nil
+// CompletePayload is the JSON body of POST /api/worker/task/complete.
+type CompletePayload struct {
+	DurationSeconds float64 `json:"durationSeconds,omitempty"`
 }
 
-// ReportError reports a job error to the server.
-// Returns ErrJobNotFound if the job no longer exists.
-func ReportError(ctx context.Context, jobID, message string) error {
-	body := map[string]interface{}{
-		"message": message,
+// CompleteTask reports a single job completion with up to 5 retries
+// (0/1/2/3/4 s backoff). Returns nil on 204, ErrJobNotFound on 404, ErrAuthFailed
+// on a 401 that re-auth could not recover, and ErrCompleteRetriesExhausted if all
+// 5 attempts fail with 5xx / network errors.
+func CompleteTask(ctx context.Context, jobID string, payload CompletePayload) error {
+	body := map[string]interface{}{"jobId": jobID}
+	if payload.DurationSeconds > 0 {
+		body["durationSeconds"] = payload.DurationSeconds
 	}
 
-	resp, err := doRequest(ctx, "POST", fmt.Sprintf("/api/worker/task/%s/error", jobID), body)
-	if err != nil {
-		return err // includes ErrJobNotFound
-	}
-	resp.Body.Close()
+	var lastErr error
+	for i, delay := range completeRetryDelays {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if delay > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+		}
 
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("error report returned status %d", resp.StatusCode)
-	}
-	return nil
-}
+		resp, err := doRequest(ctx, http.MethodPost, "/api/worker/task/complete", body)
+		if err != nil {
+			lastErr = err
+			// Auth failures propagated from doRequest are fatal — don't retry.
+			if err == ErrAuthFailed {
+				return err
+			}
+			continue
+		}
+		resp.Body.Close()
 
-// ReportAbort tells the server the job was aborted (worker shutdown), so it can requeue.
-func ReportAbort(ctx context.Context, jobID string) error {
-	resp, err := doRequest(ctx, "POST", fmt.Sprintf("/api/worker/task/%s/abort", jobID), nil)
-	if err != nil {
-		return err
+		switch resp.StatusCode {
+		case http.StatusNoContent:
+			return nil
+		case http.StatusNotFound:
+			return ErrJobNotFound
+		}
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("complete returned %d", resp.StatusCode)
+			_ = i
+			continue
+		}
+		// 4xx other than 404 is not a retry candidate.
+		return fmt.Errorf("complete returned %d", resp.StatusCode)
 	}
-	resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("abort report returned status %d", resp.StatusCode)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("complete failed with unknown error")
 	}
-	return nil
+	return fmt.Errorf("%w: %v", ErrCompleteRetriesExhausted, lastErr)
 }

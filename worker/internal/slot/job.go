@@ -104,12 +104,20 @@ type Job struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	failedTypes    map[string]bool
-	initialEncoder config.Encoder // encoder assigned when the slot was acquired (includes device index)
+	initialEncoder config.Encoder  // encoder assigned when the slot was acquired (includes device index)
 	hwDecodeFailed map[string]bool // per encoder-type: true if full-GPU (hw decode) path failed this job
 	tempDir        string
 	outputDir      string
 	duration       float64
 	phase          atomic.Value // current phase: "downloading", "probing", "transcoding", "uploading", "completing"
+
+	// Current status for the batched /task/status reporter. Read by
+	// Manager.SnapshotStatuses every 2 s; written by the job goroutine on
+	// progress. Duration is NOT mirrored here — it lives on j.duration and
+	// is sent exactly once with /task/complete.
+	reportMu       sync.Mutex
+	reportStage    string
+	reportProgress int
 }
 
 // NewJob creates a new job.
@@ -158,6 +166,51 @@ func (j *Job) Cancel() {
 	j.cancel()
 }
 
+// SetStage updates the job's currently-reported stage + progress.
+// Stage is one of "downloading" / "processing" / "transcoding" / "uploading"
+// — the server maps it to (queue_status, video_status) in reportJobStatuses.
+// Read by Manager.SnapshotStatuses via currentReport().
+func (j *Job) SetStage(stage string, progress int) {
+	j.reportMu.Lock()
+	j.reportStage = stage
+	j.reportProgress = progress
+	j.reportMu.Unlock()
+}
+
+// SetProgress updates just the progress value, leaving stage alone.
+func (j *Job) SetProgress(progress int) {
+	j.reportMu.Lock()
+	j.reportProgress = progress
+	j.reportMu.Unlock()
+}
+
+// currentReport returns the job's current reporting state for the status loop.
+func (j *Job) currentReport() (stage string, progress int) {
+	j.reportMu.Lock()
+	defer j.reportMu.Unlock()
+	return j.reportStage, j.reportProgress
+}
+
+// MarkFailed queues a "failed" terminal status for the next status tick.
+func (j *Job) MarkFailed(reason string) {
+	j.Manager.RecordTerminal(api.JobStatus{
+		JobID:        j.JobID,
+		Status:       "failed",
+		ErrorMessage: reason,
+	})
+}
+
+// MarkAborted queues an "aborted" terminal status for the next status tick.
+// Used for worker-self-aborts (transient errors, graceful shutdown) — the
+// server requeues rather than counting as a fault.
+func (j *Job) MarkAborted(reason string) {
+	j.Manager.RecordTerminal(api.JobStatus{
+		JobID:        j.JobID,
+		Status:       "aborted",
+		ErrorMessage: reason,
+	})
+}
+
 // Run executes the full job lifecycle: download → probe → transcode → upload → complete.
 func (j *Job) Run() error {
 	defer j.cancel()
@@ -203,16 +256,17 @@ func (j *Job) Run() error {
 		return j.handleError("upload", err)
 	}
 
-	// 8. COMPLETE (with retry — all work is done, don't waste it)
+	// 8. COMPLETE — retry is embedded inside api.CompleteTask
+	// (5 attempts, 0/1/2/3/4 s backoff, 204 success, 404 = gone, 401 re-auth).
 	j.phase.Store("completing")
-	err = api.RetryWithBackoff(j.ctx, "report completion", func() error {
-		return api.Complete(j.ctx, j.JobID, j.duration)
-	})
-	if err != nil && !errors.Is(err, api.ErrJobNotFound) {
+	err = api.CompleteTask(j.ctx, j.JobID, api.CompletePayload{DurationSeconds: j.duration})
+	if err != nil && !errors.Is(err, api.ErrJobNotFound) && !errors.Is(err, api.ErrCompleteRetriesExhausted) {
 		fmt.Printf("%s [%s] ERROR: failed to report completion: %v\n", util.Ts(), j.JobID, err)
 	}
-	// ErrJobNotFound here means the job was deleted while we were uploading.
-	// Upload is done, R2 files exist. Server's delayed R2 cleanup handles it.
+	// ErrJobNotFound: job was deleted while we were uploading. Upload is done,
+	// R2 files exist — server's delayed R2 cleanup handles it.
+	// ErrCompleteRetriesExhausted: R2 objects are uploaded but the server can't
+	// be reached; the server's `processing` timeout will eventually requeue.
 
 	j.Progress.Remove(j.JobID)
 	fmt.Printf("%s [%s] completed\n", util.Ts(), j.JobID)
@@ -225,15 +279,7 @@ func (j *Job) download() error {
 	os.MkdirAll(j.tempDir, 0755)
 
 	j.Progress.Update(j.JobID, "downloading", 0)
-
-	// Report status to server (non-fatal, 404 → abort)
-	err := api.UpdateStatus(j.ctx, j.JobID, "leased", 0, "worker_downloading", 0)
-	if errors.Is(err, api.ErrJobNotFound) {
-		return fmt.Errorf("aborted: job no longer exists")
-	}
-	if err != nil {
-		fmt.Printf("%s [%s] WARN: failed to report download start: %v\n", util.Ts(), j.JobID, err)
-	}
+	j.SetStage("downloading", 0)
 
 	// HEAD first to get total size for multipart planning
 	totalSize, err := j.downloadHead()
@@ -395,11 +441,7 @@ func (j *Job) downloadMultipart(totalSize int64) error {
 					globalPct = 9
 				}
 				j.Progress.Update(j.JobID, "downloading", globalPct)
-				err := api.UpdateStatus(j.ctx, j.JobID, "leased", globalPct, "worker_downloading", 0)
-				if errors.Is(err, api.ErrJobNotFound) {
-					j.cancel()
-					return
-				}
+				j.SetStage("downloading", globalPct)
 			}
 		}
 	}()
@@ -613,35 +655,17 @@ func (j *Job) downloadSingle() error {
 	defer resp.Body.Close()
 
 	counter := &byteCounter{}
-	stopCh := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-j.ctx.Done():
-				return
-			case <-stopCh:
-				return
-			case <-ticker.C:
-				j.Progress.Update(j.JobID, "downloading", 0)
-				err := api.UpdateStatus(j.ctx, j.JobID, "leased", 0, "worker_downloading", 0)
-				if errors.Is(err, api.ErrJobNotFound) {
-					j.cancel()
-					return
-				}
-			}
-		}
-	}()
+	// No internal heartbeat — the worker's 2-second status loop reads
+	// j.reportStage/reportProgress directly. Single-connection downloads
+	// don't expose byte progress, so we just publish "downloading" / 0%.
+	j.SetStage("downloading", 0)
 
 	sourcePath := filepath.Join(j.tempDir, "source.mp4")
 	f, err := os.Create(sourcePath)
 	if err != nil {
-		close(stopCh)
 		return fmt.Errorf("create source file: %w", err)
 	}
 	_, copyErr := io.Copy(f, io.TeeReader(resp.Body, counter))
-	close(stopCh)
 	f.Close()
 	if copyErr != nil {
 		return fmt.Errorf("save source file: %w", copyErr)
@@ -676,14 +700,10 @@ func (j *Job) probe() (*transcoder.ProbeResult, error) {
 	j.duration = probe.DurationSeconds
 	fmt.Printf("%s [%s] probe complete: %dx%d, %.1fs, %s\n", util.Ts(), j.JobID, probe.Width, probe.Height, probe.DurationSeconds, probe.Codec)
 
-	// Report duration to server (non-fatal, check 404 only)
-	err = api.UpdateStatus(j.ctx, j.JobID, "processing", 9, "processing", probe.DurationSeconds)
-	if errors.Is(err, api.ErrJobNotFound) {
-		return nil, fmt.Errorf("aborted: job no longer exists")
-	}
-	if err != nil {
-		fmt.Printf("%s [%s] WARN: failed to report probe status: %v\n", util.Ts(), j.JobID, err)
-	}
+	// Stage is picked up by the next /task/status tick (worker status loop
+	// reads SnapshotStatuses every 2 s). Duration is NOT pushed into the
+	// status path — it rides on /task/complete for a single DB write.
+	j.SetStage("processing", 9)
 
 	return probe, nil
 }
@@ -742,30 +762,11 @@ func (j *Job) analyzeLoudness(probe *transcoder.ProbeResult) (string, error) {
 	}
 
 	j.Progress.Update(j.JobID, "analyzing audio", 10)
+	j.SetStage("processing", 10)
 	fmt.Printf("%s [%s] analyzing audio loudness (EBU R128)...\n", util.Ts(), j.JobID)
 
-	// Heartbeat goroutine: keeps the server stale-timer from firing during analysis.
-	// Global progress stays at 10% throughout; only console shows local percentage.
-	stopHeartbeat := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-j.ctx.Done():
-				return
-			case <-stopHeartbeat:
-				return
-			case <-ticker.C:
-				err := api.UpdateStatus(j.ctx, j.JobID, "processing", 10, "processing", 0)
-				if errors.Is(err, api.ErrJobNotFound) {
-					j.cancel()
-					return
-				}
-			}
-		}
-	}()
-
+	// No internal heartbeat — worker status loop picks up the stage/progress
+	// we set above on its own 2-second cadence.
 	sourcePath := filepath.Join(j.tempDir, "source.mp4")
 	lastPct := -1
 	stats, err := transcoder.AnalyzeLoudness(j.ctx, sourcePath, j.duration, func(pct int) {
@@ -774,7 +775,6 @@ func (j *Job) analyzeLoudness(probe *transcoder.ProbeResult) (string, error) {
 			lastPct = pct
 		}
 	})
-	close(stopHeartbeat)
 	if err != nil {
 		if j.ctx.Err() != nil {
 			return "", fmt.Errorf("aborted: %w", j.ctx.Err())
@@ -877,7 +877,6 @@ func (j *Job) remuxProfile(sourcePath, profileDir string, profile transcoder.Fil
 		j.ctx, sourcePath, profileDir, profile.OutputProfile, keyInfoFile, logFile, j.duration, loudnormFilter,
 	)
 
-	lastReport := time.Now().Add(-3 * time.Second) // allow first report immediately
 	lastConsolePct := -1
 	for pct := range progressCh {
 		if pct != lastConsolePct {
@@ -886,18 +885,9 @@ func (j *Job) remuxProfile(sourcePath, profileDir string, profile transcoder.Fil
 		}
 		j.Progress.Update(j.JobID, fmt.Sprintf("remuxing %s", profile.Name), pct)
 
-		if time.Since(lastReport) >= 2*time.Second {
-			globalPct := 10 + int(float64(profileIndex)*profileShare+float64(pct)/100.0*profileShare)
-			err := api.UpdateStatus(j.ctx, j.JobID, "processing", globalPct, "processing", 0)
-			if errors.Is(err, api.ErrJobNotFound) {
-				j.cancel()
-				break
-			}
-			if err != nil {
-				fmt.Printf("%s [%s] WARN: failed to report remux progress: %v\n", util.Ts(), j.JobID, err)
-			}
-			lastReport = time.Now()
-		}
+		// Update local report state; worker status loop picks it up every 2 s.
+		globalPct := 10 + int(float64(profileIndex)*profileShare+float64(pct)/100.0*profileShare)
+		j.SetStage("processing", globalPct)
 	}
 	// Drain any remaining items so the FFmpeg goroutine can close the channel.
 	for range progressCh {}
@@ -950,8 +940,7 @@ func (j *Job) transcodeProfile(sourcePath, profileDir string, profile transcoder
 		progressCh, errCh := transcoder.TranscodeToHLS(j.ctx, sourcePath, profileDir, profile.OutputProfile, encoder, duration, keyInfoFile, swDecode, logFile, srcW, srcH, loudnormFilter)
 
 		// Drain progress updates, printing local 0-100% to console and
-		// reporting global progress to the server every 2 seconds.
-		lastReport := time.Now().Add(-3 * time.Second) // allow first report immediately
+		// updating local report state — worker status loop sends it every 2 s.
 		lastConsolePct := -1
 		for pct := range progressCh {
 			if pct != lastConsolePct {
@@ -960,19 +949,9 @@ func (j *Job) transcodeProfile(sourcePath, profileDir string, profile transcoder
 			}
 			j.Progress.Update(j.JobID, fmt.Sprintf("transcoding %s", profile.Name), pct)
 
-			if time.Since(lastReport) >= 2*time.Second {
-				// Map per-profile pct (0-100) into the global 10-90% range.
-				globalPct := 10 + int(float64(profileIndex)*profileShare+float64(pct)/100.0*profileShare)
-				err := api.UpdateStatus(j.ctx, j.JobID, "processing", globalPct, "processing", 0)
-				if errors.Is(err, api.ErrJobNotFound) {
-					j.cancel()
-					break
-				}
-				if err != nil {
-					fmt.Printf("%s [%s] WARN: failed to report transcode progress: %v\n", util.Ts(), j.JobID, err)
-				}
-				lastReport = time.Now()
-			}
+			// Map per-profile pct (0-100) into the global 10-90% range.
+			globalPct := 10 + int(float64(profileIndex)*profileShare+float64(pct)/100.0*profileShare)
+			j.SetStage("processing", globalPct)
 		}
 		// Drain any remaining items so the FFmpeg goroutine can close the channel.
 		for range progressCh {}
@@ -1067,14 +1046,8 @@ func (j *Job) upload() error {
 		return fmt.Errorf("no output files to upload")
 	}
 
-	// 1. Report upload start (non-fatal, check 404)
-	err := api.UpdateStatus(j.ctx, j.JobID, "processing", 90, "worker_uploading", 0) // 90-100% for upload
-	if errors.Is(err, api.ErrJobNotFound) {
-		return fmt.Errorf("aborted: job no longer exists")
-	}
-	if err != nil {
-		fmt.Printf("%s [%s] WARN: failed to report upload start: %v\n", util.Ts(), j.JobID, err)
-	}
+	// 1. Publish upload start locally — status loop reports it on its own cadence.
+	j.SetStage("uploading", 90)
 
 	// 2. Request presigned URLs (with retry)
 	allURLs, err := j.fetchUploadURLsWithRetry(j.ctx, tasks)
@@ -1100,17 +1073,14 @@ func (j *Job) fetchUploadURLsWithRetry(ctx context.Context, tasks []uploadTask) 
 	return urls, nil
 }
 
-// doUploadWithMonitoring performs the actual upload with a background goroutine
-// that monitors API reachability. If upload progress reports fail continuously
-// for 60 seconds, the upload is cancelled and an error is returned.
+// doUploadWithMonitoring performs the actual upload.
+//
+// The 60-second "server unreachable" safety net lives at the worker level now
+// (status loop calls slotMgr.AbortAll when /task/status has been silent that
+// long), so this function only has to worry about cancellation and 403 token
+// refresh.
 //
 // ctx is j.ctx — the job's own context (rooted at Background, not the worker ctx).
-// uploadCtx is derived from ctx and also cancelled on the 60-second API failure
-// detection path, so all upload goroutines stop cleanly in both cases.
-//
-// Each UpdateStatus call in the monitoring goroutine uses its own 10-second
-// timeout context (not ctx/uploadCtx) so that a hanging server is detected
-// promptly regardless of other cancellation signals.
 func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, allURLs map[string]string) error {
 	cfg := config.Get()
 	concurrency := cfg.ConcurrentUploads
@@ -1123,25 +1093,17 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 
 	fmt.Printf("%s [%s] uploading %d files\n", util.Ts(), j.JobID, totalFiles)
 
-	// uploadCtx wraps ctx: cancelled on 60s API failure so uploads stop.
-	apiFailCh := make(chan struct{})
-	uploadCtx, uploadCancel := context.WithCancel(ctx)
-	defer uploadCancel()
-
-	// Background progress reporter with API failure detection.
-	// Each UpdateStatus uses a fresh 10-second timeout so a hanging server
-	// is caught within one tick cycle, not after the full client timeout.
-	// Console shows local 0-100%; API reports global 90-100%.
+	// Progress publisher: drives console output + local j.reportProgress.
+	// Worker status loop reads the latter on its own 2-second cadence.
 	stopProgress := make(chan struct{})
 	defer close(stopProgress)
 	lastConsolePct := -1
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
-		var firstFailure time.Time
 		for {
 			select {
-			case <-uploadCtx.Done():
+			case <-ctx.Done():
 				return
 			case <-stopProgress:
 				return
@@ -1154,42 +1116,16 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 				}
 				globalPct := 90 + filePct/10 // 90-100%
 				j.Progress.Update(j.JobID, "uploading", globalPct)
-
-				updateCtx, updateCancel := context.WithTimeout(context.Background(), 10*time.Second)
-				err := api.UpdateStatus(updateCtx, j.JobID, "processing", globalPct, "worker_uploading", 0)
-				updateCancel()
-
-				if errors.Is(err, api.ErrJobNotFound) {
-					j.cancel() // job deleted — abort immediately
-					return
-				}
-				if err != nil {
-					if firstFailure.IsZero() {
-						firstFailure = time.Now()
-					} else if time.Since(firstFailure) >= 60*time.Second {
-						close(apiFailCh) // signal upload abort
-						uploadCancel()
-						return
-					}
-				} else {
-					firstFailure = time.Time{} // reset on success
-				}
+				j.SetStage("uploading", globalPct)
 			}
 		}
 	}()
 
 	// First pass: upload everything
-	failed, anyForbidden, firstErr := j.uploadConcurrent(uploadCtx, tasks, allURLs, concurrency, totalFiles, &uploaded)
+	failed, anyForbidden, firstErr := j.uploadConcurrent(ctx, tasks, allURLs, concurrency, totalFiles, &uploaded)
 	if len(failed) == 0 {
 		fmt.Printf("%s [%s] upload complete\n", util.Ts(), j.JobID)
 		return nil
-	}
-
-	// Check if API failure triggered the abort
-	select {
-	case <-apiFailCh:
-		return fmt.Errorf("server API unreachable for 60s during upload")
-	default:
 	}
 
 	// Check for job abort
@@ -1202,8 +1138,7 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 		return fmt.Errorf("upload failed: %w", firstErr)
 	}
 
-	// Token refresh: fetch new URLs for failed files using the job ctx (not
-	// uploadCtx, which may have been cancelled by the API-failure path above).
+	// Token refresh: fetch new URLs for failed files.
 	fmt.Printf("%s [%s] upload token refresh (%d files)\n", util.Ts(), j.JobID, len(failed))
 	newURLs, err := j.fetchUploadURLsBatch(ctx, failed)
 	if err != nil {
@@ -1214,14 +1149,7 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 	}
 
 	// Second pass: retry failed files with fresh tokens
-	failed2, _, firstErr2 := j.uploadConcurrent(uploadCtx, failed, allURLs, concurrency, totalFiles, &uploaded)
-
-	// Check API failure again
-	select {
-	case <-apiFailCh:
-		return fmt.Errorf("server API unreachable for 60s during upload")
-	default:
-	}
+	failed2, _, firstErr2 := j.uploadConcurrent(ctx, failed, allURLs, concurrency, totalFiles, &uploaded)
 
 	if ctx.Err() != nil {
 		return fmt.Errorf("aborted during upload retry: %w", ctx.Err())
@@ -1359,74 +1287,61 @@ func (j *Job) reportProfileProgress(completedIndex, totalProfiles int) {
 	pct := 10 + int(float64(completedIndex+1)/float64(totalProfiles)*80) // 10-90% range for transcoding
 	j.Progress.Update(j.JobID, "transcoding", pct)
 
-	// Report to server with retry (profile completion is a critical checkpoint)
-	err := api.RetryWithBackoff(j.ctx, "report profile completion", func() error {
-		return api.UpdateStatus(j.ctx, j.JobID, "processing", pct, "processing", 0)
-	})
-	if errors.Is(err, api.ErrJobNotFound) {
-		j.cancel()
-	}
-	// context cancel errors are handled by the caller checking j.ctx.Err()
+	// Publish locally — worker status loop picks it up every 2 s and batches
+	// with other active jobs into a single /task/status call.
+	j.SetStage("processing", pct)
 }
 
+// handleError classifies a job-phase error and queues a terminal status.
+//
+// The actual /task/status delivery happens in the worker status loop via
+// Manager.SnapshotStatuses — all this method does is:
+//
+//   - Return nil for errors the server already knows about (ErrJobNotFound).
+//   - Queue "aborted" for worker-self-aborts (transient download, context
+//     cancelled by operator/status-silence). The server requeues these.
+//   - Queue "failed" for real errors (R2 403, transcode failure, etc.).
+//   - Propagate ErrFFmpegFatal so the worker main loop can shut down.
 func (j *Job) handleError(phase string, err error) error {
-	// Job was deleted from server (404) — not a real error
+	// Job was deleted from server (404 propagated up from some earlier call).
+	// Nothing to report — the server already forgot about it.
 	if errors.Is(err, api.ErrJobNotFound) {
 		fmt.Printf("%s [%s] job no longer exists on server (phase: %s)\n", util.Ts(), j.JobID, phase)
 		j.Progress.Remove(j.JobID)
-		return nil // Don't blocklist
+		return nil
 	}
 
-	// Transient download failure — requeue for another attempt rather than failing the job.
-	// 403 from R2 (errSourceForbidden) is NOT transient and falls through to ReportError below.
+	// Transient download failure — requeue rather than fail the job.
+	// 403 from R2 (errSourceForbidden) falls through to the "failed" branch below.
 	if errors.Is(err, errTransientDownload) {
 		fmt.Printf("%s [%s] download error (will requeue): %v\n", util.Ts(), j.JobID, err)
-		reportCtx, reportCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer reportCancel()
-		if reportErr := api.ReportAbort(reportCtx, j.JobID); reportErr != nil {
-			if !errors.Is(reportErr, api.ErrJobNotFound) {
-				fmt.Printf("%s [%s] WARN: failed to report abort: %v\n", util.Ts(), j.JobID, reportErr)
-			}
-		}
+		j.MarkAborted(fmt.Sprintf("%s: %s", phase, err.Error()))
 		j.Progress.Remove(j.JobID)
-		return nil // not a real error — don't blocklist
+		return nil
 	}
 
-	// Worker-initiated abort (graceful shutdown or 404-triggered cancel)
+	// Worker-initiated abort (graceful shutdown, operator cancel, or the
+	// status loop's 60-second silence watchdog).
 	if j.ctx.Err() != nil {
 		fmt.Printf("%s [%s] aborted (phase: %s)\n", util.Ts(), j.JobID, phase)
-
-		// Report abort so server requeues. Use a background context since
-		// j.ctx is already cancelled — we still want this call to go through.
-		reportCtx, reportCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer reportCancel()
-		if reportErr := api.ReportAbort(reportCtx, j.JobID); reportErr != nil {
-			if !errors.Is(reportErr, api.ErrJobNotFound) {
-				fmt.Printf("%s [%s] WARN: failed to report abort: %v\n", util.Ts(), j.JobID, reportErr)
-			}
-		}
-
+		j.MarkAborted(fmt.Sprintf("%s: worker cancelled", phase))
 		j.Progress.Remove(j.JobID)
-		return nil // Not a real error — don't blocklist
+		return nil
 	}
 
 	// FFmpeg binary missing — fatal worker error.
-	// Do NOT report to server so the task gets released after heartbeat timeout.
+	// Do NOT queue a terminal status; the server's processing-timeout will
+	// requeue on its own, and we need to shut down the worker regardless.
 	if errors.Is(err, transcoder.ErrFFmpegMissing) {
 		fmt.Printf("%s [%s] ERROR: FFmpeg binary missing during %s\n", util.Ts(), j.JobID, phase)
 		j.Progress.Remove(j.JobID)
 		return fmt.Errorf("%w: detected during %s of job %s", ErrFFmpegFatal, phase, j.JobID)
 	}
 
-	// Real error — report to server (best-effort, no retry)
+	// Real error — queue "failed" so it lands in the next status tick.
 	errMsg := fmt.Sprintf("%s: %s", phase, err.Error())
 	fmt.Printf("%s [%s] ERROR: job failed at %s: %v\n", util.Ts(), j.JobID, phase, err)
-	reportCtx, reportCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer reportCancel()
-	if reportErr := api.ReportError(reportCtx, j.JobID, errMsg); reportErr != nil {
-		fmt.Printf("%s [%s] ERROR: failed to report error to server: %v\n", util.Ts(), j.JobID, reportErr)
-	}
-
+	j.MarkFailed(errMsg)
 	j.Progress.Remove(j.JobID)
 	return fmt.Errorf("job %s failed at %s: %w", j.JobID, phase, err)
 }

@@ -147,6 +147,17 @@ app.listen(PORT, async () => {
         }
     }, 60 * 60 * 1000);
 
+    // Clean expired worker sessions every hour
+    const { cleanupExpiredWorkerSessions } = require('./services/workerAuthService');
+    setInterval(async () => {
+        try {
+            const n = await cleanupExpiredWorkerSessions();
+            if (n > 0) console.log(`Cleaned ${n} expired worker sessions`);
+        } catch (err) {
+            console.error('Worker session cleanup error:', err.message);
+        }
+    }, 60 * 60 * 1000);
+
     // Sweep stale upload sessions on startup and restart their timers
     try {
         const { resetStaleUploads } = require('./services/uploadSessionService');

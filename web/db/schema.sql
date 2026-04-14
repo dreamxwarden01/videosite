@@ -174,6 +174,18 @@ CREATE TABLE IF NOT EXISTS worker_access_keys (
     FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS worker_sessions (
+    session_id     VARCHAR(32)  NOT NULL PRIMARY KEY,
+    worker_key_id  VARCHAR(64)  NOT NULL,
+    bearer_token   VARCHAR(128) NOT NULL UNIQUE,
+    ip_address     VARCHAR(64)  NOT NULL,
+    last_seen      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (worker_key_id) REFERENCES worker_access_keys(key_id) ON DELETE CASCADE,
+    INDEX idx_worker_sessions_key (worker_key_id),
+    INDEX idx_worker_sessions_last_seen (last_seen)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS watch_progress (
     user_id       INT UNSIGNED NOT NULL,
     video_id      INT UNSIGNED NOT NULL,

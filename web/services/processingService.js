@@ -1,6 +1,15 @@
 const crypto = require('crypto');
 const { getPool } = require('../config/database');
 
+// Base62 12-char job ID generator (matches hashed_video_id family).
+const JOB_ID_BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+function generateJobId() {
+    const buf = crypto.randomBytes(12);
+    let out = '';
+    for (let i = 0; i < 12; i++) out += JOB_ID_BASE62[buf[i] % 62];
+    return out;
+}
+
 // --- Per-job stale detection timers ---
 // Each active job gets a 2-minute timer that resets on every heartbeat.
 // When the timer fires, the job is checked and reset if truly stale.
@@ -86,47 +95,6 @@ async function createTask(videoId) {
         'INSERT INTO processing_queue (video_id) VALUES (?)',
         [videoId]
     );
-}
-
-async function leaseNextTask(workerKeyId) {
-    const pool = getPool();
-    const jobId = crypto.randomUUID();
-
-    // Atomic lease: update the first queued task
-    const [result] = await pool.execute(
-        `UPDATE processing_queue
-         SET status = 'leased', job_id = ?, worker_key_id = ?, leased_at = NOW(), last_heartbeat = NOW()
-         WHERE status = 'queued'
-         ORDER BY created_at ASC
-         LIMIT 1`,
-        [jobId, workerKeyId]
-    );
-
-    if (result.affectedRows === 0) {
-        return null; // No tasks available
-    }
-
-    // Get the leased task details
-    const [rows] = await pool.execute(
-        `SELECT pq.*, v.course_id, v.hashed_video_id, v.r2_source_key, v.original_filename
-         FROM processing_queue pq
-         JOIN videos v ON pq.video_id = v.video_id
-         WHERE pq.job_id = ?`,
-        [jobId]
-    );
-
-    if (rows.length === 0) return null;
-
-    const task = rows[0];
-
-    // Update video status
-    await pool.execute(
-        "UPDATE videos SET status = 'worker_downloading', processing_job_id = ? WHERE video_id = ?",
-        [jobId, task.video_id]
-    );
-
-    startStaleTimer(jobId);
-    return task;
 }
 
 async function updateTaskStatus(jobId, status, progress = null, errorMessage = null) {
@@ -280,25 +248,6 @@ async function reportError(jobId, errorMessage) {
     return { found: true };
 }
 
-// Generate a short 12-char hex job ID with collision retry
-async function generateShortJobId(videoId, workerKeyId, timestamp) {
-    const pool = getPool();
-    for (let attempt = 0; attempt < 10; attempt++) {
-        const salt = attempt > 0 ? crypto.randomBytes(4).toString('hex') : '';
-        const input = `${videoId}:${workerKeyId}:${timestamp}${salt}`;
-        const hash = crypto.createHash('sha256').update(input).digest('hex');
-        const shortId = hash.substring(0, 12);
-
-        const [existing] = await pool.execute(
-            'SELECT 1 FROM processing_queue WHERE job_id = ?',
-            [shortId]
-        );
-        if (existing.length === 0) return shortId;
-    }
-    // Extremely unlikely fallback
-    return crypto.randomBytes(6).toString('hex');
-}
-
 // Reset expired pending tasks (check-then-lease timeout)
 async function resetExpiredPendingTasks() {
     const pool = getPool();
@@ -309,44 +258,62 @@ async function resetExpiredPendingTasks() {
     );
 }
 
-// Check for an available task (atomically sets to pending with 10s hold)
-async function checkAvailableTask() {
+// Reserve up to maxCount queued tasks atomically (queued → pending, 10s hold).
+// Returns array of video_ids. Uses FOR UPDATE SKIP LOCKED so parallel workers
+// don't collide on the same candidate rows.
+async function reserveTasks(maxCount) {
+    if (!Number.isInteger(maxCount) || maxCount <= 0) return [];
+
     const pool = getPool();
 
     // Reset expired pending + stale tasks first
     await resetExpiredPendingTasks();
     await resetStaleTasks();
 
-    // Atomically find first queued task and set to pending
-    const [result] = await pool.execute(
-        `UPDATE processing_queue
-         SET status = 'pending', pending_until = DATE_ADD(NOW(), INTERVAL 10 SECOND)
-         WHERE status = 'queued'
-         ORDER BY created_at ASC
-         LIMIT 1`
-    );
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
 
-    if (result.affectedRows === 0) {
-        return { hasAvailableTask: false, videoId: null };
+        const [rows] = await conn.query(
+            `SELECT task_id, video_id
+             FROM processing_queue
+             WHERE status = 'queued'
+             ORDER BY created_at ASC
+             LIMIT ?
+             FOR UPDATE SKIP LOCKED`,
+            [maxCount]
+        );
+
+        if (rows.length === 0) {
+            await conn.commit();
+            return [];
+        }
+
+        const taskIds = rows.map(r => r.task_id);
+        await conn.query(
+            `UPDATE processing_queue
+             SET status = 'pending', pending_until = DATE_ADD(NOW(), INTERVAL 10 SECOND)
+             WHERE task_id IN (?)`,
+            [taskIds]
+        );
+
+        await conn.commit();
+        return rows.map(r => r.video_id);
+    } catch (err) {
+        try { await conn.rollback(); } catch { /* ignore */ }
+        throw err;
+    } finally {
+        conn.release();
     }
-
-    // Get the video_id of the task we just set to pending
-    const [rows] = await pool.execute(
-        `SELECT video_id FROM processing_queue WHERE status = 'pending' ORDER BY pending_until DESC LIMIT 1`
-    );
-
-    if (rows.length === 0) {
-        return { hasAvailableTask: false, videoId: null };
-    }
-
-    return { hasAvailableTask: true, videoId: rows[0].video_id };
 }
 
-// Lease a specific pending task
+// Lease a specific pending task. Returns a per-video result object that can
+// include status: "leased" (full spec), "taken" (lost the race), or "notfound"
+// (videoId not in queue). Called directly and via the batched leaseTasks wrapper.
 async function leaseTask(videoId, workerKeyId) {
     const pool = getPool();
 
-    const jobId = await generateShortJobId(videoId, workerKeyId, Date.now().toString());
+    const jobId = generateJobId();
 
     // Atomically update pending → leased for this specific video
     const [result] = await pool.execute(
@@ -358,7 +325,12 @@ async function leaseTask(videoId, workerKeyId) {
     );
 
     if (result.affectedRows === 0) {
-        return { isLeaseSuccess: false, jobId: null, downloadUrl: null };
+        // Either the row is not pending (lost the race) or doesn't exist at all.
+        const [existRows] = await pool.execute(
+            'SELECT 1 FROM processing_queue WHERE video_id = ? LIMIT 1',
+            [videoId]
+        );
+        return { videoId, status: existRows.length > 0 ? 'taken' : 'notfound' };
     }
 
     // Get task details for download URL generation
@@ -420,6 +392,109 @@ async function leaseTask(videoId, workerKeyId) {
         audioNormalizationPeak: parseFloat(normSettings.peak),
         audioNormalizationMaxGain: parseFloat(normSettings.maxGain)
     };
+}
+
+// Batched lease — runs leaseTask sequentially for each videoId and returns
+// an array of per-video results. A "leased" result carries the full job spec;
+// "taken" / "notfound" results only carry the videoId so the worker can skip.
+async function leaseTasks(videoIds, workerKeyId) {
+    if (!Array.isArray(videoIds) || videoIds.length === 0) return [];
+    const results = [];
+    for (const videoId of videoIds) {
+        try {
+            const r = await leaseTask(videoId, workerKeyId);
+            if (r && r.isLeaseSuccess) {
+                results.push({
+                    videoId: r.videoId,
+                    status: 'leased',
+                    jobId: r.jobId,
+                    downloadUrl: r.downloadUrl,
+                    encryptionKey: r.encryptionKey,
+                    outputProfiles: r.outputProfiles,
+                    audioNormalization: r.audioNormalization,
+                    audioNormalizationTarget: r.audioNormalizationTarget,
+                    audioNormalizationPeak: r.audioNormalizationPeak,
+                    audioNormalizationMaxGain: r.audioNormalizationMaxGain
+                });
+            } else if (r && r.status === 'taken') {
+                results.push({ videoId, status: 'taken' });
+            } else {
+                results.push({ videoId, status: 'notfound' });
+            }
+        } catch (err) {
+            console.error(`leaseTask failed for video ${videoId}:`, err.message);
+            results.push({ videoId, status: 'error' });
+        }
+    }
+    return results;
+}
+
+// Handle a batched status report from the worker.
+// Each entry is { jobId, status, stage?, progress?, errorMessage? }:
+//   - running  → updateTaskStatus (maps stage → queue/video status)
+//   - failed   → reportError (moves to 'error', increments attempts via existing logic)
+//   - aborted  → abortAndRequeue (requeue without counting as a fault)
+// Returns a parallel array of { jobId, ack } so the worker can drop unknown ids.
+async function reportJobStatuses(jobs) {
+    if (!Array.isArray(jobs) || jobs.length === 0) return [];
+
+    // Map stage keyword → (queue_status, video_status)
+    const stageMap = {
+        downloading: { queue: 'leased',     video: 'worker_downloading' },
+        processing:  { queue: 'processing', video: 'processing' },
+        transcoding: { queue: 'processing', video: 'processing' },
+        uploading:   { queue: 'processing', video: 'worker_uploading' }
+    };
+
+    const results = [];
+    for (const job of jobs) {
+        if (!job || !job.jobId) { results.push({ jobId: null, ack: false }); continue; }
+        const { jobId, status } = job;
+        let found = false;
+        try {
+            if (status === 'running') {
+                const stageKey = (job.stage || '').toLowerCase();
+                const mapped = stageMap[stageKey] || stageMap.processing;
+                const progress = typeof job.progress === 'number' ? job.progress : null;
+
+                const r = await updateTaskStatus(jobId, mapped.queue, progress);
+                found = !!r.found;
+
+                if (found) {
+                    // Also push the mapped video status (updateTaskStatus maps
+                    // queue→video but not for worker_uploading). duration_seconds
+                    // is NOT written here — completeTask writes it once at the
+                    // end of the job, which keeps the status path to a single
+                    // write per tick.
+                    const task = await getTaskByJobId(jobId);
+                    if (task) {
+                        const pool = getPool();
+                        const setParts = ['status = ?'];
+                        const vals = [mapped.video];
+                        if (progress !== null) { setParts.push('processing_progress = ?'); vals.push(progress); }
+                        vals.push(task.video_id);
+                        await pool.execute(
+                            `UPDATE videos SET ${setParts.join(', ')} WHERE video_id = ?`,
+                            vals
+                        );
+                    }
+                }
+            } else if (status === 'failed') {
+                const r = await reportError(jobId, job.errorMessage || 'Unknown error');
+                found = !!r.found;
+            } else if (status === 'aborted') {
+                found = await abortAndRequeue(jobId);
+            } else {
+                // Unknown status value — treat as ack:false so worker drops it.
+                found = false;
+            }
+        } catch (err) {
+            console.error(`reportJobStatuses error for job ${jobId}:`, err.message);
+            found = false;
+        }
+        results.push({ jobId, ack: found });
+    }
+    return results;
 }
 
 // Map file extension to the correct MIME type for R2 storage.
@@ -664,16 +739,17 @@ async function abortAndRequeue(jobId) {
 
 module.exports = {
     createTask,
-    leaseNextTask,
     updateTaskStatus,
     completeTask,
     reportError,
     resetStaleTasks,
     getTaskByJobId,
-    generateShortJobId,
+    generateJobId,
     resetExpiredPendingTasks,
-    checkAvailableTask,
+    reserveTasks,
     leaseTask,
+    leaseTasks,
+    reportJobStatuses,
     generateUploadUrls,
     retryFailedVideo,
     abortAndRequeue,

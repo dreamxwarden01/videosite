@@ -2,14 +2,18 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 	"videosite-worker/internal/api"
+	"videosite-worker/internal/auth"
 	"videosite-worker/internal/config"
 	"videosite-worker/internal/hardware"
 	"videosite-worker/internal/mtls"
@@ -69,6 +73,19 @@ func main() {
 	api.Init(tlsCfg, cfg.UseSystemProxy)
 	fmt.Println()
 
+	// 4b. Obtain the first bearer token. All authenticated API calls go
+	// through the shared Session, which will transparently re-auth on any
+	// future 401. Bad credentials here → exit 2; transient errors → retry.
+	if err := bootstrapSession(); err != nil {
+		if errors.Is(err, api.ErrAuthFailed) {
+			fmt.Printf("%s ERROR: authentication rejected — check keyId/keySecret in config.json\n", util.Ts())
+			os.Exit(2)
+		}
+		fmt.Printf("%s ERROR: could not authenticate to site after retries: %s\n", util.Ts(), err)
+		os.Exit(1)
+	}
+	fmt.Printf("%s Authenticated (bearer issued)\n", util.Ts())
+
 	// 5. Detect hardware encoders
 	caps, err := hardware.DetectAndMerge()
 	if err != nil {
@@ -91,6 +108,36 @@ func main() {
 
 	// 8. Start the worker
 	w.Run()
+}
+
+// bootstrapSession performs the initial /api/worker/auth exchange and hands
+// the populated Session to the API client. Retries with a simple linear
+// backoff on transient errors; 401 is fatal (bad config).
+func bootstrapSession() error {
+	session := auth.NewSession()
+	api.SetSession(session)
+
+	backoff := []time.Duration{0, 2 * time.Second, 5 * time.Second, 10 * time.Second, 20 * time.Second}
+	var lastErr error
+	for i, delay := range backoff {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := session.Refresh(ctx, api.Authenticate)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, api.ErrAuthFailed) {
+			return err // fatal — no point retrying
+		}
+		lastErr = err
+		if i < len(backoff)-1 {
+			fmt.Printf("%s Auth attempt %d/%d failed: %s — retrying\n", util.Ts(), i+1, len(backoff), err)
+		}
+	}
+	return fmt.Errorf("auth failed after %d attempts: %w", len(backoff), lastErr)
 }
 
 // handleMTLS checks the mTLS configuration and runs interactive setup if needed.
