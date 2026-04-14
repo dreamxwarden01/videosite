@@ -9,10 +9,21 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+)
+
+// Sentinel errors returned by CheckCertValidity so callers can differentiate
+// an expired cert (needs renewal) from a not-yet-valid one (clock skew or
+// freshly-issued cert that hasn't started). Both are fatal for the worker —
+// it cannot authenticate against the server with an invalid cert.
+var (
+	ErrCertExpired     = errors.New("mTLS client certificate expired")
+	ErrCertNotYetValid = errors.New("mTLS client certificate not yet valid")
 )
 
 const (
@@ -43,6 +54,47 @@ func LoadTLSConfig() (*tls.Config, error) {
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 	}, nil
+}
+
+// LoadTLSConfigWithCert loads the client cert/key AND returns the parsed leaf
+// *x509.Certificate so the caller can do per-request NotBefore/NotAfter checks
+// without re-reading the file every time.
+//
+// The returned cert is the immutable, in-memory parsed copy — editing
+// cert/client.crt on disk after startup does not affect it.
+func LoadTLSConfigWithCert() (*tls.Config, *x509.Certificate, error) {
+	cert, err := tls.LoadX509KeyPair(certPath(), keyPath())
+	if err != nil {
+		return nil, nil, fmt.Errorf("load client certificate: %w", err)
+	}
+	if len(cert.Certificate) == 0 {
+		return nil, nil, fmt.Errorf("client certificate is empty")
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse leaf certificate: %w", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}, leaf, nil
+}
+
+// CheckCertValidity returns ErrCertNotYetValid if now is before NotBefore,
+// or ErrCertExpired if now is after NotAfter. Returns nil if the cert is
+// currently within its validity window.
+//
+// This is the cheap (~nanoseconds) pre-flight check the API client runs
+// before every outbound request so an expired cert fails fast with a clean
+// shutdown instead of an opaque TLS handshake error.
+func CheckCertValidity(cert *x509.Certificate) error {
+	now := time.Now()
+	if now.Before(cert.NotBefore) {
+		return fmt.Errorf("%w (NotBefore=%s)", ErrCertNotYetValid, cert.NotBefore.Format(time.RFC3339))
+	}
+	if now.After(cert.NotAfter) {
+		return fmt.Errorf("%w (NotAfter=%s)", ErrCertExpired, cert.NotAfter.Format(time.RFC3339))
+	}
+	return nil
 }
 
 // Setup runs the interactive mTLS certificate setup flow:

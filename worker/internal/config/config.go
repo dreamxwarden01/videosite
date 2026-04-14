@@ -11,6 +11,10 @@ import (
 )
 
 // OutputProfile defines a transcoding output profile.
+//
+// This is the shape the server sends per-job in the lease response
+// (see api.LeaseResult.OutputProfiles). It is NOT read from config.json —
+// each job's profile set is authoritative and can differ between jobs.
 type OutputProfile struct {
 	Name             string `json:"name"`
 	Width            int    `json:"width"`
@@ -25,21 +29,19 @@ type OutputProfile struct {
 }
 
 // Config holds the worker configuration loaded from config.json.
+//
+// Note: output_profiles and audio_normalization_* are deliberately absent.
+// Those values are supplied by the server per-job via the lease response
+// (see api.LeaseResult), not from the worker's local config. If they appear
+// in an existing config.json file they are silently ignored on parse.
 type Config struct {
-	SiteHostname      string          `json:"site_hostname"`
-	AccessKeyID       string          `json:"access_key_id"`
-	AccessKeySecret   string          `json:"access_key_secret"`
-	EnableMTLS        *bool           `json:"enable_mtls,omitempty"`
-	UseSystemProxy    bool            `json:"useSystemProxies"`
-	OutputProfiles    []OutputProfile `json:"output_profiles"`
-	ConcurrentUploads   int             `json:"concurrent_uploads"`   // max parallel file uploads (default 10)
-	ConcurrentDownloads int             `json:"concurrent_downloads"` // max parallel part downloads (default 5)
-
-	// Audio normalization (EBU R128 two-pass loudnorm).
-	AudioNormalization        bool    `json:"audio_normalization"`         // true = normalize audio; false = skip
-	AudioNormalizationTarget  float64 `json:"audio_normalization_target"`  // integrated loudness target in LUFS (e.g. -16)
-	AudioNormalizationPeak    float64 `json:"audio_normalization_peak"`    // true peak ceiling in dBFS (e.g. -1.5)
-	AudioNormalizationMaxGain float64 `json:"audio_normalization_max_gain"` // max upward gain in dB (e.g. 10)
+	SiteHostname        string `json:"site_hostname"`
+	AccessKeyID         string `json:"access_key_id"`
+	AccessKeySecret     string `json:"access_key_secret"`
+	EnableMTLS          *bool  `json:"enable_mtls,omitempty"`
+	UseSystemProxy      bool   `json:"use_system_proxies"`
+	ConcurrentUploads   int    `json:"concurrent_uploads"`   // max parallel file uploads (default 10)
+	ConcurrentDownloads int    `json:"concurrent_downloads"` // max parallel part downloads (default 5)
 }
 
 // MTLSEnabled returns true if enable_mtls is explicitly set to true.
@@ -60,68 +62,113 @@ var (
 
 const configFile = "config.json"
 
-// DefaultProfiles returns the default output profiles.
-func DefaultProfiles() []OutputProfile {
-	return []OutputProfile{
-		{
-			Name: "1080p", Width: 1920, Height: 1080,
-			VideoBitrateKbps: 3500, AudioBitrateKbps: 128,
-			Codec: "h264", Profile: "high", Preset: "medium",
-			SegmentDuration: 6, GOPSize: 48,
-		},
-		{
-			Name: "720p", Width: 1280, Height: 720,
-			VideoBitrateKbps: 2000, AudioBitrateKbps: 128,
-			Codec: "h264", Profile: "main", Preset: "medium",
-			SegmentDuration: 6, GOPSize: 48,
-		},
-	}
+// Defaults for fields that must be positive. Applied by validateAndNormalize.
+const (
+	defaultConcurrentUploads   = 10
+	defaultConcurrentDownloads = 5
+)
+
+// ReloadResult reports the outcome of a Reload() call so the caller can act
+// per-field (rebuild HTTP client on proxy change, warn on mTLS/hostname change,
+// etc.). Summary is pre-formatted for console output.
+type ReloadResult struct {
+	Summary            string   // human-readable, for console
+	HostnameChanged    bool     // true if site_hostname differs (LOCKED — reverted in memory)
+	OldHostname        string   // previous value, for the restart-required warning
+	MTLSChanged        bool     // true if enable_mtls differs (LOCKED — reverted in memory)
+	OldMTLSEnabled     *bool    // previous value, for the restart-required warning
+	ProxyChanged       bool     // true if use_system_proxies differs
+	ConcurrencyChanged bool     // true if concurrent_uploads or concurrent_downloads differs
+	KeysChanged        bool     // true if access_key_id or access_key_secret differs (log-only)
+	InvalidFields      []string // any fields that were auto-corrected during load
 }
 
-// Load reads config.json. Returns nil if file doesn't exist (first run).
-// If the file exists but is missing newer fields (e.g. concurrent_uploads),
-// defaults are applied and the file is updated automatically.
+// validateAndNormalize resets invalid numeric fields to their defaults so the
+// worker keeps running with sane values even if the user entered 0 or a
+// negative number. Returns the list of corrections for user-visible logging.
+func validateAndNormalize(cfg *Config) []string {
+	var fixed []string
+	if cfg.ConcurrentUploads <= 0 {
+		cfg.ConcurrentUploads = defaultConcurrentUploads
+		fixed = append(fixed, fmt.Sprintf("concurrent_uploads reset to %d (was <= 0)", defaultConcurrentUploads))
+	}
+	if cfg.ConcurrentDownloads <= 0 {
+		cfg.ConcurrentDownloads = defaultConcurrentDownloads
+		fixed = append(fixed, fmt.Sprintf("concurrent_downloads reset to %d (was <= 0)", defaultConcurrentDownloads))
+	}
+	return fixed
+}
+
+// Load reads config.json. Returns nil if the file doesn't exist (first run).
+// Missing fields get defaults, invalid fields are reset, and the file is
+// rewritten so subsequent loads see a clean shape. Startup callers log the
+// fix-ups via slog; Reload uses loadAndNormalize directly to surface them in
+// ReloadResult.
 func Load() (*Config, error) {
+	cfg, fixups, err := loadAndNormalize()
+	if err != nil || cfg == nil {
+		return cfg, err
+	}
+	if len(fixups) > 0 {
+		slog.Info("Config auto-migrated", "fields", strings.Join(fixups, ", "))
+	}
+	return cfg, nil
+}
+
+// loadAndNormalize is the internal Load implementation. It returns the parsed
+// config plus a list of any auto-corrections applied (missing fields filled
+// in, invalid numeric values reset, camelCase keys migrated). On error the
+// in-memory `current` pointer is NOT touched — callers keep running on the
+// previous values.
+func loadAndNormalize() (*Config, []string, error) {
 	data, err := os.ReadFile(configFile)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, fmt.Errorf("read config: %w", err)
+		return nil, nil, fmt.Errorf("read config: %w", err)
 	}
 
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
+		return nil, nil, fmt.Errorf("parse config: %w", err)
 	}
 
-	// Detect missing fields in raw JSON for migration.
+	// Inspect raw keys to drive migration — struct-tag unmarshal alone can't
+	// tell us which keys were present in the file.
 	var raw map[string]json.RawMessage
-	json.Unmarshal(data, &raw)
+	_ = json.Unmarshal(data, &raw)
 
-	// Auto-migrate: add missing fields introduced in newer versions.
 	needsSave := false
-	var migrated []string
+	var fixups []string
 
-	if cfg.ConcurrentUploads <= 0 {
-		cfg.ConcurrentUploads = 10
+	// useSystemProxies → use_system_proxies rename. If the new key is absent
+	// but the old one is present, port the value over. If neither is present,
+	// zero value (false) is already assigned.
+	if _, hasNew := raw["use_system_proxies"]; !hasNew {
+		if oldVal, hasOld := raw["useSystemProxies"]; hasOld {
+			_ = json.Unmarshal(oldVal, &cfg.UseSystemProxy)
+			fixups = append(fixups, fmt.Sprintf("use_system_proxies=%v (migrated from useSystemProxies)", cfg.UseSystemProxy))
+		} else {
+			fixups = append(fixups, "use_system_proxies=false")
+		}
 		needsSave = true
-		migrated = append(migrated, "concurrent_uploads=10")
 	}
+
+	// Missing concurrent_downloads key → add the default explicitly.
 	if _, ok := raw["concurrent_downloads"]; !ok {
-		cfg.ConcurrentDownloads = 5
+		cfg.ConcurrentDownloads = defaultConcurrentDownloads
+		fixups = append(fixups, fmt.Sprintf("concurrent_downloads=%d", defaultConcurrentDownloads))
 		needsSave = true
-		migrated = append(migrated, "concurrent_downloads=5")
 	}
-	if _, ok := raw["useSystemProxies"]; !ok {
-		cfg.UseSystemProxy = false
+
+	// Numeric validation: positive-int enforcement for the two concurrency
+	// settings. Anything <= 0 gets reset to the default so fan-out doesn't
+	// deadlock on a zero-sized gate.
+	for _, f := range validateAndNormalize(&cfg) {
+		fixups = append(fixups, f)
 		needsSave = true
-		migrated = append(migrated, "useSystemProxies=false")
 	}
-	// Note: output_profiles and audio_normalization_* are now provided by the
-	// server per-job via the lease response. Local config values are ignored.
-	// Existing fields are kept for backward compatibility (they parse without
-	// error but are never read during transcoding).
 
 	mu.Lock()
 	current = &cfg
@@ -130,12 +177,10 @@ func Load() (*Config, error) {
 	if needsSave {
 		if saveErr := Save(&cfg); saveErr != nil {
 			slog.Warn("Failed to save config with updated defaults", "err", saveErr)
-		} else {
-			slog.Info("Config auto-migrated", "fields", strings.Join(migrated, ", "))
 		}
 	}
 
-	return &cfg, nil
+	return &cfg, fixups, nil
 }
 
 // Get returns the current config (thread-safe).
@@ -145,49 +190,97 @@ func Get() *Config {
 	return current
 }
 
-// Reload re-reads config.json and returns a summary of changes.
-func Reload() (string, error) {
+// Reload re-reads config.json and returns a structured change set.
+//
+// Two fields are locked against hot-swap because they anchor trust:
+//   - site_hostname — what TLS validates against and what every URL points to.
+//   - enable_mtls   — whether a client cert is presented at all.
+//
+// If either drifts we revert the new in-memory config to the old value before
+// publishing it, and set the *Changed flags so the caller can warn the user
+// that a restart is required. The user's intended change stays on disk and
+// takes effect on the next restart.
+//
+// If the file can't be read or parsed, the in-memory `current` pointer is
+// left untouched and the error is returned so the caller can print a warning
+// and keep running.
+func Reload() (ReloadResult, error) {
 	mu.RLock()
 	old := current
 	mu.RUnlock()
 
-	newCfg, err := Load()
+	newCfg, fixups, err := loadAndNormalize()
 	if err != nil {
-		return "", err
+		return ReloadResult{}, fmt.Errorf("config reload failed, keeping previous values: %w", err)
 	}
 	if newCfg == nil {
-		return "", fmt.Errorf("config.json not found")
+		return ReloadResult{}, fmt.Errorf("config.json not found")
 	}
 
+	result := ReloadResult{InvalidFields: fixups}
+	if old == nil {
+		// No previous config — treat this like a fresh load. Nothing to diff.
+		result.Summary = "initial load"
+		return result, nil
+	}
+
+	// --- Locked fields: detect drift, revert in memory, flag for the caller.
+	if old.SiteHostname != newCfg.SiteHostname {
+		result.HostnameChanged = true
+		result.OldHostname = old.SiteHostname
+		// Revert in the new in-memory config so readers never see the drifted
+		// value. The on-disk value is left alone — a restart will apply it.
+		mu.Lock()
+		if current != nil {
+			current.SiteHostname = old.SiteHostname
+		}
+		mu.Unlock()
+	}
+	if old.MTLSEnabled() != newCfg.MTLSEnabled() {
+		result.MTLSChanged = true
+		result.OldMTLSEnabled = old.EnableMTLS
+		mu.Lock()
+		if current != nil {
+			current.EnableMTLS = old.EnableMTLS
+		}
+		mu.Unlock()
+	}
+
+	// --- Live-reload fields: produce a summary and set flags for side-effects.
 	var changes []string
-	if old != nil {
-		if old.SiteHostname != newCfg.SiteHostname {
-			changes = append(changes, fmt.Sprintf("site_hostname: %s -> %s", old.SiteHostname, newCfg.SiteHostname))
-		}
-		if old.AccessKeyID != newCfg.AccessKeyID {
-			changes = append(changes, "access_key_id changed")
-		}
-		if old.AccessKeySecret != newCfg.AccessKeySecret {
-			changes = append(changes, "access_key_secret changed")
-		}
-		if old.MTLSEnabled() != newCfg.MTLSEnabled() {
-			changes = append(changes, fmt.Sprintf("enable_mtls: %v -> %v", old.MTLSEnabled(), newCfg.MTLSEnabled()))
-		}
-		if old.UseSystemProxy != newCfg.UseSystemProxy {
-			changes = append(changes, fmt.Sprintf("useSystemProxies: %v -> %v", old.UseSystemProxy, newCfg.UseSystemProxy))
-		}
-		if old.ConcurrentUploads != newCfg.ConcurrentUploads {
-			changes = append(changes, fmt.Sprintf("concurrent_uploads: %d -> %d", old.ConcurrentUploads, newCfg.ConcurrentUploads))
-		}
-		if old.ConcurrentDownloads != newCfg.ConcurrentDownloads {
-			changes = append(changes, fmt.Sprintf("concurrent_downloads: %d -> %d", old.ConcurrentDownloads, newCfg.ConcurrentDownloads))
-		}
+	if result.HostnameChanged {
+		changes = append(changes, fmt.Sprintf("site_hostname: %s -> %s (LOCKED — restart required)", old.SiteHostname, newCfg.SiteHostname))
+	}
+	if result.MTLSChanged {
+		changes = append(changes, fmt.Sprintf("enable_mtls: %v -> %v (LOCKED — restart required)", old.MTLSEnabled(), newCfg.MTLSEnabled()))
+	}
+	if old.AccessKeyID != newCfg.AccessKeyID {
+		result.KeysChanged = true
+		changes = append(changes, "access_key_id changed")
+	}
+	if old.AccessKeySecret != newCfg.AccessKeySecret {
+		result.KeysChanged = true
+		changes = append(changes, "access_key_secret changed")
+	}
+	if old.UseSystemProxy != newCfg.UseSystemProxy {
+		result.ProxyChanged = true
+		changes = append(changes, fmt.Sprintf("use_system_proxies: %v -> %v", old.UseSystemProxy, newCfg.UseSystemProxy))
+	}
+	if old.ConcurrentUploads != newCfg.ConcurrentUploads {
+		result.ConcurrencyChanged = true
+		changes = append(changes, fmt.Sprintf("concurrent_uploads: %d -> %d", old.ConcurrentUploads, newCfg.ConcurrentUploads))
+	}
+	if old.ConcurrentDownloads != newCfg.ConcurrentDownloads {
+		result.ConcurrencyChanged = true
+		changes = append(changes, fmt.Sprintf("concurrent_downloads: %d -> %d", old.ConcurrentDownloads, newCfg.ConcurrentDownloads))
 	}
 
 	if len(changes) == 0 {
-		return "No changes detected", nil
+		result.Summary = "No changes detected"
+	} else {
+		result.Summary = strings.Join(changes, ", ")
 	}
-	return strings.Join(changes, ", "), nil
+	return result, nil
 }
 
 // Save writes config to config.json.

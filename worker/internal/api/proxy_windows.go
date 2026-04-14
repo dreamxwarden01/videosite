@@ -12,7 +12,10 @@ import (
 
 // systemProxyFunc returns an http.Transport-compatible proxy function that
 // reads the current Windows IE/WinINET system proxy settings from the registry
-// (HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings).
+// (HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings) on EACH
+// request. This lets the user toggle proxies in Windows Internet Options
+// while the worker is running and have it take effect on the next outbound
+// call without needing a reload.
 //
 // This is what Charles, Fiddler, and other Windows proxies configure when they
 // register themselves as the system proxy. Go's http.ProxyFromEnvironment only
@@ -21,10 +24,12 @@ import (
 // Falls back to http.ProxyFromEnvironment if the registry cannot be read or
 // if the system proxy is disabled.
 func systemProxyFunc() func(*http.Request) (*url.URL, error) {
-	if u := windowsRegistryProxyURL(); u != nil {
-		return http.ProxyURL(u)
+	return func(req *http.Request) (*url.URL, error) {
+		if u := windowsRegistryProxyURL(); u != nil {
+			return u, nil
+		}
+		return http.ProxyFromEnvironment(req)
 	}
-	return http.ProxyFromEnvironment
 }
 
 // windowsRegistryProxyURL reads the HTTPS (or HTTP) proxy address from the

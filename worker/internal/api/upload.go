@@ -127,7 +127,7 @@ func doUpload(ctx context.Context, filePath, presignedURL string) (int, error) {
 	req.Header.Set("Content-Type", hlsContentType(filepath.Base(filePath)))
 	req.Header.Set("Cache-Control", "public, max-age=31536000, immutable")
 
-	resp, err := httpClient.Do(req)
+	resp, err := httpClientPtr.Load().Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("upload request failed: %w", err)
 	}

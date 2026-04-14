@@ -10,21 +10,30 @@ import (
 )
 
 // systemProxyFunc returns an http.Transport-compatible proxy function that
-// reads macOS system proxy settings from System Configuration via `scutil --proxy`.
+// reads macOS system proxy settings from System Configuration via `scutil --proxy`
+// on EACH request. This lets the user change system proxy settings while the
+// worker is running and have them take effect on the next outbound call without
+// needing a reload.
 //
 // This covers proxies configured in System Settings → Network → Proxies (e.g. Charles,
 // Proxyman, corporate HTTP(S) proxies). These are NOT exposed as environment variables,
 // so Go's http.ProxyFromEnvironment alone does not pick them up.
 //
-// Strategy:
+// Per-request cost: one fork+exec of `/usr/sbin/scutil` (~5 ms). Negligible at the
+// worker's typical request volume (once every 2–5 seconds when idle, dozens per
+// second during an active upload).
+//
+// Strategy per request:
 //  1. Run `scutil --proxy`, parse HTTPS proxy (preferred), fall back to HTTP proxy.
 //  2. If scutil fails or reports no proxy, fall back to http.ProxyFromEnvironment
-//     which reads HTTPS_PROXY / HTTP_PROXY / NO_PROXY environment variables.
+//     which reads HTTPS_PROXY / HTTP_PROXY / NO_PROXY environment variables live.
 func systemProxyFunc() func(*http.Request) (*url.URL, error) {
-	if u := macOSSystemProxyURL(); u != nil {
-		return http.ProxyURL(u)
+	return func(req *http.Request) (*url.URL, error) {
+		if u := macOSSystemProxyURL(); u != nil {
+			return u, nil
+		}
+		return http.ProxyFromEnvironment(req)
 	}
-	return http.ProxyFromEnvironment
 }
 
 // macOSSystemProxyURL reads the macOS system-level proxy from scutil --proxy.

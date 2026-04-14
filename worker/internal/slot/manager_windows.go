@@ -33,13 +33,108 @@ func NewManager() *Manager {
 }
 
 // Reload refreshes the encoder list from capabilities (for reload command).
+//
+// Diff-based graceful-shrink model:
+//
+//  1. If a previously-deactivated encoder is back in the new enabled list,
+//     clear its deactivated flag and drop its shrinkRemaining counter.
+//     Its in-flight jobs go back to the normal release path.
+//
+//  2. For each encoder in the OLD list that's not in the new list: if it
+//     has active jobs, mark it deactivated so their future releases shrink
+//     totalSlots instead of freeing slots. If it has no active jobs, it's
+//     simply removed.
+//
+//  3. For each still-enabled encoder whose per-encoder cap dropped below
+//     current usage, queue shrinkRemaining[hwID] = usage − newCap so that
+//     many future releases on that encoder shrink totalSlots. Once the
+//     counter drains, further releases take the normal free-slot path.
+//
+//  4. Recompute totalSlots as:
+//     sum(effective cap of each enabled encoder)
+//     + sum(active usage on deactivated encoders)       — retire on release
+//     + sum(shrinkRemaining for capped-down encoders)   — retire on release
+//
+//     The extra terms keep FreeSlots accurate: jobs that haven't released
+//     yet still count as occupying real slots until they hit the graceful
+//     shrink path.
 func (m *Manager) Reload() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	encoders := config.EnabledEncoders()
-	m.encoders = encoders
-	m.totalSlots = totalEncoderSlots(encoders)
+	newEncoders := config.EnabledEncoders()
+
+	// Build lookup of new enabled set for O(1) membership checks below.
+	newByID := make(map[string]config.Encoder, len(newEncoders))
+	for _, e := range newEncoders {
+		newByID[e.HardwareID] = e
+	}
+
+	if m.deactivated == nil {
+		m.deactivated = make(map[string]bool)
+	}
+	if m.shrinkRemaining == nil {
+		m.shrinkRemaining = make(map[string]int)
+	}
+
+	// 1. Re-enable: if a previously-deactivated encoder is back in the new
+	//    list, clear the deactivated flag and reset any shrinkRemaining for
+	//    it. In-flight jobs on that encoder will now release normally.
+	for hid := range newByID {
+		if m.deactivated[hid] {
+			delete(m.deactivated, hid)
+			delete(m.shrinkRemaining, hid)
+		}
+	}
+
+	// 2. Disable-with-jobs: any encoder in the old list but not in the new
+	//    list that still has active jobs gets marked deactivated. If it has
+	//    no active jobs, it's implicitly dropped when we replace m.encoders.
+	for _, old := range m.encoders {
+		if _, stillEnabled := newByID[old.HardwareID]; stillEnabled {
+			continue
+		}
+		if m.encoderUsage[old.HardwareID] > 0 {
+			m.deactivated[old.HardwareID] = true
+		}
+	}
+
+	// 3. Per-encoder cap shrink: for each encoder still enabled, if the new
+	//    cap is below current usage, queue (usage − newCap) future releases
+	//    to shrink totalSlots instead of freeing a slot.
+	//    We clear any prior shrinkRemaining entry first so back-to-back
+	//    reloads don't stack (e.g., 5→3 then 3→2 should leave exactly 1
+	//    queued shrink remaining per subsequent reload, not accumulate).
+	for _, enc := range newEncoders {
+		usage := m.encoderUsage[enc.HardwareID]
+		newCap := config.EffectiveConcurrentJobs(enc)
+		if usage > newCap {
+			m.shrinkRemaining[enc.HardwareID] = usage - newCap
+		} else {
+			// No over-capacity on this encoder — drop any stale shrink queue.
+			delete(m.shrinkRemaining, enc.HardwareID)
+		}
+	}
+
+	m.encoders = newEncoders
+
+	// 4. Recompute totalSlots: live encoder capacity plus the outstanding
+	//    occupancy on deactivated/shrinking encoders so FreeSlots reports
+	//    correctly until those graceful shrinks drain.
+	newTotal := 0
+	for _, enc := range newEncoders {
+		newTotal += config.EffectiveConcurrentJobs(enc)
+	}
+	for hid := range m.deactivated {
+		newTotal += m.encoderUsage[hid]
+	}
+	for _, over := range m.shrinkRemaining {
+		newTotal += over
+	}
+	if newTotal == 0 {
+		newTotal = 1 // software-only fallback
+	}
+	m.totalSlots = newTotal
 }
 
 // AcquireSlot assigns an encoder to a job using load-balanced scheduling.

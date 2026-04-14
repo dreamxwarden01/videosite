@@ -26,6 +26,26 @@ func NewManager() *Manager {
 }
 
 // Reload refreshes slot count and VT status from capabilities (for reload command).
+//
+// Graceful-shrink model on macOS:
+//
+//   - VT toggle doesn't change slot count — VT and Software share the same
+//     slot pool (sized by capabilities.concurrent_jobs). Disabling VT only
+//     affects which encoder pickEncoder chooses for new acquires. In-flight
+//     VT jobs finish normally and free their slot on release.
+//
+//   - concurrent_jobs change: totalSlots is updated directly. If the new
+//     value is below current occupancy, AcquireSlot blocks new work until
+//     enough jobs release; existing over-occupied jobs run to completion.
+//     Once occupied drops below the new total, acquires resume. Net effect
+//     is a permanent shrink of (old − new) slots, matching user intent.
+//
+//   - concurrent_jobs increase: totalSlots updates immediately, and new work
+//     can be acquired on the next poll tick.
+//
+// No per-encoder deactivated/shrinkRemaining bookkeeping is needed here —
+// Windows uses it because each encoder has its own cap and slot share;
+// macOS does not.
 func (m *Manager) Reload() {
 	m.mu.Lock()
 	defer m.mu.Unlock()

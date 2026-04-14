@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -61,16 +62,17 @@ func main() {
 		fmt.Printf("%s Config loaded (site: %s)\n", util.Ts(), cfg.SiteHostname)
 	}
 
-	// 3. mTLS setup
-	var tlsCfg *tls.Config
-	tlsCfg, err = handleMTLS(cfg)
+	// 3. mTLS setup. Returns the parsed leaf certificate alongside the
+	// tls.Config so the API client can do per-request NotBefore/NotAfter
+	// checks without re-reading the cert file.
+	tlsCfg, leafCert, err := handleMTLS(cfg)
 	if err != nil {
 		fmt.Printf("%s ERROR: mTLS setup failed: %s\n", util.Ts(), err)
 		os.Exit(1)
 	}
 
-	// 4. Initialize HTTP client (mTLS + proxy)
-	api.Init(tlsCfg, cfg.UseSystemProxy)
+	// 4. Initialize HTTP client (mTLS + live system-proxy lookup).
+	api.Init(tlsCfg, leafCert, cfg.UseSystemProxy)
 	fmt.Println()
 
 	// 4b. Obtain the first bearer token. All authenticated API calls go
@@ -141,8 +143,14 @@ func bootstrapSession() error {
 }
 
 // handleMTLS checks the mTLS configuration and runs interactive setup if needed.
-// Returns a *tls.Config for the HTTP client (nil if mTLS is disabled).
-func handleMTLS(cfg *config.Config) (*tls.Config, error) {
+// Returns the *tls.Config and the parsed leaf *x509.Certificate used for
+// per-request NotBefore/NotAfter pre-flight checks. Both are nil when mTLS
+// is disabled (the cert check is then a no-op).
+//
+// An expired / not-yet-valid cert at startup is treated as fatal here so the
+// user sees the exact reason immediately, rather than watching requests fail
+// with opaque handshake errors.
+func handleMTLS(cfg *config.Config) (*tls.Config, *x509.Certificate, error) {
 	reader := bufio.NewReader(os.Stdin)
 
 	needsPrompt := cfg.EnableMTLS == nil || (cfg.MTLSEnabled() && !mtls.CertFilesExist())
@@ -155,33 +163,37 @@ func handleMTLS(cfg *config.Config) (*tls.Config, error) {
 		enabled := answer == "yes" || answer == "y"
 
 		if err := cfg.SetMTLS(enabled); err != nil {
-			return nil, fmt.Errorf("save mTLS config: %w", err)
+			return nil, nil, fmt.Errorf("save mTLS config: %w", err)
 		}
 
 		if !enabled {
 			fmt.Println("mTLS disabled")
-			return nil, nil
+			return nil, nil, nil
 		}
 
 		fmt.Println()
 		fmt.Println("=== mTLS Certificate Setup ===")
 		if err := mtls.Setup(reader); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
 	if !cfg.MTLSEnabled() {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	if !mtls.CertFilesExist() {
-		return nil, fmt.Errorf("mTLS is enabled but cert/client.key or cert/client.crt is missing")
+		return nil, nil, fmt.Errorf("mTLS is enabled but cert/client.key or cert/client.crt is missing")
 	}
 
-	tlsCfg, err := mtls.LoadTLSConfig()
+	tlsCfg, leafCert, err := mtls.LoadTLSConfigWithCert()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	fmt.Printf("%s mTLS: client certificate loaded\n", util.Ts())
-	return tlsCfg, nil
+	if err := mtls.CheckCertValidity(leafCert); err != nil {
+		return nil, nil, fmt.Errorf("client certificate not usable: %w", err)
+	}
+	fmt.Printf("%s mTLS: client certificate loaded (valid until %s)\n",
+		util.Ts(), leafCert.NotAfter.Format("2006-01-02"))
+	return tlsCfg, leafCert, nil
 }

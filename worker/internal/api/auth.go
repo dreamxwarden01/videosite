@@ -19,8 +19,14 @@ type authResponse struct {
 // cannot recurse through doRequest's 401-retry path.
 //
 // Returns ErrAuthFailed on 401 (bad keyId/keySecret — worker should exit).
-// Any other non-2xx is returned as a plain error (worker retries with backoff).
+// Returns ErrCertFatal on 403 if the in-memory mTLS cert is outside its
+// validity window (hard shutdown). Other non-2xx statuses are returned as a
+// plain error so the worker retries with backoff.
 func Authenticate(ctx context.Context) (string, error) {
+	if err := checkCertPreflight(); err != nil {
+		return "", err
+	}
+
 	cfg := config.Get()
 	if cfg == nil {
 		return "", fmt.Errorf("config not loaded")
@@ -46,7 +52,7 @@ func Authenticate(ctx context.Context) (string, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := httpClient.Do(req)
+	resp, err := httpClientPtr.Load().Do(req)
 	if err != nil {
 		return "", fmt.Errorf("auth request: %w", err)
 	}
@@ -54,6 +60,12 @@ func Authenticate(ctx context.Context) (string, error) {
 
 	if resp.StatusCode == http.StatusUnauthorized {
 		return "", ErrAuthFailed
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		if certErr := checkCertPreflight(); certErr != nil {
+			return "", certErr
+		}
+		return "", fmt.Errorf("auth returned 403 — server rejected request")
 	}
 	if resp.StatusCode >= 300 {
 		return "", fmt.Errorf("auth returned status %d", resp.StatusCode)

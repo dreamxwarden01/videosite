@@ -11,6 +11,25 @@ import (
 // The struct uses a superset of fields needed by both platforms.
 // macOS uses vtEnabled; Windows uses encoders. Platform-specific methods
 // (NewManager, Reload, AcquireSlot, NextEncoder) are in build-tagged files.
+//
+// Graceful encoder shrink (deactivated / shrinkRemaining):
+//
+// When a user disables an encoder (or shrinks its per-encoder cap) while
+// jobs are still running on it, we can't pre-empt those jobs — they're
+// actively producing output. Instead:
+//
+//   - deactivated[hwID]=true marks the encoder as "no new acquires, every
+//     release shrinks totalSlots instead of freeing a slot". When its last
+//     active job releases and encoderUsage[hwID] drops to 0, the flag is
+//     cleared (the encoder is fully gone).
+//   - shrinkRemaining[hwID]=N means "the next N releases on this encoder
+//     shrink totalSlots instead of freeing a slot". Used when only part of
+//     an encoder's capacity is being retired (cap 5 → 2 with 3 active =
+//     shrink 1 release, then resume normal free-slot behaviour).
+//
+// If the user re-enables a deactivated encoder before its jobs finish,
+// Reload() clears both maps for that hwID — the in-flight jobs count
+// normally again.
 type Manager struct {
 	mu              sync.Mutex
 	vtEnabled       bool                      // macOS: VideoToolbox available and enabled
@@ -20,6 +39,9 @@ type Manager struct {
 	activeJobs      map[string]*Job           // jobID → Job (for graceful shutdown + status reporting)
 	totalSlots      int
 	pendingTerminal []api.JobStatus // terminal statuses waiting to be reported
+
+	deactivated     map[string]bool // hwID → pending full removal (every release shrinks)
+	shrinkRemaining map[string]int  // hwID → N releases that should shrink instead of free
 }
 
 // TotalSlots returns the total number of concurrent job slots.
@@ -56,16 +78,68 @@ func (m *Manager) RegisterJob(jobID string, job *Job) {
 }
 
 // ReleaseSlot frees the slot used by a job.
+//
+// Three paths:
+//  1. Deactivated encoder: shrink totalSlots by 1 (don't free). If this was
+//     the last active job on that encoder, clear deactivated so a later
+//     re-enable can start fresh.
+//  2. Pending shrink: consume one shrinkRemaining[hwID], shrink totalSlots
+//     by 1, don't free. Once drained, subsequent releases on this encoder
+//     take the normal free path.
+//  3. Normal: decrement encoderUsage, free the slot.
+//
+// occupied and activeJobs are cleared in all three paths.
 func (m *Manager) ReleaseSlot(jobID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if enc, ok := m.occupied[jobID]; ok && m.encoderUsage != nil {
-		if m.encoderUsage[enc.HardwareID] > 0 {
-			m.encoderUsage[enc.HardwareID]--
-		}
+
+	enc, ok := m.occupied[jobID]
+	if !ok {
+		// Unknown job — still drop the activeJobs entry if present.
+		delete(m.activeJobs, jobID)
+		return
 	}
 	delete(m.occupied, jobID)
 	delete(m.activeJobs, jobID)
+
+	hid := enc.HardwareID
+
+	// Path 1: encoder is fully deactivated — every release shrinks totalSlots.
+	if m.deactivated != nil && m.deactivated[hid] {
+		if m.totalSlots > 0 {
+			m.totalSlots--
+		}
+		if m.encoderUsage != nil && m.encoderUsage[hid] > 0 {
+			m.encoderUsage[hid]--
+		}
+		// Last job on this encoder drained — clear the deactivated flag so a
+		// subsequent re-enable doesn't keep shrinking future releases.
+		if m.encoderUsage == nil || m.encoderUsage[hid] == 0 {
+			delete(m.deactivated, hid)
+		}
+		return
+	}
+
+	// Path 2: this release is one of N queued shrinks (cap was reduced below
+	// current usage). Shrink totalSlots, tick the counter, do not free.
+	if m.shrinkRemaining != nil && m.shrinkRemaining[hid] > 0 {
+		if m.totalSlots > 0 {
+			m.totalSlots--
+		}
+		m.shrinkRemaining[hid]--
+		if m.shrinkRemaining[hid] == 0 {
+			delete(m.shrinkRemaining, hid)
+		}
+		if m.encoderUsage != nil && m.encoderUsage[hid] > 0 {
+			m.encoderUsage[hid]--
+		}
+		return
+	}
+
+	// Path 3: normal release — just decrement per-encoder usage.
+	if m.encoderUsage != nil && m.encoderUsage[hid] > 0 {
+		m.encoderUsage[hid]--
+	}
 }
 
 // ActiveJobs returns a snapshot copy of all active jobs.

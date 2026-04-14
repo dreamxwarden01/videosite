@@ -112,6 +112,10 @@ func (w *Worker) poll() {
 	// 1. Reserve up to `free` tasks (server flips queued→pending atomically).
 	videoIDs, err := api.AvailableTasks(w.ctx, free)
 	if err != nil {
+		if errors.Is(err, api.ErrCertFatal) {
+			w.handleCertFatal(err)
+			return
+		}
 		if errors.Is(err, api.ErrAuthFailed) {
 			w.handleAuthFailure()
 			return
@@ -140,6 +144,10 @@ func (w *Worker) poll() {
 	// 2. Lease the reserved tasks (pending→processing, server assigns jobId).
 	results, err := api.LeaseTasks(w.ctx, filtered)
 	if err != nil {
+		if errors.Is(err, api.ErrCertFatal) {
+			w.handleCertFatal(err)
+			return
+		}
 		if errors.Is(err, api.ErrAuthFailed) {
 			w.handleAuthFailure()
 			return
@@ -199,6 +207,13 @@ func (w *Worker) launchJob(r api.LeaseResult) {
 				w.handleFFmpegMissing()
 				return
 			}
+			// mTLS cert became invalid mid-job (via an API call the job
+			// made — e.g. reporting a segment, fetching upload URLs).
+			// Nothing the worker can do until it's restarted.
+			if errors.Is(err, api.ErrCertFatal) {
+				w.handleCertFatal(err)
+				return
+			}
 			w.blocklist.Add(videoID)
 			slog.Error("Job failed, video blocked", "job", jobID, "video", videoID, "err", err)
 		}
@@ -245,6 +260,10 @@ func (w *Worker) statusLoop() {
 		cancel()
 
 		if err != nil {
+			if errors.Is(err, api.ErrCertFatal) {
+				w.handleCertFatal(err)
+				return
+			}
 			if errors.Is(err, api.ErrAuthFailed) {
 				w.handleAuthFailure()
 				return
@@ -324,16 +343,52 @@ func (w *Worker) initiateGracefulStop() {
 func (w *Worker) handleReload() {
 	fmt.Printf("%s Reloading configuration...\n", util.Ts())
 
-	configChanges, err := config.Reload()
+	result, err := config.Reload()
 	if err != nil {
-		fmt.Printf("%s Config reload error: %s\n", util.Ts(), err)
+		// Unreadable/corrupt config.json: keep running on the previous
+		// in-memory values. The user's changes stay on disk until they
+		// fix the file.
+		fmt.Printf("%s Config reload error (keeping previous values): %s\n", util.Ts(), err)
 	} else {
-		fmt.Printf("%s Config: %s\n", util.Ts(), configChanges)
+		fmt.Printf("%s Config: %s\n", util.Ts(), result.Summary)
+		for _, f := range result.InvalidFields {
+			fmt.Printf("%s   ! %s\n", util.Ts(), f)
+		}
+
+		// site_hostname and enable_mtls are locked — config.Reload has
+		// already reverted them in memory, so we only need to warn the user
+		// that the on-disk change will take effect after a restart.
+		if result.HostnameChanged {
+			fmt.Printf("%s   ! site_hostname change detected — restart worker to apply. Value reverted in memory.\n", util.Ts())
+		}
+		if result.MTLSChanged {
+			fmt.Printf("%s   ! enable_mtls change detected — restart worker to apply. Value reverted in memory.\n", util.Ts())
+		}
+
+		// Proxy toggle: rebuild the HTTP client transport. Any in-flight
+		// requests on the old transport drain naturally; retries use the new.
+		if result.ProxyChanged {
+			api.Reconfigure(config.Get().UseSystemProxy)
+			fmt.Printf("%s   HTTP client rebuilt (use_system_proxies=%v)\n", util.Ts(), config.Get().UseSystemProxy)
+		}
+
+		if result.KeysChanged {
+			// No explicit action needed — config.Get() is what Authenticate reads.
+			// Any future 401 will re-auth with the new credentials.
+			fmt.Printf("%s   Access keys updated — applied on next re-auth.\n", util.Ts())
+		}
+
+		if result.ConcurrencyChanged {
+			// util.DynamicGate reads config.Get() on each Acquire, so the
+			// next part download / upload picks up the new value. No
+			// plumbing needed — just surface the fact in the log.
+			fmt.Printf("%s   Concurrency limits applied to new operations (in-flight ones finish on old limit).\n", util.Ts())
+		}
 	}
 
 	capsChanges, err := config.ReloadCapabilities()
 	if err != nil {
-		fmt.Printf("%s Capabilities reload error: %s\n", util.Ts(), err)
+		fmt.Printf("%s Capabilities reload error (keeping previous values): %s\n", util.Ts(), err)
 	} else {
 		fmt.Printf("%s Capabilities: %s\n", util.Ts(), capsChanges)
 	}
@@ -361,6 +416,38 @@ func (w *Worker) handleFFmpegMissing() {
 	// Jobs that need FFmpeg can't proceed — cancel them.
 	// Jobs already in upload/complete don't need FFmpeg — let them finish.
 	// shutdown() will wait up to 30s for any remaining uploading jobs.
+	for _, job := range w.manager.ActiveJobs() {
+		phase := job.Phase()
+		if phase != "uploading" && phase != "completing" {
+			job.Cancel()
+		}
+	}
+	w.cancel() // exit poll loop
+}
+
+// handleCertFatal is invoked when api.ErrCertFatal bubbles up from any API
+// call — i.e. the in-memory leaf cert's NotBefore/NotAfter window has been
+// violated, or the server returned 403 and a re-check confirmed the cert is
+// outside its validity window. Nothing the worker can do locally fixes this
+// (the cert is immutable for the process lifetime), so we shut down cleanly
+// and let the operator renew the cert before restarting.
+//
+// Uploading/completing jobs are allowed to finish — they need R2, not our
+// worker-API cert — while download/probe/transcode jobs are cancelled so
+// they don't keep hitting the same fatal error.
+func (w *Worker) handleCertFatal(err error) {
+	if w.stopping.Swap(true) {
+		return // another goroutine already handling this
+	}
+	fmt.Println()
+	fmt.Printf("%s ==========================================================\n", util.Ts())
+	fmt.Printf("%s FATAL: mTLS client certificate invalid.\n", util.Ts())
+	fmt.Printf("%s %s\n", util.Ts(), err)
+	fmt.Println()
+	fmt.Printf("%s Renew cert/client.crt and restart the worker.\n", util.Ts())
+	fmt.Printf("%s ==========================================================\n", util.Ts())
+	fmt.Println()
+
 	for _, job := range w.manager.ActiveJobs() {
 		phase := job.Phase()
 		if phase != "uploading" && phase != "completing" {

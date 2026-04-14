@@ -87,12 +87,12 @@ const downloadPartSize = 32 * 1024 * 1024
 
 // Job represents a single transcoding job.
 type Job struct {
-	JobID          string
-	VideoID        int
-	DownloadURL    string
-	EncryptionKey  string // hex-encoded AES-128 key (empty = no encryption)
-	Manager        *Manager
-	Progress       *progress.Tracker
+	JobID         string
+	VideoID       int
+	DownloadURL   string
+	EncryptionKey string // hex-encoded AES-128 key (empty = no encryption)
+	Manager       *Manager
+	Progress      *progress.Tracker
 
 	// Server-provided transcoding config (per-course or global defaults).
 	OutputProfiles            []config.OutputProfile
@@ -129,12 +129,12 @@ func NewJob(jobID string, videoID int, downloadURL string, encryptionKey string,
 	outputProfiles []config.OutputProfile, audioNorm bool, audioNormTarget, audioNormPeak, audioNormMaxGain float64) *Job {
 	jobCtx, cancel := context.WithCancel(context.Background())
 	j := &Job{
-		JobID:          jobID,
-		VideoID:        videoID,
-		DownloadURL:    downloadURL,
-		EncryptionKey:  encryptionKey,
-		Manager:        mgr,
-		Progress:       tracker,
+		JobID:         jobID,
+		VideoID:       videoID,
+		DownloadURL:   downloadURL,
+		EncryptionKey: encryptionKey,
+		Manager:       mgr,
+		Progress:      tracker,
 
 		OutputProfiles:            outputProfiles,
 		AudioNormalization:        audioNorm,
@@ -398,17 +398,18 @@ func (j *Job) downloadHead() (int64, error) {
 
 // downloadMultipart downloads the source file in 32 MB parts concurrently,
 // then concatenates them into source.mp4.
+//
+// Concurrency is bounded by util.DynamicGate, which re-reads the live
+// config.Get().ConcurrentDownloads on every Acquire. A mid-download reload
+// that raises the limit ramps up parked goroutines; a lowered limit blocks
+// new acquires until active count drops — already-running parts finish.
 func (j *Job) downloadMultipart(totalSize int64) error {
 	numParts := int((totalSize + downloadPartSize - 1) / downloadPartSize)
 
-	cfg := config.Get()
-	concurrency := cfg.ConcurrentDownloads
-	if concurrency <= 0 {
-		concurrency = 5
-	}
+	startCap := config.Get().ConcurrentDownloads
 
-	fmt.Printf("%s [%s] downloading %s in %d parts (concurrency %d)\n",
-		util.Ts(), j.JobID, formatDownloadBytes(totalSize), numParts, concurrency)
+	fmt.Printf("%s [%s] downloading %s in %d parts (concurrency %d, live)\n",
+		util.Ts(), j.JobID, formatDownloadBytes(totalSize), numParts, startCap)
 
 	// Shared atomic byte counter: updated in real-time by all part goroutines.
 	var downloaded int64
@@ -453,7 +454,7 @@ func (j *Job) downloadMultipart(totalSize int64) error {
 
 	// Per-part error storage — one writer per index, no mutex needed.
 	partErrors := make([]error, numParts)
-	sem := make(chan struct{}, concurrency)
+	gate := util.NewDynamicGate(func() int { return config.Get().ConcurrentDownloads })
 
 	var wg sync.WaitGroup
 	for i := 0; i < numParts; i++ {
@@ -461,13 +462,12 @@ func (j *Job) downloadMultipart(totalSize int64) error {
 		go func(partNum int) {
 			defer wg.Done()
 
-			// Acquire semaphore, abort if already cancelled by another part.
-			select {
-			case sem <- struct{}{}:
-			case <-dlCtx.Done():
+			// Block until a gate slot frees. Returns early if dlCtx was
+			// cancelled (another part failed) — no slot was taken so no release.
+			if err := gate.Acquire(dlCtx); err != nil {
 				return
 			}
-			defer func() { <-sem }()
+			defer gate.Release()
 
 			if dlCtx.Err() != nil {
 				return
@@ -890,7 +890,8 @@ func (j *Job) remuxProfile(sourcePath, profileDir string, profile transcoder.Fil
 		j.SetStage("processing", globalPct)
 	}
 	// Drain any remaining items so the FFmpeg goroutine can close the channel.
-	for range progressCh {}
+	for range progressCh {
+	}
 
 	return <-errCh
 }
@@ -954,7 +955,8 @@ func (j *Job) transcodeProfile(sourcePath, profileDir string, profile transcoder
 			j.SetStage("processing", globalPct)
 		}
 		// Drain any remaining items so the FFmpeg goroutine can close the channel.
-		for range progressCh {}
+		for range progressCh {
+		}
 
 		err := <-errCh
 		if err == nil {
@@ -1081,17 +1083,18 @@ func (j *Job) fetchUploadURLsWithRetry(ctx context.Context, tasks []uploadTask) 
 // refresh.
 //
 // ctx is j.ctx — the job's own context (rooted at Background, not the worker ctx).
+//
+// Upload concurrency is bounded by util.DynamicGate, which re-reads the live
+// config.Get().ConcurrentUploads on every Acquire. Reloading mid-upload
+// takes effect immediately for new acquires; already-running PUTs finish
+// regardless of the cap change.
 func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, allURLs map[string]string) error {
-	cfg := config.Get()
-	concurrency := cfg.ConcurrentUploads
-	if concurrency <= 0 {
-		concurrency = 10
-	}
+	startCap := config.Get().ConcurrentUploads
 
 	totalFiles := len(tasks)
 	var uploaded int64 // atomic counter shared across both passes
 
-	fmt.Printf("%s [%s] uploading %d files\n", util.Ts(), j.JobID, totalFiles)
+	fmt.Printf("%s [%s] uploading %d files (concurrency %d, live)\n", util.Ts(), j.JobID, totalFiles, startCap)
 
 	// Progress publisher: drives console output + local j.reportProgress.
 	// Worker status loop reads the latter on its own 2-second cadence.
@@ -1122,7 +1125,7 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 	}()
 
 	// First pass: upload everything
-	failed, anyForbidden, firstErr := j.uploadConcurrent(ctx, tasks, allURLs, concurrency, totalFiles, &uploaded)
+	failed, anyForbidden, firstErr := j.uploadConcurrent(ctx, tasks, allURLs, totalFiles, &uploaded)
 	if len(failed) == 0 {
 		fmt.Printf("%s [%s] upload complete\n", util.Ts(), j.JobID)
 		return nil
@@ -1149,7 +1152,7 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 	}
 
 	// Second pass: retry failed files with fresh tokens
-	failed2, _, firstErr2 := j.uploadConcurrent(ctx, failed, allURLs, concurrency, totalFiles, &uploaded)
+	failed2, _, firstErr2 := j.uploadConcurrent(ctx, failed, allURLs, totalFiles, &uploaded)
 
 	if ctx.Err() != nil {
 		return fmt.Errorf("aborted during upload retry: %w", ctx.Err())
@@ -1171,11 +1174,13 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 //   - On 403 (ErrUploadForbidden): cancels remaining in-flight uploads and
 //     returns all unfinished tasks in failed (so the caller can refresh tokens).
 //   - Returns (failed tasks, anyForbidden, first non-cancellation error).
+//   - Concurrency is bounded by a DynamicGate reading config.Get().ConcurrentUploads
+//     live, so a reload mid-upload applies to subsequent acquires.
 func (j *Job) uploadConcurrent(
 	ctx context.Context,
 	tasks []uploadTask,
 	urls map[string]string,
-	concurrency, totalFiles int,
+	totalFiles int,
 	uploaded *int64,
 ) (failed []uploadTask, anyForbidden bool, firstErr error) {
 	type uploadResult struct {
@@ -1188,7 +1193,7 @@ func (j *Job) uploadConcurrent(
 	uploadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	sem := make(chan struct{}, concurrency)
+	gate := util.NewDynamicGate(func() int { return config.Get().ConcurrentUploads })
 	resultCh := make(chan uploadResult, len(tasks))
 
 	var wg sync.WaitGroup
@@ -1197,14 +1202,12 @@ func (j *Job) uploadConcurrent(
 		go func(task uploadTask) {
 			defer wg.Done()
 
-			// Acquire semaphore slot, respecting cancellation
-			select {
-			case sem <- struct{}{}:
-			case <-uploadCtx.Done():
-				resultCh <- uploadResult{task: task, err: uploadCtx.Err()}
+			// Acquire a gate slot (blocks until active < live cap), respecting cancellation.
+			if err := gate.Acquire(uploadCtx); err != nil {
+				resultCh <- uploadResult{task: task, err: err}
 				return
 			}
-			defer func() { <-sem }()
+			defer gate.Release()
 
 			url := urls[task.relPath]
 			if url == "" {
