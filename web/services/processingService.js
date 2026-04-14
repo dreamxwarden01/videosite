@@ -2,12 +2,30 @@ const crypto = require('crypto');
 const { getPool } = require('../config/database');
 
 // Base62 12-char job ID generator (matches hashed_video_id family).
+// Collision probability in a 62^12 space is astronomically low (~10^-14 at
+// 10k concurrent jobs), but the column has no UNIQUE constraint so a freak
+// collision would silently double-write to the same job_id. The retry loop
+// keeps the old behavior: generate → SELECT → retry if taken.
 const JOB_ID_BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-function generateJobId() {
+function generateJobIdCandidate() {
     const buf = crypto.randomBytes(12);
     let out = '';
     for (let i = 0; i < 12; i++) out += JOB_ID_BASE62[buf[i] % 62];
     return out;
+}
+async function generateJobId() {
+    const pool = getPool();
+    for (let attempt = 0; attempt < 10; attempt++) {
+        const candidate = generateJobIdCandidate();
+        const [existing] = await pool.execute(
+            'SELECT 1 FROM processing_queue WHERE job_id = ? LIMIT 1',
+            [candidate]
+        );
+        if (existing.length === 0) return candidate;
+    }
+    // 10 consecutive collisions in a 62^12 space is effectively impossible —
+    // if it happens, the DB is almost certainly corrupted or the PRNG broken.
+    throw new Error('generateJobId: 10 consecutive collisions — aborting');
 }
 
 // --- Per-job stale detection timers ---
@@ -313,7 +331,7 @@ async function reserveTasks(maxCount) {
 async function leaseTask(videoId, workerKeyId) {
     const pool = getPool();
 
-    const jobId = generateJobId();
+    const jobId = await generateJobId();
 
     // Atomically update pending → leased for this specific video
     const [result] = await pool.execute(
