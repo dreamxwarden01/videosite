@@ -130,21 +130,28 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
     setUploadProgress(0);
     setUploading(true);
 
-    await multipartUpload({
-      file,
-      createUrl: '/api/upload/replace',
-      createBody: {
-        videoId: video.video_id,
-        filename: file.name,
-        fileSize: file.size,
-        contentType: file.type || 'application/octet-stream',
-      },
-      onProgress: (percent, uploaded, total) => {
-        setUploadProgress(percent);
-        setUploadText(`${percent}% (${(uploaded / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB)`);
-      },
-      onAbortRef: abortRef,
-    });
+    try {
+      await multipartUpload({
+        file,
+        createUrl: '/api/upload/replace',
+        createBody: {
+          videoId: video.video_id,
+          filename: file.name,
+          fileSize: file.size,
+          contentType: file.type || 'application/octet-stream',
+        },
+        onProgress: (percent, uploaded, total) => {
+          setUploadProgress(percent);
+          setUploadText(`${percent}% (${(uploaded / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB)`);
+        },
+        onAbortRef: abortRef,
+      });
+    } finally {
+      // Clear uploading on both success and error so the beforeunload
+      // handler detaches before the success screen renders. The catch in
+      // handleAction still handles error UX; we just own the flag here.
+      setUploading(false);
+    }
   }
 
   async function handleAction() {
