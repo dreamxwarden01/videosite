@@ -132,12 +132,27 @@ async function updateTaskStatus(jobId, status, progress = null, errorMessage = n
     }
     values.push(jobId);
 
+    // Guard: never downgrade a terminal state (completed / error) back to a
+    // processing state. Stale worker status reports can race with a successful
+    // /task/complete when the same worker holds another in-flight job — the
+    // job that just completed may still be in the worker's next /task/status
+    // batch because the job goroutine hasn't finished its defer cleanup yet.
+    // Without this guard that batch would flip the row from 'completed' back
+    // to 'processing', re-arm the stale timer, and 2 minutes later the stale
+    // sweep would wipe the already-uploaded HLS output from R2.
+    //
+    // Admin-driven resets (retryFailedVideo, video replace) update the queue
+    // row directly and don't route through updateTaskStatus, so they're
+    // unaffected by this guard.
     const [result] = await pool.execute(
-        `UPDATE processing_queue SET ${fields.join(', ')} WHERE job_id = ?`,
+        `UPDATE processing_queue SET ${fields.join(', ')}
+         WHERE job_id = ? AND status NOT IN ('completed', 'error')`,
         values
     );
 
-    // Job not found — 404 signals abort to worker
+    // affectedRows === 0 means either the job_id doesn't exist OR the row is
+    // already in a terminal state. Either way, tell the worker to drop the
+    // job — there's nothing left to update on the server side.
     if (result.affectedRows === 0) {
         return { found: false };
     }

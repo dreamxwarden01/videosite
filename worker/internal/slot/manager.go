@@ -181,6 +181,15 @@ func (m *Manager) SnapshotStatuses() []api.JobStatus {
 
 	statuses := make([]api.JobStatus, 0, len(m.activeJobs)+len(m.pendingTerminal))
 	for jobID, j := range m.activeJobs {
+		// Skip jobs whose /task/complete call is in flight. Their last stored
+		// stage is still "uploading 99%" (Progress.Remove runs only after
+		// CompleteTask returns), and a concurrent status batch would race with
+		// the server's terminal write — on the server this is already blocked
+		// by updateTaskStatus's NOT IN ('completed','error') guard, but
+		// skipping locally avoids sending a known-stale entry at all.
+		if j.Phase() == "completing" {
+			continue
+		}
 		stage, progress := j.currentReport()
 		if stage == "" {
 			continue // Job not yet reporting (init phase)
