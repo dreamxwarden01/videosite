@@ -19,6 +19,7 @@ import (
 	"videosite-worker/internal/hardware"
 	"videosite-worker/internal/mtls"
 	"videosite-worker/internal/transcoder"
+	"videosite-worker/internal/ui"
 	"videosite-worker/internal/util"
 	"videosite-worker/internal/worker"
 )
@@ -96,19 +97,31 @@ func main() {
 
 	printHardwareInfo(caps)
 
-	// 6. Create the worker
-	w := worker.New()
+	// 6. Build the shared UI manager. Everything after this point — worker
+	// status, per-job bars, slog output — goes through uiMgr. The startup
+	// banner above stays on plain stdout because those lines happen before
+	// uiMgr exists (and before there's any progress bar to render beside).
+	uiMgr := ui.NewManager()
+	defer uiMgr.Close()
 
-	// 7. Handle OS interrupt signals — trigger graceful stop (same as "stop" command)
+	// Route slog through the UI manager so its records interleave correctly
+	// with the sticky progress bars. The level stays LevelInfo to match the
+	// prior text handler; Debug lines remain filtered out.
+	slog.SetDefault(slog.New(ui.SlogHandler(uiMgr, slog.LevelInfo)))
+
+	// 7. Create the worker, handing it the shared UI manager.
+	w := worker.New(uiMgr)
+
+	// 8. Handle OS interrupt signals — trigger graceful stop (same as "stop" command)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Println("\nInterrupt received — initiating graceful stop...")
+		uiMgr.Logf("Interrupt received — initiating graceful stop...")
 		w.GracefulStop()
 	}()
 
-	// 8. Start the worker
+	// 9. Start the worker (blocks until Run returns).
 	w.Run()
 }
 

@@ -18,6 +18,7 @@ import (
 	"videosite-worker/internal/config"
 	"videosite-worker/internal/hardware"
 	"videosite-worker/internal/transcoder"
+	"videosite-worker/internal/ui"
 	"videosite-worker/internal/util"
 	"videosite-worker/internal/worker/progress"
 )
@@ -53,6 +54,9 @@ func (c *byteCounter) Write(p []byte) (int, error) {
 type uploadTask struct {
 	relPath string // relative path from outputDir
 	absPath string // absolute local filesystem path
+	size    int64  // file size in bytes — captured during the output walk so
+	// upload progress can advance per-byte (smooth) instead of per-file
+	// (chunky 1/N% jumps when N is small)
 }
 
 // partWriter is an io.Writer that atomically increments a shared progress counter
@@ -94,6 +98,16 @@ type Job struct {
 	Manager       *Manager
 	Progress      *progress.Tracker
 
+	// LeasedAt is the wall-clock time the worker leased this job from the
+	// server. Used by the UI manager to sort the sticky progress bars
+	// oldest-first; no server-facing role.
+	LeasedAt time.Time
+
+	// UI is the user-visible output surface (sticky progress bars + log
+	// lines above). All job-owned stdout goes through it. Never nil — the
+	// worker constructs one Manager at startup and passes it to every Job.
+	UI ui.Manager
+
 	// Server-provided transcoding config (per-course or global defaults).
 	OutputProfiles            []config.OutputProfile
 	AudioNormalization        bool
@@ -125,7 +139,11 @@ type Job struct {
 // from the worker context. This means the worker can cancel its own poll loop
 // (w.cancel) without affecting active jobs; jobs are cancelled individually
 // via job.Cancel() when the worker needs to abort them.
-func NewJob(jobID string, videoID int, downloadURL string, encryptionKey string, initialEncoder config.Encoder, mgr *Manager, tracker *progress.Tracker,
+//
+// LeasedAt is captured here (time.Now) rather than passed in by the caller so
+// every Job carries a consistent timestamp regardless of how the caller was
+// written; it only influences UI bar ordering.
+func NewJob(jobID string, videoID int, downloadURL string, encryptionKey string, initialEncoder config.Encoder, mgr *Manager, tracker *progress.Tracker, uiMgr ui.Manager,
 	outputProfiles []config.OutputProfile, audioNorm bool, audioNormTarget, audioNormPeak, audioNormMaxGain float64) *Job {
 	jobCtx, cancel := context.WithCancel(context.Background())
 	j := &Job{
@@ -135,6 +153,8 @@ func NewJob(jobID string, videoID int, downloadURL string, encryptionKey string,
 		EncryptionKey: encryptionKey,
 		Manager:       mgr,
 		Progress:      tracker,
+		LeasedAt:      time.Now(),
+		UI:            uiMgr,
 
 		OutputProfiles:            outputProfiles,
 		AudioNormalization:        audioNorm,
@@ -212,21 +232,50 @@ func (j *Job) MarkAborted(reason string) {
 }
 
 // Run executes the full job lifecycle: download → probe → transcode → upload → complete.
+//
+// The first thing Run does is register with the UI manager so the sticky
+// bar appears and the "leased" line is logged. Every terminal path
+// (handleError branches + the normal completion below) calls
+// j.UI.FinishJob to drop the bar; the UI contract treats FinishJob as
+// idempotent so there's no risk of double-calls.
 func (j *Job) Run() error {
+	profileNames := make([]string, 0, len(j.OutputProfiles))
+	for _, p := range j.OutputProfiles {
+		profileNames = append(profileNames, p.Name)
+	}
+	j.UI.StartJob(j.JobID, j.LeasedAt, profileNames, j.AudioNormalization)
+
 	defer j.cancel()
 	defer j.Manager.ReleaseSlot(j.JobID)
 	defer j.cleanup()
 
-	fmt.Printf("%s [%s] job started (video %d, encoder %s device %d)\n", util.Ts(), j.JobID, j.VideoID, j.initialEncoder.EncoderType, j.initialEncoder.DeviceIndex)
+	j.UI.Logf("[%s] job started (video %d, encoder %s device %d)",
+		j.JobID, j.VideoID, j.initialEncoder.EncoderType, j.initialEncoder.DeviceIndex)
 
 	// 1. DOWNLOAD
 	j.phase.Store("downloading")
+	j.UI.UpdateStage(j.JobID, "downloading", 0)
 	if err := j.download(); err != nil {
 		return j.handleError("download", err)
 	}
 
 	// 2. PROBE
+	//
+	// Probe is a 1–2s ffprobe call. We deliberately do NOT call
+	// UpdateStage here — that would reset the bar to "probing 0%" and
+	// leave it stuck there for the entire probe, then snap to
+	// "analyzing audio 0%" the moment probe finishes. The user-visible
+	// effect was a confusing flash-of-empty-bar between two real stages.
+	//
+	// Instead the bar stays at "downloading 100%" (pinned by
+	// downloadMultipart / downloadSingle just before they returned) and
+	// the audit log gets the boundary line via Logf directly. The next
+	// real stage (analyzing audio or remuxing/transcoding) is the next
+	// thing that calls UpdateStage and resets the bar.
 	j.phase.Store("probing")
+	j.Progress.Update(j.JobID, "probing", 10)
+	j.SetStage("probing", 10)
+	j.UI.LogStageBoundary(j.JobID, "probing", 10)
 	probe, err := j.probe()
 	if err != nil {
 		return j.handleError("probe", err)
@@ -252,6 +301,7 @@ func (j *Job) Run() error {
 
 	// 7. UPLOAD
 	j.phase.Store("uploading")
+	j.UI.UpdateStage(j.JobID, "uploading", 90)
 	if err := j.upload(); err != nil {
 		return j.handleError("upload", err)
 	}
@@ -259,9 +309,10 @@ func (j *Job) Run() error {
 	// 8. COMPLETE — retry is embedded inside api.CompleteTask
 	// (5 attempts, 0/1/2/3/4 s backoff, 204 success, 404 = gone, 401 re-auth).
 	j.phase.Store("completing")
+	j.UI.UpdateStage(j.JobID, "completing", 99)
 	err = api.CompleteTask(j.ctx, j.JobID, api.CompletePayload{DurationSeconds: j.duration})
 	if err != nil && !errors.Is(err, api.ErrJobNotFound) && !errors.Is(err, api.ErrCompleteRetriesExhausted) {
-		fmt.Printf("%s [%s] ERROR: failed to report completion: %v\n", util.Ts(), j.JobID, err)
+		j.UI.Logf("[%s] ERROR: failed to report completion: %v", j.JobID, err)
 	}
 	// ErrJobNotFound: job was deleted while we were uploading. Upload is done,
 	// R2 files exist — server's delayed R2 cleanup handles it.
@@ -269,7 +320,7 @@ func (j *Job) Run() error {
 	// be reached; the server's `processing` timeout will eventually requeue.
 
 	j.Progress.Remove(j.JobID)
-	fmt.Printf("%s [%s] completed\n", util.Ts(), j.JobID)
+	j.UI.FinishJob(j.JobID, "completed")
 	return nil
 }
 
@@ -293,7 +344,7 @@ func (j *Job) download() error {
 	var dlErr error
 	if totalSize <= 0 {
 		// No Content-Length: fall back to single-connection download
-		fmt.Printf("%s [%s] no Content-Length from R2, using single-connection download\n", util.Ts(), j.JobID)
+		j.UI.Logf("[%s] no Content-Length from R2, using single-connection download", j.JobID)
 		dlErr = j.downloadSingle()
 	} else {
 		dlErr = j.downloadMultipart(totalSize)
@@ -333,7 +384,7 @@ func (j *Job) downloadWithRetry(ctx context.Context, buildReq func() (*http.Requ
 		if err != nil {
 			lastErr = err
 			if i < len(delays)-1 {
-				fmt.Printf("%s [%s] WARN: R2 request error, retrying (%d/%d): %v\n", util.Ts(), j.JobID, i+1, len(delays), err)
+				j.UI.Logf("[%s] WARN: R2 request error, retrying (%d/%d): %v", j.JobID, i+1, len(delays), err)
 			}
 			continue
 		}
@@ -350,7 +401,7 @@ func (j *Job) downloadWithRetry(ctx context.Context, buildReq func() (*http.Requ
 			resp.Body.Close()
 			lastErr = fmt.Errorf("R2 5xx (status %d)", resp.StatusCode)
 			if i < len(delays)-1 {
-				fmt.Printf("%s [%s] WARN: R2 5xx (status %d), retrying (%d/%d)\n", util.Ts(), j.JobID, resp.StatusCode, i+1, len(delays))
+				j.UI.Logf("[%s] WARN: R2 5xx (status %d), retrying (%d/%d)", j.JobID, resp.StatusCode, i+1, len(delays))
 			}
 		default:
 			resp.Body.Close()
@@ -408,18 +459,26 @@ func (j *Job) downloadMultipart(totalSize int64) error {
 
 	startCap := config.Get().ConcurrentDownloads
 
-	fmt.Printf("%s [%s] downloading %s in %d parts (concurrency %d, live)\n",
-		util.Ts(), j.JobID, formatDownloadBytes(totalSize), numParts, startCap)
+	j.UI.Logf("[%s] downloading %s in %d parts (concurrency %d, live)",
+		j.JobID, formatDownloadBytes(totalSize), numParts, startCap)
 
 	// Shared atomic byte counter: updated in real-time by all part goroutines.
 	var downloaded int64
 
-	// Progress reporting goroutine: fires every 2s for the duration of the download.
-	// Console shows local 0-100%; API reports global 0-9% (download phase slice).
+	// Progress reporting goroutine: fires every 250ms for the duration of
+	// the download. UI bar shows local 0-100%; API reports global 0-9%
+	// (download phase slice). The per-1% console print that used to live
+	// here was removed — the bar supersedes it.
+	//
+	// The previous 2s tick was visibly chunky on small jobs (a 130 MB
+	// download finishes in 1–2 ticks total) and even on large ones — with
+	// 5-way concurrent 32 MB parts, ~150 MB lands per tick, so the bar
+	// jumped in ~20% steps. The atomic load and one UI write per tick are
+	// trivial, so dropping to 250ms (matches the bar render rate) buys
+	// smoothness for free.
 	stopProgress := make(chan struct{})
-	lastConsolePct := -1
 	go func() {
-		ticker := time.NewTicker(2 * time.Second)
+		ticker := time.NewTicker(250 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
@@ -433,13 +492,10 @@ func (j *Job) downloadMultipart(totalSize int64) error {
 				if localPct > 100 {
 					localPct = 100
 				}
-				if localPct != lastConsolePct {
-					fmt.Printf("%s [%s] downloading: %d%%\n", util.Ts(), j.JobID, localPct)
-					lastConsolePct = localPct
-				}
-				globalPct := localPct / 10 // 0-9% globally
-				if globalPct > 9 {
-					globalPct = 9
+				j.UI.UpdateStageProgress(j.JobID, localPct)
+				globalPct := localPct / 10 // 0-10% globally
+				if globalPct > 10 {
+					globalPct = 10
 				}
 				j.Progress.Update(j.JobID, "downloading", globalPct)
 				j.SetStage("downloading", globalPct)
@@ -523,7 +579,14 @@ func (j *Job) downloadMultipart(totalSize int64) error {
 		os.Remove(filepath.Join(j.tempDir, fmt.Sprintf("part_%06d", i)))
 	}
 
-	fmt.Printf("%s [%s] download complete\n", util.Ts(), j.JobID)
+	// Pin the bar to 100% before the next stage begins. Without this the
+	// bar would visibly read whatever value the last 250ms poll captured
+	// (typically 96–99% — the final part finishes between ticks), then
+	// snap to "downloading 100%" only if the user happened to be looking
+	// during the 1–2s probe window. The user-perceived effect was "the
+	// bar never quite reaches 100% during downloading".
+	j.UI.UpdateStageProgress(j.JobID, 100)
+	j.UI.Logf("[%s] download complete", j.JobID)
 	return nil
 }
 
@@ -568,7 +631,7 @@ func (j *Job) downloadPart(ctx context.Context, partPath string, start, end int6
 		if err != nil {
 			lastErr = err
 			if i < len(delays)-1 {
-				fmt.Printf("%s [%s] WARN: part %d request error, retrying (%d/%d): %v\n", util.Ts(), j.JobID, partNum, i+1, len(delays), err)
+				j.UI.Logf("[%s] WARN: part %d request error, retrying (%d/%d): %v", j.JobID, partNum, i+1, len(delays), err)
 			}
 			continue
 		}
@@ -583,7 +646,7 @@ func (j *Job) downloadPart(ctx context.Context, partPath string, start, end int6
 			resp.Body.Close()
 			lastErr = fmt.Errorf("R2 5xx (status %d)", resp.StatusCode)
 			if i < len(delays)-1 {
-				fmt.Printf("%s [%s] WARN: part %d R2 5xx (status %d), retrying (%d/%d)\n", util.Ts(), j.JobID, partNum, resp.StatusCode, i+1, len(delays))
+				j.UI.Logf("[%s] WARN: part %d R2 5xx (status %d), retrying (%d/%d)", j.JobID, partNum, resp.StatusCode, i+1, len(delays))
 			}
 			continue
 		default:
@@ -613,7 +676,7 @@ func (j *Job) downloadPart(ctx context.Context, partPath string, start, end int6
 
 		lastErr = fmt.Errorf("stream read: %w", copyErr)
 		if i < len(delays)-1 {
-			fmt.Printf("%s [%s] WARN: part %d stream error, retrying (%d/%d): %v\n", util.Ts(), j.JobID, partNum, i+1, len(delays), copyErr)
+			j.UI.Logf("[%s] WARN: part %d stream error, retrying (%d/%d): %v", j.JobID, partNum, i+1, len(delays), copyErr)
 		}
 		os.Remove(partPath) // remove the partial file before retrying
 	}
@@ -671,7 +734,10 @@ func (j *Job) downloadSingle() error {
 		return fmt.Errorf("save source file: %w", copyErr)
 	}
 
-	fmt.Printf("%s [%s] download complete\n", util.Ts(), j.JobID)
+	// See doDownloadMultipart's matching call — pin the bar to 100% so
+	// the brief probe window doesn't display a stuck "downloading 97%".
+	j.UI.UpdateStageProgress(j.JobID, 100)
+	j.UI.Logf("[%s] download complete", j.JobID)
 	return nil
 }
 
@@ -698,7 +764,7 @@ func (j *Job) probe() (*transcoder.ProbeResult, error) {
 	}
 
 	j.duration = probe.DurationSeconds
-	fmt.Printf("%s [%s] probe complete: %dx%d, %.1fs, %s\n", util.Ts(), j.JobID, probe.Width, probe.Height, probe.DurationSeconds, probe.Codec)
+	j.UI.Logf("[%s] probe complete: %dx%d, %.1fs, %s", j.JobID, probe.Width, probe.Height, probe.DurationSeconds, probe.Codec)
 
 	// Stage is picked up by the next /task/status tick (worker status loop
 	// reads SnapshotStatuses every 2 s). Duration is NOT pushed into the
@@ -745,51 +811,58 @@ func (j *Job) prepareEncryption() (string, error) {
 		return "", fmt.Errorf("write key info file: %w", err)
 	}
 
-	fmt.Printf("%s [%s] encryption prepared\n", util.Ts(), j.JobID)
+	j.UI.Logf("[%s] encryption prepared", j.JobID)
 	return keyInfoPath, nil
 }
 
 // analyzeLoudness runs a loudnorm pass-1 analysis if audio normalization is
 // enabled in config. Returns the loudnorm filter string for pass 2, or "" if
 // normalization is disabled or the source has no audio stream.
+//
+// Progress wiring: when norm is on, analyze is step 0 of the weighted 10–90
+// processing plan. The bar shows 0–100 local pct; the server-facing global
+// pct advances through the analyze span instead of staying pinned at 10
+// until the first profile starts.
 func (j *Job) analyzeLoudness(probe *transcoder.ProbeResult) (string, error) {
 	if !j.AudioNormalization {
 		return "", nil
 	}
 	if probe.AudioCodec == "" {
-		fmt.Printf("%s [%s] audio normalization: no audio stream, skipping\n", util.Ts(), j.JobID)
+		j.UI.Logf("[%s] audio normalization: no audio stream, skipping", j.JobID)
 		return "", nil
 	}
 
-	j.Progress.Update(j.JobID, "analyzing audio", 10)
-	j.SetStage("processing", 10)
-	fmt.Printf("%s [%s] analyzing audio loudness (EBU R128)...\n", util.Ts(), j.JobID)
+	// Step 0 of the processing plan when normOn = true.
+	plan := processingPlan(len(j.OutputProfiles), true)
+	aStart, aEnd := stepRange(plan, 0)
 
-	// No internal heartbeat — worker status loop picks up the stage/progress
-	// we set above on its own 2-second cadence.
+	j.Progress.Update(j.JobID, "analyzing audio", int(aStart))
+	j.SetStage("processing", int(aStart))
+	j.UI.UpdateStage(j.JobID, "analyzing audio", int(aStart))
+	j.UI.Logf("[%s] analyzing audio loudness (EBU R128)...", j.JobID)
+
 	sourcePath := filepath.Join(j.tempDir, "source.mp4")
-	lastPct := -1
 	stats, err := transcoder.AnalyzeLoudness(j.ctx, sourcePath, j.duration, func(pct int) {
-		if pct != lastPct {
-			fmt.Printf("%s [%s] analyzing audio: %d%%\n", util.Ts(), j.JobID, pct)
-			lastPct = pct
-		}
+		j.UI.UpdateStageProgress(j.JobID, pct)
+		globalPct := scaleLocal(aStart, aEnd, pct)
+		j.Progress.Update(j.JobID, "analyzing audio", globalPct)
+		j.SetStage("processing", globalPct)
 	})
 	if err != nil {
 		if j.ctx.Err() != nil {
 			return "", fmt.Errorf("aborted: %w", j.ctx.Err())
 		}
 		// Non-fatal: if analysis fails, proceed without normalization.
-		fmt.Printf("%s [%s] WARN: audio loudness analysis failed, skipping normalization: %v\n", util.Ts(), j.JobID, err)
+		j.UI.Logf("[%s] WARN: audio loudness analysis failed, skipping normalization: %v", j.JobID, err)
 		return "", nil
 	}
 	if stats == nil {
-		fmt.Printf("%s [%s] audio normalization: no audio detected by loudnorm, skipping\n", util.Ts(), j.JobID)
+		j.UI.Logf("[%s] audio normalization: no audio detected by loudnorm, skipping", j.JobID)
 		return "", nil
 	}
 
 	gainRequired := j.AudioNormalizationTarget - stats.InputI
-	fmt.Printf("[%s] audio: measured %.1f LUFS, target %.1f LUFS, gain required %.1f dB (max %.1f dB)\n",
+	j.UI.Logf("[%s] audio: measured %.1f LUFS, target %.1f LUFS, gain required %.1f dB (max %.1f dB)",
 		j.JobID, stats.InputI, j.AudioNormalizationTarget, gainRequired, j.AudioNormalizationMaxGain)
 
 	filter := transcoder.BuildLoudnormFilter(stats,
@@ -817,13 +890,32 @@ func (j *Job) transcode(probe *transcoder.ProbeResult, loudnormFilter string) ([
 	sourcePath := filepath.Join(j.tempDir, "source.mp4")
 	totalProfiles := len(profiles)
 
+	// Build the weighted progress plan once so every profile's global-pct
+	// span is computed consistently with the analyze pass (if any).
+	normOn := loudnormFilter != ""
+	plan := processingPlan(totalProfiles, normOn)
+
 	for i, profile := range profiles {
 		if err := j.ctx.Err(); err != nil {
 			return nil, fmt.Errorf("aborted: %w", err)
 		}
 
+		// Step index in the plan: 0 is analyze when normOn, so profiles
+		// start at 1; otherwise they start at 0.
+		stepIdx := i
+		if normOn {
+			stepIdx++
+		}
+		pStart, pEnd := stepRange(plan, stepIdx)
+		// Stage label kept short ("remuxing 1080p") — the profile name,
+		// step index, and codec details already appear in the surrounding
+		// Logf lines (the lease line lists the full profile set; the
+		// per-encoder messages name the codec). Putting all of that into
+		// the bar label too just chewed bar width and duplicated info
+		// that's two lines up in the scroll log.
+		stageLabel := fmt.Sprintf("%dp", profile.Height)
+
 		profileDir := filepath.Join(j.outputDir, profile.Name)
-		fmt.Printf("%s [%s] transcoding profile %d/%d: %s\n", util.Ts(), j.JobID, i+1, totalProfiles, profile.Name)
 
 		// Try remux first if eligible.
 		// With normalization active, remux copies video but re-encodes audio.
@@ -831,15 +923,13 @@ func (j *Job) transcode(probe *transcoder.ProbeResult, loudnormFilter string) ([
 			remuxTier := "remux"
 			if loudnormFilter != "" {
 				remuxTier = "remux+norm"
-				fmt.Printf("%s [%s] remuxing %s (copy video, normalize audio)\n", util.Ts(), j.JobID, profile.Name)
-			} else {
-				fmt.Printf("%s [%s] remuxing %s\n", util.Ts(), j.JobID, profile.Name)
 			}
+			j.UI.UpdateStage(j.JobID, "remuxing "+stageLabel, int(pStart))
 			remuxLog := ffmpegLogPath(j.JobID, profile.Name, remuxTier)
-			err := j.remuxProfile(sourcePath, profileDir, profile, keyInfoFile, remuxLog, i, totalProfiles, loudnormFilter)
+			err := j.remuxProfile(sourcePath, profileDir, profile, keyInfoFile, remuxLog, pStart, pEnd, loudnormFilter)
 			if err == nil {
-				fmt.Printf("%s [%s] remux successful: %s\n", util.Ts(), j.JobID, profile.Name)
-				j.reportProfileProgress(i, totalProfiles)
+				j.UI.Logf("[%s] remux successful: %s", j.JobID, profile.Name)
+				j.reportProfileProgress(pEnd)
 				continue
 			}
 			if j.ctx.Err() != nil {
@@ -848,45 +938,44 @@ func (j *Job) transcode(probe *transcoder.ProbeResult, loudnormFilter string) ([
 			if errors.Is(err, transcoder.ErrFFmpegMissing) {
 				return nil, err // Fatal — propagate without falling back to transcode
 			}
-			fmt.Printf("%s [%s] WARN: remux failed for %s, falling back to transcode: %v\n", util.Ts(), j.JobID, profile.Name, err)
+			j.UI.Logf("[%s] WARN: remux failed for %s, falling back to transcode: %v", j.JobID, profile.Name, err)
 			os.RemoveAll(profileDir) // Clean up failed remux
 		}
 
-		// Transcode with encoder fallback
-		if err := j.transcodeProfile(sourcePath, profileDir, profile, probe.DurationSeconds, i, totalProfiles, keyInfoFile, probe.Width, probe.Height, loudnormFilter); err != nil {
+		// Transcode with encoder fallback. The stage label and bar reset
+		// happen once here (not per-encoder-retry inside transcodeProfile) so
+		// hw→sw decode fallbacks don't spam the log.
+		j.UI.UpdateStage(j.JobID, "transcoding "+stageLabel, int(pStart))
+		if err := j.transcodeProfile(sourcePath, profileDir, profile, probe.DurationSeconds, pStart, pEnd, keyInfoFile, probe.Width, probe.Height, loudnormFilter); err != nil {
 			return nil, err
 		}
 
-		j.reportProfileProgress(i, totalProfiles)
+		j.reportProfileProgress(pEnd)
 	}
 
 	return profiles, nil
 }
 
-// remuxProfile runs a remux for one profile and reports progress to the console
-// and server on the same 2-second heartbeat cadence as transcode.
+// remuxProfile runs a remux for one profile and reports progress. pStart/pEnd
+// define this profile's slice of the weighted 10–90% global-pct band (see
+// processingPlan / stepRange in weights.go). The UI bar is driven with local
+// 0–100 pct; the per-1% console print was removed in favor of the bar.
 // loudnormFilter is passed through to RemuxToHLS: when non-empty, video is
 // stream-copied and audio is re-encoded with normalization applied.
 // Returns nil on success, a non-nil error on failure or FFmpeg missing.
 // The caller must check j.ctx.Err() after a non-nil return to distinguish
 // an abort from a genuine remux failure (which should fall back to transcode).
-func (j *Job) remuxProfile(sourcePath, profileDir string, profile transcoder.FilteredProfile, keyInfoFile, logFile string, profileIndex, totalProfiles int, loudnormFilter string) error {
-	profileShare := 80.0 / float64(totalProfiles) // each profile's share of the 10-90% range
-
+func (j *Job) remuxProfile(sourcePath, profileDir string, profile transcoder.FilteredProfile, keyInfoFile, logFile string, pStart, pEnd float64, loudnormFilter string) error {
 	progressCh, errCh := transcoder.RemuxToHLS(
 		j.ctx, sourcePath, profileDir, profile.OutputProfile, keyInfoFile, logFile, j.duration, loudnormFilter,
 	)
 
-	lastConsolePct := -1
 	for pct := range progressCh {
-		if pct != lastConsolePct {
-			fmt.Printf("%s [%s] remuxing %s: %d%%\n", util.Ts(), j.JobID, profile.Name, pct)
-			lastConsolePct = pct
-		}
+		j.UI.UpdateStageProgress(j.JobID, pct)
 		j.Progress.Update(j.JobID, fmt.Sprintf("remuxing %s", profile.Name), pct)
 
 		// Update local report state; worker status loop picks it up every 2 s.
-		globalPct := 10 + int(float64(profileIndex)*profileShare+float64(pct)/100.0*profileShare)
+		globalPct := scaleLocal(pStart, pEnd, pct)
 		j.SetStage("processing", globalPct)
 	}
 	// Drain any remaining items so the FFmpeg goroutine can close the channel.
@@ -896,7 +985,13 @@ func (j *Job) remuxProfile(sourcePath, profileDir string, profile transcoder.Fil
 	return <-errCh
 }
 
-func (j *Job) transcodeProfile(sourcePath, profileDir string, profile transcoder.FilteredProfile, duration float64, profileIndex, totalProfiles int, keyInfoFile string, srcW, srcH int, loudnormFilter string) error {
+// transcodeProfile encodes one profile with encoder-tier fallback.
+// pStart/pEnd are this profile's slice of the weighted 10–90% global-pct
+// band; local progress (0–100) is scaled into that slice for the server
+// report and drives the UI bar directly. The stage label and bar reset are
+// handled by the caller, so encoder-tier retries inside this function don't
+// spam the bar with repeated transitions.
+func (j *Job) transcodeProfile(sourcePath, profileDir string, profile transcoder.FilteredProfile, duration float64, pStart, pEnd float64, keyInfoFile string, srcW, srcH int, loudnormFilter string) error {
 	// Start with the encoder assigned when this job acquired its slot.
 	// If that type has already failed (from a previous profile), ask the
 	// manager for the next available fallback — no new slot is acquired.
@@ -908,9 +1003,6 @@ func (j *Job) transcodeProfile(sourcePath, profileDir string, profile transcoder
 			return fmt.Errorf("no encoder available for profile %s: %w", profile.Name, err)
 		}
 	}
-
-	// profileShare is this profile's slice of the 10-90% transcoding range.
-	profileShare := 80.0 / float64(totalProfiles)
 
 	for {
 		if err := j.ctx.Err(); err != nil {
@@ -928,30 +1020,31 @@ func (j *Job) transcodeProfile(sourcePath, profileDir string, profile transcoder
 		switch {
 		case encoder.EncoderType == hardware.EncoderSW:
 			tierLabel = "software"
-			fmt.Printf("%s [%s] transcoding %s with software (libx264)\n", util.Ts(), j.JobID, profile.Name)
+			j.UI.Logf("[%s] transcoding %s with software (libx264)", j.JobID, profile.Name)
 		case swDecode:
 			tierLabel = "vt-swdec"
-			fmt.Printf("%s [%s] transcoding %s with %s (sw decode + hw encode)\n", util.Ts(), j.JobID, profile.Name, encoder.EncoderType)
+			j.UI.Logf("[%s] transcoding %s with %s (sw decode + hw encode)", j.JobID, profile.Name, encoder.EncoderType)
 		default:
 			tierLabel = "vt-hwdec"
-			fmt.Printf("%s [%s] transcoding %s with %s (hw decode + hw encode)\n", util.Ts(), j.JobID, profile.Name, encoder.EncoderType)
+			j.UI.Logf("[%s] transcoding %s with %s (hw decode + hw encode)", j.JobID, profile.Name, encoder.EncoderType)
 		}
+
+		// Re-reset the bar on tier retry so the user sees the new attempt
+		// start from 0 instead of continuing from wherever the failed attempt
+		// left off.
+		j.UI.UpdateStageProgress(j.JobID, 0)
 
 		logFile := ffmpegLogPath(j.JobID, profile.Name, tierLabel)
 		progressCh, errCh := transcoder.TranscodeToHLS(j.ctx, sourcePath, profileDir, profile.OutputProfile, encoder, duration, keyInfoFile, swDecode, logFile, srcW, srcH, loudnormFilter)
 
-		// Drain progress updates, printing local 0-100% to console and
-		// updating local report state — worker status loop sends it every 2 s.
-		lastConsolePct := -1
+		// Drain progress updates into the bar + server-report state.
+		// The per-1% Printf that used to live here was removed in favor of
+		// the bar.
 		for pct := range progressCh {
-			if pct != lastConsolePct {
-				fmt.Printf("%s [%s] transcoding %s: %d%%\n", util.Ts(), j.JobID, profile.Name, pct)
-				lastConsolePct = pct
-			}
+			j.UI.UpdateStageProgress(j.JobID, pct)
 			j.Progress.Update(j.JobID, fmt.Sprintf("transcoding %s", profile.Name), pct)
 
-			// Map per-profile pct (0-100) into the global 10-90% range.
-			globalPct := 10 + int(float64(profileIndex)*profileShare+float64(pct)/100.0*profileShare)
+			globalPct := scaleLocal(pStart, pEnd, pct)
 			j.SetStage("processing", globalPct)
 		}
 		// Drain any remaining items so the FFmpeg goroutine can close the channel.
@@ -977,14 +1070,14 @@ func (j *Job) transcodeProfile(sourcePath, profileDir string, profile transcoder
 		// Per-job tracking: other concurrent jobs on the same machine still try
 		// full-GPU first for their own videos.
 		if !swDecode {
-			fmt.Printf("%s [%s] WARN: %s full-GPU failed for %s, retrying with sw decode: %v\n", util.Ts(), j.JobID, encoder.EncoderType, profile.Name, err)
+			j.UI.Logf("[%s] WARN: %s full-GPU failed for %s, retrying with sw decode: %v", j.JobID, encoder.EncoderType, profile.Name, err)
 			j.hwDecodeFailed[encoder.EncoderType] = true
 			os.RemoveAll(profileDir)
 			continue // same encoder type, sw decode next iteration
 		}
 
 		// Tier-2 also failed (or hw decode never available) — this encoder type is done.
-		fmt.Printf("%s [%s] WARN: %s exhausted for %s, trying next encoder: %v\n", util.Ts(), j.JobID, encoder.EncoderType, profile.Name, err)
+		j.UI.Logf("[%s] WARN: %s exhausted for %s, trying next encoder: %v", j.JobID, encoder.EncoderType, profile.Name, err)
 		j.failedTypes[encoder.EncoderType] = true
 		os.RemoveAll(profileDir)
 
@@ -1027,7 +1120,12 @@ func (j *Job) generateMasterPlaylist(profiles []transcoder.FilteredProfile) erro
 func (j *Job) upload() error {
 	j.Progress.Update(j.JobID, "uploading", 90)
 
-	// Collect all output files (only needs to be done once)
+	// Collect all output files (only needs to be done once). info.Size() is
+	// captured here so doUploadWithMonitoring can drive the bar by
+	// bytes-uploaded rather than files-uploaded — segments vary widely in
+	// size (an HLS init segment is tens of KB, a 10s segment can be tens of
+	// MB), so per-file progress on a 50–200-segment job stutters between
+	// bursts of small files and pauses on large ones.
 	var tasks []uploadTask
 	walkErr := filepath.Walk(j.outputDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -1038,7 +1136,7 @@ func (j *Job) upload() error {
 		}
 		relPath, _ := filepath.Rel(j.outputDir, path)
 		relPath = strings.ReplaceAll(relPath, "\\", "/") // normalize separators
-		tasks = append(tasks, uploadTask{relPath: relPath, absPath: path})
+		tasks = append(tasks, uploadTask{relPath: relPath, absPath: path, size: info.Size()})
 		return nil
 	})
 	if walkErr != nil {
@@ -1092,17 +1190,32 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 	startCap := config.Get().ConcurrentUploads
 
 	totalFiles := len(tasks)
-	var uploaded int64 // atomic counter shared across both passes
+	// totalBytes drives the per-byte progress percentage. Computed once
+	// from the walk-captured sizes; protected by a max(1, …) below to
+	// avoid a divide-by-zero in the (impossible-but-cheap-to-guard) case
+	// of an all-empty file set.
+	var totalBytes int64
+	for _, t := range tasks {
+		totalBytes += t.size
+	}
+	if totalBytes < 1 {
+		totalBytes = 1
+	}
+	var bytesUploaded int64 // atomic, shared across both upload passes
 
-	fmt.Printf("%s [%s] uploading %d files (concurrency %d, live)\n", util.Ts(), j.JobID, totalFiles, startCap)
+	j.UI.Logf("[%s] uploading %d files (%s, concurrency %d, live)",
+		j.JobID, totalFiles, formatDownloadBytes(totalBytes), startCap)
 
-	// Progress publisher: drives console output + local j.reportProgress.
-	// Worker status loop reads the latter on its own 2-second cadence.
+	// Progress publisher: drives the UI bar + the server-facing report state.
+	// 250ms tick (vs the old 2s) so the bar moves smoothly even on small
+	// jobs where the whole upload fits in 5–10s. Each tick is a single
+	// atomic load + a UI write that reduces to an atomic int store on the
+	// hot path (the actual repaint is 4Hz on the render goroutine), so
+	// quadrupling the rate is essentially free.
 	stopProgress := make(chan struct{})
 	defer close(stopProgress)
-	lastConsolePct := -1
 	go func() {
-		ticker := time.NewTicker(2 * time.Second)
+		ticker := time.NewTicker(250 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
@@ -1111,13 +1224,13 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 			case <-stopProgress:
 				return
 			case <-ticker.C:
-				n := atomic.LoadInt64(&uploaded)
-				filePct := int(float64(n) / float64(totalFiles) * 100)
-				if filePct != lastConsolePct {
-					fmt.Printf("%s [%s] uploading: %d%%\n", util.Ts(), j.JobID, filePct)
-					lastConsolePct = filePct
+				n := atomic.LoadInt64(&bytesUploaded)
+				localPct := int(n * 100 / totalBytes)
+				if localPct > 100 {
+					localPct = 100
 				}
-				globalPct := 90 + filePct/10 // 90-100%
+				j.UI.UpdateStageProgress(j.JobID, localPct)
+				globalPct := 90 + localPct/10 // 90-100%
 				j.Progress.Update(j.JobID, "uploading", globalPct)
 				j.SetStage("uploading", globalPct)
 			}
@@ -1125,9 +1238,9 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 	}()
 
 	// First pass: upload everything
-	failed, anyForbidden, firstErr := j.uploadConcurrent(ctx, tasks, allURLs, totalFiles, &uploaded)
+	failed, anyForbidden, firstErr := j.uploadConcurrent(ctx, tasks, allURLs, totalFiles, &bytesUploaded)
 	if len(failed) == 0 {
-		fmt.Printf("%s [%s] upload complete\n", util.Ts(), j.JobID)
+		j.UI.Logf("[%s] upload complete", j.JobID)
 		return nil
 	}
 
@@ -1142,7 +1255,7 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 	}
 
 	// Token refresh: fetch new URLs for failed files.
-	fmt.Printf("%s [%s] upload token refresh (%d files)\n", util.Ts(), j.JobID, len(failed))
+	j.UI.Logf("[%s] upload token refresh (%d files)", j.JobID, len(failed))
 	newURLs, err := j.fetchUploadURLsBatch(ctx, failed)
 	if err != nil {
 		return fmt.Errorf("refresh upload URLs: %w", err)
@@ -1152,7 +1265,7 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 	}
 
 	// Second pass: retry failed files with fresh tokens
-	failed2, _, firstErr2 := j.uploadConcurrent(ctx, failed, allURLs, totalFiles, &uploaded)
+	failed2, _, firstErr2 := j.uploadConcurrent(ctx, failed, allURLs, totalFiles, &bytesUploaded)
 
 	if ctx.Err() != nil {
 		return fmt.Errorf("aborted during upload retry: %w", ctx.Err())
@@ -1164,7 +1277,7 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 		return fmt.Errorf("upload failed after token refresh: %d files could not be uploaded", len(failed2))
 	}
 
-	fmt.Printf("%s [%s] upload complete (after token refresh)\n", util.Ts(), j.JobID)
+	j.UI.Logf("[%s] upload complete (after token refresh)", j.JobID)
 	return nil
 }
 
@@ -1176,13 +1289,18 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 //   - Returns (failed tasks, anyForbidden, first non-cancellation error).
 //   - Concurrency is bounded by a DynamicGate reading config.Get().ConcurrentUploads
 //     live, so a reload mid-upload applies to subsequent acquires.
+// totalFiles is kept in the signature for symmetry with the call sites
+// (and in case we ever surface "X of N files" again), but it is no longer
+// used to compute the progress percentage — bytesUploaded / totalBytes is
+// the sole driver, owned by doUploadWithMonitoring's ticker.
 func (j *Job) uploadConcurrent(
 	ctx context.Context,
 	tasks []uploadTask,
 	urls map[string]string,
 	totalFiles int,
-	uploaded *int64,
+	bytesUploaded *int64,
 ) (failed []uploadTask, anyForbidden bool, firstErr error) {
+	_ = totalFiles
 	type uploadResult struct {
 		task      uploadTask
 		err       error
@@ -1217,9 +1335,15 @@ func (j *Job) uploadConcurrent(
 
 			err := api.UploadFile(uploadCtx, task.absPath, url)
 			if err == nil {
-				n := atomic.AddInt64(uploaded, 1)
-				localPct := int(float64(n) / float64(totalFiles) * 100)
-				j.Progress.Update(j.JobID, "uploading", 90+localPct/10)
+				// Per-byte: one atomic add of this file's size lets the
+				// monitor goroutine compute pct = bytesUploaded /
+				// totalBytes without each upload goroutine having to do
+				// the math (or know totalBytes). The previous per-file
+				// Progress.Update here was redundant with the 250ms
+				// ticker in doUploadWithMonitoring; removed so the bar's
+				// pct and the server's pct are always in sync (single
+				// writer).
+				atomic.AddInt64(bytesUploaded, task.size)
 				resultCh <- uploadResult{task: task}
 				return
 			}
@@ -1286,8 +1410,11 @@ func (j *Job) fetchUploadURLsBatch(ctx context.Context, tasks []uploadTask) (map
 	return allURLs, nil
 }
 
-func (j *Job) reportProfileProgress(completedIndex, totalProfiles int) {
-	pct := 10 + int(float64(completedIndex+1)/float64(totalProfiles)*80) // 10-90% range for transcoding
+// reportProfileProgress snaps the server-reported progress to the end of the
+// just-finished profile step. pEnd comes from stepRange and already accounts
+// for the weighted plan (analyze + profiles).
+func (j *Job) reportProfileProgress(pEnd float64) {
+	pct := int(pEnd)
 	j.Progress.Update(j.JobID, "transcoding", pct)
 
 	// Publish locally — worker status loop picks it up every 2 s and batches
@@ -1309,26 +1436,27 @@ func (j *Job) handleError(phase string, err error) error {
 	// Job was deleted from server (404 propagated up from some earlier call).
 	// Nothing to report — the server already forgot about it.
 	if errors.Is(err, api.ErrJobNotFound) {
-		fmt.Printf("%s [%s] job no longer exists on server (phase: %s)\n", util.Ts(), j.JobID, phase)
 		j.Progress.Remove(j.JobID)
+		j.UI.FinishJob(j.JobID, fmt.Sprintf("gone from server (phase: %s)", phase))
 		return nil
 	}
 
 	// Transient download failure — requeue rather than fail the job.
 	// 403 from R2 (errSourceForbidden) falls through to the "failed" branch below.
 	if errors.Is(err, errTransientDownload) {
-		fmt.Printf("%s [%s] download error (will requeue): %v\n", util.Ts(), j.JobID, err)
+		j.UI.Logf("[%s] download error (will requeue): %v", j.JobID, err)
 		j.MarkAborted(fmt.Sprintf("%s: %s", phase, err.Error()))
 		j.Progress.Remove(j.JobID)
+		j.UI.FinishJob(j.JobID, fmt.Sprintf("aborted (phase: %s, will requeue)", phase))
 		return nil
 	}
 
 	// Worker-initiated abort (graceful shutdown, operator cancel, or the
 	// status loop's 60-second silence watchdog).
 	if j.ctx.Err() != nil {
-		fmt.Printf("%s [%s] aborted (phase: %s)\n", util.Ts(), j.JobID, phase)
 		j.MarkAborted(fmt.Sprintf("%s: worker cancelled", phase))
 		j.Progress.Remove(j.JobID)
+		j.UI.FinishJob(j.JobID, fmt.Sprintf("aborted (phase: %s)", phase))
 		return nil
 	}
 
@@ -1336,16 +1464,16 @@ func (j *Job) handleError(phase string, err error) error {
 	// Do NOT queue a terminal status; the server's processing-timeout will
 	// requeue on its own, and we need to shut down the worker regardless.
 	if errors.Is(err, transcoder.ErrFFmpegMissing) {
-		fmt.Printf("%s [%s] ERROR: FFmpeg binary missing during %s\n", util.Ts(), j.JobID, phase)
 		j.Progress.Remove(j.JobID)
+		j.UI.FinishJob(j.JobID, fmt.Sprintf("ERROR: FFmpeg binary missing during %s", phase))
 		return fmt.Errorf("%w: detected during %s of job %s", ErrFFmpegFatal, phase, j.JobID)
 	}
 
 	// Real error — queue "failed" so it lands in the next status tick.
 	errMsg := fmt.Sprintf("%s: %s", phase, err.Error())
-	fmt.Printf("%s [%s] ERROR: job failed at %s: %v\n", util.Ts(), j.JobID, phase, err)
 	j.MarkFailed(errMsg)
 	j.Progress.Remove(j.JobID)
+	j.UI.FinishJob(j.JobID, fmt.Sprintf("ERROR: failed at %s: %v", phase, err))
 	return fmt.Errorf("job %s failed at %s: %w", j.JobID, phase, err)
 }
 

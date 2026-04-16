@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"os"
 	"strings"
@@ -15,6 +14,7 @@ import (
 	"videosite-worker/internal/config"
 	"videosite-worker/internal/slot"
 	"videosite-worker/internal/transcoder"
+	"videosite-worker/internal/ui"
 	"videosite-worker/internal/util"
 	"videosite-worker/internal/worker/progress"
 )
@@ -37,6 +37,7 @@ type Worker struct {
 	manager   *slot.Manager
 	tracker   *progress.Tracker
 	blocklist *ErrorBlocklist
+	ui        ui.Manager // user-visible output (sticky bars + scrolling log)
 	wg        sync.WaitGroup
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -47,13 +48,17 @@ type Worker struct {
 	statusOnce sync.Once
 }
 
-// New creates a new worker.
-func New() *Worker {
+// New creates a new worker. uiMgr is the shared output surface — must be
+// non-nil; main.go constructs it once and passes the same instance here.
+// Close of uiMgr is the caller's responsibility (main.go defers it) so the
+// manager outlives any straggler log lines from the Worker.shutdown path.
+func New(uiMgr ui.Manager) *Worker {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Worker{
 		manager:   slot.NewManager(),
 		tracker:   progress.NewTracker(),
 		blocklist: NewErrorBlocklist(),
+		ui:        uiMgr,
 		ctx:       ctx,
 		cancel:    cancel,
 	}
@@ -69,11 +74,26 @@ func (w *Worker) Run() {
 		logArgs = append(logArgs, k, v)
 	}
 	slog.Info("Worker started", logArgs...)
-	fmt.Printf("%s Commands: stop, reload\n", util.Ts())
-	fmt.Println()
+	w.ui.Logf("Commands: stop, reload")
 
 	// Start console command reader
 	go w.readConsoleCommands()
+
+	// First-poll warm-up: 1s rather than the full pollInterval. The
+	// previous behaviour was a 5s wait between "Worker started" and the
+	// first /tasks/available request, which felt unresponsive on a freshly
+	// launched worker (the user just saw the startup banner sit there).
+	// 1s leaves the banner readable for a beat — long enough that the
+	// startup output isn't immediately scrolled by lease activity, short
+	// enough that idle workers pick up queued work promptly. ctx-aware so
+	// a fast Ctrl-C during the warm-up exits cleanly.
+	select {
+	case <-w.ctx.Done():
+		w.shutdown()
+		return
+	case <-time.After(1 * time.Second):
+		w.poll()
+	}
 
 	// Main poll loop (lease cadence)
 	ticker := time.NewTicker(pollInterval)
@@ -186,7 +206,7 @@ func (w *Worker) launchJob(r api.LeaseResult) {
 	slog.Info("Launching job", "job", r.JobID, "video", r.VideoID,
 		"encoder", encoder.EncoderType, "device", encoder.DeviceIndex)
 
-	job := slot.NewJob(r.JobID, r.VideoID, r.DownloadURL, r.EncryptionKey, encoder, w.manager, w.tracker,
+	job := slot.NewJob(r.JobID, r.VideoID, r.DownloadURL, r.EncryptionKey, encoder, w.manager, w.tracker, w.ui,
 		r.OutputProfiles, r.AudioNormalization, r.AudioNormalizationTarget, r.AudioNormalizationPeak, r.AudioNormalizationMaxGain)
 	w.manager.RegisterJob(r.JobID, job)
 
@@ -293,7 +313,7 @@ func (w *Worker) readConsoleCommands() {
 		cmd := strings.TrimSpace(scanner.Text())
 		switch strings.ToLower(cmd) {
 		case "stop":
-			fmt.Printf("%s Graceful stop requested...\n", util.Ts())
+			w.ui.Logf("Graceful stop requested...")
 			w.stopping.Store(true)
 			w.initiateGracefulStop()
 			return
@@ -302,7 +322,7 @@ func (w *Worker) readConsoleCommands() {
 		case "":
 			// Ignore empty lines
 		default:
-			fmt.Printf("%s Unknown command: %s (available: stop, reload)\n", util.Ts(), cmd)
+			w.ui.Logf("Unknown command: %s (available: stop, reload)", cmd)
 		}
 	}
 }
@@ -322,16 +342,16 @@ func (w *Worker) initiateGracefulStop() {
 	activeJobs := w.manager.ActiveJobs()
 
 	if len(activeJobs) == 0 {
-		fmt.Printf("%s No active jobs. Stopping immediately.\n", util.Ts())
+		w.ui.Logf("No active jobs. Stopping immediately.")
 	} else {
 		// Cancel non-uploading jobs immediately; uploading/completing jobs
 		// are left running — shutdown() will wait up to 30s for them.
 		for _, job := range activeJobs {
 			phase := job.Phase()
 			if phase == "uploading" || phase == "completing" {
-				fmt.Printf("%s   Waiting for job %s (phase: %s)\n", util.Ts(), job.JobID, phase)
+				w.ui.Logf("  Waiting for job %s (phase: %s)", job.JobID, phase)
 			} else {
-				fmt.Printf("%s   Aborting job %s (phase: %s)\n", util.Ts(), job.JobID, phase)
+				w.ui.Logf("  Aborting job %s (phase: %s)", job.JobID, phase)
 				job.Cancel()
 			}
 		}
@@ -341,78 +361,74 @@ func (w *Worker) initiateGracefulStop() {
 }
 
 func (w *Worker) handleReload() {
-	fmt.Printf("%s Reloading configuration...\n", util.Ts())
+	w.ui.Logf("Reloading configuration...")
 
 	result, err := config.Reload()
 	if err != nil {
 		// Unreadable/corrupt config.json: keep running on the previous
 		// in-memory values. The user's changes stay on disk until they
 		// fix the file.
-		fmt.Printf("%s Config reload error (keeping previous values): %s\n", util.Ts(), err)
+		w.ui.Logf("Config reload error (keeping previous values): %s", err)
 	} else {
-		fmt.Printf("%s Config: %s\n", util.Ts(), result.Summary)
+		w.ui.Logf("Config: %s", result.Summary)
 		for _, f := range result.InvalidFields {
-			fmt.Printf("%s   ! %s\n", util.Ts(), f)
+			w.ui.Logf("  ! %s", f)
 		}
 
 		// site_hostname and enable_mtls are locked — config.Reload has
 		// already reverted them in memory, so we only need to warn the user
 		// that the on-disk change will take effect after a restart.
 		if result.HostnameChanged {
-			fmt.Printf("%s   ! site_hostname change detected — restart worker to apply. Value reverted in memory.\n", util.Ts())
+			w.ui.Logf("  ! site_hostname change detected — restart worker to apply. Value reverted in memory.")
 		}
 		if result.MTLSChanged {
-			fmt.Printf("%s   ! enable_mtls change detected — restart worker to apply. Value reverted in memory.\n", util.Ts())
+			w.ui.Logf("  ! enable_mtls change detected — restart worker to apply. Value reverted in memory.")
 		}
 
 		// Proxy toggle: rebuild the HTTP client transport. Any in-flight
 		// requests on the old transport drain naturally; retries use the new.
 		if result.ProxyChanged {
 			api.Reconfigure(config.Get().UseSystemProxy)
-			fmt.Printf("%s   HTTP client rebuilt (use_system_proxies=%v)\n", util.Ts(), config.Get().UseSystemProxy)
+			w.ui.Logf("  HTTP client rebuilt (use_system_proxies=%v)", config.Get().UseSystemProxy)
 		}
 
 		if result.KeysChanged {
 			// No explicit action needed — config.Get() is what Authenticate reads.
 			// Any future 401 will re-auth with the new credentials.
-			fmt.Printf("%s   Access keys updated — applied on next re-auth.\n", util.Ts())
+			w.ui.Logf("  Access keys updated — applied on next re-auth.")
 		}
 
 		if result.ConcurrencyChanged {
 			// util.DynamicGate reads config.Get() on each Acquire, so the
 			// next part download / upload picks up the new value. No
 			// plumbing needed — just surface the fact in the log.
-			fmt.Printf("%s   Concurrency limits applied to new operations (in-flight ones finish on old limit).\n", util.Ts())
+			w.ui.Logf("  Concurrency limits applied to new operations (in-flight ones finish on old limit).")
 		}
 	}
 
 	capsChanges, err := config.ReloadCapabilities()
 	if err != nil {
-		fmt.Printf("%s Capabilities reload error (keeping previous values): %s\n", util.Ts(), err)
+		w.ui.Logf("Capabilities reload error (keeping previous values): %s", err)
 	} else {
-		fmt.Printf("%s Capabilities: %s\n", util.Ts(), capsChanges)
+		w.ui.Logf("Capabilities: %s", capsChanges)
 	}
 
 	w.manager.Reload()
-	fmt.Printf("%s Slots: %d total\n", util.Ts(), w.manager.TotalSlots())
-	fmt.Printf("%s Reload complete. Active jobs continue with original settings.\n", util.Ts())
+	w.ui.Logf("Slots: %d total", w.manager.TotalSlots())
+	w.ui.Logf("Reload complete. Active jobs continue with original settings.")
 }
 
 func (w *Worker) handleFFmpegMissing() {
 	if w.stopping.Swap(true) {
 		return // another goroutine already handling this
 	}
-	fmt.Println()
-	fmt.Printf("%s ==========================================================\n", util.Ts())
-	fmt.Printf("%s FATAL: FFmpeg binary not found or not executable.\n", util.Ts())
-	fmt.Printf("%s FFmpeg may have been uninstalled or removed from PATH.\n", util.Ts())
-	fmt.Println()
-	fmt.Printf("%s Jobs in download/probe/transcode are being aborted.\n", util.Ts())
-	fmt.Printf("%s Jobs already uploading will be allowed to finish.\n", util.Ts())
-	fmt.Println()
-	fmt.Printf("%s Please reinstall FFmpeg, verify your PATH, and restart.\n", util.Ts())
-	fmt.Printf("%s ==========================================================\n", util.Ts())
-	fmt.Println()
+	w.ui.Logf("==========================================================")
+	w.ui.Logf("FATAL: FFmpeg binary not found or not executable.")
+	w.ui.Logf("FFmpeg may have been uninstalled or removed from PATH.")
+	w.ui.Logf("Jobs in download/probe/transcode are being aborted.")
+	w.ui.Logf("Jobs already uploading will be allowed to finish.")
+	w.ui.Logf("Please reinstall FFmpeg, verify your PATH, and restart.")
+	w.ui.Logf("==========================================================")
 	// Jobs that need FFmpeg can't proceed — cancel them.
 	// Jobs already in upload/complete don't need FFmpeg — let them finish.
 	// shutdown() will wait up to 30s for any remaining uploading jobs.
@@ -439,14 +455,11 @@ func (w *Worker) handleCertFatal(err error) {
 	if w.stopping.Swap(true) {
 		return // another goroutine already handling this
 	}
-	fmt.Println()
-	fmt.Printf("%s ==========================================================\n", util.Ts())
-	fmt.Printf("%s FATAL: mTLS client certificate invalid.\n", util.Ts())
-	fmt.Printf("%s %s\n", util.Ts(), err)
-	fmt.Println()
-	fmt.Printf("%s Renew cert/client.crt and restart the worker.\n", util.Ts())
-	fmt.Printf("%s ==========================================================\n", util.Ts())
-	fmt.Println()
+	w.ui.Logf("==========================================================")
+	w.ui.Logf("FATAL: mTLS client certificate invalid.")
+	w.ui.Logf("%s", err)
+	w.ui.Logf("Renew cert/client.crt and restart the worker.")
+	w.ui.Logf("==========================================================")
 
 	for _, job := range w.manager.ActiveJobs() {
 		phase := job.Phase()
@@ -464,12 +477,10 @@ func (w *Worker) handleAuthFailure() {
 	if w.stopping.Swap(true) {
 		return // another goroutine already handling this
 	}
-	fmt.Println()
-	fmt.Printf("%s ==========================================================\n", util.Ts())
-	fmt.Printf("%s AUTHENTICATION FAILED — worker key may have been revoked.\n", util.Ts())
-	fmt.Printf("%s Please check your credentials and restart.\n", util.Ts())
-	fmt.Printf("%s ==========================================================\n", util.Ts())
-	fmt.Println()
+	w.ui.Logf("==========================================================")
+	w.ui.Logf("AUTHENTICATION FAILED — worker key may have been revoked.")
+	w.ui.Logf("Please check your credentials and restart.")
+	w.ui.Logf("==========================================================")
 	// Auth is revoked — all server API calls will fail (401).
 	// Cancel every active job immediately; no point continuing.
 	for _, job := range w.manager.ActiveJobs() {
@@ -479,7 +490,7 @@ func (w *Worker) handleAuthFailure() {
 }
 
 func (w *Worker) shutdown() {
-	fmt.Printf("%s Shutting down... waiting for active jobs\n", util.Ts())
+	w.ui.Logf("Shutting down... waiting for active jobs")
 
 	// Wait for active jobs with 30-second timeout
 	done := make(chan struct{})
@@ -511,10 +522,10 @@ func (w *Worker) shutdown() {
 	if err := os.RemoveAll(slot.LogsDir); err != nil {
 		slog.Warn("Failed to clean logs directory", "err", err)
 	} else {
-		fmt.Printf("%s Logs cleaned.\n", util.Ts())
+		w.ui.Logf("Logs cleaned.")
 	}
 
-	fmt.Printf("%s Worker stopped.\n", util.Ts())
+	w.ui.Logf("Worker stopped.")
 }
 
 // flushShutdownStatuses pushes any queued terminal statuses (aborted/failed)
