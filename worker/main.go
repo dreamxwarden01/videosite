@@ -206,7 +206,7 @@ func handleMTLS(cfg *config.Config) (*tls.Config, *x509.Certificate, error) {
 	if err := mtls.CheckCertValidity(leafCert); err != nil {
 		return nil, nil, fmt.Errorf("client certificate not usable: %w", err)
 	}
-	fmt.Printf("%s mTLS: client certificate loaded (valid until %s)\n",
-		util.Ts(), leafCert.NotAfter.Format("2006-01-02"))
+	fmt.Printf("%s mTLS: client certificate loaded (CN: %s, valid until %s)\n",
+		util.Ts(), leafCert.Subject.CommonName, leafCert.NotAfter.Format("2006-01-02"))
 	return tlsCfg, leafCert, nil
 }

@@ -73,7 +73,6 @@ func SetSession(s *auth.Session) {
 func Init(tlsCfg *tls.Config, cert *x509.Certificate, useProxy bool) {
 	if tlsCfg != nil {
 		cachedTLS.Store(tlsCfg)
-		slog.Info("API client: mTLS enabled")
 	}
 	if cert != nil {
 		cachedCert.Store(cert)

@@ -309,7 +309,7 @@ func (j *Job) Run() error {
 	// 8. COMPLETE — retry is embedded inside api.CompleteTask
 	// (5 attempts, 0/1/2/3/4 s backoff, 204 success, 404 = gone, 401 re-auth).
 	j.phase.Store("completing")
-	j.UI.UpdateStage(j.JobID, "completing", 99)
+	j.UI.UpdateStage(j.JobID, "completing", 100)
 	err = api.CompleteTask(j.ctx, j.JobID, api.CompletePayload{DurationSeconds: j.duration})
 	if err != nil && !errors.Is(err, api.ErrJobNotFound) && !errors.Is(err, api.ErrCompleteRetriesExhausted) {
 		j.UI.Logf("[%s] ERROR: failed to report completion: %v", j.JobID, err)
@@ -1240,6 +1240,11 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 	// First pass: upload everything
 	failed, anyForbidden, firstErr := j.uploadConcurrent(ctx, tasks, allURLs, totalFiles, &bytesUploaded)
 	if len(failed) == 0 {
+		// Pin to 100% — the 250ms ticker may not have fired since the
+		// last byte landed, so the bar could be sitting at 97-99%.
+		j.UI.UpdateStageProgress(j.JobID, 100)
+		j.Progress.Update(j.JobID, "uploading", 100)
+		j.SetStage("uploading", 100)
 		j.UI.Logf("[%s] upload complete", j.JobID)
 		return nil
 	}
@@ -1277,6 +1282,9 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 		return fmt.Errorf("upload failed after token refresh: %d files could not be uploaded", len(failed2))
 	}
 
+	j.UI.UpdateStageProgress(j.JobID, 100)
+	j.Progress.Update(j.JobID, "uploading", 100)
+	j.SetStage("uploading", 100)
 	j.UI.Logf("[%s] upload complete (after token refresh)", j.JobID)
 	return nil
 }

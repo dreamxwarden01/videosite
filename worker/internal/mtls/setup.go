@@ -31,6 +31,9 @@ const (
 	keyFile  = "client.key"
 	certFile = "client.crt"
 	csrFile  = "client.csr"
+
+	// base62 is the alphabet for random CN suffixes.
+	base62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 )
 
 func keyPath() string  { return filepath.Join(certDir, keyFile) }
@@ -95,6 +98,50 @@ func CheckCertValidity(cert *x509.Certificate) error {
 		return fmt.Errorf("%w (NotAfter=%s)", ErrCertExpired, cert.NotAfter.Format(time.RFC3339))
 	}
 	return nil
+}
+
+// randomBase62 returns a cryptographically random n-character string from the
+// base62 alphabet (0-9 A-Z a-z).
+func randomBase62(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto/rand failed: " + err.Error())
+	}
+	for i := range b {
+		b[i] = base62[b[i]%62]
+	}
+	return string(b)
+}
+
+// promptCN asks the user for a certificate Common Name. A random default is
+// generated and shown; pressing Enter (or entering only whitespace) accepts it.
+// Spaces mixed with other characters are rejected — the user must re-enter or
+// press Enter for the default.
+func promptCN(reader *bufio.Reader) string {
+	defaultCN := "videosite-worker-" + randomBase62(12)
+	fmt.Println()
+	fmt.Printf("  Default Common Name: %s\n", defaultCN)
+	fmt.Print("  Enter a custom CN (or press Enter for default): ")
+
+	for {
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimRight(input, "\r\n")
+
+		// Empty or whitespace-only → accept the default.
+		if strings.TrimSpace(input) == "" {
+			fmt.Printf("  Using CN: %s\n", defaultCN)
+			return defaultCN
+		}
+
+		// Mixed characters and spaces → invalid.
+		if strings.Contains(input, " ") {
+			fmt.Print("  Spaces are not allowed in a CN. Enter a valid name or press Enter for default: ")
+			continue
+		}
+
+		fmt.Printf("  Using CN: %s\n", input)
+		return input
+	}
 }
 
 // Setup runs the interactive mTLS certificate setup flow:
@@ -165,9 +212,11 @@ func Setup(reader *bufio.Reader) error {
 		return fmt.Errorf("parse private key: %w", err)
 	}
 
+	cn := promptCN(reader)
+
 	csrTemplate := &x509.CertificateRequest{
 		Subject: pkix.Name{
-			CommonName: "videosite-worker",
+			CommonName: cn,
 		},
 	}
 	csrDER, err := x509.CreateCertificateRequest(rand.Reader, csrTemplate, privKey)
