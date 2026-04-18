@@ -584,6 +584,17 @@ async function runMigrations() {
                         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                     `);
                 }
+            },
+            {
+                id: '026_watch_seconds_decimal',
+                up: async () => {
+                    // INT → DECIMAL(10,2) so the client can report actual
+                    // wall-clock-elapsed playback (fractional seconds) without
+                    // half-second rounding loss on every flush. DECIMAL, not
+                    // FLOAT: watch_seconds is a running counter and += 0.N on
+                    // FLOAT accumulates IEEE-754 drift; DECIMAL is exact.
+                    await pool.execute(`ALTER TABLE watch_progress MODIFY watch_seconds DECIMAL(10,2) NOT NULL DEFAULT 0`);
+                }
             }
         ];
 

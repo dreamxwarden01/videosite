@@ -189,7 +189,7 @@ CREATE TABLE IF NOT EXISTS worker_sessions (
 CREATE TABLE IF NOT EXISTS watch_progress (
     user_id       INT UNSIGNED NOT NULL,
     video_id      INT UNSIGNED NOT NULL,
-    watch_seconds INT UNSIGNED NOT NULL DEFAULT 0,
+    watch_seconds DECIMAL(10,2) NOT NULL DEFAULT 0,
     last_position FLOAT        NOT NULL DEFAULT 0,
     last_watch_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (user_id, video_id),

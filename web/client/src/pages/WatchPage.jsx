@@ -22,6 +22,25 @@ export default function WatchPage() {
   const tokenRef = useRef('');
   const validityRef = useRef(0);
 
+  // Watch-tracking state lives in a ref so flush triggers outside the Shaka
+  // effect (pause listener, back-button onClick) can reach it.
+  //   accumulated — real-time-elapsed seconds not yet credited to the server
+  //   inflight    — true while a POST is outstanding (single-flight lock)
+  //   stopped     — set on 401/403/429, kills further flushes for the session
+  //   lastWall    — wall-clock ms of the previous tick
+  //   lastPos     — video currentTime at the previous tick
+  const trackingRef = useRef({
+    accumulated: 0,
+    inflight: false,
+    stopped: false,
+    lastWall: 0,
+    lastPos: 0,
+  });
+  // Populated once the video element exists (inside player.load().then).
+  // Calling it triggers a flush of whatever is in `accumulated`, respecting
+  // the in-flight lock.
+  const flushWatchRef = useRef(null);
+
   // Fetch video data
   useEffect(() => {
     (async () => {
@@ -173,42 +192,87 @@ export default function WatchPage() {
       // Load manifest
       player.load(data.videoUrl, data.resumePosition > 0 ? data.resumePosition : undefined)
         .then(() => {
-          // Start watch tracking
-          let lastWall = Date.now();
-          let lastPos = videoEl.currentTime;
-          let accumulated = 0;
-          let stopped = false;
+          // Start watch tracking. Reset the shared ref so a second load of this
+          // page (route change back to the same video) starts clean.
+          const t = trackingRef.current;
+          t.accumulated = 0;
+          t.inflight = false;
+          t.stopped = false;
+          t.lastWall = Date.now();
+          t.lastPos = videoEl.currentTime;
 
-          function tick() {
-            if (stopped || destroyedRef.current) return;
-            const now = Date.now();
+          // flushNow — the single send path. Called by the 1s tick when
+          // accumulated crosses the threshold, by the videoEl 'pause' event,
+          // and by the back-button onClick.
+          //
+          // Optimistic zeroing: we snapshot `accumulated` as `delta` and set
+          // accumulated to 0 before the fetch. A pause/back that fires while
+          // a request is in flight sees accumulated already at (or near) 0
+          // and the in-flight guard short-circuits it anyway — no double-count.
+          //
+          // We send exactly the real seconds accumulated (float, no rounding)
+          // so quick pause/unpause cycles don't bleed up to 0.5s per flush.
+          // We also send even when delta is 0 (pause fired with nothing new
+          // watched) so the server refreshes last_position — the user may
+          // have scrubbed while paused and we want that saved.
+          //
+          // Network error rolls the seconds back. HTTP error statuses
+          // (401/403/429) are terminal: tracking stops, rollback doesn't
+          // matter because no future flush will fire.
+          function flushNow() {
+            if (t.stopped || destroyedRef.current || t.inflight) return;
+
+            const delta = Math.max(0, t.accumulated);
+            t.inflight = true;
+            t.accumulated = 0;
             const pos = videoEl.currentTime;
-            const wallDelta = (now - lastWall) / 1000;
-            const posMoved = pos !== lastPos;
-            lastWall = now;
-            lastPos = pos;
 
-            if (!videoEl.paused && !videoEl.ended && posMoved && wallDelta > 0) {
-              accumulated += wallDelta;
-            }
-
-            while (accumulated >= 10) {
-              accumulated -= 10;
-              fetch('/api/updatewatch', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ video_id: parseInt(videoId), position: pos })
-              }).then(resp => {
-                if (resp.status === 401) { stopped = true; triggerAuthFailure(); }
-                else if (resp.status === 429) { stopped = true; destroyAndShowError('Too Many Requests', 'Rate limited.'); }
-                else if (resp.status === 403) { stopped = true; destroyAndShowError('Access Denied', 'Permission revoked.'); }
-              }).catch(() => {});
-            }
+            fetch('/api/updatewatch', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                video_id: parseInt(videoId),
+                position: pos,
+                delta,
+              }),
+            })
+              .then(resp => {
+                if (resp.status === 401) { t.stopped = true; triggerAuthFailure(); }
+                else if (resp.status === 429) { t.stopped = true; destroyAndShowError('Too Many Requests', 'Rate limited.'); }
+                else if (resp.status === 403) { t.stopped = true; destroyAndShowError('Access Denied', 'Permission revoked.'); }
+              })
+              .catch(() => {
+                // Network failure — put the seconds back so the next flush
+                // picks them up. Adds zero if this was a position-only flush,
+                // which is the correct no-op.
+                t.accumulated += delta;
+              })
+              .finally(() => { t.inflight = false; });
           }
 
-          const trackingInterval = setInterval(tick, 1000);
-          const visTrack = () => { if (!document.hidden) tick(); };
-          document.addEventListener('visibilitychange', visTrack);
+          flushWatchRef.current = flushNow;
+
+          function tick() {
+            if (t.stopped || destroyedRef.current) return;
+            const now = Date.now();
+            const pos = videoEl.currentTime;
+            const wallDelta = (now - t.lastWall) / 1000;
+            const posMoved = pos !== t.lastPos;
+            t.lastWall = now;
+            t.lastPos = pos;
+
+            if (!videoEl.paused && !videoEl.ended && posMoved && wallDelta > 0) {
+              t.accumulated += wallDelta;
+            }
+
+            if (t.accumulated >= 10) flushNow();
+          }
+
+          setInterval(tick, 1000);
+          document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+          // Flush on pause so a user who watches 7s and pauses doesn't lose
+          // those seconds. Also fires at end-of-stream, which is fine.
+          videoEl.addEventListener('pause', flushNow);
         })
         .catch(handleShakaError);
     });
@@ -284,7 +348,11 @@ export default function WatchPage() {
   return (
     <div className="player-container">
       <div className="player-nav-bar">
-        <Link to={backUrl} className="player-back-link">
+        <Link
+          to={backUrl}
+          className="player-back-link"
+          onClick={() => { flushWatchRef.current?.(); }}
+        >
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
             <path d="M10 12L6 8l4-4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
           </svg>

@@ -60,13 +60,43 @@ router.get('/videos/:id/playback', requireAuth, async (req, res) => {
 });
 
 // POST /api/updatewatch
+//
+// Body: { video_id: int, position: float, delta?: float }
+//
+// `delta` is the number of watched seconds the client wants credited this call.
+// The client accumulates real-time-elapsed locally and flushes in chunks
+// (normally ~10s on the tick threshold, but also on pause and on back-button
+// click — sometimes with a delta of zero, purely to persist last_position
+// after the user scrubbed while paused).
+//
+// Back-compat: if `delta` is absent, credit 10 (legacy pre-rollout bundle).
+//
+// Anti-abuse: any delta > 60 has its watch-time contribution dropped (0-credit)
+// but the upsert still runs so last_position tracks. 60s is tight — legitimate
+// bursts fit (a single ~30s network blip on retry), abusive claims don't. No
+// comparison against last_watch_at: two devices viewing the same video
+// concurrently is a real use case that would false-positive.
 router.post('/updatewatch', requireAuth, async (req, res) => {
     try {
         const user = res.locals.user;
-        const { video_id, position } = req.body;
+        const { video_id, position, delta } = req.body;
 
         if (!video_id || position === undefined) {
             return res.status(400).json({ error: 'video_id and position are required' });
+        }
+
+        // Decide how many seconds to credit.
+        //   delta absent          → 10 (back-compat with old client bundles)
+        //   delta 0..60 finite    → credit that amount (0 = position-only flush)
+        //   delta > 60 or invalid → 0 (watch time dropped, still updates position)
+        let credit = 10;
+        if (delta !== undefined) {
+            const d = Number(delta);
+            if (!Number.isFinite(d) || d < 0 || d > 60) {
+                credit = 0;
+            } else {
+                credit = d;
+            }
         }
 
         const pool = getPool();
@@ -92,15 +122,19 @@ router.post('/updatewatch', requireAuth, async (req, res) => {
             }
         }
 
-        // Upsert watch progress
+        // Always upsert — credit may be 0, in which case watch_seconds is
+        // unchanged (watch_seconds + 0) but last_position still refreshes. That
+        // handles pause-with-no-new-playback (user scrubbed while paused) and
+        // silently-dropped delta>60 reports (position is still trusted — it's
+        // a harmless number, unlike the watch-time claim which we capped).
         await pool.execute(
             `INSERT INTO watch_progress (user_id, video_id, watch_seconds, last_position, last_watch_at)
-             VALUES (?, ?, 10, ?, NOW())
+             VALUES (?, ?, ?, ?, NOW())
              ON DUPLICATE KEY UPDATE
-                watch_seconds = watch_seconds + 10,
+                watch_seconds = watch_seconds + ?,
                 last_position = VALUES(last_position),
                 last_watch_at = NOW()`,
-            [user.user_id, videoId, parseFloat(position)]
+            [user.user_id, videoId, credit, parseFloat(position), credit]
         );
 
         res.status(204).end();
