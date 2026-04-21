@@ -15,12 +15,16 @@ import (
 // This is the shape the server sends per-job in the lease response
 // (see api.LeaseResult.OutputProfiles). It is NOT read from config.json —
 // each job's profile set is authoritative and can differ between jobs.
+//
+// Audio bitrate is site-wide (api.LeaseResult.AudioBitrateKbps), not per-profile.
+// FpsLimit caps the output frame rate for this profile; sources below the limit
+// are passed through unchanged (no upsampling).
 type OutputProfile struct {
 	Name             string `json:"name"`
 	Width            int    `json:"width"`
 	Height           int    `json:"height"`
 	VideoBitrateKbps int    `json:"video_bitrate_kbps"`
-	AudioBitrateKbps int    `json:"audio_bitrate_kbps"`
+	FpsLimit         int    `json:"fps_limit"`
 	Codec            string `json:"codec"`
 	Profile          string `json:"profile"`
 	Preset           string `json:"preset"`

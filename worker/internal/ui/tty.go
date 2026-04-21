@@ -44,11 +44,29 @@ const (
 // ttyBar is one pinned bar's state. stage is updated by UpdateStage, pct by
 // UpdateStageProgress, both from job goroutines. Render reads them under the
 // same atomics.
+//
+// vaActive toggles the bar between its two rendering modes:
+//
+//   - false (default) — single-fill mode: one bracketed bar stretches across
+//     the full free width, filled to `pct`%. Matches the classic
+//     download / transcode / upload UX.
+//
+//   - true — composite V+A mode: two smaller bracketed bars sit side by side
+//     on the same row, one per track, filled to vPct% and aPct% respectively.
+//     Used during the CMAF processing stage where video and audio
+//     goroutines run in parallel.
+//
+// Mode is toggled by the Manager methods: UpdateStageProgressVA flips it on,
+// UpdateStage / UpdateStageProgress flip it off.
 type ttyBar struct {
 	jobID    string
 	priority int64        // stable ascending lease order (bar sort key)
 	stage    atomic.Value // string — current stage label
 	pct      atomic.Int32 // 0..100 local pct within current stage
+
+	vaActive atomic.Bool  // if set, render() draws the V+A composite instead of single-fill
+	vPct     atomic.Int32 // 0..100 video track progress (VA mode only)
+	aPct     atomic.Int32 // 0..100 audio track progress (VA mode only)
 }
 
 // ttyManager owns the bottom-pinned sticky region. Every write to stdout
@@ -422,9 +440,15 @@ func (m *ttyManager) assertRegion() []byte {
 	return buf.Bytes()
 }
 
-// render formats a single bar row. Format:
+// render formats a single bar row. Two modes (see ttyBar docs):
+//
+// Single-fill (vaActive == false):
 //
 //	[<jobID>] <stage> <NNN>% [████████░░░░░░░░…]
+//
+// Composite V+A (vaActive == true):
+//
+//	[<jobID>] <stage> V [████░░░░] VV%  A [██████░░] AA%
 //
 // The bar filler stretches to fill whatever width is left after the prefix.
 // `%3d%%` right-aligns the percent so single / double / triple digits don't
@@ -446,6 +470,11 @@ func (b *ttyBar) render(width int) string {
 		return ""
 	}
 	stage, _ := b.stage.Load().(string)
+
+	if b.vaActive.Load() {
+		return renderVA(b.jobID, int(b.vPct.Load()), int(b.aPct.Load()), safe)
+	}
+
 	pct := int(b.pct.Load())
 	if pct < 0 {
 		pct = 0
@@ -480,6 +509,103 @@ func (b *ttyBar) render(width int) string {
 	return sb.String()
 }
 
+// renderVA builds the composite `V [bar] NNN%  A [bar] NNN%` body for the
+// processing stage. The two inner bars each get half of the free space
+// after the `[jobID] ` prefix and the fixed `V [`, `] NNN%`, `  A [`,
+// `] NNN%` framing — each bar's fill width has a minimum of 1 below which
+// we elide the bars entirely and fall back to a pair of `V NN% A NN%`
+// readouts so narrow terminals still carry the information.
+//
+// Budget accounting (must match byte-for-byte or the line wraps):
+//
+//	"[jobID] "     — len(prefix)
+//	"V ["          — 3
+//	<fill>         — fillWidth
+//	"] "           — 2
+//	"NNN%"         — 4   (%3d → 3 chars + literal '%')
+//	"  "           — 2   gap
+//	"A ["          — 3
+//	<fill>         — fillWidth
+//	"] "           — 2
+//	"NNN%"         — 4
+//
+// Non-fill total = 20. Caller passes `safe = width-1` already; we reserve
+// one additional column via endMargin so the composite is capped at
+// `width - 2`, which gives Windows Terminal / conhost two columns of
+// pending-wrap buffer around the mid-paint of two adjacent bars. Without
+// this the percent readout of the A bar can land in column `width`, put
+// the terminal into pending-wrap, and the next escape emits a viewport
+// scroll — showing up as the audio % leaking onto the next row.
+func renderVA(jobID string, vPct, aPct, safe int) string {
+	if vPct < 0 {
+		vPct = 0
+	} else if vPct > 100 {
+		vPct = 100
+	}
+	if aPct < 0 {
+		aPct = 0
+	} else if aPct > 100 {
+		aPct = 100
+	}
+	const endMargin = 1 // on top of the caller's width-1 → total reserve = 2
+	budget := safe - endMargin
+	if budget < 1 {
+		return ""
+	}
+	prefix := fmt.Sprintf("[%s] ", jobID)
+	const perBarFrame = 9 // "V [" (3) + "] " (2) + "NNN%" (4)
+	const gap = 2         // "  " between V's percent and A's label
+	fixed := len(prefix) + perBarFrame*2 + gap
+	if fixed >= budget {
+		// Not enough room for both bars — fall back to a compact digest.
+		compact := fmt.Sprintf("%sV %d%% A %d%%", prefix, vPct, aPct)
+		if len(compact) > budget {
+			return compact[:budget]
+		}
+		return compact
+	}
+	barSpace := budget - fixed
+	fillWidth := barSpace / 2
+	if fillWidth < 1 {
+		// Tiny terminal — still too narrow for two bars with ≥1-char fill.
+		compact := fmt.Sprintf("%sV %d%% A %d%%", prefix, vPct, aPct)
+		if len(compact) > budget {
+			return compact[:budget]
+		}
+		return compact
+	}
+	vFill := vPct * fillWidth / 100
+	if vFill > fillWidth {
+		vFill = fillWidth
+	}
+	aFill := aPct * fillWidth / 100
+	if aFill > fillWidth {
+		aFill = fillWidth
+	}
+
+	var sb strings.Builder
+	// Prefix + 2 × ("X [" + fill (4 bytes/char) + "] NNN%") + gap + margin.
+	sb.Grow(len(prefix) + 2*(3+fillWidth*4+6) + gap)
+	sb.WriteString(prefix)
+	sb.WriteString("V [")
+	for i := 0; i < vFill; i++ {
+		sb.WriteString("█")
+	}
+	for i := vFill; i < fillWidth; i++ {
+		sb.WriteString("░")
+	}
+	fmt.Fprintf(&sb, "] %3d%%", vPct)
+	sb.WriteString("  A [")
+	for i := 0; i < aFill; i++ {
+		sb.WriteString("█")
+	}
+	for i := aFill; i < fillWidth; i++ {
+		sb.WriteString("░")
+	}
+	fmt.Fprintf(&sb, "] %3d%%", aPct)
+	return sb.String()
+}
+
 // StartJob registers a new bar. leasedAt is stored but not currently
 // consumed — ordering is handled by seq (monotonically increasing per call,
 // which matches real lease order).
@@ -506,6 +632,10 @@ func (m *ttyManager) StartJob(jobID string, leasedAt time.Time, profiles []strin
 
 // UpdateStage swaps the bar label and resets the local pct to 0. Also logs
 // the transition with the global pct so the audit trail records it.
+//
+// Clears composite VA mode too: a stage transition leaves the processing
+// stage behind (or re-enters it fresh), and in both cases we want the bar
+// to revert to single-fill until the next UpdateStageProgressVA call.
 func (m *ttyManager) UpdateStage(jobID, stage string, globalPct int) {
 	if m.closed.Load() {
 		return
@@ -518,6 +648,9 @@ func (m *ttyManager) UpdateStage(jobID, stage string, globalPct int) {
 	}
 	b.stage.Store(stage)
 	b.pct.Store(0)
+	b.vaActive.Store(false)
+	b.vPct.Store(0)
+	b.aPct.Store(0)
 	m.dirty.Add(1)
 
 	m.Logf("[%s] → %s (global: %d%%)", jobID, stage, globalPct)
@@ -536,6 +669,9 @@ func (m *ttyManager) LogStageBoundary(jobID, stage string, globalPct int) {
 // UpdateStageProgress stores the new pct. No log line, no guaranteed
 // immediate repaint — called at ffmpeg-frame / R2-part granularity and
 // picked up by the next render tick (at most 250ms away).
+//
+// Also drops any composite VA mode — using the single-fill update is a
+// declaration that the bar should render single-fill again.
 func (m *ttyManager) UpdateStageProgress(jobID string, localPct int) {
 	if m.closed.Load() {
 		return
@@ -552,6 +688,39 @@ func (m *ttyManager) UpdateStageProgress(jobID string, localPct int) {
 		return
 	}
 	b.pct.Store(int32(localPct))
+	b.vaActive.Store(false)
+	m.dirty.Add(1)
+}
+
+// UpdateStageProgressVA stores the video and audio track pcts and flips the
+// bar into composite rendering mode. See ttyBar docs for the two modes.
+//
+// Expected call shape: during the CMAF processing stage, the job publishes
+// V+A on every ffmpeg progress event. A subsequent UpdateStage (e.g.
+// entering the upload stage) automatically clears the composite flag.
+func (m *ttyManager) UpdateStageProgressVA(jobID string, videoPct, audioPct int) {
+	if m.closed.Load() {
+		return
+	}
+	if videoPct < 0 {
+		videoPct = 0
+	} else if videoPct > 100 {
+		videoPct = 100
+	}
+	if audioPct < 0 {
+		audioPct = 0
+	} else if audioPct > 100 {
+		audioPct = 100
+	}
+	m.barsMu.Lock()
+	b, ok := m.bars[jobID]
+	m.barsMu.Unlock()
+	if !ok {
+		return
+	}
+	b.vPct.Store(int32(videoPct))
+	b.aPct.Store(int32(audioPct))
+	b.vaActive.Store(true)
 	m.dirty.Add(1)
 }
 

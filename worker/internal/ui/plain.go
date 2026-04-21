@@ -15,6 +15,11 @@ import (
 // UpdateStageProgress; they are read by the 10-second summary goroutine
 // which emits one line per active job.
 //
+// vaActive/vPct/aPct mirror the ttyBar composite mode — set by
+// UpdateStageProgressVA and cleared by UpdateStage / UpdateStageProgress.
+// When vaActive is true the summarizer emits the dual-track form
+// (`V=NN% A=NN%`) instead of a single local pct.
+//
 // All fields are accessed under plainManager.mu — the hot paths are
 // stage transitions and finishes, both low-frequency. localPct is updated
 // per ffmpeg-frame but each update is one int-write under the same lock
@@ -25,6 +30,11 @@ type plainJob struct {
 	stage     string
 	localPct  int
 	globalPct int
+
+	vaActive bool
+	vPct     int
+	aPct     int
+
 	// completing == true once UpdateStage("completing", _) fires. The
 	// summarizer skips these rows to avoid the same stale-terminal race
 	// the server already guards against in /task/status.
@@ -101,6 +111,13 @@ func (m *plainManager) emitSummary() {
 		if j.completing || j.stage == "" {
 			continue
 		}
+		if j.vaActive {
+			lines = append(lines,
+				fmt.Sprintf("%s [%s] %s V=%d%% A=%d%% (global %d%%)",
+					util.Ts(), j.jobID, j.stage, j.vPct, j.aPct, j.globalPct),
+			)
+			continue
+		}
 		lines = append(lines,
 			fmt.Sprintf("%s [%s] %s %d%% (global %d%%)",
 				util.Ts(), j.jobID, j.stage, j.localPct, j.globalPct),
@@ -132,6 +149,8 @@ func (m *plainManager) StartJob(jobID string, leasedAt time.Time, profiles []str
 // UpdateStage records the transition and emits the boundary log line with
 // global %. Mirrors the TTY path exactly so a user reading stdout sees the
 // same stage-boundary messages regardless of terminal mode.
+//
+// Also clears composite VA mode — same semantics as the TTY path.
 func (m *plainManager) UpdateStage(jobID, stage string, globalPct int) {
 	if m.closed.Load() {
 		return
@@ -142,6 +161,9 @@ func (m *plainManager) UpdateStage(jobID, stage string, globalPct int) {
 		j.stage = stage
 		j.globalPct = globalPct
 		j.localPct = 0
+		j.vaActive = false
+		j.vPct = 0
+		j.aPct = 0
 		if stage == "completing" {
 			j.completing = true
 		}
@@ -166,7 +188,8 @@ func (m *plainManager) LogStageBoundary(jobID, stage string, globalPct int) {
 }
 
 // UpdateStageProgress stores the latest local % without logging. The
-// summarizer will publish it on the next tick.
+// summarizer will publish it on the next tick. Also clears composite VA
+// mode so the next summary goes back to the single-pct form.
 func (m *plainManager) UpdateStageProgress(jobID string, localPct int) {
 	if m.closed.Load() {
 		return
@@ -180,6 +203,32 @@ func (m *plainManager) UpdateStageProgress(jobID string, localPct int) {
 	m.mu.Lock()
 	if j, ok := m.jobs[jobID]; ok {
 		j.localPct = localPct
+		j.vaActive = false
+	}
+	m.mu.Unlock()
+}
+
+// UpdateStageProgressVA stores the V and A track pcts and enables composite
+// reporting for the next summary tick. See plainJob docs.
+func (m *plainManager) UpdateStageProgressVA(jobID string, videoPct, audioPct int) {
+	if m.closed.Load() {
+		return
+	}
+	if videoPct < 0 {
+		videoPct = 0
+	} else if videoPct > 100 {
+		videoPct = 100
+	}
+	if audioPct < 0 {
+		audioPct = 0
+	} else if audioPct > 100 {
+		audioPct = 100
+	}
+	m.mu.Lock()
+	if j, ok := m.jobs[jobID]; ok {
+		j.vPct = videoPct
+		j.aPct = audioPct
+		j.vaActive = true
 	}
 	m.mu.Unlock()
 }

@@ -29,7 +29,7 @@ const { generateWorkerKeyPair, revokeWorkerKey, deleteWorkerKey, listWorkerKeys 
 const { generateSecretKey, isHmacConfigured, setSetting } = require('../../services/tokenService');
 
 // Services - Transcoding Profiles
-const { getGlobalProfiles, getCourseProfiles, saveGlobalProfiles, saveCourseProfiles, deleteCourseProfiles, getAudioNormalizationSettings, saveAudioNormalizationSettings, validateProfile } = require('../../services/transcodingProfileService');
+const { getGlobalProfiles, getCourseProfiles, saveGlobalProfiles, saveCourseProfiles, deleteCourseProfiles, getAudioNormalizationSettings, saveAudioNormalizationSettings, getAudioBitrateDefault, saveAudioBitrateDefault, validateAudioBitrate, validateProfile } = require('../../services/transcodingProfileService');
 
 // Services - Invitations
 const { generateInvitationCode, listInvitationCodes, removeInvitationCode } = require('../../services/registrationService');
@@ -151,7 +151,8 @@ router.get('/admin/courses/:courseId/edit', requireAuth, checkPermission('change
         const globalProfiles = await getGlobalProfiles();
         const courseProfiles = course.use_custom_profiles ? await getCourseProfiles(req.params.courseId) : [];
         const audioNormalization = await getAudioNormalizationSettings();
-        res.json({ course, videos: videoResult.videos.map(sanitizeAdminVideo), globalProfiles, courseProfiles, audioNormalization });
+        const audioBitrateKbps = await getAudioBitrateDefault();
+        res.json({ course, videos: videoResult.videos.map(sanitizeAdminVideo), globalProfiles, courseProfiles, audioNormalization, audioBitrateKbps });
     } catch (err) {
         console.error('API get course edit error:', err);
         res.status(500).json({ error: 'Failed to load course.' });
@@ -206,7 +207,7 @@ router.put('/admin/courses/:courseId/transcoding-profiles', requireAuth, checkPe
                 width: parseInt(p.width, 10),
                 height: parseInt(p.height, 10),
                 video_bitrate_kbps: parseInt(p.video_bitrate_kbps, 10),
-                audio_bitrate_kbps: parseInt(p.audio_bitrate_kbps, 10),
+                fps_limit: p.fps_limit !== undefined ? parseInt(p.fps_limit, 10) : 60,
                 segment_duration: p.segment_duration !== undefined ? parseInt(p.segment_duration, 10) : 6,
                 gop_size: p.gop_size !== undefined ? parseInt(p.gop_size, 10) : 48
             };
@@ -884,7 +885,7 @@ router.get('/admin/settings', requireAuth, checkPermission('manageSite'), requir
 
         // Strip keys managed by other pages / returned separately
         for (const key of Object.keys(settingsMap)) {
-            if (key.startsWith('mfa_') || key.startsWith('audio_normalization_')) {
+            if (key.startsWith('mfa_') || key.startsWith('audio_normalization_') || key === 'audio_bitrate_default') {
                 delete settingsMap[key];
             }
         }
@@ -897,8 +898,9 @@ router.get('/admin/settings', requireAuth, checkPermission('manageSite'), requir
 
         const transcodingProfiles = await getGlobalProfiles();
         const audioNormalization = await getAudioNormalizationSettings();
+        const audioBitrateKbps = await getAudioBitrateDefault();
 
-        res.json({ settings: settingsMap, workerKeys: sanitizedWorkerKeys, roles, hmacKeyConfigured, r2PublicDomain: process.env.R2_PUBLIC_DOMAIN || '', transcodingProfiles, audioNormalization });
+        res.json({ settings: settingsMap, workerKeys: sanitizedWorkerKeys, roles, hmacKeyConfigured, r2PublicDomain: process.env.R2_PUBLIC_DOMAIN || '', transcodingProfiles, audioNormalization, audioBitrateKbps });
     } catch (err) {
         console.error('API settings error:', err);
         res.status(500).json({ error: 'Failed to load settings.' });
@@ -1039,10 +1041,10 @@ router.put('/admin/settings', requireAuth, checkPermission('manageSite'), requir
     }
 });
 
-// PUT /api/admin/settings/transcoding-profiles — save global profiles + audio normalization
+// PUT /api/admin/settings/transcoding-profiles — save global profiles + audio normalization + site-wide audio bitrate
 router.put('/admin/settings/transcoding-profiles', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
     try {
-        const { profiles, audioNormalization } = req.body;
+        const { profiles, audioNormalization, audioBitrateKbps } = req.body;
 
         // Validate profiles
         if (!Array.isArray(profiles) || profiles.length === 0) {
@@ -1055,7 +1057,7 @@ router.put('/admin/settings/transcoding-profiles', requireAuth, checkPermission(
                 width: parseInt(p.width, 10),
                 height: parseInt(p.height, 10),
                 video_bitrate_kbps: parseInt(p.video_bitrate_kbps, 10),
-                audio_bitrate_kbps: parseInt(p.audio_bitrate_kbps, 10),
+                fps_limit: p.fps_limit !== undefined ? parseInt(p.fps_limit, 10) : 60,
                 segment_duration: p.segment_duration !== undefined ? parseInt(p.segment_duration, 10) : 6,
                 gop_size: p.gop_size !== undefined ? parseInt(p.gop_size, 10) : 48
             };
@@ -1064,6 +1066,16 @@ router.put('/admin/settings/transcoding-profiles', requireAuth, checkPermission(
                 return res.status(400).json({ error: `Profile ${i + 1}: ${errors.join(', ')}` });
             }
             profiles[i] = { ...p, ...parsed };
+        }
+
+        // Validate the site-wide audio bitrate before we touch the DB.
+        let audioBitrateParsed = null;
+        if (audioBitrateKbps !== undefined) {
+            audioBitrateParsed = parseInt(audioBitrateKbps, 10);
+            const errors = validateAudioBitrate(audioBitrateParsed);
+            if (errors.length > 0) {
+                return res.status(400).json({ error: errors.join(', ') });
+            }
         }
 
         await saveGlobalProfiles(profiles);
@@ -1077,6 +1089,10 @@ router.put('/admin/settings/transcoding-profiles', requireAuth, checkPermission(
             if (isNaN(peak) || peak < -20 || peak > 0) return res.status(400).json({ error: 'True peak must be between -20 and 0' });
             if (isNaN(maxGain) || maxGain < 0 || maxGain > 40) return res.status(400).json({ error: 'Max gain must be between 0 and 40' });
             await saveAudioNormalizationSettings({ target: String(target), peak: String(peak), maxGain: String(maxGain) });
+        }
+
+        if (audioBitrateParsed !== null) {
+            await saveAudioBitrateDefault(audioBitrateParsed);
         }
 
         res.status(204).end();

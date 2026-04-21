@@ -14,7 +14,7 @@ router.get('/videos/:id/playback', requireAuth, async (req, res) => {
         const videoId = parseInt(req.params.id);
 
         if (!user.permissions.allowPlayback) {
-            return res.json({ videoUrl: null, isPlaybackAllowed: false, resumePosition: null });
+            return res.json({ hlsUrl: null, isPlaybackAllowed: false, resumePosition: null });
         }
 
         const video = await getVideoById(videoId);
@@ -35,7 +35,24 @@ router.get('/videos/:id/playback', requireAuth, async (req, res) => {
         }
 
         const publicDomain = process.env.R2_PUBLIC_DOMAIN;
-        const videoUrl = `https://${publicDomain}/${video.hashed_video_id}/${video.processing_job_id}/master.m3u8`;
+        const videoType = video.video_type || 'ts';
+        const basePath = `/${video.hashed_video_id}/${video.processing_job_id}/`;
+        let hlsUrl = `https://${publicDomain}${basePath}master.m3u8`;
+        let dashUrl = null;
+
+        // CMAF videos get both an HLS and a DASH manifest URL. Shaka on non-Apple
+        // clients loads the DASH one; Apple (Safari/iOS/iPadOS) uses native HLS
+        // off the same master.m3u8 via #EXT-X-DEFINE QUERYPARAM substitution.
+        if (videoType === 'cmaf') {
+            const token = await generateToken(basePath);
+            if (token) {
+                const q = `?verify=${encodeURIComponent(token)}`;
+                hlsUrl = `${hlsUrl}${q}`;
+                dashUrl = `https://${publicDomain}${basePath}manifest.mpd${q}`;
+            } else {
+                dashUrl = `https://${publicDomain}${basePath}manifest.mpd`;
+            }
+        }
 
         // Get resume position
         let resumePosition = null;
@@ -52,7 +69,7 @@ router.get('/videos/:id/playback', requireAuth, async (req, res) => {
             }
         }
 
-        res.json({ videoUrl, isPlaybackAllowed: true, resumePosition });
+        res.json({ hlsUrl, dashUrl, videoType, isPlaybackAllowed: true, resumePosition });
     } catch (err) {
         console.error('Playback API error:', err);
         res.status(500).json({ error: 'Failed to get playback info' });

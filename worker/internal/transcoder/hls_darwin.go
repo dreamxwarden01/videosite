@@ -22,7 +22,11 @@ import (
 //  3. Full software: CPU decode + CPU scale/pad → libx264.
 //
 // swDecode=true → skip VideoToolbox hardware decode (tier-2 path).
-func TranscodeToHLS(ctx context.Context, sourcePath, outputDir string, profile config.OutputProfile, encoder config.Encoder, duration float64, keyInfoFile string, swDecode bool, logFile string, srcW, srcH int, loudnormFilter string) (<-chan int, <-chan error) {
+//
+// audioBitrateKbps is the site-wide AAC bitrate injected into the single
+// ffmpeg process (TS muxes video and audio together; for CMAF, audio runs
+// in a separate ffmpeg invocation — see TranscodeAudioCMAF in cmaf.go).
+func TranscodeToHLS(ctx context.Context, sourcePath, outputDir string, profile config.OutputProfile, audioBitrateKbps int, encoder config.Encoder, duration float64, keyInfoFile string, swDecode bool, logFile string, srcW, srcH int, loudnormFilter string) (<-chan int, <-chan error) {
 	os.MkdirAll(outputDir, 0755)
 
 	ffmpegEncoder := hardware.FFmpegEncoderName[encoder.EncoderType]
@@ -30,51 +34,69 @@ func TranscodeToHLS(ctx context.Context, sourcePath, outputDir string, profile c
 		ffmpegEncoder = "libx264"
 	}
 
-	// CPU scale+pad filter used by tiers 2 and 3.
+	hwArgs, vfFilter := resolveHWArgs(encoder, swDecode, srcW, srcH, profile.Width, profile.Height)
+
+	args := buildBaseTranscodeArgs(hwArgs, sourcePath, outputDir, profile, audioBitrateKbps, ffmpegEncoder, vfFilter, loudnormFilter, keyInfoFile)
+
+	// Encoder-specific options (shared with CMAF path via applyEncoderOpts).
+	args = applyEncoderOpts(args, encoder, ffmpegEncoder, profile)
+
+	return RunFFmpegWithProgress(ctx, duration, logFile, args...)
+}
+
+// applyEncoderOpts injects encoder-specific FFmpeg flags (preset, RC mode,
+// quality tuning) immediately after the -c:v value. Shared between TS
+// (TranscodeToHLS) and CMAF (TranscodeVideoCMAF); platform-specific because
+// the set of encoders differs (VT only on darwin).
+func applyEncoderOpts(args []string, encoder config.Encoder, ffmpegEncoder string, profile config.OutputProfile) []string {
+	switch encoder.EncoderType {
+	case hardware.EncoderVT:
+		// No -preset for VideoToolbox.
+		return args
+	default:
+		return insertAfter(args, ffmpegEncoder, "-preset", profile.Preset)
+	}
+}
+
+// resolveHWArgs returns (hwArgs, vfFilter) for the chosen encoder and decode
+// tier on macOS. Shared between TS (TranscodeToHLS) and CMAF (cmaf.go).
+//
+// hwArgs contains FFmpeg global-input flags (-hwaccel …) injected before -i;
+// vfFilter is the value passed to -vf and handles scaling + padding as
+// required by the target profile. When scale_vt delivers exact target dims
+// vfFilter uses pure GPU filtering; otherwise it scales on GPU and does a
+// hwdownload + CPU pad.
+func resolveHWArgs(encoder config.Encoder, swDecode bool, srcW, srcH, tgtW, tgtH int) (hwArgs []string, vfFilter string) {
 	cpuVF := fmt.Sprintf(
 		"scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2",
-		profile.Width, profile.Height, profile.Width, profile.Height,
+		tgtW, tgtH, tgtW, tgtH,
 	)
-
-	var hwArgs []string
-	var vfFilter string
 
 	switch encoder.EncoderType {
 	case hardware.EncoderVT:
 		if hardware.VTHWDecodeSupported() && hardware.ScaleVTSupported() && !swDecode {
 			// Tier 1: VT hw decode → scale_vt → optional pad → VT hw encode.
-			scaledW, scaledH := scaleVTDims(srcW, srcH, profile.Width, profile.Height)
+			scaledW, scaledH := scaleVTDims(srcW, srcH, tgtW, tgtH)
 			hwArgs = []string{
 				"-hwaccel", "videotoolbox",
 				"-hwaccel_output_format", "videotoolbox_vld",
 			}
-			if scaledW == profile.Width && scaledH == profile.Height {
-				vfFilter = fmt.Sprintf("scale_vt=%d:%d", profile.Width, profile.Height)
+			if scaledW == tgtW && scaledH == tgtH {
+				vfFilter = fmt.Sprintf("scale_vt=%d:%d", tgtW, tgtH)
 			} else {
 				vfFilter = fmt.Sprintf(
 					"scale_vt=%d:%d,hwdownload,format=nv12,pad=%d:%d:(ow-iw)/2:(oh-ih)/2",
-					scaledW, scaledH, profile.Width, profile.Height,
+					scaledW, scaledH, tgtW, tgtH,
 				)
 			}
-		} else {
-			// Tier 2: CPU decode + CPU scale/pad + VT hw encode.
-			vfFilter = cpuVF
+			return
 		}
+		// Tier 2: CPU decode + CPU scale/pad + VT hw encode.
+		vfFilter = cpuVF
 	default: // SOFTWARE
 		vfFilter = cpuVF
 	}
-
-	args := buildBaseTranscodeArgs(hwArgs, sourcePath, outputDir, profile, ffmpegEncoder, vfFilter, loudnormFilter, keyInfoFile)
-
-	// Encoder-specific options.
-	switch encoder.EncoderType {
-	case hardware.EncoderVT:
-		// No -preset for VideoToolbox.
-	default:
-		args = insertAfter(args, ffmpegEncoder, "-preset", profile.Preset)
-	}
-
-	return RunFFmpegWithProgress(ctx, duration, logFile, args...)
+	return
 }
 
 // scaleVTDims computes scale_vt output dimensions preserving source aspect ratio.

@@ -90,9 +90,12 @@ func UploadFile(ctx context.Context, filePath, presignedURL string) error {
 	return fmt.Errorf("upload %s: failed after %d retries: %w", filepath.Base(filePath), maxUploadRetries, lastErr)
 }
 
-// hlsContentType returns the correct MIME type for HLS output files.
-// Must match the ContentType used when generating the presigned PUT URL
+// hlsContentType returns the correct MIME type for HLS / CMAF / DASH output
+// files. Must match the ContentType used when generating the presigned PUT URL
 // on the server side (processingService.js hlsContentType).
+//
+// Legacy TS uses .m3u8 + .ts; CMAF adds .mpd (DASH manifest), .mp4 (init
+// segment), and .m4s (media segments). All are served cache-immutable.
 func hlsContentType(filename string) string {
 	lower := strings.ToLower(filename)
 	switch {
@@ -100,6 +103,10 @@ func hlsContentType(filename string) string {
 		return "application/vnd.apple.mpegurl"
 	case strings.HasSuffix(lower, ".ts"):
 		return "video/mp2t"
+	case strings.HasSuffix(lower, ".mpd"):
+		return "application/dash+xml"
+	case strings.HasSuffix(lower, ".mp4"), strings.HasSuffix(lower, ".m4s"):
+		return "video/mp4"
 	default:
 		return "application/octet-stream"
 	}

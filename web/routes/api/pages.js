@@ -179,12 +179,23 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
 
         const publicDomain = process.env.R2_PUBLIC_DOMAIN;
         const basePath = `/${video.hashed_video_id}/${video.processing_job_id}/`;
-        let videoUrl = `https://${publicDomain}${basePath}master.m3u8`;
+        const videoType = video.video_type || 'ts';
+        let hlsUrl = `https://${publicDomain}${basePath}master.m3u8`;
+        let dashUrl = null;
 
         const hmacToken = await generateToken(basePath);
         const tokenValiditySeconds = await getTokenValiditySeconds();
         if (hmacToken) {
-            videoUrl += `?verify=${encodeURIComponent(hmacToken)}`;
+            hlsUrl += `?verify=${encodeURIComponent(hmacToken)}`;
+        }
+
+        // CMAF videos also expose a DASH manifest for Shaka on non-Apple clients.
+        // WatchPage picks between hlsUrl and dashUrl based on UA.
+        if (videoType === 'cmaf') {
+            dashUrl = `https://${publicDomain}${basePath}manifest.mpd`;
+            if (hmacToken) {
+                dashUrl += `?verify=${encodeURIComponent(hmacToken)}`;
+            }
         }
 
         let resumePosition = 0;
@@ -211,7 +222,9 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
                 course_id: video.course_id,
                 course_name: video.course_name,
             },
-            videoUrl,
+            hlsUrl,
+            dashUrl,
+            videoType,
             resumePosition,
             hmacToken: hmacToken || '',
             r2PublicDomain: publicDomain || '',

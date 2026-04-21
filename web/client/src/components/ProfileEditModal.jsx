@@ -5,7 +5,7 @@ const FIELDS = [
   { key: 'width', label: 'Width (px)', type: 'numeric', min: 1, max: 7680 },
   { key: 'height', label: 'Height (px)', type: 'numeric', min: 1, max: 4320 },
   { key: 'video_bitrate_kbps', label: 'Video Bitrate (kbps)', type: 'numeric', min: 100, max: 100000 },
-  { key: 'audio_bitrate_kbps', label: 'Audio Bitrate (kbps)', type: 'numeric', min: 32, max: 512 },
+  { key: 'fps_limit', label: 'Max FPS', type: 'numeric', min: 1, max: 120 },
   { key: 'codec', label: 'Codec', type: 'select', options: ['h264'] },
   { key: 'profile', label: 'H.264 Profile', type: 'select', options: ['baseline', 'main', 'high'] },
   { key: 'preset', label: 'Encoding Preset', type: 'select', options: ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'] },
@@ -14,7 +14,7 @@ const FIELDS = [
 ];
 
 const DEFAULT_PROFILE = {
-  name: '', width: '', height: '', video_bitrate_kbps: '', audio_bitrate_kbps: '',
+  name: '', width: '', height: '', video_bitrate_kbps: '', fps_limit: '60',
   codec: 'h264', profile: 'high', preset: 'medium', segment_duration: '6', gop_size: '48'
 };
 

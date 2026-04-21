@@ -64,16 +64,20 @@ async function generateHashedVideoId() {
 /**
  * Create a video record. Accepts a pre-generated hashed_video_id and r2_source_key
  * in options (used by upload complete). If not provided, generates a new hash.
+ *
+ * options.video_type: 'ts' | 'cmaf'. Defaults to 'ts'. Upload flows will
+ * override this to 'cmaf' once the CMAF pipeline is fully deployed (phase 4).
  */
 async function createVideo(courseId, title, options = {}) {
     const pool = getPool();
 
     const hashedVideoId = options.hashed_video_id || await generateHashedVideoId();
+    const videoType = options.video_type === 'cmaf' ? 'cmaf' : 'ts';
 
     const [result] = await pool.execute(
         `INSERT INTO videos (course_id, title, description, week, lecture_date,
-         original_filename, file_size_bytes, uploaded_by, hashed_video_id, r2_source_key)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         original_filename, file_size_bytes, uploaded_by, hashed_video_id, r2_source_key, video_type)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
             courseId, title,
             options.description || null,
@@ -83,7 +87,8 @@ async function createVideo(courseId, title, options = {}) {
             options.file_size_bytes || null,
             options.uploaded_by || null,
             hashedVideoId,
-            options.r2_source_key || null
+            options.r2_source_key || null,
+            videoType
         ]
     );
 
@@ -116,6 +121,11 @@ async function updateVideo(videoId, updates) {
     if (updates.processing_error !== undefined) { fields.push('processing_error = ?'); values.push(updates.processing_error); }
     if (updates.duration_seconds !== undefined) { fields.push('duration_seconds = ?'); values.push(updates.duration_seconds); }
     if (updates.r2_source_key !== undefined) { fields.push('r2_source_key = ?'); values.push(updates.r2_source_key); }
+    if (updates.video_type !== undefined) {
+        // Only 'ts' or 'cmaf' are valid; everything else is silently ignored.
+        const vt = updates.video_type === 'cmaf' ? 'cmaf' : (updates.video_type === 'ts' ? 'ts' : null);
+        if (vt !== null) { fields.push('video_type = ?'); values.push(vt); }
+    }
 
     if (fields.length === 0) return;
     values.push(videoId);

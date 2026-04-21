@@ -220,7 +220,12 @@ router.post('/upload/:uploadId/complete', requireAuth, checkPermission('uploadVi
         let videoId;
 
         if (!session.video_id) {
-            // New upload — create video record
+            // New upload — create video record.
+            //
+            // All newly created videos go through the CMAF pipeline (fMP4
+            // HLS + DASH, unencrypted). Legacy TS videos created before
+            // this flip remain at video_type='ts' and continue to work
+            // through their existing pipeline — coexistence, not migration.
             const user = res.locals.user;
             const result = await createVideo(session.course_id, session.title, {
                 description: session.description,
@@ -229,7 +234,8 @@ router.post('/upload/:uploadId/complete', requireAuth, checkPermission('uploadVi
                 original_filename: session.original_filename,
                 file_size_bytes: session.file_size_bytes,
                 uploaded_by: user.user_id,
-                r2_source_key: session.object_key
+                r2_source_key: session.object_key,
+                video_type: 'cmaf'
             });
             videoId = result.videoId;
 
@@ -264,11 +270,15 @@ router.post('/upload/:uploadId/complete', requireAuth, checkPermission('uploadVi
             // Delete old processing_queue row
             await pool.execute('DELETE FROM processing_queue WHERE video_id = ?', [videoId]);
 
-            // Update video with new source info and reset state
+            // Update video with new source info and reset state. Replacement
+            // uploads also flip video_type to 'cmaf' — a re-uploaded source
+            // moves onto the new pipeline and drops its old encryption_key
+            // (CMAF rows are unencrypted; /api/keys/:id already 404s on NULL).
             await pool.execute(
                 `UPDATE videos SET r2_source_key = ?, original_filename = ?, file_size_bytes = ?,
                  status = 'queued', processing_job_id = NULL, encryption_key = NULL,
-                 processing_progress = 0, processing_error = NULL, duration_seconds = NULL
+                 processing_progress = 0, processing_error = NULL, duration_seconds = NULL,
+                 video_type = 'cmaf'
                  WHERE video_id = ?`,
                 [session.object_key, session.original_filename, session.file_size_bytes, videoId]
             );

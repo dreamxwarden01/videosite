@@ -5,7 +5,6 @@ package main
 import (
 	"fmt"
 	"videosite-worker/internal/config"
-	"videosite-worker/internal/hardware"
 	"videosite-worker/internal/util"
 )
 
@@ -36,11 +35,6 @@ func printHardwareInfo(caps *config.Capabilities) {
 		} else {
 			fmt.Printf("%s   %d encoder(s) enabled, %d total job slot(s)\n", util.Ts(), enabledCount, totalSlots)
 		}
-	}
-	if hardware.CUDAHWDecodeSupported() {
-		fmt.Printf("%s   NVDEC hardware decode: available (GPU decode + CPU scale + GPU encode)\n", util.Ts())
-	} else {
-		fmt.Printf("%s   NVDEC hardware decode: not available (CPU decode+scale, GPU encode only)\n", util.Ts())
 	}
 	fmt.Println()
 }

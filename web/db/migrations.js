@@ -595,6 +595,40 @@ async function runMigrations() {
                     // FLOAT accumulates IEEE-754 drift; DECIMAL is exact.
                     await pool.execute(`ALTER TABLE watch_progress MODIFY watch_seconds DECIMAL(10,2) NOT NULL DEFAULT 0`);
                 }
+            },
+            {
+                id: '027_cmaf_support',
+                up: async () => {
+                    // Videos: tag each row with its container format. Legacy rows
+                    // stay on TS forever; new uploads will start getting 'cmaf'
+                    // once the upload flow is flipped (phase 4 of the rollout).
+                    await pool.execute(`
+                        ALTER TABLE videos
+                        ADD COLUMN video_type ENUM('ts','cmaf') NOT NULL DEFAULT 'ts' AFTER encryption_key
+                    `);
+
+                    // Transcoding profiles: audio is now a single site-wide
+                    // rendition (CMAF puts audio in its own adaptation set),
+                    // so per-profile audio_bitrate_kbps is gone.
+                    await pool.execute(`
+                        ALTER TABLE transcoding_profiles
+                        DROP COLUMN audio_bitrate_kbps
+                    `);
+
+                    // fps_limit per profile — downsample if source > limit,
+                    // never upsample. Default 60 matches current content norms.
+                    await pool.execute(`
+                        ALTER TABLE transcoding_profiles
+                        ADD COLUMN fps_limit INT UNSIGNED NOT NULL DEFAULT 60 AFTER video_bitrate_kbps
+                    `);
+
+                    // Site-wide audio bitrate default (kbps). One rendition for
+                    // every CMAF job. Validated 128–320 on the API boundary.
+                    await pool.execute(`
+                        INSERT IGNORE INTO site_settings (setting_key, setting_value)
+                        VALUES ('audio_bitrate_default', '192')
+                    `);
+                }
             }
         ];
 

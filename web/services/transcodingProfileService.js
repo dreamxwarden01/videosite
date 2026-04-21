@@ -1,6 +1,6 @@
 const { getPool } = require('../config/database');
 
-const PROFILE_COLUMNS = 'profile_id, course_id, name, width, height, video_bitrate_kbps, audio_bitrate_kbps, codec, profile, preset, segment_duration, gop_size, sort_order';
+const PROFILE_COLUMNS = 'profile_id, course_id, name, width, height, video_bitrate_kbps, fps_limit, codec, profile, preset, segment_duration, gop_size, sort_order';
 
 async function getGlobalProfiles() {
     const pool = getPool();
@@ -42,9 +42,9 @@ async function saveGlobalProfiles(profiles) {
         for (let i = 0; i < profiles.length; i++) {
             const p = profiles[i];
             await conn.execute(
-                `INSERT INTO transcoding_profiles (course_id, name, width, height, video_bitrate_kbps, audio_bitrate_kbps, codec, profile, preset, segment_duration, gop_size, sort_order)
+                `INSERT INTO transcoding_profiles (course_id, name, width, height, video_bitrate_kbps, fps_limit, codec, profile, preset, segment_duration, gop_size, sort_order)
                  VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [p.name, p.width, p.height, p.video_bitrate_kbps, p.audio_bitrate_kbps, p.codec || 'h264', p.profile || 'high', p.preset || 'medium', p.segment_duration || 6, p.gop_size || 48, i]
+                [p.name, p.width, p.height, p.video_bitrate_kbps, p.fps_limit || 60, p.codec || 'h264', p.profile || 'high', p.preset || 'medium', p.segment_duration || 6, p.gop_size || 48, i]
             );
         }
         await conn.commit();
@@ -65,9 +65,9 @@ async function saveCourseProfiles(courseId, profiles) {
         for (let i = 0; i < profiles.length; i++) {
             const p = profiles[i];
             await conn.execute(
-                `INSERT INTO transcoding_profiles (course_id, name, width, height, video_bitrate_kbps, audio_bitrate_kbps, codec, profile, preset, segment_duration, gop_size, sort_order)
+                `INSERT INTO transcoding_profiles (course_id, name, width, height, video_bitrate_kbps, fps_limit, codec, profile, preset, segment_duration, gop_size, sort_order)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [courseId, p.name, p.width, p.height, p.video_bitrate_kbps, p.audio_bitrate_kbps, p.codec || 'h264', p.profile || 'high', p.preset || 'medium', p.segment_duration || 6, p.gop_size || 48, i]
+                [courseId, p.name, p.width, p.height, p.video_bitrate_kbps, p.fps_limit || 60, p.codec || 'h264', p.profile || 'high', p.preset || 'medium', p.segment_duration || 6, p.gop_size || 48, i]
             );
         }
         await conn.commit();
@@ -110,15 +110,52 @@ async function saveAudioNormalizationSettings({ target, peak, maxGain }) {
     await pool.execute(`INSERT INTO site_settings (setting_key, setting_value) VALUES ('audio_normalization_max_gain', ?) ON DUPLICATE KEY UPDATE setting_value = ?`, [maxGain, maxGain]);
 }
 
+/**
+ * Site-wide default audio bitrate (kbps) used for every CMAF video's single
+ * audio rendition. Returns a number in [128, 320]; falls back to 192 when
+ * the setting is missing or malformed.
+ */
+async function getAudioBitrateDefault() {
+    const pool = getPool();
+    const [rows] = await pool.execute(
+        `SELECT setting_value FROM site_settings WHERE setting_key = 'audio_bitrate_default'`
+    );
+    if (rows.length === 0) return 192;
+    const n = parseInt(rows[0].setting_value, 10);
+    if (!Number.isFinite(n) || n < 128 || n > 320) return 192;
+    return n;
+}
+
+async function saveAudioBitrateDefault(kbps) {
+    const pool = getPool();
+    const v = String(kbps);
+    await pool.execute(
+        `INSERT INTO site_settings (setting_key, setting_value) VALUES ('audio_bitrate_default', ?)
+         ON DUPLICATE KEY UPDATE setting_value = ?`,
+        [v, v]
+    );
+}
+
+/** Validate a site-wide audio bitrate. Returns array of errors (empty = ok). */
+function validateAudioBitrate(n) {
+    const errors = [];
+    if (!Number.isInteger(n) || n < 128 || n > 320) {
+        errors.push('Audio bitrate must be an integer between 128 and 320 kbps');
+    }
+    return errors;
+}
+
 function validateProfile(p) {
     const errors = [];
     if (!p.name || !p.name.trim()) errors.push('Name is required');
     if (!Number.isInteger(p.width) || p.width <= 0) errors.push('Width must be a positive integer');
     if (!Number.isInteger(p.height) || p.height <= 0) errors.push('Height must be a positive integer');
     if (!Number.isInteger(p.video_bitrate_kbps) || p.video_bitrate_kbps <= 0) errors.push('Video bitrate must be a positive integer');
-    if (!Number.isInteger(p.audio_bitrate_kbps) || p.audio_bitrate_kbps <= 0) errors.push('Audio bitrate must be a positive integer');
+    if (p.fps_limit !== undefined && (!Number.isInteger(p.fps_limit) || p.fps_limit < 1 || p.fps_limit > 120)) errors.push('FPS limit must be an integer between 1 and 120');
     if (p.segment_duration !== undefined && (!Number.isInteger(p.segment_duration) || p.segment_duration < 1 || p.segment_duration > 30)) errors.push('Segment duration must be 1-30');
     if (p.gop_size !== undefined && (!Number.isInteger(p.gop_size) || p.gop_size < 1 || p.gop_size > 250)) errors.push('GOP size must be 1-250');
+    // audio_bitrate_kbps is no longer a per-profile field — reject if the client still sends it.
+    if (p.audio_bitrate_kbps !== undefined) errors.push('audio_bitrate_kbps is no longer a per-profile field; use the site-wide audio bitrate setting');
     return errors;
 }
 
@@ -131,5 +168,8 @@ module.exports = {
     deleteCourseProfiles,
     getAudioNormalizationSettings,
     saveAudioNormalizationSettings,
+    getAudioBitrateDefault,
+    saveAudioBitrateDefault,
+    validateAudioBitrate,
     validateProfile
 };

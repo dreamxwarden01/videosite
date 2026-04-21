@@ -53,6 +53,14 @@ type Manager interface {
 	// line is emitted. Called at ffmpeg-frame / R2-part granularity.
 	UpdateStageProgress(jobID string, localPct int)
 
+	// UpdateStageProgressVA switches the bar into "composite" rendering —
+	// the row shows two side-by-side micro-bars (V for video, A for audio)
+	// instead of a single full-width bar. Intended for the CMAF processing
+	// stage, where video profiles and the audio track run in parallel and
+	// each has its own 0-100 progress. Subsequent UpdateStage or
+	// UpdateStageProgress calls reset the bar back to single-fill mode.
+	UpdateStageProgressVA(jobID string, videoPct, audioPct int)
+
 	// FinishJob removes the job's bar and emits a final log line. reason is a
 	// pre-formatted human-readable string (e.g. "completed", "aborted (phase:
 	// download)", "ERROR: job failed at transcode: no encoder available"). The

@@ -368,7 +368,7 @@ async function leaseTask(videoId, workerKeyId) {
 
     // Get task details for download URL generation
     const [rows] = await pool.execute(
-        `SELECT pq.*, v.course_id, v.hashed_video_id, v.r2_source_key, v.original_filename
+        `SELECT pq.*, v.course_id, v.hashed_video_id, v.r2_source_key, v.original_filename, v.video_type
          FROM processing_queue pq
          JOIN videos v ON pq.video_id = v.video_id
          WHERE pq.job_id = ?`,
@@ -380,15 +380,27 @@ async function leaseTask(videoId, workerKeyId) {
     }
 
     const task = rows[0];
+    const videoType = task.video_type || 'ts';
 
-    // Generate HLS encryption key (AES-128 = 16 bytes)
-    const encryptionKey = crypto.randomBytes(16);
-
-    // Update video status to worker_downloading and store encryption key
-    await pool.execute(
-        "UPDATE videos SET status = 'worker_downloading', processing_job_id = ?, encryption_key = ? WHERE video_id = ?",
-        [jobId, encryptionKey, task.video_id]
-    );
+    // Generate HLS AES-128 key only for legacy TS videos. CMAF pipelines ship
+    // unencrypted — the existing /api/keys endpoint returns 404 when the column
+    // is NULL, which is exactly what the CMAF client path expects.
+    let encryptionKey = null;
+    let encryptionKeyHex = null;
+    if (videoType === 'ts') {
+        encryptionKey = crypto.randomBytes(16);
+        encryptionKeyHex = encryptionKey.toString('hex');
+        await pool.execute(
+            "UPDATE videos SET status = 'worker_downloading', processing_job_id = ?, encryption_key = ? WHERE video_id = ?",
+            [jobId, encryptionKey, task.video_id]
+        );
+    } else {
+        // CMAF: clear any stale key from a previous lease, keep the column NULL.
+        await pool.execute(
+            "UPDATE videos SET status = 'worker_downloading', processing_job_id = ?, encryption_key = NULL WHERE video_id = ?",
+            [jobId, task.video_id]
+        );
+    }
 
     // Generate presigned download URL
     const { GetObjectCommand } = require('@aws-sdk/client-s3');
@@ -400,8 +412,10 @@ async function leaseTask(videoId, workerKeyId) {
     const command = new GetObjectCommand({ Bucket: bucket, Key: task.r2_source_key });
     const downloadUrl = await getSignedUrl(r2, command, { expiresIn: 3600 });
 
-    // Fetch transcoding profiles and audio normalization for this course
-    const { getEffectiveProfiles, getAudioNormalizationSettings } = require('./transcodingProfileService');
+    // Fetch transcoding profiles, audio normalization, and site-wide audio bitrate
+    const {
+        getEffectiveProfiles, getAudioNormalizationSettings, getAudioBitrateDefault
+    } = require('./transcodingProfileService');
     const [courseRows] = await pool.execute(
         'SELECT audio_normalization FROM courses WHERE course_id = ?',
         [task.course_id]
@@ -410,13 +424,18 @@ async function leaseTask(videoId, workerKeyId) {
 
     const profiles = await getEffectiveProfiles(task.course_id);
     const normSettings = await getAudioNormalizationSettings();
+    const audioBitrateKbps = await getAudioBitrateDefault();
 
     startStaleTimer(jobId);
     return {
-        isLeaseSuccess: true, jobId, downloadUrl, videoId: task.video_id, encryptionKey: encryptionKey.toString('hex'),
+        isLeaseSuccess: true, jobId, downloadUrl, videoId: task.video_id,
+        encryptionKey: encryptionKeyHex,
+        videoType,
+        audioBitrateKbps,
         outputProfiles: profiles.map(p => ({
             name: p.name, width: p.width, height: p.height,
-            video_bitrate_kbps: p.video_bitrate_kbps, audio_bitrate_kbps: p.audio_bitrate_kbps,
+            video_bitrate_kbps: p.video_bitrate_kbps,
+            fps_limit: p.fps_limit,
             codec: p.codec, profile: p.profile, preset: p.preset,
             segment_duration: p.segment_duration, gop_size: p.gop_size
         })),
@@ -443,6 +462,8 @@ async function leaseTasks(videoIds, workerKeyId) {
                     jobId: r.jobId,
                     downloadUrl: r.downloadUrl,
                     encryptionKey: r.encryptionKey,
+                    videoType: r.videoType,
+                    audioBitrateKbps: r.audioBitrateKbps,
                     outputProfiles: r.outputProfiles,
                     audioNormalization: r.audioNormalization,
                     audioNormalizationTarget: r.audioNormalizationTarget,
@@ -531,9 +552,14 @@ async function reportJobStatuses(jobs) {
 }
 
 // Map file extension to the correct MIME type for R2 storage.
+// Covers both legacy TS segments and CMAF (fMP4 HLS + DASH) outputs.
 function hlsContentType(filename) {
     if (filename.endsWith('.m3u8')) return 'application/vnd.apple.mpegurl';
+    if (filename.endsWith('.mpd'))  return 'application/dash+xml';
     if (filename.endsWith('.ts'))   return 'video/mp2t';
+    // .m4s = CMAF media segment, .mp4 = fMP4 init segment
+    if (filename.endsWith('.m4s'))  return 'video/mp4';
+    if (filename.endsWith('.mp4'))  return 'video/mp4';
     return 'application/octet-stream';
 }
 

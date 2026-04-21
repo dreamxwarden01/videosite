@@ -322,7 +322,7 @@ export default function CourseEditPage() {
                           <th>Name</th>
                           <th>Resolution</th>
                           <th>Video Bitrate</th>
-                          <th>Audio Bitrate</th>
+                          <th>Max FPS</th>
                           {useCustomProfiles && <th>Actions</th>}
                         </tr>
                       </thead>
@@ -332,7 +332,7 @@ export default function CourseEditPage() {
                             <td>{p.name}</td>
                             <td>{p.width}x{p.height}</td>
                             <td>{p.video_bitrate_kbps} kbps</td>
-                            <td>{p.audio_bitrate_kbps} kbps</td>
+                            <td>{p.fps_limit} fps</td>
                             {useCustomProfiles && (
                               <td>
                                 <button className="btn btn-secondary btn-sm" onClick={() => { setEditingProfile(idx); setShowProfileModal(true); }}>Edit</button>

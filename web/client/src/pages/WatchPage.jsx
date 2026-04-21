@@ -5,6 +5,41 @@ import { useToast } from '../context/ToastContext';
 import { apiGet, apiPost, triggerAuthFailure } from '../api';
 import LoadingSpinner from '../components/LoadingSpinner';
 
+// isAppleDevice returns true for clients whose video stack prefers HLS over
+// DASH: iOS/iPadOS Safari (all browsers on iOS share WebKit), macOS Safari,
+// and iPadOS 13+ which masquerades as "Macintosh" but reports maxTouchPoints.
+// Everywhere else we prefer DASH so Shaka Player handles the media itself
+// (Chromium, Firefox, Edge, Chrome on Android).
+//
+// This branch only matters for CMAF videos — TS videos always load the HLS
+// master URL regardless of UA (no DASH manifest exists for them).
+function isAppleDevice() {
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+  if (/iPad|iPhone|iPod/.test(ua)) return true;
+  // iPadOS 13+ advertises itself as Macintosh but is still Safari/WebKit
+  // under the hood and supports native HLS the same way.
+  if (/Macintosh/.test(ua) && typeof navigator !== 'undefined'
+      && navigator.maxTouchPoints > 1) return true;
+  // Safari on macOS — positive Safari token, rule out the other big
+  // Safari-derivative UAs that also include the "Safari" substring.
+  if (/Safari/.test(ua) && !/Chrome|Chromium|Edg|OPR|Firefox|FxiOS/.test(ua)) return true;
+  return false;
+}
+
+// pickManifestUrl chooses HLS or DASH based on videoType + UA.
+//   - legacy TS: always the HLS master URL (hlsUrl). No DASH for TS.
+//   - CMAF + Apple: HLS master URL; Safari delegates to <video> native HLS.
+//   - CMAF + non-Apple: DASH MPD URL; Shaka handles the segments directly.
+//
+// Falls back to hlsUrl if dashUrl is missing — protects the page in the
+// transitional window where a server response may not yet include the field.
+function pickManifestUrl(data) {
+  if (data.videoType === 'cmaf' && !isAppleDevice() && data.dashUrl) {
+    return data.dashUrl;
+  }
+  return data.hlsUrl;
+}
+
 export default function WatchPage() {
   const { videoId } = useParams();
   const { siteName } = useSite();
@@ -189,8 +224,9 @@ export default function WatchPage() {
 
       player.addEventListener('error', (event) => handleShakaError(event.detail));
 
-      // Load manifest
-      player.load(data.videoUrl, data.resumePosition > 0 ? data.resumePosition : undefined)
+      // Load manifest — HLS for TS + Apple clients; DASH for CMAF elsewhere.
+      const manifestUrl = pickManifestUrl(data);
+      player.load(manifestUrl, data.resumePosition > 0 ? data.resumePosition : undefined)
         .then(() => {
           // Start watch tracking. Reset the shared ref so a second load of this
           // page (route change back to the same video) starts clean.

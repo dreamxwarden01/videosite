@@ -93,8 +93,9 @@ const downloadPartSize = 32 * 1024 * 1024
 type Job struct {
 	JobID         string
 	VideoID       int
+	VideoType     string // "ts" (legacy MPEG-TS + AES-128) or "cmaf" (fMP4 HLS + DASH, unencrypted)
 	DownloadURL   string
-	EncryptionKey string // hex-encoded AES-128 key (empty = no encryption)
+	EncryptionKey string // hex-encoded AES-128 key (empty = no encryption; always empty for CMAF)
 	Manager       *Manager
 	Progress      *progress.Tracker
 
@@ -109,7 +110,12 @@ type Job struct {
 	UI ui.Manager
 
 	// Server-provided transcoding config (per-course or global defaults).
+	// AudioBitrateKbps is site-wide (moved off the per-profile struct in the
+	// CMAF migration); consumed by both TS (passed to RemuxToHLS /
+	// TranscodeToHLS) and CMAF (the single AAC rendition for all video
+	// profiles) pipelines.
 	OutputProfiles            []config.OutputProfile
+	AudioBitrateKbps          int
 	AudioNormalization        bool
 	AudioNormalizationTarget  float64
 	AudioNormalizationPeak    float64
@@ -143,12 +149,18 @@ type Job struct {
 // LeasedAt is captured here (time.Now) rather than passed in by the caller so
 // every Job carries a consistent timestamp regardless of how the caller was
 // written; it only influences UI bar ordering.
-func NewJob(jobID string, videoID int, downloadURL string, encryptionKey string, initialEncoder config.Encoder, mgr *Manager, tracker *progress.Tracker, uiMgr ui.Manager,
+func NewJob(jobID string, videoID int, videoType, downloadURL, encryptionKey string, audioBitrateKbps int, initialEncoder config.Encoder, mgr *Manager, tracker *progress.Tracker, uiMgr ui.Manager,
 	outputProfiles []config.OutputProfile, audioNorm bool, audioNormTarget, audioNormPeak, audioNormMaxGain float64) *Job {
 	jobCtx, cancel := context.WithCancel(context.Background())
+	// Default to the legacy TS pipeline when the server omits videoType (back-compat
+	// during the staged rollout — pre-migration servers don't set the field).
+	if videoType == "" {
+		videoType = "ts"
+	}
 	j := &Job{
 		JobID:         jobID,
 		VideoID:       videoID,
+		VideoType:     videoType,
 		DownloadURL:   downloadURL,
 		EncryptionKey: encryptionKey,
 		Manager:       mgr,
@@ -157,6 +169,7 @@ func NewJob(jobID string, videoID int, downloadURL string, encryptionKey string,
 		UI:            uiMgr,
 
 		OutputProfiles:            outputProfiles,
+		AudioBitrateKbps:          audioBitrateKbps,
 		AudioNormalization:        audioNorm,
 		AudioNormalizationTarget:  audioNormTarget,
 		AudioNormalizationPeak:    audioNormPeak,
@@ -281,22 +294,36 @@ func (j *Job) Run() error {
 		return j.handleError("probe", err)
 	}
 
-	// 3. ANALYZE AUDIO (loudness, for normalization)
-	loudnormFilter, err := j.analyzeLoudness(probe)
-	if err != nil {
-		return j.handleError("audio analysis", err)
-	}
-
-	// 4. TRANSCODE
-	j.phase.Store("transcoding")
-	profiles, err := j.transcode(probe, loudnormFilter)
-	if err != nil {
-		return j.handleError("transcode", err)
-	}
-
-	// 6. GENERATE MASTER PLAYLIST
-	if err := j.generateMasterPlaylist(profiles); err != nil {
-		return j.handleError("master playlist", err)
+	// 3-6. PROCESSING — branches on VideoType.
+	//
+	// TS path (legacy):
+	//   analyze audio → transcode per-profile (serial) → write master.m3u8
+	//   One ffmpeg per profile muxes video + audio together; encryption
+	//   applied via -hls_key_info_file.
+	//
+	// CMAF path (new):
+	//   video goroutine (serial per-profile fMP4 HLS, no audio, no encryption) ||
+	//   audio goroutine (single AAC fMP4 rendition with optional two-pass norm)
+	//   → rewrite playlists for HMAC → probe init.mp4 for codecs →
+	//     write master.m3u8 (CMAF form) + manifest.mpd (DASH).
+	if j.VideoType == "cmaf" {
+		j.phase.Store("transcoding")
+		if err := j.runCMAF(probe); err != nil {
+			return j.handleError("processing", err)
+		}
+	} else {
+		loudnormFilter, err := j.analyzeLoudness(probe)
+		if err != nil {
+			return j.handleError("audio analysis", err)
+		}
+		j.phase.Store("transcoding")
+		profiles, err := j.transcode(probe, loudnormFilter)
+		if err != nil {
+			return j.handleError("transcode", err)
+		}
+		if err := j.generateMasterPlaylist(profiles); err != nil {
+			return j.handleError("master playlist", err)
+		}
 	}
 
 	// 7. UPLOAD
@@ -873,6 +900,52 @@ func (j *Job) analyzeLoudness(probe *transcoder.ProbeResult) (string, error) {
 	return filter, nil
 }
 
+// analyzeLoudnessCMAF runs loudnorm pass-1 for the CMAF pipeline. It emits
+// the same start/result/skip log lines as analyzeLoudness (TS path) so the
+// console trace is consistent between pipelines; progress reporting is
+// delegated via progressCb because CMAF feeds it into the V+A bar rather than
+// the TS weighted processingPlan.
+//
+// Returns the loudnorm filter string for pass 2, or "" if normalization is
+// disabled, the source has no audio, analysis failed, or loudnorm saw no audio.
+func (j *Job) analyzeLoudnessCMAF(probe *transcoder.ProbeResult, progressCb func(pct int)) (string, error) {
+	if !j.AudioNormalization {
+		return "", nil
+	}
+	if probe.AudioCodec == "" {
+		j.UI.Logf("[%s] audio normalization: no audio stream, skipping", j.JobID)
+		return "", nil
+	}
+
+	j.UI.Logf("[%s] analyzing audio loudness (EBU R128)...", j.JobID)
+
+	sourcePath := filepath.Join(j.tempDir, "source.mp4")
+	stats, err := transcoder.AnalyzeLoudness(j.ctx, sourcePath, probe.DurationSeconds, progressCb)
+	if err != nil {
+		if j.ctx.Err() != nil {
+			return "", fmt.Errorf("aborted: %w", j.ctx.Err())
+		}
+		// Non-fatal: fall back to plain encode.
+		j.UI.Logf("[%s] WARN: audio loudness analysis failed, skipping normalization: %v", j.JobID, err)
+		return "", nil
+	}
+	if stats == nil {
+		j.UI.Logf("[%s] audio normalization: no audio detected by loudnorm, skipping", j.JobID)
+		return "", nil
+	}
+
+	gainRequired := j.AudioNormalizationTarget - stats.InputI
+	j.UI.Logf("[%s] audio: measured %.1f LUFS, target %.1f LUFS, gain required %.1f dB (max %.1f dB)",
+		j.JobID, stats.InputI, j.AudioNormalizationTarget, gainRequired, j.AudioNormalizationMaxGain)
+
+	filter := transcoder.BuildLoudnormFilter(stats,
+		j.AudioNormalizationTarget,
+		j.AudioNormalizationPeak,
+		j.AudioNormalizationMaxGain,
+	)
+	return filter, nil
+}
+
 func (j *Job) transcode(probe *transcoder.ProbeResult, loudnormFilter string) ([]transcoder.FilteredProfile, error) {
 	profiles := transcoder.FilterProfiles(probe, j.OutputProfiles)
 	profiles = transcoder.ApplyBitrateCaps(j.JobID, profiles, probe.Height, probe.VideoBitrateKbps)
@@ -967,7 +1040,7 @@ func (j *Job) transcode(probe *transcoder.ProbeResult, loudnormFilter string) ([
 // an abort from a genuine remux failure (which should fall back to transcode).
 func (j *Job) remuxProfile(sourcePath, profileDir string, profile transcoder.FilteredProfile, keyInfoFile, logFile string, pStart, pEnd float64, loudnormFilter string) error {
 	progressCh, errCh := transcoder.RemuxToHLS(
-		j.ctx, sourcePath, profileDir, profile.OutputProfile, keyInfoFile, logFile, j.duration, loudnormFilter,
+		j.ctx, sourcePath, profileDir, profile.OutputProfile, j.AudioBitrateKbps, keyInfoFile, logFile, j.duration, loudnormFilter,
 	)
 
 	for pct := range progressCh {
@@ -1035,7 +1108,7 @@ func (j *Job) transcodeProfile(sourcePath, profileDir string, profile transcoder
 		j.UI.UpdateStageProgress(j.JobID, 0)
 
 		logFile := ffmpegLogPath(j.JobID, profile.Name, tierLabel)
-		progressCh, errCh := transcoder.TranscodeToHLS(j.ctx, sourcePath, profileDir, profile.OutputProfile, encoder, duration, keyInfoFile, swDecode, logFile, srcW, srcH, loudnormFilter)
+		progressCh, errCh := transcoder.TranscodeToHLS(j.ctx, sourcePath, profileDir, profile.OutputProfile, j.AudioBitrateKbps, encoder, duration, keyInfoFile, swDecode, logFile, srcW, srcH, loudnormFilter)
 
 		// Drain progress updates into the bar + server-report state.
 		// The per-1% Printf that used to live here was removed in favor of
@@ -1094,7 +1167,7 @@ func (j *Job) transcodeProfile(sourcePath, profileDir string, profile transcoder
 
 func (j *Job) generateMasterPlaylist(profiles []transcoder.FilteredProfile) error {
 	// Write master playlist (always includes HMAC query params)
-	if err := transcoder.WriteMasterPlaylist(j.outputDir, profiles); err != nil {
+	if err := transcoder.WriteMasterPlaylist(j.outputDir, profiles, j.AudioBitrateKbps); err != nil {
 		return fmt.Errorf("write master playlist: %w", err)
 	}
 
@@ -1407,7 +1480,7 @@ func (j *Job) fetchUploadURLsBatch(ctx context.Context, tasks []uploadTask) (map
 		if end > len(names) {
 			end = len(names)
 		}
-		urls, err := api.GetUploadURLs(ctx, j.JobID, names[i:end])
+		urls, err := api.GetUploadURLsLocked(ctx, j.JobID, names[i:end])
 		if err != nil {
 			return nil, err
 		}
@@ -1485,8 +1558,405 @@ func (j *Job) handleError(phase string, err error) error {
 	return fmt.Errorf("job %s failed at %s: %w", j.JobID, phase, err)
 }
 
+// runCMAF drives the CMAF (fMP4 HLS + DASH) processing branch.
+//
+// Video and audio run in parallel — two ffmpeg processes, one per track —
+// because each uses its own encoder/codec and there's no muxing benefit to
+// serialising them the way the TS pipeline does. Profiles within the video
+// track are still serial to avoid oversubscribing the GPU (a single encoder
+// slot from Manager backs this whole job).
+//
+// Progress reporting: video reports `(done*100 + pct) / N` local %, audio
+// reports 0–50 during loudnorm analyze + 50–100 during encode (or 0–100 if
+// norm is off). The global server-reported pct is `10 + min(V,A)*80/100`
+// so the bar only advances when *both* tracks are making progress — a
+// deliberate choice so a fast audio track can't peg the pct at 100 while
+// the video is still grinding.
+//
+// On success, produces master.m3u8 + manifest.mpd + per-track playlists,
+// init segments, and .m4s segments — ready for upload by the caller.
+func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
+	profiles := transcoder.FilterProfiles(probe, j.OutputProfiles)
+	profiles = transcoder.ApplyBitrateCaps(j.JobID, profiles, probe.Height, probe.VideoBitrateKbps)
+	if len(profiles) == 0 {
+		return fmt.Errorf("no suitable output profiles for source %dx%d", probe.Width, probe.Height)
+	}
+
+	sourcePath := filepath.Join(j.tempDir, "source.mp4")
+	audioName := fmt.Sprintf("aac_%dk", j.AudioBitrateKbps)
+	audioDir := filepath.Join(j.outputDir, "audio", audioName)
+	os.MkdirAll(audioDir, 0755)
+
+	j.UI.UpdateStage(j.JobID, "processing", 10)
+	j.Progress.Update(j.JobID, "processing", 10)
+	j.SetStage("processing", 10)
+
+	// Shared V / A progress state; min(V,A) drives the server-reported pct.
+	var (
+		vaMu     sync.Mutex
+		videoPct int
+		audioPct int
+	)
+	publish := func() {
+		vaMu.Lock()
+		v, a := videoPct, audioPct
+		vaMu.Unlock()
+		m := v
+		if a < m {
+			m = a
+		}
+		globalPct := 10 + m*80/100
+		// TTY shows both V and A side by side; server-reported pct stays on
+		// min(V,A) so the progress bar only advances when both tracks do.
+		j.UI.UpdateStageProgressVA(j.JobID, v, a)
+		j.Progress.Update(j.JobID, "processing", globalPct)
+		j.SetStage("processing", globalPct)
+	}
+	updateV := func(p int) {
+		if p < 0 {
+			p = 0
+		}
+		if p > 100 {
+			p = 100
+		}
+		vaMu.Lock()
+		videoPct = p
+		vaMu.Unlock()
+		publish()
+	}
+	updateA := func(p int) {
+		if p < 0 {
+			p = 0
+		}
+		if p > 100 {
+			p = 100
+		}
+		vaMu.Lock()
+		audioPct = p
+		vaMu.Unlock()
+		publish()
+	}
+
+	// Derived context: cancel on first-track failure so the other track stops.
+	egCtx, egCancel := context.WithCancel(j.ctx)
+	defer egCancel()
+
+	var (
+		wg      sync.WaitGroup
+		errMu   sync.Mutex
+		firstErr error
+	)
+	recordErr := func(err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		defer errMu.Unlock()
+		if firstErr == nil {
+			firstErr = err
+			egCancel() // stop the peer track
+		}
+	}
+
+	// --- Video goroutine ---
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		totalProfiles := len(profiles)
+		encoder := j.initialEncoder
+		if j.failedTypes[encoder.EncoderType] {
+			var err error
+			encoder, err = j.Manager.NextEncoder(j.failedTypes)
+			if err != nil {
+				recordErr(fmt.Errorf("no encoder available: %w", err))
+				return
+			}
+		}
+
+		for i, p := range profiles {
+			if err := egCtx.Err(); err != nil {
+				recordErr(fmt.Errorf("aborted: %w", err))
+				return
+			}
+
+			profileVideoDir := filepath.Join(j.outputDir, "video", p.Name)
+			os.MkdirAll(profileVideoDir, 0755)
+
+			profileStart := (i * 100) / totalProfiles
+			profileEnd := ((i + 1) * 100) / totalProfiles
+
+			onLocalProgress := func(pct int) {
+				if pct < 0 {
+					pct = 0
+				}
+				if pct > 100 {
+					pct = 100
+				}
+				overall := profileStart + (profileEnd-profileStart)*pct/100
+				updateV(overall)
+			}
+
+			if err := j.cmafVideoProfile(egCtx, &encoder, sourcePath, profileVideoDir, p, probe, onLocalProgress); err != nil {
+				recordErr(fmt.Errorf("video profile %s: %w", p.Name, err))
+				return
+			}
+			updateV(profileEnd)
+		}
+		updateV(100)
+	}()
+
+	// --- Audio goroutine ---
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		// Pass 1: loudnorm analysis. Progress maps onto 0–50% of the audio
+		// bar when norm is actually going to run; when it's off (or skipped)
+		// the analyze call returns "" immediately and the encode owns the
+		// full 0–100 range.
+		normWillRun := j.AudioNormalization && probe.AudioCodec != ""
+		analyzeProgress := func(pct int) {
+			if normWillRun {
+				updateA(pct / 2)
+			}
+		}
+		loudnormFilter, err := j.analyzeLoudnessCMAF(probe, analyzeProgress)
+		if err != nil {
+			recordErr(fmt.Errorf("audio analyze: %w", err))
+			return
+		}
+
+		// Pass 2: encode. Re-check against the actual filter string — if
+		// analysis skipped (source silent, loudnorm bailed, etc.) the filter
+		// is empty and we remap encode to 0–100.
+		encodeProgress := func(pct int) {
+			if loudnormFilter != "" {
+				updateA(50 + pct/2)
+			} else {
+				updateA(pct)
+			}
+		}
+
+		logFile := ffmpegLogPath(j.JobID, "audio", "cmaf-audio")
+		segDur := profiles[0].SegmentDuration
+		err = transcoder.TranscodeAudioCMAF(
+			egCtx, sourcePath, audioDir,
+			j.AudioBitrateKbps, segDur, loudnormFilter,
+			probe.DurationSeconds, encodeProgress, logFile,
+		)
+		if err != nil {
+			recordErr(fmt.Errorf("audio: %w", err))
+			return
+		}
+
+		// Verify the fMP4 init segment is where we expect it. ffmpeg's HLS
+		// muxer has historically put init.mp4 in the CWD when the playlist
+		// path contained backslashes — catching that here surfaces the
+		// failure at the ffmpeg boundary rather than much later at
+		// ProbeCodecString / playback.
+		if vErr := verifyCMAFInit(audioDir, logFile); vErr != nil {
+			recordErr(fmt.Errorf("audio: %w", vErr))
+		}
+	}()
+
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+
+	// Rewrite per-rendition playlists so segment + init URIs carry {$verify}.
+	for _, p := range profiles {
+		pl := filepath.Join(j.outputDir, "video", p.Name, "playlist.m3u8")
+		if err := transcoder.RewritePlaylistHMAC(pl); err != nil {
+			return fmt.Errorf("rewrite video playlist %s: %w", p.Name, err)
+		}
+	}
+	if err := transcoder.RewritePlaylistHMAC(filepath.Join(audioDir, "playlist.m3u8")); err != nil {
+		return fmt.Errorf("rewrite audio playlist: %w", err)
+	}
+
+	// Build variants by probing each init.mp4 for its RFC 6381 codec string.
+	// A missing string is non-fatal — WriteMasterPlaylistCMAF / WriteDASHManifest
+	// fall back to a conservative default so the manifests still validate.
+	variants := make([]transcoder.CMAFVariant, 0, len(profiles))
+	for _, p := range profiles {
+		initPath := filepath.Join(j.outputDir, "video", p.Name, "init.mp4")
+		codecStr, err := transcoder.ProbeCodecString(initPath)
+		if err != nil {
+			j.UI.Logf("[%s] WARN: could not probe codec for %s: %v", j.JobID, p.Name, err)
+			codecStr = ""
+		}
+		outFps := int(probe.FrameRate + 0.5)
+		if outFps <= 0 {
+			outFps = 30
+		}
+		if p.FpsLimit > 0 && outFps > p.FpsLimit {
+			outFps = p.FpsLimit
+		}
+		variants = append(variants, transcoder.CMAFVariant{
+			Name:             p.Name,
+			Width:            p.Width,
+			Height:           p.Height,
+			VideoBitrateKbps: p.VideoBitrateKbps,
+			Codecs:           codecStr,
+			FrameRate:        outFps,
+		})
+	}
+
+	if err := transcoder.WriteMasterPlaylistCMAF(j.outputDir, variants, audioName, j.AudioBitrateKbps); err != nil {
+		return fmt.Errorf("write CMAF master playlist: %w", err)
+	}
+	if err := transcoder.WriteDASHManifest(j.outputDir, variants, audioName, j.AudioBitrateKbps, probe.DurationSeconds, profiles[0].SegmentDuration); err != nil {
+		return fmt.Errorf("write DASH manifest: %w", err)
+	}
+
+	return nil
+}
+
+// cmafVideoProfile encodes one CMAF video profile with the same encoder-tier
+// fallback strategy used by transcodeProfile (TS path):
+//
+//	tier 1: hw decode + hw encode (full GPU)  [if supported]
+//	tier 2: sw decode + hw encode
+//	next:   fall over to the next encoder type (Manager.NextEncoder)
+//
+// encoder is a *config.Encoder so a successful fallback persists across
+// profiles (once a type has failed on this job we stop trying it). Remux
+// takes a disjoint path: it's either applicable (copy + mux only, no encoder
+// involved) or we transcode.
+func (j *Job) cmafVideoProfile(ctx context.Context, encoder *config.Encoder, sourcePath, profileDir string, profile transcoder.FilteredProfile, probe *transcoder.ProbeResult, onProgress func(int)) error {
+	// Remux first if eligible. CMAF remux is the simplest case — video copy,
+	// no audio, no encryption — so no encoder fallback applies; a failure
+	// just drops us into the transcode path below.
+	if profile.CanRemux {
+		j.UI.Logf("[%s] remuxing %s (cmaf)...", j.JobID, profile.Name)
+		remuxLog := ffmpegLogPath(j.JobID, profile.Name, "cmaf-remux")
+		progressCh, errCh := transcoder.RemuxVideoCMAF(ctx, sourcePath, profileDir, profile.OutputProfile, probe.DurationSeconds, remuxLog)
+		for pct := range progressCh {
+			onProgress(pct)
+		}
+		err := <-errCh
+		if err == nil {
+			// Gate remux success on the init segment actually landing in
+			// profileDir (see verifyCMAFInit for the Windows hls muxer
+			// backstory). If it's missing, fall back to transcode instead
+			// of declaring a silent failure.
+			if vErr := verifyCMAFInit(profileDir, remuxLog); vErr != nil {
+				j.UI.Logf("[%s] WARN: cmaf remux for %s produced no init.mp4, falling back to transcode: %v", j.JobID, profile.Name, vErr)
+				os.RemoveAll(profileDir)
+				os.MkdirAll(profileDir, 0755)
+			} else {
+				j.UI.Logf("[%s] remux successful: %s (cmaf)", j.JobID, profile.Name)
+				return nil
+			}
+		} else {
+			if ctx.Err() != nil {
+				return fmt.Errorf("aborted: %w", ctx.Err())
+			}
+			if errors.Is(err, transcoder.ErrFFmpegMissing) {
+				return err
+			}
+			j.UI.Logf("[%s] WARN: cmaf remux failed for %s, falling back to transcode: %v", j.JobID, profile.Name, err)
+			os.RemoveAll(profileDir)
+			os.MkdirAll(profileDir, 0755)
+		}
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("aborted: %w", err)
+		}
+
+		swDecode := !hwDecodeAvailable(encoder.EncoderType) || j.hwDecodeFailed[encoder.EncoderType]
+
+		var tierLabel string
+		switch {
+		case encoder.EncoderType == hardware.EncoderSW:
+			tierLabel = "cmaf-sw"
+			j.UI.Logf("[%s] cmaf transcoding %s with software (libx264)", j.JobID, profile.Name)
+		case swDecode:
+			tierLabel = "cmaf-vt-swdec"
+			j.UI.Logf("[%s] cmaf transcoding %s with %s (sw decode + hw encode)", j.JobID, profile.Name, encoder.EncoderType)
+		default:
+			tierLabel = "cmaf-vt-hwdec"
+			j.UI.Logf("[%s] cmaf transcoding %s with %s (hw decode + hw encode)", j.JobID, profile.Name, encoder.EncoderType)
+		}
+
+		onProgress(0)
+
+		logFile := ffmpegLogPath(j.JobID, profile.Name, tierLabel)
+		progressCh, errCh := transcoder.TranscodeVideoCMAF(ctx, sourcePath, profileDir, profile.OutputProfile, *encoder, probe.DurationSeconds, swDecode, logFile, probe.Width, probe.Height, probe.FrameRate)
+
+		for pct := range progressCh {
+			onProgress(pct)
+		}
+
+		err := <-errCh
+		if err == nil {
+			// Same defensive init.mp4 check as the remux path.
+			if vErr := verifyCMAFInit(profileDir, logFile); vErr != nil {
+				j.UI.Logf("[%s] WARN: cmaf transcode for %s produced no init.mp4: %v", j.JobID, profile.Name, vErr)
+				return vErr
+			}
+			j.UI.Logf("[%s] transcoded %s successfully (cmaf)", j.JobID, profile.Name)
+			return nil
+		}
+
+		if ctx.Err() != nil {
+			return fmt.Errorf("aborted during transcode: %w", ctx.Err())
+		}
+		if errors.Is(err, transcoder.ErrFFmpegMissing) {
+			return err
+		}
+
+		if !swDecode {
+			j.UI.Logf("[%s] WARN: %s full-GPU failed for %s (cmaf), retrying with sw decode: %v", j.JobID, encoder.EncoderType, profile.Name, err)
+			j.hwDecodeFailed[encoder.EncoderType] = true
+			os.RemoveAll(profileDir)
+			os.MkdirAll(profileDir, 0755)
+			continue
+		}
+
+		j.UI.Logf("[%s] WARN: %s exhausted for %s (cmaf), trying next encoder: %v", j.JobID, encoder.EncoderType, profile.Name, err)
+		j.failedTypes[encoder.EncoderType] = true
+		os.RemoveAll(profileDir)
+		os.MkdirAll(profileDir, 0755)
+
+		next, nextErr := j.Manager.NextEncoder(j.failedTypes)
+		if nextErr != nil {
+			return fmt.Errorf("all encoders failed for profile %s: %w", profile.Name, nextErr)
+		}
+		*encoder = next
+	}
+}
+
 func (j *Job) cleanup() {
 	if j.tempDir != "" {
 		util.CleanupTempDir(j.JobID)
 	}
+}
+
+// verifyCMAFInit confirms that {dir}/init.mp4 was produced (non-empty) after
+// a CMAF ffmpeg run completes. ffmpeg's HLS muxer locates fmp4_init_filename
+// by running strrchr('/') over the playlist URL string; on Windows the native
+// backslash paths used to send init.mp4 to the worker's CWD while ffmpeg still
+// returned exit 0. The main fix lives in transcoder/cmaf.go (all paths are
+// ToSlash'd before being handed to ffmpeg), but this check is the belt: if a
+// future build of ffmpeg, a third encoder option, or some other quirk puts
+// the init segment somewhere unexpected, we catch it here with a directory
+// listing and the ffmpeg log path so diagnosis is trivial — instead of
+// showing up hours later as a 404 in the browser.
+func verifyCMAFInit(dir, logFile string) error {
+	initPath := filepath.Join(dir, "init.mp4")
+	if st, err := os.Stat(initPath); err == nil && st.Size() > 0 {
+		return nil
+	}
+	var names []string
+	if entries, derr := os.ReadDir(dir); derr == nil {
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+	}
+	return fmt.Errorf("init.mp4 missing from %s (produced: %v; ffmpeg log: %s)", dir, names, logFile)
 }

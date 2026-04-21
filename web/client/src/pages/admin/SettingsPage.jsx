@@ -65,6 +65,7 @@ export default function SettingsPage() {
 
   // Transcoding profiles
   const [transcodingProfiles, setTranscodingProfiles] = useState([]);
+  const [audioBitrateKbps, setAudioBitrateKbps] = useState('192');
   const [audioNormTarget, setAudioNormTarget] = useState('-20');
   const [audioNormPeak, setAudioNormPeak] = useState('-2');
   const [audioNormMaxGain, setAudioNormMaxGain] = useState('20');
@@ -118,11 +119,14 @@ export default function SettingsPage() {
         setAudioNormTarget(an.target || '-20');
         setAudioNormPeak(an.peak || '-2');
         setAudioNormMaxGain(an.maxGain || '20');
+        const abk = String(data.audioBitrateKbps ?? '192');
+        setAudioBitrateKbps(abk);
         originalTranscoding.current = {
           profiles: JSON.stringify(data.transcodingProfiles || []),
           target: an.target || '-20',
           peak: an.peak || '-2',
-          maxGain: an.maxGain || '20'
+          maxGain: an.maxGain || '20',
+          audioBitrateKbps: abk
         };
         setTranscodingErrors({});
         setTranscodingTouched({});
@@ -595,7 +599,7 @@ export default function SettingsPage() {
                   <th>Name</th>
                   <th>Resolution</th>
                   <th>Video Bitrate</th>
-                  <th>Audio Bitrate</th>
+                  <th>Max FPS</th>
                   <th>Actions</th>
                 </tr>
               </thead>
@@ -605,7 +609,7 @@ export default function SettingsPage() {
                     <td>{p.name}</td>
                     <td>{p.width}x{p.height}</td>
                     <td>{p.video_bitrate_kbps} kbps</td>
-                    <td>{p.audio_bitrate_kbps} kbps</td>
+                    <td>{p.fps_limit} fps</td>
                     <td>
                       <button className="btn btn-secondary btn-sm" onClick={() => { setEditingProfileIdx(idx); setShowProfileModal(true); }}>Edit</button>
                       <button className="btn btn-danger btn-sm" style={{ marginLeft: '4px' }} onClick={async () => {
@@ -626,6 +630,37 @@ export default function SettingsPage() {
             onClick={() => { setEditingProfileIdx(null); setShowProfileModal(true); }}>
             Add Profile
           </button>
+
+          <div className="form-group" style={{ maxWidth: '400px' }}>
+            <label htmlFor="audioBitrateKbps">Audio Bitrate (kbps)</label>
+            <input
+              id="audioBitrateKbps"
+              type="text"
+              inputMode="numeric"
+              className={`form-control${transcodingTouched.audioBitrateKbps && transcodingErrors.audioBitrateKbps ? ' input-error' : ''}`}
+              value={audioBitrateKbps}
+              onChange={e => setAudioBitrateKbps(e.target.value.replace(/\D/g, ''))}
+              onKeyDown={handleDigitOnly}
+              onPaste={handleDigitPaste(setAudioBitrateKbps)}
+              onBlur={() => {
+                setTranscodingTouched(t => ({ ...t, audioBitrateKbps: true }));
+                const v = parseInt(audioBitrateKbps, 10);
+                setTranscodingErrors(e => {
+                  const n = { ...e };
+                  if (!Number.isInteger(v) || v < 128 || v > 320) n.audioBitrateKbps = 'Must be an integer between 128 and 320';
+                  else delete n.audioBitrateKbps;
+                  return n;
+                });
+              }}
+              style={{ maxWidth: '200px' }}
+            />
+            {transcodingTouched.audioBitrateKbps && transcodingErrors.audioBitrateKbps && (
+              <span className="field-error">{transcodingErrors.audioBitrateKbps}</span>
+            )}
+            <small className="text-muted" style={{ display: 'block', marginTop: '4px' }}>
+              Site-wide AAC-LC bitrate used for all transcoded videos. Range 128–320.
+            </small>
+          </div>
 
           <h3 style={{ marginBottom: '12px' }}>Audio Normalization Defaults</h3>
           <p className="text-muted text-sm" style={{ marginBottom: '12px' }}>
@@ -695,23 +730,33 @@ export default function SettingsPage() {
               && audioNormTarget === originalTranscoding.current.target
               && audioNormPeak === originalTranscoding.current.peak
               && audioNormMaxGain === originalTranscoding.current.maxGain
+              && audioBitrateKbps === originalTranscoding.current.audioBitrateKbps
             )}
             onClick={async () => {
               if (transcodingProfiles.length === 0) { showToast('At least one profile is required.'); return; }
+              const abkInt = parseInt(audioBitrateKbps, 10);
+              if (!Number.isInteger(abkInt) || abkInt < 128 || abkInt > 320) {
+                setTranscodingTouched(t => ({ ...t, audioBitrateKbps: true }));
+                setTranscodingErrors(e => ({ ...e, audioBitrateKbps: 'Must be an integer between 128 and 320' }));
+                showToast('Please fix the errors below.');
+                return;
+              }
               setSavingTranscoding(true);
               try {
                 const { ok, data } = await mfaFetch('/api/admin/settings/transcoding-profiles', {
                   method: 'PUT',
                   body: {
                     profiles: transcodingProfiles,
-                    audioNormalization: { target: audioNormTarget, peak: audioNormPeak, maxGain: audioNormMaxGain }
+                    audioNormalization: { target: audioNormTarget, peak: audioNormPeak, maxGain: audioNormMaxGain },
+                    audioBitrateKbps: abkInt
                   }
                 });
                 if (ok) {
                   showToast('Transcoding settings saved.', 'success');
                   originalTranscoding.current = {
                     profiles: JSON.stringify(transcodingProfiles),
-                    target: audioNormTarget, peak: audioNormPeak, maxGain: audioNormMaxGain
+                    target: audioNormTarget, peak: audioNormPeak, maxGain: audioNormMaxGain,
+                    audioBitrateKbps: audioBitrateKbps
                   };
                 } else {
                   showToast(data?.error || 'Failed to save.');

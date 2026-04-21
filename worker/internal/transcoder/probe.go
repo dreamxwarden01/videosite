@@ -8,6 +8,100 @@ import (
 	"strings"
 )
 
+// ProbeCodecString extracts the RFC 6381 codec string (e.g. "avc1.64001F") from
+// an fMP4 init segment. This is needed for the CMAF master.m3u8 CODECS attribute
+// and DASH Representation codecs attribute — both require the full avc1.xxxxxx
+// form including profile/constraints/level, not just "avc1".
+//
+// ffprobe's codec_tag_string gives the fourcc ("avc1"); we synthesize the
+// profile/level suffix from stream profile + level. For non-AVC codecs this
+// returns the tag string as-is.
+func ProbeCodecString(mp4Path string) (string, error) {
+	cmd := exec.Command(ffprobePath,
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=codec_tag_string,codec_name,profile,level",
+		"-print_format", "json",
+		mp4Path,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		if isExecMissing(err) {
+			return "", fmt.Errorf("%w: %v", ErrFFmpegMissing, err)
+		}
+		return "", fmt.Errorf("ffprobe codec string: %w", err)
+	}
+
+	var parsed struct {
+		Streams []struct {
+			CodecTagString string `json:"codec_tag_string"`
+			CodecName      string `json:"codec_name"`
+			Profile        string `json:"profile"`
+			Level          int    `json:"level"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		return "", fmt.Errorf("parse ffprobe codec output: %w", err)
+	}
+	if len(parsed.Streams) == 0 {
+		return "", fmt.Errorf("no video stream in %s", mp4Path)
+	}
+	s := parsed.Streams[0]
+
+	// For H.264, build the avc1.PPCCLL form expected by HLS/DASH:
+	//   PP = profile_idc (hex), CC = profile_compat_flags (hex),
+	//   LL = level_idc (hex). ffprobe gives the numeric level as level*10
+	//   (e.g. level 3.1 → 31) and the profile by name.
+	if s.CodecName == "h264" {
+		profileIDC, profileCompat := h264ProfileIDC(s.Profile)
+		if profileIDC > 0 {
+			return fmt.Sprintf("avc1.%02X%02X%02X", profileIDC, profileCompat, s.Level), nil
+		}
+		// H.264 with an unrecognized profile name — do NOT return the bare
+		// fourcc "avc1". Both the HLS master CODECS attr and the DASH
+		// Representation codecs attr require the full avc1.PPCCLL form;
+		// Shaka's manifest parser outright rejects bare "avc1" (no profile/
+		// level) and stops before any segment is fetched. High@4.0 is the
+		// conservative site-wide default and matches every shipped profile.
+		return "avc1.640028", nil
+	}
+
+	// Fallback: bare fourcc tag — acceptable for non-H.264 codecs where the
+	// tag alone is a valid codec string (e.g. "mp4a" variants, "hev1", etc).
+	if s.CodecTagString != "" {
+		return s.CodecTagString, nil
+	}
+	return "", fmt.Errorf("could not determine codec string for %s", mp4Path)
+}
+
+// h264ProfileIDC maps ffprobe's human-readable profile name to the
+// (profile_idc, profile_compat_flags) bytes used in the avc1 codec string.
+// Returns (0, 0) for unknown profiles — callers should fall back.
+func h264ProfileIDC(profile string) (idc, compat int) {
+	// Strip trailing " Intra" etc.; ffprobe sometimes adds qualifiers.
+	p := strings.SplitN(profile, " ", 2)[0]
+	switch strings.ToLower(p) {
+	case "baseline", "constrained":
+		// Constrained Baseline: profile_idc=66, constraint_set1=1
+		return 66, 0x40
+	case "main":
+		// Main: profile_idc=77
+		return 77, 0x00
+	case "extended":
+		return 88, 0x00
+	case "high":
+		// High: profile_idc=100
+		return 100, 0x00
+	case "high10":
+		return 110, 0x00
+	case "high422":
+		return 122, 0x00
+	case "high444":
+		return 244, 0x00
+	}
+	return 0, 0
+}
+
 // ProbeResult holds the results from probing a source file.
 type ProbeResult struct {
 	Width           int

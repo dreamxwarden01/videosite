@@ -112,7 +112,8 @@ func ApplyBitrateCaps(jobID string, profiles []FilteredProfile, sourceHeight, so
 }
 
 // checkRemuxEligibility checks if we can just remux (copy streams) instead of transcoding.
-// Remux is possible when: same codec, similar resolution, bitrate <= target.
+// Remux is possible when: same codec, similar resolution, bitrate <= target,
+// source frame rate <= profile fps_limit.
 func checkRemuxEligibility(probe *ProbeResult, profile *config.OutputProfile) bool {
 	// Codec must match
 	if probe.Codec != profile.Codec {
@@ -127,6 +128,13 @@ func checkRemuxEligibility(probe *ProbeResult, profile *config.OutputProfile) bo
 
 	// Source bitrate must not exceed target
 	if probe.VideoBitrateKbps > 0 && probe.VideoBitrateKbps > profile.VideoBitrateKbps {
+		return false
+	}
+
+	// Source frame rate must not exceed fps_limit — remux can't downsample,
+	// only a transcode can apply -r. Epsilon 0.01 absorbs ffprobe's
+	// numerator/denominator rounding (e.g. 59.94 vs 60).
+	if probe.FrameRate > 0 && profile.FpsLimit > 0 && probe.FrameRate > float64(profile.FpsLimit)+0.01 {
 		return false
 	}
 
