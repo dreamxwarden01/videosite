@@ -90,10 +90,19 @@ type ttyManager struct {
 	// scroll content up (grow), clear orphan rows (shrink), and reposition
 	// the cursor at the new entry line.
 	//
-	// Atomic because Logf / Write read it (to decide whether to re-assert
-	// DECSTBM before writing) from non-render goroutines, while render
-	// updates it. Torn reads would cause assertRegion to emit the wrong
-	// scrollBot row.
+	// Writes happen inside writeMu and are paired with the bytes that
+	// install the corresponding DECSTBM region — so once a writer releases
+	// writeMu, lastK and the terminal's actual scroll region are in sync.
+	// Readers (assertRegion via Logf / Write) MUST call Load while holding
+	// writeMu; otherwise the following sequence races:
+	//
+	//	render: write GROW seq + new DECSTBM; unlock; store lastK=2
+	//	Logf  : read lastK=1 (stale); lock; write DECSTBM for h-1 — wrong
+	//	        scroll region, log LF pushes cursor onto a bar row, STEADY
+	//	        repaints preserve the bad position via DECSC/DECRC.
+	//
+	// Atomic because render's own setup path reads it without locking (it's
+	// the only writer, so it sees its own previous store).
 	lastK atomic.Int32
 	// lastH, lastW track the terminal dimensions at the previous render.
 	// On resize either the old bar positions (height change) or the old
@@ -290,8 +299,8 @@ func (m *ttyManager) render(lastDirty int64) int64 {
 		buf.WriteString(escShowCursor)
 		m.writeMu.Lock()
 		_, _ = m.out.Write(buf.Bytes())
-		m.writeMu.Unlock()
 		m.lastK.Store(0)
+		m.writeMu.Unlock()
 		// Nudge the next render so we repaint promptly rather than
 		// waiting for the next 250ms tick.
 		select {
@@ -328,8 +337,8 @@ func (m *ttyManager) render(lastDirty int64) int64 {
 		buf.WriteString(escShowCursor)
 		m.writeMu.Lock()
 		_, _ = m.out.Write(buf.Bytes())
-		m.writeMu.Unlock()
 		m.lastK.Store(0)
+		m.writeMu.Unlock()
 		return curDirty
 	case k > 0 && lastK == 0:
 		// ENTER — first bars. Scroll the entire screen up by k lines so
@@ -396,9 +405,8 @@ func (m *ttyManager) render(lastDirty int64) int64 {
 
 	m.writeMu.Lock()
 	_, _ = m.out.Write(buf.Bytes())
-	m.writeMu.Unlock()
-
 	m.lastK.Store(int32(k))
+	m.writeMu.Unlock()
 	return curDirty
 }
 
@@ -749,14 +757,16 @@ func (m *ttyManager) FinishJob(jobID string, reason string) {
 //
 // assertRegion() is prepended so a resize-induced DECSTBM reset (common on
 // legacy Windows conhost) doesn't cause this log line to land in the bar
-// area between renders.
+// area between renders. It MUST be called while holding writeMu so the
+// lastK it reads agrees with the DECSTBM region render last installed —
+// otherwise a stale-region write will override a freshly-grown region and
+// misplace the cursor onto a bar row (see lastK field doc).
 //
 // After Close the render loop is gone; writes fall through to the raw file.
 func (m *ttyManager) Logf(format string, args ...interface{}) {
 	line := util.Ts() + " " + fmt.Sprintf(format, args...) + "\n"
-	prefix := m.assertRegion()
 	m.writeMu.Lock()
-	if prefix != nil {
+	if prefix := m.assertRegion(); prefix != nil {
 		_, _ = m.out.Write(prefix)
 	}
 	_, _ = io.WriteString(m.out, line)
@@ -768,15 +778,16 @@ func (m *ttyManager) Logf(format string, args ...interface{}) {
 // added if missing so the next write doesn't glue onto this one.
 //
 // Same assertRegion prefix as Logf — the slog handler doesn't know anything
-// about bars, so we protect it here.
+// about bars, so we protect it here. Same locking rule: the read must
+// happen under writeMu or it may observe a stale lastK and override a
+// freshly-installed scroll region (see lastK field doc).
 func (m *ttyManager) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	prefix := m.assertRegion()
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
-	if prefix != nil {
+	if prefix := m.assertRegion(); prefix != nil {
 		_, _ = m.out.Write(prefix)
 	}
 	if p[len(p)-1] != '\n' {
