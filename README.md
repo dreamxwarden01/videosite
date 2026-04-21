@@ -7,7 +7,7 @@ A private video course platform with hardware-accelerated distributed transcodin
 **Web Server**
 - Course and video management with role-based access control and per-user permission overrides
 - Chunked resumable uploads with presigned URLs (Cloudflare R2)
-- HLS adaptive bitrate streaming via Shaka Player
+- Adaptive bitrate streaming via Shaka Player — HLS for Apple devices (native Safari), MPEG-DASH elsewhere, both served from a single CMAF (fMP4) segment set
 - Multi-factor authentication (TOTP, OTP, WebAuthn/passkeys)
 - Invitation-based registration with Cloudflare Turnstile CAPTCHA
 
@@ -36,8 +36,8 @@ Go Worker(s) --- FFmpeg
 
 1. User uploads a video through the browser in chunks (presigned PUT to R2)
 2. Server creates a processing job; worker picks it up via polling
-3. Worker downloads the source from R2, transcodes to multi-bitrate HLS, uploads segments back to R2
-4. Browser streams the video using Shaka Player with HMAC-authenticated URLs
+3. Worker downloads the source from R2, transcodes to multi-bitrate CMAF (fMP4) with HLS and DASH manifests, uploads segments back to R2
+4. Browser streams the video using Shaka Player with HMAC-authenticated URLs — the player picks HLS or DASH based on client capabilities
 
 ## Tech Stack
 
@@ -46,7 +46,7 @@ Go Worker(s) --- FFmpeg
 | Backend | Express 5, Node.js |
 | Database | MySQL / MariaDB |
 | Frontend | React 19, Vite 6 |
-| Video Player | Shaka Player (HLS) |
+| Video Player | Shaka Player (HLS + DASH, CMAF) |
 | Storage | Cloudflare R2 |
 | Worker | Go 1.22, FFmpeg |
 | Auth | Cookie sessions, Argon2, WebAuthn |
@@ -149,11 +149,13 @@ worker/
   main_windows.go        # Windows startup banner
   internal/
     api/                 # Server communication, uploads, retries
+    auth/                # Bearer session handling with the server
     config/              # config.json and capabilities.json
     hardware/            # Encoder detection (per-platform)
     mtls/                # Client certificate setup
     slot/                # Job scheduling and slot management
-    transcoder/          # FFmpeg, ffprobe, HLS, profiles
+    transcoder/          # FFmpeg, ffprobe, profiles, HLS + DASH/CMAF manifests
+    ui/                  # Terminal UI — per-job progress bars with scroll-above log
     util/                # Helpers
     worker/              # Main loop, console commands, progress
 ```
