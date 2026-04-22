@@ -78,7 +78,7 @@ router.get('/videos/:id/playback', requireAuth, async (req, res) => {
 
 // POST /api/updatewatch
 //
-// Body: { video_id: int, position: float, delta?: float }
+// Body: { video_id: uint32, position: number, delta: number }
 //
 // `delta` is the number of watched seconds the client wants credited this call.
 // The client accumulates real-time-elapsed locally and flushes in chunks
@@ -86,7 +86,14 @@ router.get('/videos/:id/playback', requireAuth, async (req, res) => {
 // click — sometimes with a delta of zero, purely to persist last_position
 // after the user scrubbed while paused).
 //
-// Back-compat: if `delta` is absent, credit 10 (legacy pre-rollout bundle).
+// Validation (all failures → 422, and the client silently drops the flush
+// without retry or rollback — a 422 only occurs when the client payload is
+// malformed, which should never happen with an unmodified bundle):
+//   - video_id must be a positive unsigned integer (1 .. 2^32-1).
+//   - position must be a finite number, 0 ≤ position ≤ video.duration_seconds.
+//   - delta must be present and a finite non-negative number. The legacy
+//     "delta absent → credit 10" fallback for pre-rollout bundles is gone;
+//     all supported clients send delta explicitly (0 for position-only flushes).
 //
 // Anti-abuse: any delta > 60 has its watch-time contribution dropped (0-credit)
 // but the upsert still runs so last_position tracks. 60s is tight — legitimate
@@ -98,34 +105,51 @@ router.post('/updatewatch', requireAuth, async (req, res) => {
         const user = res.locals.user;
         const { video_id, position, delta } = req.body;
 
-        if (!video_id || position === undefined) {
-            return res.status(400).json({ error: 'video_id and position are required' });
+        // video_id: positive unsigned integer. Number() on the raw body value
+        // accepts numeric strings too ("3" → 3) but NaN/floats/negatives fall
+        // out at isInteger / range checks.
+        const videoIdNum = Number(video_id);
+        if (!Number.isInteger(videoIdNum) || videoIdNum <= 0 || videoIdNum > 4294967295) {
+            return res.status(422).json({ error: 'invalid video_id' });
         }
 
-        // Decide how many seconds to credit.
-        //   delta absent          → 10 (back-compat with old client bundles)
-        //   delta 0..60 finite    → credit that amount (0 = position-only flush)
-        //   delta > 60 or invalid → 0 (watch time dropped, still updates position)
-        let credit = 10;
-        if (delta !== undefined) {
-            const d = Number(delta);
-            if (!Number.isFinite(d) || d < 0 || d > 60) {
-                credit = 0;
-            } else {
-                credit = d;
-            }
+        // position: finite, non-negative. Upper bound against duration is
+        // checked after the DB lookup.
+        const positionNum = Number(position);
+        if (!Number.isFinite(positionNum) || positionNum < 0) {
+            return res.status(422).json({ error: 'invalid position' });
         }
+
+        // delta: required, finite, non-negative. `delta > 60` is well-formed
+        // but drops credit to 0 (anti-abuse, see block comment above).
+        if (delta === undefined || delta === null) {
+            return res.status(422).json({ error: 'delta is required' });
+        }
+        const deltaNum = Number(delta);
+        if (!Number.isFinite(deltaNum) || deltaNum < 0) {
+            return res.status(422).json({ error: 'invalid delta' });
+        }
+        const credit = deltaNum > 60 ? 0 : deltaNum;
 
         const pool = getPool();
-        const videoId = parseInt(video_id);
 
-        // Get video's course
+        // Fetch course_id and duration_seconds in one trip — duration gates
+        // the position range check below.
         const [videoRows] = await pool.execute(
-            'SELECT course_id FROM videos WHERE video_id = ?',
-            [videoId]
+            'SELECT course_id, duration_seconds FROM videos WHERE video_id = ?',
+            [videoIdNum]
         );
         if (videoRows.length === 0) {
             return res.status(404).json({ error: 'Video not found' });
+        }
+
+        // Position must not exceed the video's stored duration. NULL duration
+        // (pre-processing / metadata missing) skips the upper-bound check —
+        // no legitimate playback flow reaches here with duration still unset,
+        // but there's no reason to hard-fail if we ever do.
+        const duration = videoRows[0].duration_seconds;
+        if (duration !== null && positionNum > duration) {
+            return res.status(422).json({ error: 'position exceeds video duration' });
         }
 
         // Check course access
@@ -151,7 +175,7 @@ router.post('/updatewatch', requireAuth, async (req, res) => {
                 watch_seconds = watch_seconds + ?,
                 last_position = VALUES(last_position),
                 last_watch_at = NOW()`,
-            [user.user_id, videoId, credit, parseFloat(position), credit]
+            [user.user_id, videoIdNum, credit, positionNum, credit]
         );
 
         res.status(204).end();

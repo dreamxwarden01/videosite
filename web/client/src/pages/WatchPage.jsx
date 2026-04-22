@@ -254,7 +254,11 @@ export default function WatchPage() {
           //
           // Network error rolls the seconds back. HTTP error statuses
           // (401/403/429) are terminal: tracking stops, rollback doesn't
-          // matter because no future flush will fire.
+          // matter because no future flush will fire. 422 means the server
+          // rejected the payload as malformed — shouldn't happen with an
+          // unmodified client; we silently drop the flush (no rollback, no
+          // retry) so a tampered client can't game the retry path. Any
+          // other non-2xx also falls through as a silent drop.
           function flushNow() {
             if (t.stopped || destroyedRef.current || t.inflight) return;
 
