@@ -21,6 +21,10 @@ import (
 // Shaka Player appends ?verify=... to every segment request via the existing
 // registerRequestFilter — DASH does NOT use the HLS EXT-X-DEFINE mechanism —
 // so this template is deliberately free of any HMAC substitution.
+// The audio AdaptationSet is gated by {{- if .HasAudio}} so no-audio sources
+// emit a video-only MPD. Shaka accepts an MPD with zero audio sets and plays
+// the <video> element silently; declaring an audio set whose segments never
+// resolve would leave Shaka stuck in the buffering state forever.
 const dashMPDTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
      type="static"
@@ -35,12 +39,14 @@ const dashMPDTemplate = `<?xml version="1.0" encoding="UTF-8"?>
       </Representation>
 {{- end}}
     </AdaptationSet>
+{{- if .HasAudio}}
     <AdaptationSet contentType="audio" mimeType="audio/mp4" lang="und">
       <Representation id="{{.AudioName}}" codecs="mp4a.40.2" bandwidth="{{.AudioBandwidth}}" audioSamplingRate="48000">
         <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2"/>
         <SegmentTemplate media="audio/{{.AudioName}}/segment_$Number%04d$.m4s" initialization="audio/{{.AudioName}}/init.mp4" duration="{{.SegmentDurationMs}}" timescale="1000" startNumber="0"/>
       </Representation>
     </AdaptationSet>
+{{- end}}
   </Period>
 </MPD>
 `
@@ -56,12 +62,17 @@ type dashVideoRep struct {
 }
 
 // dashTmplContext is the full view passed to the MPD template.
+//
+// HasAudio gates the audio AdaptationSet in the template (see dashMPDTemplate
+// above). When false, AudioName and AudioBandwidth are unused — keep them
+// zero-valued.
 type dashTmplContext struct {
 	DurationISO       string
 	SegmentDurationMs int
 	VideoReps         []dashVideoRep
 	AudioName         string
 	AudioBandwidth    int
+	HasAudio          bool
 }
 
 // WriteDASHManifest renders an MPD into outputDir/manifest.mpd.
@@ -72,7 +83,12 @@ type dashTmplContext struct {
 // "aac_192k"); audioBitrateKbps feeds the DASH bandwidth attribute.
 // durationSec is the source duration from ffprobe; segmentDurationSec is the
 // same value baked into each per-profile HLS playlist (profiles[0] convention).
-func WriteDASHManifest(outputDir string, variants []CMAFVariant, audioName string, audioBitrateKbps int, durationSec float64, segmentDurationSec int) error {
+//
+// hasAudio MUST match the master.m3u8's hasAudio — the two manifests
+// describe the same set of renditions, just in different syntaxes, and
+// Shaka / Safari / hls.js will all diverge confusingly if one lists audio
+// and the other doesn't.
+func WriteDASHManifest(outputDir string, variants []CMAFVariant, audioName string, audioBitrateKbps int, durationSec float64, segmentDurationSec int, hasAudio bool) error {
 	reps := make([]dashVideoRep, 0, len(variants))
 	for _, v := range variants {
 		codecs := v.Codecs
@@ -102,6 +118,7 @@ func WriteDASHManifest(outputDir string, variants []CMAFVariant, audioName strin
 		VideoReps:         reps,
 		AudioName:         audioName,
 		AudioBandwidth:    audioBitrateKbps * 1000,
+		HasAudio:          hasAudio,
 	}
 
 	tmpl, err := template.New("mpd").Parse(dashMPDTemplate)

@@ -103,14 +103,24 @@ func h264ProfileIDC(profile string) (idc, compat int) {
 }
 
 // ProbeResult holds the results from probing a source file.
+//
+// AudioCodec is the codec of the **first** audio stream (track 0) — not the
+// last, which is what earlier code captured by overwriting in a loop.
+// Consistent with `-map 0:a:0` (single-track path) and amix input ordering
+// (multi-track path), where stream 0 is what we actually consume.
+//
+// AudioStreamCount is the total number of audio streams in the source. Used
+// to (a) skip the audio pipeline entirely when 0, and (b) decide whether to
+// emit an amix filter chain (≥ 2).
 type ProbeResult struct {
-	Width           int
-	Height          int
-	Codec           string
+	Width            int
+	Height           int
+	Codec            string
 	VideoBitrateKbps int
-	DurationSeconds float64
-	FrameRate       float64
-	AudioCodec      string
+	DurationSeconds  float64
+	FrameRate        float64
+	AudioCodec       string
+	AudioStreamCount int
 }
 
 // ffprobeOutput holds the raw ffprobe JSON output.
@@ -181,7 +191,15 @@ func Probe(filePath string) (*ProbeResult, error) {
 			}
 		}
 		if s.CodecType == "audio" {
-			result.AudioCodec = s.CodecName
+			// AudioCodec must reflect the first audio stream (track 0) — it's
+			// the one we -map in the single-track path and it's the first
+			// input into amix in the multi-track path. Previous code
+			// overwrote on each iteration and kept the last stream's codec,
+			// which silently disagreed with what we actually encoded.
+			if result.AudioStreamCount == 0 {
+				result.AudioCodec = s.CodecName
+			}
+			result.AudioStreamCount++
 		}
 	}
 

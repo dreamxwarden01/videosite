@@ -39,10 +39,16 @@ var loudnormJSONRe = regexp.MustCompile(`(?s)\{[^{}]*"input_i"[^{}]*\}`)
 // out_time_ms / (duration * 1e6) and is for console display only — it does not
 // affect the global job progress reported to the server.
 //
+// audioStreamCount must match the encode pass — pass-1 and pass-2 have to see
+// the same merged signal or loudnorm's measured values don't apply. When ≥ 2,
+// the audio inputs are merged with amix before loudnorm (see
+// buildAudioFilterChain in cmaf.go). When ≤ 1, the original `-af loudnorm=...`
+// form is used unchanged so single-track sources stay on the pre-change path.
+//
 // Returns (nil, nil) if the loudnorm JSON block is not found in ffmpeg output,
 // which indicates no audio stream or an unsupported format — callers should
 // skip normalization gracefully in this case.
-func AnalyzeLoudness(ctx context.Context, sourcePath string, duration float64, progressFn func(pct int)) (*LoudnessStats, error) {
+func AnalyzeLoudness(ctx context.Context, sourcePath string, audioStreamCount int, duration float64, progressFn func(pct int)) (*LoudnessStats, error) {
 	// Pass 1: decode audio through loudnorm with print_format=json.
 	// -vn skips video decode overhead. -f null - discards output.
 	// loudnorm prints its JSON block to stderr before ffmpeg exits.
@@ -50,13 +56,22 @@ func AnalyzeLoudness(ctx context.Context, sourcePath string, duration float64, p
 	// When duration is known and progressFn is set, we add -progress pipe:1
 	// -nostats so FFmpeg writes out_time_ms to stdout. We read stdout in a
 	// goroutine and call progressFn; stderr is still captured for the JSON.
-	args := []string{
-		"-i", sourcePath,
-		"-vn",
-		"-af", "loudnorm=print_format=json",
-		"-f", "null",
-		"-",
+	//
+	// Multi-track branch uses the shared buildAudioFilterChain so pass 1 and
+	// pass 2 build IDENTICAL graphs for the merge — only the trailing filter
+	// differs (print_format=json here, measured_* fields in pass 2). If the
+	// two graphs diverge, loudnorm's measured values wouldn't apply to the
+	// same signal the encoder sees.
+	filterComplex, mapTarget, useFilterComplex := buildAudioFilterChain(audioStreamCount, "loudnorm=print_format=json")
+	args := []string{"-i", sourcePath, "-vn"}
+	if useFilterComplex {
+		args = append(args, "-filter_complex", filterComplex, "-map", mapTarget)
+	} else {
+		args = append(args,
+			"-af", "loudnorm=print_format=json",
+		)
 	}
+	args = append(args, "-f", "null", "-")
 
 	if duration > 0 && progressFn != nil {
 		stderr, err := runFFmpegCaptureStderrWithProgress(ctx, duration, progressFn, args...)

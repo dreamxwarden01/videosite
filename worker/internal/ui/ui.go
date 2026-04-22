@@ -61,6 +61,16 @@ type Manager interface {
 	// UpdateStageProgress calls reset the bar back to single-fill mode.
 	UpdateStageProgressVA(jobID string, videoPct, audioPct int)
 
+	// UpdateStageProgressVOnly renders a V-labeled bar with the A half
+	// dropped and V expanded to the full bar width. Same semantics as
+	// UpdateStageProgressVA except there's no audio track to report —
+	// used when a CMAF job has zero audio streams, where we still want
+	// the row to read `[jobID] V [████████████] NN%` rather than falling
+	// back to the generic single-fill `[jobID] processing NN%` bar.
+	// Subsequent UpdateStage / UpdateStageProgress calls reset the bar
+	// back to single-fill mode, same as VA mode.
+	UpdateStageProgressVOnly(jobID string, videoPct int)
+
 	// FinishJob removes the job's bar and emits a final log line. reason is a
 	// pre-formatted human-readable string (e.g. "completed", "aborted (phase:
 	// download)", "ERROR: job failed at transcode: no encoder available"). The

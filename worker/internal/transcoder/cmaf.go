@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"videosite-worker/internal/config"
 	"videosite-worker/internal/hardware"
 )
@@ -113,6 +114,7 @@ func TranscodeAudioCMAF(
 	sourcePath, outputDir string,
 	audioBitrateKbps, segmentDurationSec int,
 	loudnormFilter string,
+	audioStreamCount int,
 	duration float64,
 	progressCb func(pct int),
 	logFile string,
@@ -126,15 +128,30 @@ func TranscodeAudioCMAF(
 	args := []string{
 		"-i", sourcePath,
 		"-vn",
-		"-map", "0:a:0",
+	}
+
+	// Route audio either as a simple `-map 0:a:0` single-track with optional
+	// `-af loudnorm=...` (the original happy path, byte-identical for N=1),
+	// or as a `-filter_complex` chain that amix-merges N ≥ 2 tracks and then
+	// (optionally) applies loudnorm on the merged signal before it hits the
+	// AAC encoder. buildAudioFilterChain centralises the branch so both
+	// encode and analyze paths stay identical.
+	filterComplex, mapTarget, useFilterComplex := buildAudioFilterChain(audioStreamCount, loudnormFilter)
+	if useFilterComplex {
+		args = append(args, "-filter_complex", filterComplex, "-map", mapTarget)
+	} else {
+		args = append(args, "-map", mapTarget)
+		if loudnormFilter != "" {
+			args = append(args, "-af", loudnormFilter)
+		}
+	}
+
+	args = append(args,
 		"-c:a", "aac",
 		"-b:a", fmt.Sprintf("%dk", audioBitrateKbps),
 		"-ac", "2",
 		"-ar", "48000",
-	}
-	if loudnormFilter != "" {
-		args = append(args, "-af", loudnormFilter)
-	}
+	)
 	args = append(args,
 		"-hls_time", fmt.Sprintf("%d", segmentDurationSec),
 		"-hls_playlist_type", "vod",
@@ -198,6 +215,58 @@ func buildBaseVideoCMAFArgs(hwArgs []string, sourcePath, outputDir string, profi
 		playlistPath,
 	)
 	return args
+}
+
+// buildAudioFilterChain decides how audio should be routed through ffmpeg.
+//
+// Three distinct cases drive this:
+//
+//  1. streamCount ≤ 1 (single track, the overwhelming majority of sources):
+//     emit nothing special. Caller uses `-map 0:a:0` and, if loudnorm is
+//     desired, passes the filter via `-af`. This keeps the happy path
+//     byte-identical to pre-change — no filter_complex, no amix overhead,
+//     no new failure modes.
+//
+//  2. streamCount ≥ 2 without loudnorm: build an amix-only filter_complex
+//     that sums every audio input and routes the mix label as the map
+//     target. `normalize=0` is deliberate: the default `normalize=1` divides
+//     every input's level by N, which pushes quiet screen-recording audio
+//     to voice-track level — blowing out the voice after loudnorm applies
+//     its global gain. With normalize=0 the mic stays mic-loud and the
+//     screencast stays screencast-quiet, preserving the relative loudness
+//     the user actually recorded.
+//
+//  3. streamCount ≥ 2 with loudnorm: same amix, then the loudnorm filter
+//     runs on the merged signal (single chain, no intermediate file). Pass
+//     1 analyzes the merged signal's R128 stats; pass 2 encodes with
+//     linear=true gain. Chaining amix → loudnorm inside one filter_complex
+//     is what makes "merge before normalize" automatic in the graph.
+//
+// Return values:
+//   - filterComplexArg: the complete `-filter_complex` value (or "" when
+//     useFilterComplex == false).
+//   - mapTarget: either "0:a:0" (single-track) or "[mix]" (multi-track).
+//   - useFilterComplex: whether the caller should pass
+//     `-filter_complex <arg> -map <target>` or the simpler
+//     `-map 0:a:0 [-af loudnorm=...]` form.
+//
+// The labels inside the filter graph are stable: inputs are [0:a:0],
+// [0:a:1], … [0:a:N-1]; the final output is always [mix]. Callers rely on
+// "[mix]" as a fixed sentinel.
+func buildAudioFilterChain(streamCount int, loudnormFilter string) (filterComplexArg, mapTarget string, useFilterComplex bool) {
+	if streamCount <= 1 {
+		return "", "0:a:0", false
+	}
+	var inputs strings.Builder
+	for i := 0; i < streamCount; i++ {
+		fmt.Fprintf(&inputs, "[0:a:%d]", i)
+	}
+	chain := fmt.Sprintf("%samix=inputs=%d:normalize=0", inputs.String(), streamCount)
+	if loudnormFilter != "" {
+		chain += "," + loudnormFilter
+	}
+	chain += "[mix]"
+	return chain, "[mix]", true
 }
 
 // insertBeforeLast inserts extra args immediately before the last element of

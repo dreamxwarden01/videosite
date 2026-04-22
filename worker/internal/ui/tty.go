@@ -45,27 +45,35 @@ const (
 // UpdateStageProgress, both from job goroutines. Render reads them under the
 // same atomics.
 //
-// vaActive toggles the bar between its two rendering modes:
+// The bar has three rendering modes, selected by (vaActive, vOnly):
 //
-//   - false (default) — single-fill mode: one bracketed bar stretches across
+//   - (false, false) — single-fill mode: one bracketed bar stretches across
 //     the full free width, filled to `pct`%. Matches the classic
 //     download / transcode / upload UX.
 //
-//   - true — composite V+A mode: two smaller bracketed bars sit side by side
-//     on the same row, one per track, filled to vPct% and aPct% respectively.
-//     Used during the CMAF processing stage where video and audio
-//     goroutines run in parallel.
+//   - (true, false) — composite V+A mode: two smaller bracketed bars sit
+//     side by side on the same row, one per track, filled to vPct% and
+//     aPct% respectively. Used during the CMAF processing stage where
+//     video and audio goroutines run in parallel.
 //
-// Mode is toggled by the Manager methods: UpdateStageProgressVA flips it on,
-// UpdateStage / UpdateStageProgress flip it off.
+//   - (false, true) — V-only mode: a single bracketed bar, same full width
+//     as single-fill, but prefixed with `V ` so the row matches the
+//     composite style minus the A half. Used for CMAF jobs whose source
+//     has no audio stream — we still want the V label, just no audio track
+//     to report.
+//
+// Mode is toggled by the Manager methods: UpdateStageProgressVA flips
+// vaActive on, UpdateStageProgressVOnly flips vOnly on (and vaActive off),
+// UpdateStage / UpdateStageProgress flip both off.
 type ttyBar struct {
 	jobID    string
 	priority int64        // stable ascending lease order (bar sort key)
 	stage    atomic.Value // string — current stage label
 	pct      atomic.Int32 // 0..100 local pct within current stage
 
-	vaActive atomic.Bool  // if set, render() draws the V+A composite instead of single-fill
-	vPct     atomic.Int32 // 0..100 video track progress (VA mode only)
+	vaActive atomic.Bool  // if set, render() draws the V+A composite
+	vOnly    atomic.Bool  // if set, render() draws the V-only expanded bar
+	vPct     atomic.Int32 // 0..100 video track progress (VA / VOnly mode)
 	aPct     atomic.Int32 // 0..100 audio track progress (VA mode only)
 }
 
@@ -482,6 +490,9 @@ func (b *ttyBar) render(width int) string {
 	if b.vaActive.Load() {
 		return renderVA(b.jobID, int(b.vPct.Load()), int(b.aPct.Load()), safe)
 	}
+	if b.vOnly.Load() {
+		return renderVOnly(b.jobID, int(b.vPct.Load()), safe)
+	}
 
 	pct := int(b.pct.Load())
 	if pct < 0 {
@@ -614,6 +625,75 @@ func renderVA(jobID string, vPct, aPct, safe int) string {
 	return sb.String()
 }
 
+// renderVOnly draws a single V-labeled bar expanded to the full free width —
+// the no-audio variant of the composite row. Row shape:
+//
+//	[<jobID>] V [████████████████░░░░░░░░░░░░] NN%
+//
+// Budget accounting (keep in sync with renderVA above):
+//
+//	"[jobID] "  — len(prefix)
+//	"V ["       — 3
+//	<fill>      — fillWidth
+//	"] "        — 2
+//	"NNN%"      — 4   (%3d → 3 chars + literal '%')
+//
+// Non-fill total = 9. endMargin=1 matches single-fill rendering — the
+// "pending wrap" column stays reserved so the percent readout never lands
+// in the last column where Windows Terminal / conhost would silently
+// auto-advance the cursor to the next row.
+//
+// Fallback: if the row is too narrow to fit the label + brackets + percent
+// plus at least one fill char, collapse to "[jobID] V NN%" — same pattern
+// renderVA uses. Dropping the bar entirely at tiny widths keeps the
+// information visible without wrapping.
+func renderVOnly(jobID string, vPct, safe int) string {
+	if vPct < 0 {
+		vPct = 0
+	} else if vPct > 100 {
+		vPct = 100
+	}
+	const endMargin = 1
+	budget := safe - endMargin
+	if budget < 1 {
+		return ""
+	}
+	prefix := fmt.Sprintf("[%s] ", jobID)
+	const frame = 9 // "V [" (3) + "] " (2) + "NNN%" (4)
+	fixed := len(prefix) + frame
+	if fixed >= budget {
+		compact := fmt.Sprintf("%sV %d%%", prefix, vPct)
+		if len(compact) > budget {
+			return compact[:budget]
+		}
+		return compact
+	}
+	fillWidth := budget - fixed
+	if fillWidth < 1 {
+		compact := fmt.Sprintf("%sV %d%%", prefix, vPct)
+		if len(compact) > budget {
+			return compact[:budget]
+		}
+		return compact
+	}
+	filled := vPct * fillWidth / 100
+	if filled > fillWidth {
+		filled = fillWidth
+	}
+	var sb strings.Builder
+	sb.Grow(len(prefix) + frame + fillWidth*4)
+	sb.WriteString(prefix)
+	sb.WriteString("V [")
+	for i := 0; i < filled; i++ {
+		sb.WriteString("█")
+	}
+	for i := filled; i < fillWidth; i++ {
+		sb.WriteString("░")
+	}
+	fmt.Fprintf(&sb, "] %3d%%", vPct)
+	return sb.String()
+}
+
 // StartJob registers a new bar. leasedAt is stored but not currently
 // consumed — ordering is handled by seq (monotonically increasing per call,
 // which matches real lease order).
@@ -657,6 +737,7 @@ func (m *ttyManager) UpdateStage(jobID, stage string, globalPct int) {
 	b.stage.Store(stage)
 	b.pct.Store(0)
 	b.vaActive.Store(false)
+	b.vOnly.Store(false)
 	b.vPct.Store(0)
 	b.aPct.Store(0)
 	m.dirty.Add(1)
@@ -697,6 +778,7 @@ func (m *ttyManager) UpdateStageProgress(jobID string, localPct int) {
 	}
 	b.pct.Store(int32(localPct))
 	b.vaActive.Store(false)
+	b.vOnly.Store(false)
 	m.dirty.Add(1)
 }
 
@@ -729,6 +811,38 @@ func (m *ttyManager) UpdateStageProgressVA(jobID string, videoPct, audioPct int)
 	b.vPct.Store(int32(videoPct))
 	b.aPct.Store(int32(audioPct))
 	b.vaActive.Store(true)
+	b.vOnly.Store(false)
+	m.dirty.Add(1)
+}
+
+// UpdateStageProgressVOnly stores the video track pct and flips the bar into
+// V-only rendering mode — see the renderVOnly doc for the row shape and the
+// ttyBar doc for the full three-mode matrix. Used by CMAF jobs whose source
+// has no audio stream; runCMAF calls this instead of UpdateStageProgressVA
+// so the row keeps the V label and the bar expands to full width without an
+// A half.
+//
+// Expected call shape: during the CMAF processing stage of a no-audio job,
+// the video goroutine publishes on every ffmpeg progress event. A subsequent
+// UpdateStage (e.g. entering upload) automatically clears the V-only flag.
+func (m *ttyManager) UpdateStageProgressVOnly(jobID string, videoPct int) {
+	if m.closed.Load() {
+		return
+	}
+	if videoPct < 0 {
+		videoPct = 0
+	} else if videoPct > 100 {
+		videoPct = 100
+	}
+	m.barsMu.Lock()
+	b, ok := m.bars[jobID]
+	m.barsMu.Unlock()
+	if !ok {
+		return
+	}
+	b.vPct.Store(int32(videoPct))
+	b.vOnly.Store(true)
+	b.vaActive.Store(false)
 	m.dirty.Add(1)
 }
 

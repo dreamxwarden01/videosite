@@ -869,7 +869,11 @@ func (j *Job) analyzeLoudness(probe *transcoder.ProbeResult) (string, error) {
 	j.UI.Logf("[%s] analyzing audio loudness (EBU R128)...", j.JobID)
 
 	sourcePath := filepath.Join(j.tempDir, "source.mp4")
-	stats, err := transcoder.AnalyzeLoudness(j.ctx, sourcePath, j.duration, func(pct int) {
+	// TS path is single-audio-track by design — multi-track fixture handling
+	// lives only in the CMAF runCMAF path. Pass 1 here so AnalyzeLoudness
+	// stays on the original `-af loudnorm=...` form, byte-for-byte identical
+	// to pre-change behaviour for every legacy video that still runs TS.
+	stats, err := transcoder.AnalyzeLoudness(j.ctx, sourcePath, 1, j.duration, func(pct int) {
 		j.UI.UpdateStageProgress(j.JobID, pct)
 		globalPct := scaleLocal(aStart, aEnd, pct)
 		j.Progress.Update(j.JobID, "analyzing audio", globalPct)
@@ -920,7 +924,12 @@ func (j *Job) analyzeLoudnessCMAF(probe *transcoder.ProbeResult, progressCb func
 	j.UI.Logf("[%s] analyzing audio loudness (EBU R128)...", j.JobID)
 
 	sourcePath := filepath.Join(j.tempDir, "source.mp4")
-	stats, err := transcoder.AnalyzeLoudness(j.ctx, sourcePath, probe.DurationSeconds, progressCb)
+	// probe.AudioStreamCount drives the amix branch inside AnalyzeLoudness.
+	// Pass 1 and pass 2 MUST see the same graph or the measured R128 stats
+	// won't apply to the signal the encoder ends up processing. Plumbing
+	// the same value through both calls is how "merge before normalize"
+	// becomes automatic for multi-track sources.
+	stats, err := transcoder.AnalyzeLoudness(j.ctx, sourcePath, probe.AudioStreamCount, probe.DurationSeconds, progressCb)
 	if err != nil {
 		if j.ctx.Err() != nil {
 			return "", fmt.Errorf("aborted: %w", j.ctx.Err())
@@ -1585,18 +1594,44 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 	sourcePath := filepath.Join(j.tempDir, "source.mp4")
 	audioName := fmt.Sprintf("aac_%dk", j.AudioBitrateKbps)
 	audioDir := filepath.Join(j.outputDir, "audio", audioName)
-	os.MkdirAll(audioDir, 0755)
+
+	// hasAudio drives four intertwined decisions (keep them in sync):
+	//   1. whether to run the audio goroutine at all
+	//   2. whether the bar renders V+A composite (hasAudio) vs V-only (no audio)
+	//   3. whether the master.m3u8 includes the AUDIO group + mp4a suffix
+	//   4. whether the MPD includes an audio AdaptationSet
+	//
+	// needsMerge is a sub-case of hasAudio — when 2+ tracks are present we
+	// emit an amix filter chain (see buildAudioFilterChain in cmaf.go) and
+	// re-map the audio progress bar to reserve a 0-5% "merge" band so the
+	// user can see the first 5% of the analyze pass happen before the
+	// analyze label kicks in. The band is cosmetic (amix runs inline inside
+	// the same ffmpeg pass, not as a separate pre-pass).
+	hasAudio := probe.AudioStreamCount >= 1
+	needsMerge := probe.AudioStreamCount >= 2
+
+	if hasAudio {
+		os.MkdirAll(audioDir, 0755)
+	}
+	if needsMerge {
+		j.UI.Logf("[%s] audio: %d tracks detected, merging with amix (normalize=0)", j.JobID, probe.AudioStreamCount)
+	}
 
 	j.UI.UpdateStage(j.JobID, "processing", 10)
 	j.Progress.Update(j.JobID, "processing", 10)
 	j.SetStage("processing", 10)
 
 	// Shared V / A progress state; min(V,A) drives the server-reported pct.
+	// For no-audio jobs audioPct stays pinned at 100 so min(V,A) == V and
+	// the server pct is driven entirely by the video goroutine.
 	var (
 		vaMu     sync.Mutex
 		videoPct int
 		audioPct int
 	)
+	if !hasAudio {
+		audioPct = 100
+	}
 	publish := func() {
 		vaMu.Lock()
 		v, a := videoPct, audioPct
@@ -1606,9 +1641,16 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 			m = a
 		}
 		globalPct := 10 + m*80/100
-		// TTY shows both V and A side by side; server-reported pct stays on
-		// min(V,A) so the progress bar only advances when both tracks do.
-		j.UI.UpdateStageProgressVA(j.JobID, v, a)
+		// TTY row switches between V+A composite (hasAudio) and V-only
+		// expanded (no audio) so the bar still carries the V label instead
+		// of dropping to the generic single-fill "processing NN%" form.
+		// Server-reported pct is min(V,A) in both cases — with audioPct
+		// pinned at 100 for no-audio, that's exactly videoPct.
+		if hasAudio {
+			j.UI.UpdateStageProgressVA(j.JobID, v, a)
+		} else {
+			j.UI.UpdateStageProgressVOnly(j.JobID, v)
+		}
 		j.Progress.Update(j.JobID, "processing", globalPct)
 		j.SetStage("processing", globalPct)
 	}
@@ -1707,58 +1749,108 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 	}()
 
 	// --- Audio goroutine ---
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	// Skipped entirely when the source has no audio track — no analyze, no
+	// encode, no TranscodeAudioCMAF call, no /audio/ directory created or
+	// uploaded. audioPct is pinned at 100 in the shared state (see above)
+	// so the video goroutine's progress drives the server-reported pct by
+	// itself.
+	if hasAudio {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 
-		// Pass 1: loudnorm analysis. Progress maps onto 0–50% of the audio
-		// bar when norm is actually going to run; when it's off (or skipped)
-		// the analyze call returns "" immediately and the encode owns the
-		// full 0–100 range.
-		normWillRun := j.AudioNormalization && probe.AudioCodec != ""
-		analyzeProgress := func(pct int) {
-			if normWillRun {
-				updateA(pct / 2)
+			// Progress band allocation (plan §"Progress band allocation"):
+			//
+			//   needsMerge=false, normWillRun=false → encode 0–100
+			//   needsMerge=false, normWillRun=true  → analyze 0–50, encode 50–100
+			//   needsMerge=true,  normWillRun=false → merge 0–5, encode 5–100
+			//   needsMerge=true,  normWillRun=true  → merge 0–5, analyze 5–50, encode 50–100
+			//
+			// The "merge" band is cosmetic — amix runs inline inside the
+			// analyze (norm on) or encode (norm off) pass's ffmpeg graph,
+			// not as a separate pre-pass, so there's no distinct mechanical
+			// phase to time. We just re-map the first slice of whichever
+			// pass runs first (10% of analyze when norm on → bar 0→5, 5% of
+			// encode when norm off → bar 0→5) to that band so the user sees
+			// the bar move during what otherwise looks like a long "stuck
+			// at 0%" prelude.
+			normWillRun := j.AudioNormalization
+
+			analyzeProgress := func(pct int) {
+				// Analyze only runs when norm is on.
+				if !normWillRun {
+					return
+				}
+				if needsMerge {
+					// First 10% of analyze → bar 0→5 (merge band).
+					// Remaining 90% of analyze → bar 5→50.
+					if pct < 10 {
+						updateA(remap(pct, 0, 10, 0, 5))
+					} else {
+						updateA(remap(pct, 10, 100, 5, 50))
+					}
+				} else {
+					// Classic 0–50% analyze band.
+					updateA(pct / 2)
+				}
 			}
-		}
-		loudnormFilter, err := j.analyzeLoudnessCMAF(probe, analyzeProgress)
-		if err != nil {
-			recordErr(fmt.Errorf("audio analyze: %w", err))
-			return
-		}
 
-		// Pass 2: encode. Re-check against the actual filter string — if
-		// analysis skipped (source silent, loudnorm bailed, etc.) the filter
-		// is empty and we remap encode to 0–100.
-		encodeProgress := func(pct int) {
-			if loudnormFilter != "" {
-				updateA(50 + pct/2)
-			} else {
-				updateA(pct)
+			loudnormFilter, err := j.analyzeLoudnessCMAF(probe, analyzeProgress)
+			if err != nil {
+				recordErr(fmt.Errorf("audio analyze: %w", err))
+				return
 			}
-		}
 
-		logFile := ffmpegLogPath(j.JobID, "audio", "cmaf-audio")
-		segDur := profiles[0].SegmentDuration
-		err = transcoder.TranscodeAudioCMAF(
-			egCtx, sourcePath, audioDir,
-			j.AudioBitrateKbps, segDur, loudnormFilter,
-			probe.DurationSeconds, encodeProgress, logFile,
-		)
-		if err != nil {
-			recordErr(fmt.Errorf("audio: %w", err))
-			return
-		}
+			// Encode band is decided by whichever of norm/merge actually
+			// happened. Re-check against the returned filter string rather
+			// than normWillRun alone — analyzeLoudnessCMAF can return ""
+			// when loudnorm bailed mid-analysis (rare) even though
+			// j.AudioNormalization was true.
+			normActuallyRan := loudnormFilter != ""
 
-		// Verify the fMP4 init segment is where we expect it. ffmpeg's HLS
-		// muxer has historically put init.mp4 in the CWD when the playlist
-		// path contained backslashes — catching that here surfaces the
-		// failure at the ffmpeg boundary rather than much later at
-		// ProbeCodecString / playback.
-		if vErr := verifyCMAFInit(audioDir, logFile); vErr != nil {
-			recordErr(fmt.Errorf("audio: %w", vErr))
-		}
-	}()
+			encodeProgress := func(pct int) {
+				switch {
+				case needsMerge && !normActuallyRan:
+					// First 5% of encode → bar 0→5 (merge band).
+					// Remaining 95% → bar 5→100.
+					if pct < 5 {
+						updateA(remap(pct, 0, 5, 0, 5))
+					} else {
+						updateA(remap(pct, 5, 100, 5, 100))
+					}
+				case normActuallyRan:
+					// Bar 50→100 regardless of whether merge preceded, since
+					// the analyze band already consumed 0→50 (merged or not).
+					updateA(50 + pct/2)
+				default:
+					// Single-track, no norm — encode owns the whole range.
+					updateA(pct)
+				}
+			}
+
+			logFile := ffmpegLogPath(j.JobID, "audio", "cmaf-audio")
+			segDur := profiles[0].SegmentDuration
+			err = transcoder.TranscodeAudioCMAF(
+				egCtx, sourcePath, audioDir,
+				j.AudioBitrateKbps, segDur, loudnormFilter,
+				probe.AudioStreamCount,
+				probe.DurationSeconds, encodeProgress, logFile,
+			)
+			if err != nil {
+				recordErr(fmt.Errorf("audio: %w", err))
+				return
+			}
+
+			// Verify the fMP4 init segment is where we expect it. ffmpeg's HLS
+			// muxer has historically put init.mp4 in the CWD when the playlist
+			// path contained backslashes — catching that here surfaces the
+			// failure at the ffmpeg boundary rather than much later at
+			// ProbeCodecString / playback.
+			if vErr := verifyCMAFInit(audioDir, logFile); vErr != nil {
+				recordErr(fmt.Errorf("audio: %w", vErr))
+			}
+		}()
+	}
 
 	wg.Wait()
 	if firstErr != nil {
@@ -1772,8 +1864,13 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 			return fmt.Errorf("rewrite video playlist %s: %w", p.Name, err)
 		}
 	}
-	if err := transcoder.RewritePlaylistHMAC(filepath.Join(audioDir, "playlist.m3u8")); err != nil {
-		return fmt.Errorf("rewrite audio playlist: %w", err)
+	// Skip when no audio: no audio/ directory exists so the rewrite would
+	// fail with "no such file" — the goroutine that would have produced it
+	// was never spawned.
+	if hasAudio {
+		if err := transcoder.RewritePlaylistHMAC(filepath.Join(audioDir, "playlist.m3u8")); err != nil {
+			return fmt.Errorf("rewrite audio playlist: %w", err)
+		}
 	}
 
 	// Build variants by probing each init.mp4 for its RFC 6381 codec string.
@@ -1804,10 +1901,10 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 		})
 	}
 
-	if err := transcoder.WriteMasterPlaylistCMAF(j.outputDir, variants, audioName, j.AudioBitrateKbps); err != nil {
+	if err := transcoder.WriteMasterPlaylistCMAF(j.outputDir, variants, audioName, j.AudioBitrateKbps, hasAudio); err != nil {
 		return fmt.Errorf("write CMAF master playlist: %w", err)
 	}
-	if err := transcoder.WriteDASHManifest(j.outputDir, variants, audioName, j.AudioBitrateKbps, probe.DurationSeconds, profiles[0].SegmentDuration); err != nil {
+	if err := transcoder.WriteDASHManifest(j.outputDir, variants, audioName, j.AudioBitrateKbps, probe.DurationSeconds, profiles[0].SegmentDuration, hasAudio); err != nil {
 		return fmt.Errorf("write DASH manifest: %w", err)
 	}
 

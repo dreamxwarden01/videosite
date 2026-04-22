@@ -17,8 +17,13 @@ import (
 //
 // vaActive/vPct/aPct mirror the ttyBar composite mode — set by
 // UpdateStageProgressVA and cleared by UpdateStage / UpdateStageProgress.
+// vOnly mirrors the V-only expanded bar mode — set by
+// UpdateStageProgressVOnly and cleared by the same calls. Exactly one of
+// (vaActive, vOnly, neither) is true at any time.
+//
 // When vaActive is true the summarizer emits the dual-track form
-// (`V=NN% A=NN%`) instead of a single local pct.
+// (`V=NN% A=NN%`); when vOnly is true the summarizer emits
+// `V=NN%` (no A column); otherwise the classic single local pct is used.
 //
 // All fields are accessed under plainManager.mu — the hot paths are
 // stage transitions and finishes, both low-frequency. localPct is updated
@@ -32,6 +37,7 @@ type plainJob struct {
 	globalPct int
 
 	vaActive bool
+	vOnly    bool
 	vPct     int
 	aPct     int
 
@@ -118,6 +124,13 @@ func (m *plainManager) emitSummary() {
 			)
 			continue
 		}
+		if j.vOnly {
+			lines = append(lines,
+				fmt.Sprintf("%s [%s] %s V=%d%% (global %d%%)",
+					util.Ts(), j.jobID, j.stage, j.vPct, j.globalPct),
+			)
+			continue
+		}
 		lines = append(lines,
 			fmt.Sprintf("%s [%s] %s %d%% (global %d%%)",
 				util.Ts(), j.jobID, j.stage, j.localPct, j.globalPct),
@@ -162,6 +175,7 @@ func (m *plainManager) UpdateStage(jobID, stage string, globalPct int) {
 		j.globalPct = globalPct
 		j.localPct = 0
 		j.vaActive = false
+		j.vOnly = false
 		j.vPct = 0
 		j.aPct = 0
 		if stage == "completing" {
@@ -204,6 +218,7 @@ func (m *plainManager) UpdateStageProgress(jobID string, localPct int) {
 	if j, ok := m.jobs[jobID]; ok {
 		j.localPct = localPct
 		j.vaActive = false
+		j.vOnly = false
 	}
 	m.mu.Unlock()
 }
@@ -229,6 +244,30 @@ func (m *plainManager) UpdateStageProgressVA(jobID string, videoPct, audioPct in
 		j.vPct = videoPct
 		j.aPct = audioPct
 		j.vaActive = true
+		j.vOnly = false
+	}
+	m.mu.Unlock()
+}
+
+// UpdateStageProgressVOnly stores the V track pct and enables the V-only
+// summary form for the next tick. See plainJob docs for the three-mode
+// matrix; summaries will emit `V=NN%` without the A column until a
+// subsequent UpdateStage / UpdateStageProgress / UpdateStageProgressVA call
+// clears vOnly.
+func (m *plainManager) UpdateStageProgressVOnly(jobID string, videoPct int) {
+	if m.closed.Load() {
+		return
+	}
+	if videoPct < 0 {
+		videoPct = 0
+	} else if videoPct > 100 {
+		videoPct = 100
+	}
+	m.mu.Lock()
+	if j, ok := m.jobs[jobID]; ok {
+		j.vPct = videoPct
+		j.vOnly = true
+		j.vaActive = false
 	}
 	m.mu.Unlock()
 }

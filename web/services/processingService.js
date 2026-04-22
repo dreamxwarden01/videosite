@@ -553,13 +553,36 @@ async function reportJobStatuses(jobs) {
 
 // Map file extension to the correct MIME type for R2 storage.
 // Covers both legacy TS segments and CMAF (fMP4 HLS + DASH) outputs.
+//
+// MUST mirror worker/internal/api/upload.go hlsContentType byte-for-byte.
+// R2 rejects the PUT with SignatureDoesNotMatch if the signed URL's
+// ContentType doesn't match the header the worker actually sends; the two
+// implementations live in different languages but must agree on every
+// input.
+//
+// For .mp4 / .m4s we branch on whether the path sits under an `/audio/`
+// directory: the filename passed here is the job-relative path (e.g.
+// `audio/aac_192k/init.mp4` or `video/1080p/segment_0003.m4s`), so we can
+// tell init + segments under the audio rendition apart from the video
+// renditions by path substring alone. audio/mp4 is purely descriptive in
+// the R2 object metadata — browsers don't consume the HTTP Content-Type
+// for fMP4 init/media segments (Safari reads the box structure; Shaka
+// trusts the AdaptationSet's mimeType), but `aws s3api head-object` now
+// returns the honest type for anyone auditing the bucket.
 function hlsContentType(filename) {
     if (filename.endsWith('.m3u8')) return 'application/vnd.apple.mpegurl';
     if (filename.endsWith('.mpd'))  return 'application/dash+xml';
     if (filename.endsWith('.ts'))   return 'video/mp2t';
-    // .m4s = CMAF media segment, .mp4 = fMP4 init segment
-    if (filename.endsWith('.m4s'))  return 'video/mp4';
-    if (filename.endsWith('.mp4'))  return 'video/mp4';
+    // .m4s = CMAF media segment, .mp4 = fMP4 init segment.
+    //
+    // Prepend a leading "/" so relative paths ("audio/aac_192k/init.mp4")
+    // and absolute paths ("/tmp/foo/audio/...") both match the same way.
+    // The worker passes absolute local filesystem paths; the server passes
+    // job-relative paths. Both forms must resolve to the same ContentType
+    // or R2 rejects the signed PUT with SignatureDoesNotMatch.
+    if (filename.endsWith('.m4s') || filename.endsWith('.mp4')) {
+        return ('/' + filename).includes('/audio/') ? 'audio/mp4' : 'video/mp4';
+    }
     return 'application/octet-stream';
 }
 

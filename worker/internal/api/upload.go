@@ -92,12 +92,28 @@ func UploadFile(ctx context.Context, filePath, presignedURL string) error {
 
 // hlsContentType returns the correct MIME type for HLS / CMAF / DASH output
 // files. Must match the ContentType used when generating the presigned PUT URL
-// on the server side (processingService.js hlsContentType).
+// on the server side (processingService.js hlsContentType) — R2 rejects the
+// PUT with SignatureDoesNotMatch if the signed URL's ContentType doesn't
+// match the PUT request's Content-Type header exactly.
 //
 // Legacy TS uses .m3u8 + .ts; CMAF adds .mpd (DASH manifest), .mp4 (init
 // segment), and .m4s (media segments). All are served cache-immutable.
-func hlsContentType(filename string) string {
-	lower := strings.ToLower(filename)
+//
+// For .mp4 / .m4s we branch on whether the path sits under an /audio/
+// directory — init.mp4 and segment_*.m4s under `audio/aac_192k/` get
+// `audio/mp4`, everything else gets `video/mp4`. Players don't actually
+// consume this header (Safari reads the fMP4 box structure, Shaka trusts
+// the AdaptationSet's mimeType), but the R2 object metadata is otherwise
+// self-mislabeling — `aws s3api head-object` on an audio segment would
+// come back as video/mp4, which is surprising to anyone auditing the
+// bucket. Normalize via filepath.ToSlash so Windows-native backslash paths
+// still match — the signed URL path is always in forward-slash form on
+// the server side.
+//
+// filePath may be a relative or absolute path; we only inspect the suffix
+// and the presence of "/audio/" anywhere in it.
+func hlsContentType(filePath string) string {
+	lower := strings.ToLower(filepath.ToSlash(filePath))
 	switch {
 	case strings.HasSuffix(lower, ".m3u8"):
 		return "application/vnd.apple.mpegurl"
@@ -106,6 +122,14 @@ func hlsContentType(filename string) string {
 	case strings.HasSuffix(lower, ".mpd"):
 		return "application/dash+xml"
 	case strings.HasSuffix(lower, ".mp4"), strings.HasSuffix(lower, ".m4s"):
+		// Prepend a leading "/" so relative paths ("audio/aac_192k/init.mp4")
+		// and absolute paths ("/tmp/foo/audio/...") both match the same way.
+		// The worker passes absolute local filesystem paths; the server
+		// passes job-relative paths. Both forms need to resolve to the same
+		// ContentType or the presigned PUT fails signature validation.
+		if strings.Contains("/"+lower, "/audio/") {
+			return "audio/mp4"
+		}
 		return "video/mp4"
 	default:
 		return "application/octet-stream"
@@ -131,7 +155,11 @@ func doUpload(ctx context.Context, filePath, presignedURL string) (int, error) {
 		return 0, fmt.Errorf("create upload request: %w", err)
 	}
 	req.ContentLength = stat.Size()
-	req.Header.Set("Content-Type", hlsContentType(filepath.Base(filePath)))
+	// Pass the full filePath (not just the basename) so hlsContentType can
+	// see the /audio/ segment in the path and return audio/mp4 for init +
+	// segments under /audio/. Stripping to basename made the path check
+	// useless — every .m4s looked identical.
+	req.Header.Set("Content-Type", hlsContentType(filePath))
 	req.Header.Set("Cache-Control", "public, max-age=31536000, immutable")
 
 	resp, err := httpClientPtr.Load().Do(req)

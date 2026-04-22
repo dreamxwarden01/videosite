@@ -73,38 +73,61 @@ type CMAFVariant struct {
 }
 
 // WriteMasterPlaylistCMAF writes a CMAF-style master.m3u8 that references one
-// fMP4 video playlist per profile plus a single audio rendition.
+// fMP4 video playlist per profile plus a single audio rendition (when the
+// job has audio).
 //
 // Layout produced under outputDir:
 //
 //	master.m3u8
 //	video/<variant.Name>/playlist.m3u8     ← referenced via STREAM-INF
-//	audio/<audioName>/playlist.m3u8        ← referenced via EXT-X-MEDIA
+//	audio/<audioName>/playlist.m3u8        ← referenced via EXT-X-MEDIA  (hasAudio only)
 //
 // #EXT-X-VERSION:7 is required for fMP4 segments. QUERYPARAM="verify" is the
 // Safari-native mechanism for passing the HMAC token (set by the watch page)
 // into every child playlist request; the per-profile playlists already have
 // {$verify} substitution in segment + EXT-X-MAP URIs (see RewritePlaylistHMAC).
-func WriteMasterPlaylistCMAF(outputDir string, variants []CMAFVariant, audioName string, audioBitrateKbps int) error {
+//
+// hasAudio toggles three related pieces of the playlist in lockstep so they
+// never drift out of sync:
+//   - the `#EXT-X-MEDIA:TYPE=AUDIO` rendition line (emitted iff true)
+//   - the `AUDIO="audio"` attribute on each `#EXT-X-STREAM-INF` (emitted iff true)
+//   - the `,mp4a.40.2` suffix inside each STREAM-INF's `CODECS` attribute
+//
+// A stream-inf that declares `AUDIO="audio"` without a matching `#EXT-X-MEDIA`
+// line, or that lists an audio codec without a media rendition to play it,
+// makes Safari reject the master with "invalid HLS" and Shaka log
+// CONTENT_UNSUPPORTED_BY_BROWSER. All three must be gated together.
+func WriteMasterPlaylistCMAF(outputDir string, variants []CMAFVariant, audioName string, audioBitrateKbps int, hasAudio bool) error {
 	var sb strings.Builder
 	sb.WriteString("#EXTM3U\n")
 	sb.WriteString("#EXT-X-VERSION:7\n")
 	sb.WriteString("#EXT-X-DEFINE:QUERYPARAM=\"verify\"\n")
 
-	// Single AAC-LC audio rendition — GROUP-ID="audio" referenced from each STREAM-INF.
-	sb.WriteString(fmt.Sprintf(
-		"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"%s\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"2\",URI=\"audio/%s/playlist.m3u8?verify={$verify}\"\n",
-		audioName, audioName))
+	if hasAudio {
+		// Single AAC-LC audio rendition — GROUP-ID="audio" referenced from each STREAM-INF.
+		sb.WriteString(fmt.Sprintf(
+			"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"%s\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"2\",URI=\"audio/%s/playlist.m3u8?verify={$verify}\"\n",
+			audioName, audioName))
+	}
 
 	for _, v := range variants {
-		bandwidth := v.VideoBitrateKbps*1000 + audioBitrateKbps*1000
+		bandwidth := v.VideoBitrateKbps * 1000
+		if hasAudio {
+			bandwidth += audioBitrateKbps * 1000
+		}
 		codecs := v.Codecs
 		if codecs == "" {
 			codecs = "avc1.640028" // conservative fallback (High@4.0)
 		}
-		sb.WriteString(fmt.Sprintf(
-			"#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,CODECS=\"%s,mp4a.40.2\",AUDIO=\"audio\"\n",
-			bandwidth, v.Width, v.Height, codecs))
+		if hasAudio {
+			sb.WriteString(fmt.Sprintf(
+				"#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,CODECS=\"%s,mp4a.40.2\",AUDIO=\"audio\"\n",
+				bandwidth, v.Width, v.Height, codecs))
+		} else {
+			sb.WriteString(fmt.Sprintf(
+				"#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,CODECS=\"%s\"\n",
+				bandwidth, v.Width, v.Height, codecs))
+		}
 		sb.WriteString(fmt.Sprintf("video/%s/playlist.m3u8?verify={$verify}\n", v.Name))
 	}
 
