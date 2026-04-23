@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { useSite } from '../context/SiteContext';
+import { useAuth } from '../context/AuthContext';
 import { useToast } from '../context/ToastContext';
 import { apiGet, apiPost, triggerAuthFailure } from '../api';
 import LoadingSpinner from '../components/LoadingSpinner';
@@ -43,6 +44,7 @@ function pickManifestUrl(data) {
 export default function WatchPage() {
   const { videoId } = useParams();
   const { siteName } = useSite();
+  const { refresh } = useAuth();
   const { showToast } = useToast();
 
   const [data, setData] = useState(null);
@@ -88,13 +90,20 @@ export default function WatchPage() {
           document.title = `${d.video.title} - ${siteName}`;
         } else {
           setError(d?.error || 'Failed to load video.');
+          // If the server says playback was rejected for this user, the
+          // in-memory AuthContext copy of the user is stale. Re-fetch so
+          // the AppShell banner and course-list greyout appear without
+          // requiring a sign out / sign in cycle.
+          if (d?.code === 'no_playback_permission') {
+            refresh();
+          }
         }
       } catch {
         setError('Failed to load video.');
       }
       setLoading(false);
     })();
-  }, [videoId, siteName]);
+  }, [videoId, siteName, refresh]);
 
   // Destroy and show error
   const destroyAndShowError = useCallback((title, message) => {
@@ -378,6 +387,9 @@ export default function WatchPage() {
       <div style={{ textAlign: 'center', paddingTop: '40px' }}>
         <h2>Error</h2>
         <p className="text-muted">{error}</p>
+        <Link to="/" className="btn btn-primary" style={{ marginTop: '16px' }}>
+          Back to Home
+        </Link>
       </div>
     );
   }

@@ -1493,3 +1493,56 @@ tr.clickable-row:hover { background-color: #f9fafb; }
     padding: 16px;
   }
 }
+
+/* Playback-disabled banner — mounted by AppShell on /, /course/:id,
+   /watch/:id when the current user lacks the allowPlayback permission. */
+.playback-disabled-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px 20px;
+  margin-bottom: 16px;
+  background: #fef2f2;
+  color: #991b1b;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  font-size: 14px;
+  line-height: 1.4;
+}
+/* The span inside gets its width set by JS (Range-based line measurement
+   in PlaybackDisabledBanner.jsx) so it shrinks to the longest rendered
+   line. Parent's text-align: center then centers that block within the
+   available space; text-align: left on the span keeps lines ragged-right.
+   min-width: 0 lets the message div shrink inside the flex row so
+   wrapping actually happens instead of overflowing. */
+.playback-disabled-banner-message {
+  min-width: 0;
+  text-align: center;
+}
+.playback-disabled-banner-message > span {
+  display: inline-block;
+  text-align: left;
+}
+.playback-disabled-banner-icon {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  color: #dc2626;
+}
+@media (max-width: 768px) {
+  /* Mobile: pin the icon to the left and let the message fill the rest of
+     the row. align-items: center (inherited) keeps the icon vertically
+     centered against the multi-line text block. */
+  .playback-disabled-banner {
+    justify-content: flex-start;
+    padding: 14px 16px;
+  }
+  .playback-disabled-banner-message {
+    flex: 1;
+  }
+  .playback-disabled-banner-icon {
+    width: 28px;
+    height: 28px;
+  }
+}

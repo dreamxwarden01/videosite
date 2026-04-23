@@ -8,7 +8,7 @@ import LoadingSpinner from '../components/LoadingSpinner';
 
 export default function HomePage() {
   const { siteName } = useSite();
-  const { user } = useAuth();
+  const { user, refresh } = useAuth();
   const { showToast } = useToast();
   const [courses, setCourses] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -22,6 +22,18 @@ export default function HomePage() {
     Object.keys(sessionStorage).forEach(key => {
       if (key.startsWith('course:') && key.endsWith(':list')) sessionStorage.removeItem(key);
     });
+  }, []);
+
+  // If the user currently has no playback permission, re-fetch /api/me on
+  // every visit to the course list. Admins can grant the permission at any
+  // time; this gives the banner + greyout a chance to clear without the
+  // user having to sign out and back in. We intentionally don't poll when
+  // permission is already true — no upside, just extra requests.
+  useEffect(() => {
+    if (user && user.permissions?.allowPlayback === false) {
+      refresh();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {

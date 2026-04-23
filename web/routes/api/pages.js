@@ -152,7 +152,7 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
         const user = res.locals.user;
 
         if (!user.permissions.allowPlayback) {
-            return res.status(403).json({ error: 'Playback is not allowed.' });
+            return res.status(403).json({ error: 'Playback is not allowed.', code: 'no_playback_permission' });
         }
 
         const [videoRows] = await pool.execute(
@@ -162,7 +162,7 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
             [videoId]
         );
         if (videoRows.length === 0) {
-            return res.status(404).json({ error: 'Video not found or not ready.' });
+            return res.status(404).json({ error: 'Video not found or not ready.', code: 'video_not_found' });
         }
 
         const video = videoRows[0];
@@ -173,7 +173,7 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
                 [user.user_id, video.course_id]
             );
             if (enrollment.length === 0) {
-                return res.status(403).json({ error: 'You are not enrolled in this course.' });
+                return res.status(403).json({ error: 'You are not enrolled in this course.', code: 'no_course_enrollment' });
             }
         }
 

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useSearchParams, Link } from 'react-router-dom';
 import { useSite } from '../context/SiteContext';
+import { useAuth } from '../context/AuthContext';
 import { useToast } from '../context/ToastContext';
 import { apiGet } from '../api';
 import Pagination from '../components/Pagination';
@@ -17,7 +18,9 @@ export default function CoursePage() {
   const { courseId } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const { siteName } = useSite();
+  const { user } = useAuth();
   const { showToast } = useToast();
+  const canPlay = user?.permissions?.allowPlayback !== false;
 
   // One-shot restore: read from sessionStorage on mount (returning from watch page), then clear
   const storageKey = `course:${courseId}:list`;
@@ -107,7 +110,7 @@ export default function CoursePage() {
             ) : (
               <div>
                 {videos.map(video => (
-                  video.status === 'finished' ? (
+                  video.status === 'finished' && canPlay ? (
                     <Link
                       key={video.video_id}
                       to={`/watch/${video.video_id}`}
@@ -128,6 +131,21 @@ export default function CoursePage() {
                         <span className="status status-finished">Available</span>
                       </div>
                     </Link>
+                  ) : video.status === 'finished' && !canPlay ? (
+                    <div key={video.video_id} className="video-item disabled">
+                      <div className="video-play-icon">&#9654;</div>
+                      <div className="video-info">
+                        <h4>{video.title}</h4>
+                        <div className="video-meta">
+                          {video.week && <span className="week-badge">Week {video.week}</span>}
+                          {video.lecture_date && <span>{video.lecture_date.slice(0, 10)}</span>}
+                          {video.duration_seconds > 0 && <span>{formatDuration(video.duration_seconds)}</span>}
+                        </div>
+                      </div>
+                      <div className="video-actions">
+                        <span className="status status-finished">Available</span>
+                      </div>
+                    </div>
                   ) : (
                     <div key={video.video_id} className="video-item disabled">
                       <div className="video-info">
