@@ -95,13 +95,18 @@ export default function PlaybackStatsPage() {
     }
   };
 
-  if (loading) return <LoadingSpinner />;
-  if (!data) return <p className="text-muted">Failed to load statistics.</p>;
-
   let content;
 
+  // Keep these branches inside `content` so MfaPageGuard below can still
+  // render an MFA prompt when the API returned 403 + requireMFA (data
+  // stays null in that case).
+  if (loading) {
+    content = <LoadingSpinner />;
+  } else if (!data) {
+    content = <p className="text-muted">Failed to load statistics.</p>;
+  }
   // Drill-down level 3: videos for a specific user + course
-  if (userId && courseId && data.selectedUser && data.selectedCourse && data.courseVideos) {
+  else if (userId && courseId && data.selectedUser && data.selectedCourse && data.courseVideos) {
     content = (
       <div>
         <div className="flex-between mb-3">

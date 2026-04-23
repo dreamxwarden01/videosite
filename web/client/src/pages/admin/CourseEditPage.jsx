@@ -89,8 +89,6 @@ export default function CourseEditPage() {
   if (!user?.permissions?.changeCourse) {
     return <p className="text-muted">Permission denied.</p>;
   }
-  if (loading) return <LoadingSpinner />;
-  if (!courseInfo) return <p className="text-muted">Course not found.</p>;
 
   // Dirty tracking
   const detailsDirty = courseName !== originalDetails.current.course_name
@@ -194,9 +192,14 @@ export default function CourseEditPage() {
   return (
     <MfaPageGuard mfaBlock={mfaBlock} mfaSetupBlock={mfaSetupBlock} autoShowModal={autoShowModal}
       onSuccess={handlePageMfaSuccess} onCancel={handlePageMfaCancel} onRetry={retryVerification}>
-      <div>
+      {loading ? (
+        <LoadingSpinner />
+      ) : !courseInfo ? (
+        <p className="text-muted">Course not found.</p>
+      ) : (
+      <div className="admin-edit-page">
         {/* Title bar card */}
-        <div className="card" style={{ padding: '12px 16px', marginBottom: '16px' }}>
+        <div className="card" style={{ padding: '12px 16px', marginBottom: '16px', flexShrink: 0 }}>
           <div className="flex-between">
             <div className="flex gap-2" style={{ alignItems: 'center' }}>
               <button className="btn btn-secondary btn-sm" onClick={() => navigate('/admin/courses')}>Back</button>
@@ -254,6 +257,7 @@ export default function CourseEditPage() {
             {/* Content area */}
             <div className="course-edit-content">
               {activeTab === 'details' && (
+                <div className="course-edit-content-scroll">
                 <form onSubmit={handleSaveDetails} style={{ maxWidth: '600px' }}>
                   <h3 style={{ marginTop: 0, marginBottom: '16px' }}>Course Details</h3>
                   <div className="form-group">
@@ -278,10 +282,11 @@ export default function CourseEditPage() {
                     {savingDetails ? 'Saving...' : 'Save Changes'}
                   </button>
                 </form>
+                </div>
               )}
 
               {activeTab === 'transcoding' && (
-                <div>
+                <div className="course-edit-content-scroll">
                   <h3 style={{ marginTop: 0, marginBottom: '16px' }}>Transcoding Config</h3>
 
                   {/* Audio Normalization toggle */}
@@ -367,10 +372,11 @@ export default function CourseEditPage() {
           </div>
         </div>
       </div>
+      )}
 
       <DeleteCourseModal
         isOpen={showDeleteModal}
-        courseName={courseInfo.course_name}
+        courseName={courseInfo?.course_name || ''}
         courseId={courseId}
         onClose={() => setShowDeleteModal(false)}
         mfaFetch={mfaFetch}

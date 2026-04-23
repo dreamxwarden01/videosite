@@ -42,6 +42,8 @@ function checkPermissionLevel(req, res, next) {
     }
 
     const pool = getPool();
+    const isApi = req.path.startsWith('/api/') || req.xhr;
+
     pool.execute(
         `SELECT u.role_id, r.permission_level
          FROM users u JOIN roles r ON u.role_id = r.role_id
@@ -49,6 +51,9 @@ function checkPermissionLevel(req, res, next) {
         [targetUserId]
     ).then(([rows]) => {
         if (rows.length === 0) {
+            if (isApi) {
+                return res.status(404).json({ error: 'User not found' });
+            }
             return res.status(404).render('error', {
                 title: 'Not Found',
                 message: 'User not found.'
@@ -57,7 +62,7 @@ function checkPermissionLevel(req, res, next) {
 
         const targetLevel = rows[0].permission_level;
         if (actingUser.permission_level >= targetLevel) {
-            if (req.path.startsWith('/api/') || req.xhr) {
+            if (isApi) {
                 return res.status(403).json({ error: 'Cannot manage a user with equal or higher authority' });
             }
             return res.status(403).render('error', {
@@ -72,6 +77,9 @@ function checkPermissionLevel(req, res, next) {
         next();
     }).catch(err => {
         console.error('Permission level check error:', err);
+        if (isApi) {
+            return res.status(500).json({ error: 'Failed to verify permissions' });
+        }
         res.status(500).render('error', {
             title: 'Error',
             message: 'Failed to verify permissions.'

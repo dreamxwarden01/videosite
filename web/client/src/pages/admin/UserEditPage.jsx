@@ -43,6 +43,7 @@ export default function UserEditPage() {
   const [canChangePermissions, setCanChangePermissions] = useState(false);
   const [adminPermissions, setAdminPermissions] = useState({});
   const [savingPerms, setSavingPerms] = useState(false);
+  const originalOverrides = useRef({});
 
   // MFA
   const [mfaEnabled, setMfaEnabled] = useState(false);
@@ -94,6 +95,7 @@ export default function UserEditPage() {
           setValidity(prev => ({ ...prev, displayName: true, email: true }));
         }
         setOverrides(data.overrides || {});
+        originalOverrides.current = data.overrides || {};
         setCanChangePermissions(data.canChangePermissions || false);
         setMfaEnabled(data.mfaEnabled || false);
         setMfaMethods(data.mfaMethods || []);
@@ -143,6 +145,12 @@ export default function UserEditPage() {
   // Dirty tracking — password
   const passwordDirty = password.length > 0;
   const passwordReady = passwordDirty && validity.password && validity.confirmPassword;
+
+  // Dirty tracking — permissions (only keys the admin can actually change)
+  const permissionsDirty = allPermissions.some(perm => {
+    if (!adminPermissions[perm]) return false;
+    return (originalOverrides.current[perm] || 0) !== (overrides[perm] || 0);
+  });
 
   // ---- Blur handlers ----
   const setFieldError = (field, msg) => setErrors(prev => ({ ...prev, [field]: msg || undefined }));
@@ -247,16 +255,28 @@ export default function UserEditPage() {
 
   const handleSavePermissions = async (e) => {
     e.preventDefault();
+    if (!permissionsDirty) return;
     setSavingPerms(true);
     try {
+      // Send only the keys that actually changed, so the PUT payload
+      // stays minimal and the server only writes what's different.
       const permissionsBody = {};
       for (const perm of allPermissions) {
         if (!adminPermissions[perm]) continue;
-        permissionsBody[perm] = overrides[perm] || 0;
+        const o = originalOverrides.current[perm] || 0;
+        const c = overrides[perm] || 0;
+        if (o !== c) permissionsBody[perm] = c;
       }
       const { ok, data } = await mfaFetch(`/api/admin/users/${id}/permissions`, { method: 'PUT', body: { permissions: permissionsBody } });
       if (ok) {
         showToast('Permissions updated.', 'success');
+        // Rebuild original from current state, dropping inherits since
+        // the backend deletes the row for value 0.
+        const next = {};
+        for (const [k, v] of Object.entries(overrides)) {
+          if (v !== 0) next[k] = v;
+        }
+        originalOverrides.current = next;
       } else {
         showToast(data?.error || 'Failed to update permissions.');
       }
@@ -288,9 +308,14 @@ export default function UserEditPage() {
   return (
     <MfaPageGuard mfaBlock={mfaBlock} mfaSetupBlock={mfaSetupBlock} autoShowModal={autoShowModal}
       onSuccess={handlePageMfaSuccess} onCancel={handlePageMfaCancel} onRetry={retryVerification}>
-      <div>
+      {loading ? (
+        <LoadingSpinner />
+      ) : !username ? (
+        <p className="text-muted">User not found.</p>
+      ) : (
+      <div className="admin-edit-page">
         {/* Title bar card */}
-        <div className="card" style={{ padding: '12px 16px', marginBottom: '16px' }}>
+        <div className="card" style={{ padding: '12px 16px', marginBottom: '16px', flexShrink: 0 }}>
           <div className="flex-between">
             <div className="flex gap-2" style={{ alignItems: 'center' }}>
               <button className="btn btn-secondary btn-sm" onClick={() => navigate('/admin/users')}>Back</button>
@@ -349,6 +374,7 @@ export default function UserEditPage() {
             <div className="course-edit-content">
               {/* ===== USER DETAILS ===== */}
               {activeTab === 'details' && (
+                <div className="course-edit-content-scroll">
                 <form onSubmit={handleSaveDetails} style={{ maxWidth: '600px' }}>
                   <h3 style={{ marginTop: 0, marginBottom: '16px' }}>User Details</h3>
 
@@ -409,10 +435,12 @@ export default function UserEditPage() {
                     {savingDetails ? 'Saving...' : 'Save Changes'}
                   </button>
                 </form>
+                </div>
               )}
 
               {/* ===== SIGN IN & SECURITY ===== */}
               {activeTab === 'security' && (
+                <div className="course-edit-content-scroll">
                 <div style={{ maxWidth: '600px' }}>
                   <h3 style={{ marginTop: 0, marginBottom: '16px' }}>Sign In & Security</h3>
 
@@ -494,16 +522,17 @@ export default function UserEditPage() {
                     )}
                   </div>
                 </div>
+                </div>
               )}
 
               {/* ===== PERMISSIONS ===== */}
               {activeTab === 'permissions' && canChangePermissions && (
-                <div>
-                  <h3 style={{ marginTop: 0, marginBottom: '8px' }}>Permission Overrides</h3>
-                  <p className="text-muted text-sm mb-3">
-                    Override individual permissions for this user. "Inherit" uses the role's default setting.
-                  </p>
-                  <form onSubmit={handleSavePermissions}>
+                <form onSubmit={handleSavePermissions} className="course-edit-permissions">
+                  <div className="course-edit-content-scroll">
+                    <h3 style={{ marginTop: 0, marginBottom: '8px' }}>Permission Overrides</h3>
+                    <p className="text-muted text-sm mb-3">
+                      Override individual permissions for this user. "Inherit" uses the role's default setting.
+                    </p>
                     <div className="table-wrap">
                       <table>
                         <thead>
@@ -537,16 +566,18 @@ export default function UserEditPage() {
                         </tbody>
                       </table>
                     </div>
-                    <button type="submit" className="btn btn-primary mt-3" disabled={savingPerms}>
+                  </div>
+                  <div className="course-edit-permissions-footer">
+                    <button type="submit" className="btn btn-primary" disabled={savingPerms || !permissionsDirty}>
                       {savingPerms ? 'Saving...' : 'Save Permission Overrides'}
                     </button>
-                  </form>
-                </div>
+                  </div>
+                </form>
               )}
 
               {/* ===== RECENT ACTIVITY ===== */}
               {activeTab === 'activity' && (
-                <div>
+                <div className="course-edit-content-scroll">
                   <div className="flex-between" style={{ marginBottom: '16px' }}>
                     <h3 style={{ margin: 0 }}>Recent Activity</h3>
                     {sessions.length > 0 && (
@@ -594,6 +625,7 @@ export default function UserEditPage() {
           </div>
         </div>
       </div>
+      )}
 
       <DeleteUserModal
         isOpen={showDeleteModal}
