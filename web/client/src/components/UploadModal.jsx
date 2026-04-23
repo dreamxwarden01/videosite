@@ -2,6 +2,17 @@ import { useState, useRef, useEffect } from 'react';
 import { multipartUpload, UploadConflictError, UploadAbortedError, UploadRetryExhaustedError } from '../services/uploadService';
 import { useToast } from '../context/ToastContext';
 
+// Mirror of the server-side allowlist in routes/api/upload.js. The check
+// here is UX (fail fast, no wasted multipart init); the server is the
+// source of truth.
+const ALLOWED_EXTENSIONS = ['.mp4', '.mkv', '.mov', '.webm', '.m4v', '.avi', '.flv', '.wmv', '.ts', '.mpg', '.mpeg', '.3gp'];
+const MAX_FILE_SIZE = 50 * 1024 * 1024 * 1024; // 50 GB
+
+function getExtension(filename) {
+  const dot = filename.lastIndexOf('.');
+  return dot >= 0 ? filename.substring(dot).toLowerCase() : '';
+}
+
 function parseFilename(filename, courses) {
   const base = filename.replace(/\.[^.]+$/, '');
   const match = base.match(/^(.+?)_Week(\d+)_(\d{8})/i);
@@ -49,6 +60,7 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
   const [failed, setFailed] = useState(false);
   const [courseWarning, setCourseWarning] = useState('');
   const [successTitle, setSuccessTitle] = useState('');
+  const [fileError, setFileError] = useState('');
 
   const dropdownRef = useRef(null);
 
@@ -69,6 +81,7 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
       setFailed(false);
       setCourseWarning('');
       setSuccessTitle('');
+      setFileError('');
     }
   }, [isOpen, preselectedCourseId]);
 
@@ -100,6 +113,22 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
 
   function handleFileSelect(selectedFile) {
     if (!selectedFile) return;
+    setFileError('');
+
+    const ext = getExtension(selectedFile.name);
+    if (!ext) {
+      setFileError('File must have an extension.');
+      return;
+    }
+    if (!ALLOWED_EXTENSIONS.includes(ext)) {
+      setFileError(`File type not allowed. Supported: ${ALLOWED_EXTENSIONS.join(', ')}.`);
+      return;
+    }
+    if (selectedFile.size > MAX_FILE_SIZE) {
+      setFileError('File size exceeds 50 GB limit.');
+      return;
+    }
+
     setFile(selectedFile);
     setCourseWarning('');
 
@@ -252,11 +281,14 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
             <input
               type="file"
               ref={fileInputRef}
-              accept="video/*"
+              accept={ALLOWED_EXTENSIONS.join(',')}
               style={{ display: 'none' }}
               onChange={e => { if (e.target.files[0]) handleFileSelect(e.target.files[0]); }}
             />
           </div>
+          {fileError && (
+            <p style={{ color: '#dc3545', fontSize: '13px', marginTop: '8px', marginBottom: '0' }}>{fileError}</p>
+          )}
 
           {/* Title */}
           <div className="form-group">

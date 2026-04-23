@@ -33,6 +33,32 @@ function getExtension(filename) {
     return ext || 'bin';
 }
 
+// Source files end up at the worker, which feeds them to FFmpeg. The list
+// below is what the transcoder is known to handle; anything else gets
+// rejected here rather than failing later in the pipeline. Note: no leading
+// dot — getExtension above strips it.
+const ALLOWED_EXTENSIONS = ['mp4', 'mkv', 'mov', 'webm', 'm4v', 'avi', 'flv', 'wmv', 'ts', 'mpg', 'mpeg', '3gp'];
+
+// 50 GB — generous enough to cover full-resolution lecture captures while
+// still bounded so a hostile client can't claim an absurd size and tie up
+// the upload session table or R2 multipart slots.
+const MAX_FILE_SIZE = 50 * 1024 * 1024 * 1024;
+
+function validateUploadInputs(filename, fileSize) {
+    const sizeNum = Number(fileSize);
+    if (!Number.isInteger(sizeNum) || sizeNum <= 0) {
+        return 'invalid fileSize';
+    }
+    if (sizeNum > MAX_FILE_SIZE) {
+        return 'File size exceeds 50 GB limit.';
+    }
+    const ext = getExtension(filename);
+    if (!ALLOWED_EXTENSIONS.includes(ext)) {
+        return `File type not allowed. Supported: ${ALLOWED_EXTENSIONS.join(', ')}.`;
+    }
+    return null;
+}
+
 // POST /api/upload/create — create new upload session (new video)
 router.post('/upload/create', requireAuth, checkPermission('uploadVideo'), async (req, res) => {
     try {
@@ -40,6 +66,11 @@ router.post('/upload/create', requireAuth, checkPermission('uploadVideo'), async
 
         if (!courseId || !filename || !fileSize || !title?.trim()) {
             return res.status(400).json({ error: 'courseId, filename, fileSize, and title are required' });
+        }
+
+        const inputError = validateUploadInputs(filename, fileSize);
+        if (inputError) {
+            return res.status(400).json({ error: inputError });
         }
 
         // Validate course exists
@@ -107,6 +138,11 @@ router.post('/upload/replace', requireAuth, checkPermission('uploadVideo'), asyn
 
         if (!videoId || !filename || !fileSize) {
             return res.status(400).json({ error: 'videoId, filename, and fileSize are required' });
+        }
+
+        const inputError = validateUploadInputs(filename, fileSize);
+        if (inputError) {
+            return res.status(400).json({ error: inputError });
         }
 
         const pool = getPool();
