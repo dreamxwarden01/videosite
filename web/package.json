@@ -26,8 +26,5 @@
     "otplib": "^13.4.0",
     "qrcode": "^1.5.4",
     "ua-parser-js": "^2.0.9"
-  },
-  "overrides": {
-    "fast-xml-parser": "^5.7.1"
   }
 }
