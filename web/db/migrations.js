@@ -629,6 +629,31 @@ async function runMigrations() {
                         VALUES ('audio_bitrate_default', '192')
                     `);
                 }
+            },
+            {
+                id: '028_mfa_otp_encrypt',
+                up: async () => {
+                    // Drop all in-flight OTP state — per directive we don't
+                    // preserve mid-verification rows across this migration.
+                    await pool.execute(`
+                        UPDATE mfa_challenges
+                        SET otp_hash = NULL, otp_sent_at = NULL, otp_attempts = 0
+                    `);
+                    // otp_hash held an argon2 hash; we now store the OTP
+                    // encrypted with MFA_ENCRYPTION_KEY so it can be recovered
+                    // and resent unchanged when the user asks for a retry.
+                    await pool.execute(`
+                        ALTER TABLE mfa_challenges
+                        CHANGE COLUMN otp_hash otp_value VARCHAR(255) DEFAULT NULL
+                    `);
+                    // otp_sent_at tracks the latest send (drives verification
+                    // expiry); otp_generated_at tracks the original generation
+                    // and decides when a resend must produce a fresh code.
+                    await pool.execute(`
+                        ALTER TABLE mfa_challenges
+                        ADD COLUMN otp_generated_at DATETIME DEFAULT NULL AFTER otp_value
+                    `);
+                }
             }
         ];
 

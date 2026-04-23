@@ -1,5 +1,4 @@
 const crypto = require('crypto');
-const argon2 = require('argon2');
 const otplib = require('otplib');
 const QRCode = require('qrcode');
 const {
@@ -230,6 +229,71 @@ function generateOtp() {
     return String(num).padStart(6, '0');
 }
 
+function encryptOtp(code) {
+    const key = getEncryptionKey();
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    let encrypted = cipher.update(code, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const authTag = cipher.getAuthTag().toString('hex');
+    return iv.toString('hex') + ':' + authTag + ':' + encrypted;
+}
+
+function decryptOtp(encrypted) {
+    if (!encrypted) return null;
+    const parts = encrypted.split(':');
+    if (parts.length !== 3) return null;
+    try {
+        const key = getEncryptionKey();
+        const iv = Buffer.from(parts[0], 'hex');
+        const authTag = Buffer.from(parts[1], 'hex');
+        const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+        decipher.setAuthTag(authTag);
+        let decrypted = decipher.update(parts[2], 'hex', 'utf8');
+        decrypted += decipher.final('utf8');
+        return decrypted;
+    } catch {
+        return null;
+    }
+}
+
+// Issue an OTP for a challenge: reuse the existing code if it was generated
+// recently and still has attempts left, otherwise mint a fresh one.
+// Refreshes otp_sent_at on every call (used for verification expiry);
+// otp_generated_at only moves forward when a new code is minted.
+async function issueOtpForChallenge(challenge, challengeId) {
+    const pool = getPool();
+    const otpTimeoutSeconds = parseInt(await getSetting('mfa_otp_timeout_seconds', '300'), 10) || 300;
+
+    if (challenge.otp_value && challenge.otp_generated_at && challenge.otp_attempts < 5) {
+        const [[timeCheck]] = await pool.execute(
+            `SELECT otp_generated_at >= DATE_SUB(NOW(), INTERVAL ? SECOND) AS within_window
+             FROM mfa_challenges WHERE id = ?`,
+            [otpTimeoutSeconds, challengeId]
+        );
+        if (timeCheck && timeCheck.within_window) {
+            const existing = decryptOtp(challenge.otp_value);
+            if (existing !== null) {
+                await pool.execute(
+                    'UPDATE mfa_challenges SET otp_sent_at = NOW() WHERE id = ?',
+                    [challengeId]
+                );
+                return existing;
+            }
+        }
+    }
+
+    const otp = generateOtp();
+    const otpValue = encryptOtp(otp);
+    await pool.execute(
+        `UPDATE mfa_challenges
+         SET otp_value = ?, otp_generated_at = NOW(), otp_sent_at = NOW(), otp_attempts = 0
+         WHERE id = ?`,
+        [otpValue, challengeId]
+    );
+    return otp;
+}
+
 async function checkOtpRateLimit(userId) {
     const pool = getPool();
 
@@ -283,45 +347,9 @@ async function sendOtpEmail(challengeId, userId) {
         return { success: false, message: 'Challenge not found or expired' };
     }
 
-    // Determine whether to resend existing OTP or generate new one
-    let otp;
-    let otpHash;
-    const hasExistingOtp = challenge.otp_sent_at !== null;
-
-    // Check if existing OTP is within 5-minute resend window and under attempt limit
-    let resendExisting = false;
-    if (hasExistingOtp) {
-        const [[timeCheck]] = await pool.execute(
-            `SELECT otp_sent_at >= DATE_SUB(NOW(), INTERVAL 5 MINUTE) AS within_window
-             FROM mfa_challenges WHERE id = ?`,
-            [challengeId]
-        );
-        if (timeCheck && timeCheck.within_window && challenge.otp_attempts < 5) {
-            resendExisting = true;
-        }
-    }
-
-    if (resendExisting) {
-        // Resend same OTP — do not regenerate, just resend email
-        // otp_hash stays the same, we cannot recover the plaintext so we skip hash update
-        // Actually, we need the plaintext to send in the email. We must generate a new one
-        // if we can't recover the old one. But the spec says "resend same OTP" which implies
-        // we should store it in a recoverable way, or we regenerate and re-hash.
-        // Since argon2 is one-way, on resend within 5 min we generate a fresh OTP.
-        otp = generateOtp();
-        otpHash = await argon2.hash(otp, { type: argon2.argon2id });
-        await pool.execute(
-            'UPDATE mfa_challenges SET otp_hash = ?, otp_sent_at = NOW() WHERE id = ?',
-            [otpHash, challengeId]
-        );
-    } else {
-        // Generate new OTP (either no existing one, attempts >= 5, or outside window)
-        otp = generateOtp();
-        otpHash = await argon2.hash(otp, { type: argon2.argon2id });
-        await pool.execute(
-            'UPDATE mfa_challenges SET otp_hash = ?, otp_sent_at = NOW(), otp_attempts = 0 WHERE id = ?',
-            [otpHash, challengeId]
-        );
+    const otp = await issueOtpForChallenge(challenge, challengeId);
+    if (!otp) {
+        return { success: false, message: 'Failed to issue OTP' };
     }
 
     // Get user email
@@ -423,17 +451,12 @@ async function verifyOtp(challengeId, code) {
         return { valid: false, reason: 'Code expired', mustResend: true };
     }
 
-    // Verify code against hash
-    if (!challenge.otp_hash) {
+    if (!challenge.otp_value) {
         return { valid: false, reason: 'No OTP issued' };
     }
 
-    let isValid = false;
-    try {
-        isValid = await argon2.verify(challenge.otp_hash, code);
-    } catch {
-        isValid = false;
-    }
+    const stored = decryptOtp(challenge.otp_value);
+    const isValid = stored !== null && stored === code;
 
     if (isValid) {
         await markChallengeVerified(challengeId, 'email');
@@ -978,37 +1001,9 @@ async function sendOtpToEmail(challengeId, userId, targetEmail) {
         return { success: false, message: 'Challenge not found or expired' };
     }
 
-    // Determine whether to resend existing OTP or generate new one
-    let otp;
-    let otpHash;
-    const hasExistingOtp = challenge.otp_sent_at !== null;
-
-    let resendExisting = false;
-    if (hasExistingOtp) {
-        const [[timeCheck]] = await pool.execute(
-            `SELECT otp_sent_at >= DATE_SUB(NOW(), INTERVAL 5 MINUTE) AS within_window
-             FROM mfa_challenges WHERE id = ?`,
-            [challengeId]
-        );
-        if (timeCheck && timeCheck.within_window && challenge.otp_attempts < 5) {
-            resendExisting = true;
-        }
-    }
-
-    if (resendExisting) {
-        otp = generateOtp();
-        otpHash = await argon2.hash(otp, { type: argon2.argon2id });
-        await pool.execute(
-            'UPDATE mfa_challenges SET otp_hash = ?, otp_sent_at = NOW() WHERE id = ?',
-            [otpHash, challengeId]
-        );
-    } else {
-        otp = generateOtp();
-        otpHash = await argon2.hash(otp, { type: argon2.argon2id });
-        await pool.execute(
-            'UPDATE mfa_challenges SET otp_hash = ?, otp_sent_at = NOW(), otp_attempts = 0 WHERE id = ?',
-            [otpHash, challengeId]
-        );
+    const otp = await issueOtpForChallenge(challenge, challengeId);
+    if (!otp) {
+        return { success: false, message: 'Failed to issue OTP' };
     }
 
     // Build email from template based on challenge.message_type
