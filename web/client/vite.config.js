@@ -7,7 +7,7 @@ export default defineConfig({
   root: '.',
   build: {
     outDir: 'dist',
-    rollupOptions: {
+    rolldownOptions: {
       input: {
         main: path.resolve(__dirname, 'index.html'),
         install: path.resolve(__dirname, 'install.html'),
