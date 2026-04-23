@@ -85,7 +85,11 @@ export function MfaSetupRequiredModal({ mfaSetupState, onDismiss }) {
   const methodNames = formatMethods(methods);
 
   return (
-    <div className="modal-overlay active" onClick={onDismiss}>
+    // Overlay click is a no-op — dismissing this prompt by mis-clicking
+    // outside the box would silently abandon the privileged action the
+    // user was trying to perform, with no feedback. Force them through
+    // the explicit OK / Go-to-Settings buttons.
+    <div className="modal-overlay active" onClick={() => {}}>
       <div className="upload-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '420px' }}>
         <div className="modal-header">
           <h3>MFA Required</h3>
