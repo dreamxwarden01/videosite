@@ -45,7 +45,7 @@ Go Worker(s) --- FFmpeg
 |-----------|-----------|
 | Backend | Express 5, Node.js |
 | Database | MySQL / MariaDB |
-| Frontend | React 19, Vite 6 |
+| Frontend | React 19, Vite 8 |
 | Video Player | Shaka Player (HLS + DASH, CMAF) |
 | Storage | Cloudflare R2 |
 | Worker | Go 1.22, FFmpeg |
@@ -54,7 +54,7 @@ Go Worker(s) --- FFmpeg
 
 ## Prerequisites
 
-- **Node.js** (v18+) and npm
+- **Node.js** (v20.19+ or v22.12+) and npm
 - **Go** 1.22+
 - **MySQL** or **MariaDB**
 - **FFmpeg** and **FFprobe** (in PATH)
