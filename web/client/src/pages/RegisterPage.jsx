@@ -69,9 +69,13 @@ export default function RegisterPage() {
     }
   };
 
-  // Invitation code input
+  // Invitation code input — codes are 12 uppercase alphanumeric chars
+  // (see generateInvitationCode in registrationService.js). Strip anything
+  // outside that set as the user types so a paste with stray punctuation
+  // or whitespace silently normalises instead of triggering a validation
+  // error on submit.
   const handleCodeInput = (e) => {
-    const val = e.target.value.replace(/\s/g, '').toUpperCase();
+    const val = e.target.value.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
     setCode(val);
     setCodeError('');
     setCodeValid(/^[A-Z0-9]{12}$/.test(val));

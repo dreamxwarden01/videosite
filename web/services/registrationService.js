@@ -38,7 +38,10 @@ async function getTokenValidityMinutes() {
 // ---------------------------------------------------------------------------
 
 async function validateInvitationCode(code) {
-    if (!code || code.length !== 12) {
+    // Generated codes are exactly 12 uppercase alphanumeric chars
+    // (see generateInvitationCode below). Reject anything outside that
+    // shape up front so we don't waste a DB roundtrip on garbage input.
+    if (!code || !/^[A-Z0-9]{12}$/.test(code)) {
         return { valid: false, error: 'Invalid invitation code' };
     }
 
