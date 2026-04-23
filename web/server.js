@@ -8,6 +8,13 @@ const { cleanExpiredSessions } = require('./config/session');
 
 const app = express();
 
+// API responses should never be cached: ETags trigger 304s that complicate
+// debugging (have to strip If-None-Match by hand), and stale JSON in a
+// browser cache is more confusing than useful for a session-scoped app.
+// Disabling here only affects res.json/res.send — express.static keeps its
+// own ETag handling so hashed bundle assets still cache properly.
+app.disable('etag');
+
 // Middleware
 app.use(morgan('dev'));
 app.use(express.json());
@@ -50,6 +57,16 @@ app.use(authRoutes);
 app.use(mfaAuthRoutes);
 app.use(registerRoutes);
 app.use(passwordResetRoutes);
+
+// Belt-and-suspenders: disabling app-level etag stops 304s, but a browser
+// that previously cached an /api response (e.g. with a stale Cache-Control
+// from before this change) could still reuse it. no-store on every /api
+// reply makes the cache miss explicit.
+app.use('/api', (req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    next();
+});
+
 app.use('/api', apiAppRoutes);
 app.use('/api', apiPagesRoutes);
 app.use('/api', apiAdminRoutes);
