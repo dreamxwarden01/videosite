@@ -1,5 +1,23 @@
 import { apiPost } from '../api';
 
+// Mirror of the server-side allowlist in routes/api/upload.js. The check
+// on the client is UX (fail fast, no wasted multipart init); the server
+// is the source of truth.
+export const ALLOWED_VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.mov', '.webm', '.m4v', '.avi', '.flv', '.wmv', '.ts', '.mpg', '.mpeg', '.3gp'];
+export const MAX_VIDEO_FILE_SIZE = 50 * 1024 * 1024 * 1024; // 50 GB
+
+// Returns an error message if the file fails validation, or null if OK.
+export function validateVideoFile(file) {
+  const dot = file.name.lastIndexOf('.');
+  const ext = dot >= 0 ? file.name.substring(dot).toLowerCase() : '';
+  if (!ext) return 'File must have an extension.';
+  if (!ALLOWED_VIDEO_EXTENSIONS.includes(ext)) {
+    return `File type not allowed. Supported: ${ALLOWED_VIDEO_EXTENSIONS.join(', ')}.`;
+  }
+  if (file.size > MAX_VIDEO_FILE_SIZE) return 'File size exceeds 50 GB limit.';
+  return null;
+}
+
 // --- Error classes ---
 
 export class UploadConflictError extends Error {

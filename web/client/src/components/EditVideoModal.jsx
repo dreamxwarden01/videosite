@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { apiPost } from '../api';
-import { multipartUpload, UploadConflictError, UploadAbortedError, UploadRetryExhaustedError } from '../services/uploadService';
+import { multipartUpload, UploadConflictError, UploadAbortedError, UploadRetryExhaustedError, ALLOWED_VIDEO_EXTENSIONS, validateVideoFile } from '../services/uploadService';
 import { useToast } from '../context/ToastContext';
 
 export default function EditVideoModal({ isOpen, video, courseName, canReplace, onClose, onComplete }) {
@@ -14,6 +14,7 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
   const [description, setDescription] = useState('');
   const [file, setFile] = useState(null);
   const [dragActive, setDragActive] = useState(false);
+  const [fileError, setFileError] = useState('');
 
   // Original values for change detection
   const [origTitle, setOrigTitle] = useState('');
@@ -44,6 +45,7 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
       setOrigDesc(desc);
       setFile(null);
       setDragActive(false);
+      setFileError('');
       setBusy(false);
       setUploading(false);
       setUploadProgress(0);
@@ -81,12 +83,23 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
     actionEnabled = true;
   }
 
+  function handleFileSelect(selectedFile) {
+    if (!selectedFile) return;
+    setFileError('');
+    const err = validateVideoFile(selectedFile);
+    if (err) {
+      setFile(null);
+      setFileError(err);
+      return;
+    }
+    setFile(selectedFile);
+  }
+
   function handleDrop(e) {
     e.preventDefault();
     setDragActive(false);
     if (busy || !canReplaceFile) return;
-    const f = e.dataTransfer.files[0];
-    if (f) setFile(f);
+    handleFileSelect(e.dataTransfer.files[0]);
   }
 
   function handleDragOver(e) {
@@ -240,9 +253,9 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
                 <input
                   type="file"
                   ref={fileInputRef}
-                  accept="video/*"
+                  accept={ALLOWED_VIDEO_EXTENSIONS.join(',')}
                   style={{ display: 'none' }}
-                  onChange={e => { if (e.target.files[0]) setFile(e.target.files[0]); }}
+                  onChange={e => handleFileSelect(e.target.files[0])}
                 />
               </div>
             ) : (
@@ -257,6 +270,9 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
                 </p>
               </div>
             )
+          )}
+          {fileError && (
+            <p style={{ color: '#dc3545', fontSize: '13px', marginTop: '8px', marginBottom: '0' }}>{fileError}</p>
           )}
 
           {/* Title */}

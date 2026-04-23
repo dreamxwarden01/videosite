@@ -1,17 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
-import { multipartUpload, UploadConflictError, UploadAbortedError, UploadRetryExhaustedError } from '../services/uploadService';
+import { multipartUpload, UploadConflictError, UploadAbortedError, UploadRetryExhaustedError, ALLOWED_VIDEO_EXTENSIONS, validateVideoFile } from '../services/uploadService';
 import { useToast } from '../context/ToastContext';
-
-// Mirror of the server-side allowlist in routes/api/upload.js. The check
-// here is UX (fail fast, no wasted multipart init); the server is the
-// source of truth.
-const ALLOWED_EXTENSIONS = ['.mp4', '.mkv', '.mov', '.webm', '.m4v', '.avi', '.flv', '.wmv', '.ts', '.mpg', '.mpeg', '.3gp'];
-const MAX_FILE_SIZE = 50 * 1024 * 1024 * 1024; // 50 GB
-
-function getExtension(filename) {
-  const dot = filename.lastIndexOf('.');
-  return dot >= 0 ? filename.substring(dot).toLowerCase() : '';
-}
 
 function parseFilename(filename, courses) {
   const base = filename.replace(/\.[^.]+$/, '');
@@ -115,17 +104,9 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
     if (!selectedFile) return;
     setFileError('');
 
-    const ext = getExtension(selectedFile.name);
-    if (!ext) {
-      setFileError('File must have an extension.');
-      return;
-    }
-    if (!ALLOWED_EXTENSIONS.includes(ext)) {
-      setFileError(`File type not allowed. Supported: ${ALLOWED_EXTENSIONS.join(', ')}.`);
-      return;
-    }
-    if (selectedFile.size > MAX_FILE_SIZE) {
-      setFileError('File size exceeds 50 GB limit.');
+    const err = validateVideoFile(selectedFile);
+    if (err) {
+      setFileError(err);
       return;
     }
 
@@ -281,7 +262,7 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
             <input
               type="file"
               ref={fileInputRef}
-              accept={ALLOWED_EXTENSIONS.join(',')}
+              accept={ALLOWED_VIDEO_EXTENSIONS.join(',')}
               style={{ display: 'none' }}
               onChange={e => { if (e.target.files[0]) handleFileSelect(e.target.files[0]); }}
             />
