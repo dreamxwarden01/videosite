@@ -90,7 +90,12 @@ router.get('/videos/:id/playback', requireAuth, async (req, res) => {
 // without retry or rollback — a 422 only occurs when the client payload is
 // malformed, which should never happen with an unmodified bundle):
 //   - video_id must be a positive unsigned integer (1 .. 2^32-1).
-//   - position must be a finite number, 0 ≤ position ≤ video.duration_seconds.
+//   - position must be a finite number, 0 ≤ position ≤ video.duration_seconds + 1.
+//     The +1s tolerance covers the sub-second gap between the true video
+//     duration (ffprobe emits fractional seconds, e.g. 123.45) and the
+//     value stored in the DB column (INT UNSIGNED, rounded to 123). A
+//     player reporting position=123.4 on the final frame would otherwise
+//     be 422'd as "exceeds duration" even though it's entirely legitimate.
 //   - delta must be present and a finite non-negative number. The legacy
 //     "delta absent → credit 10" fallback for pre-rollout bundles is gone;
 //     all supported clients send delta explicitly (0 for position-only flushes).
@@ -143,12 +148,15 @@ router.post('/updatewatch', requireAuth, async (req, res) => {
             return res.status(404).json({ error: 'Video not found' });
         }
 
-        // Position must not exceed the video's stored duration. NULL duration
-        // (pre-processing / metadata missing) skips the upper-bound check —
-        // no legitimate playback flow reaches here with duration still unset,
-        // but there's no reason to hard-fail if we ever do.
+        // Position must not exceed the video's stored duration, with a +1s
+        // tolerance to absorb the DB's sub-second truncation — see the
+        // block comment above for the ffprobe-float → INT UNSIGNED rounding
+        // rationale. NULL duration (pre-processing / metadata missing)
+        // skips the upper-bound check; no legitimate playback flow reaches
+        // here with duration still unset, but there's no reason to
+        // hard-fail if we ever do.
         const duration = videoRows[0].duration_seconds;
-        if (duration !== null && positionNum > duration) {
+        if (duration !== null && positionNum > duration + 1) {
             return res.status(422).json({ error: 'position exceeds video duration' });
         }
 
