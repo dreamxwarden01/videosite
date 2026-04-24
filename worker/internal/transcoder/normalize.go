@@ -62,7 +62,12 @@ func AnalyzeLoudness(ctx context.Context, sourcePath string, audioStreamCount in
 	// differs (print_format=json here, measured_* fields in pass 2). If the
 	// two graphs diverge, loudnorm's measured values wouldn't apply to the
 	// same signal the encoder sees.
-	filterComplex, mapTarget, useFilterComplex := buildAudioFilterChain(audioStreamCount, "loudnorm=print_format=json")
+	//
+	// padForEnd=false is mandatory here: this pass has no -t cap (it runs
+	// the entire audio to measure R128 stats), and apad generates infinite
+	// silence — ffmpeg would never exit. The encode pass owns the length
+	// cap and is the only place where padForEnd=true is allowed.
+	filterComplex, mapTarget, useFilterComplex := buildAudioFilterChain(audioStreamCount, "loudnorm=print_format=json", false)
 	args := []string{"-i", sourcePath, "-vn"}
 	if useFilterComplex {
 		args = append(args, "-filter_complex", filterComplex, "-map", mapTarget)

@@ -136,14 +136,30 @@ func TranscodeAudioCMAF(
 	// (optionally) applies loudnorm on the merged signal before it hits the
 	// AAC encoder. buildAudioFilterChain centralises the branch so both
 	// encode and analyze paths stay identical.
-	filterComplex, mapTarget, useFilterComplex := buildAudioFilterChain(audioStreamCount, loudnormFilter)
+	//
+	// padForEnd=true makes the chain append `apad` so the audio stream is
+	// padded with silence to match whatever duration the output is capped
+	// to below via `-t`. This is the CMAF half of the source-audio-shorter-
+	// than-video fix (DASH got its own fix earlier via per-rendition
+	// SegmentTimeline; HLS needs the segment count to actually match video,
+	// otherwise the player stalls at the end waiting for the missing last
+	// audio segment). `-t <duration>` MUST be set below or apad will pump
+	// silence forever — keep these two settings paired.
+	filterComplex, mapTarget, useFilterComplex := buildAudioFilterChain(audioStreamCount, loudnormFilter, true)
 	if useFilterComplex {
 		args = append(args, "-filter_complex", filterComplex, "-map", mapTarget)
 	} else {
 		args = append(args, "-map", mapTarget)
+		// Single-track path — compose `-af` value from the pieces this
+		// branch owns: loudnorm (if any) then apad. The filter_complex
+		// branch already inlines both into the graph; this branch has no
+		// filter_complex so we place them on the -af value directly.
+		afParts := []string{}
 		if loudnormFilter != "" {
-			args = append(args, "-af", loudnormFilter)
+			afParts = append(afParts, loudnormFilter)
 		}
+		afParts = append(afParts, "apad")
+		args = append(args, "-af", strings.Join(afParts, ","))
 	}
 
 	args = append(args,
@@ -152,6 +168,13 @@ func TranscodeAudioCMAF(
 		"-ac", "2",
 		"-ar", "48000",
 	)
+	// Cap output to the video's exact duration. Paired with apad above: if
+	// source audio is shorter than `duration`, apad extends it with silence
+	// up to the cap; if source audio is longer, -t trims the tail. Either
+	// way the produced audio playlist has segment count = ceil(duration /
+	// segDur), which matches the video playlist and prevents the HLS
+	// tail-stall (player waiting on a missing trailing audio segment).
+	args = append(args, "-t", fmt.Sprintf("%.3f", duration))
 	args = append(args,
 		"-hls_time", fmt.Sprintf("%d", segmentDurationSec),
 		"-hls_playlist_type", "vod",
@@ -222,10 +245,10 @@ func buildBaseVideoCMAFArgs(hwArgs []string, sourcePath, outputDir string, profi
 // Three distinct cases drive this:
 //
 //  1. streamCount ≤ 1 (single track, the overwhelming majority of sources):
-//     emit nothing special. Caller uses `-map 0:a:0` and, if loudnorm is
-//     desired, passes the filter via `-af`. This keeps the happy path
-//     byte-identical to pre-change — no filter_complex, no amix overhead,
-//     no new failure modes.
+//     emit nothing special. Caller uses `-map 0:a:0` and, if loudnorm or
+//     apad is desired, passes the filter via `-af`. This keeps the happy
+//     path byte-identical to pre-change — no filter_complex, no amix
+//     overhead, no new failure modes.
 //
 //  2. streamCount ≥ 2 without loudnorm: build an amix-only filter_complex
 //     that sums every audio input and routes the mix label as the map
@@ -242,6 +265,23 @@ func buildBaseVideoCMAFArgs(hwArgs []string, sourcePath, outputDir string, profi
 //     linear=true gain. Chaining amix → loudnorm inside one filter_complex
 //     is what makes "merge before normalize" automatic in the graph.
 //
+// padForEnd controls whether `apad` is appended at the end of the chain
+// (right before the `[mix]` label in the filter_complex path, or as an
+// extra `-af` component in the simple path owned by the caller). apad
+// appends infinite silence AFTER the source audio ends, so it is ONLY
+// safe when the caller caps the output duration — either `-t <duration>`
+// at the output level (CMAF audio) or `-shortest` alongside a video
+// stream (TS muxed). Never pass true in an analysis pass with no length
+// cap; ffmpeg would then run forever pumping silence through loudnorm.
+//
+// For the loudnorm pass-1/pass-2 graph-identity invariant: apad inserts
+// constant silence after the real samples, and pass-2 loudnorm applies a
+// linear gain; silence × linear_gain is silence, so the measurement
+// taken on the pass-1 graph (which sees the same real samples) still
+// applies to the real portion of the pass-2 signal unchanged. The
+// parameter is still threaded through explicitly so callers can only
+// turn on padding when they own the length cap.
+//
 // Return values:
 //   - filterComplexArg: the complete `-filter_complex` value (or "" when
 //     useFilterComplex == false).
@@ -253,7 +293,7 @@ func buildBaseVideoCMAFArgs(hwArgs []string, sourcePath, outputDir string, profi
 // The labels inside the filter graph are stable: inputs are [0:a:0],
 // [0:a:1], … [0:a:N-1]; the final output is always [mix]. Callers rely on
 // "[mix]" as a fixed sentinel.
-func buildAudioFilterChain(streamCount int, loudnormFilter string) (filterComplexArg, mapTarget string, useFilterComplex bool) {
+func buildAudioFilterChain(streamCount int, loudnormFilter string, padForEnd bool) (filterComplexArg, mapTarget string, useFilterComplex bool) {
 	if streamCount <= 1 {
 		return "", "0:a:0", false
 	}
@@ -264,6 +304,9 @@ func buildAudioFilterChain(streamCount int, loudnormFilter string) (filterComple
 	chain := fmt.Sprintf("%samix=inputs=%d:normalize=0", inputs.String(), streamCount)
 	if loudnormFilter != "" {
 		chain += "," + loudnormFilter
+	}
+	if padForEnd {
+		chain += ",apad"
 	}
 	chain += "[mix]"
 	return chain, "[mix]", true

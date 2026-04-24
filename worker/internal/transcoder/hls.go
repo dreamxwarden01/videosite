@@ -24,21 +24,32 @@ func RemuxToHLS(ctx context.Context, sourcePath, outputDir string, profile confi
 	segmentPattern := filepath.Join(outputDir, "segment_%04d.ts")
 
 	var args []string
+	shortest := false
 	if loudnormFilter != "" {
-		// Copy video, re-encode audio with normalization. -ac 2 ensures stereo.
+		// Copy video, re-encode audio with normalization. -ac 2 ensures
+		// stereo. `,apad` + `-shortest` pad audio with silence if it's
+		// shorter than the video (same fix applied to buildBaseTranscodeArgs
+		// for the TS transcode path). This only runs in the loudnorm
+		// branch — the pure-copy branch below cannot add filters without
+		// re-encoding, and remains a known-limitation for sources with
+		// audio/video duration drift.
 		args = []string{
 			"-i", sourcePath,
 			"-c:v", "copy",
 			"-c:a", "aac",
 			"-b:a", fmt.Sprintf("%dk", audioBitrateKbps),
 			"-ac", "2",
-			"-af", loudnormFilter,
+			"-af", loudnormFilter + ",apad",
 		}
+		shortest = true
 	} else {
 		args = []string{
 			"-i", sourcePath,
 			"-c", "copy",
 		}
+	}
+	if shortest {
+		args = append(args, "-shortest")
 	}
 	args = append(args,
 		"-hls_time", fmt.Sprintf("%d", profile.SegmentDuration),
@@ -273,12 +284,25 @@ func buildBaseTranscodeArgs(hwArgs []string, sourcePath, outputDir string, profi
 		"-b:a", fmt.Sprintf("%dk", audioBitrateKbps),
 		"-ac", "2",
 	)
+	// Always append `apad` (with loudnorm if present, standalone otherwise).
+	// Combined with `-shortest` below, this pads the audio stream with
+	// silence up to the video duration if source audio is shorter, or
+	// lets -shortest trim if audio is longer — either way the muxed TS
+	// ends at exactly video duration. Source captures often have audio
+	// shorter than video (mic closes before screen cap), producing a TS
+	// whose trailing packets are video-only; HLS players then stall on the
+	// final segment waiting for audio that never arrives. apad + -shortest
+	// fixes both "audio shorter" and "audio longer" cases symmetrically.
+	afParts := []string{}
 	if loudnormFilter != "" {
-		args = append(args, "-af", loudnormFilter)
+		afParts = append(afParts, loudnormFilter)
 	}
+	afParts = append(afParts, "apad")
+	args = append(args, "-af", strings.Join(afParts, ","))
 	args = append(args,
 		"-g", fmt.Sprintf("%d", profile.GOPSize),
 		"-sc_threshold", "0",
+		"-shortest",
 		"-hls_time", fmt.Sprintf("%d", profile.SegmentDuration),
 		"-hls_playlist_type", "vod",
 		"-hls_segment_filename", segmentPattern,
