@@ -1904,7 +1904,7 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 	if err := transcoder.WriteMasterPlaylistCMAF(j.outputDir, variants, audioName, j.AudioBitrateKbps, hasAudio); err != nil {
 		return fmt.Errorf("write CMAF master playlist: %w", err)
 	}
-	if err := transcoder.WriteDASHManifest(j.outputDir, variants, audioName, j.AudioBitrateKbps, probe.DurationSeconds, profiles[0].SegmentDuration, hasAudio); err != nil {
+	if err := transcoder.WriteDASHManifest(j.outputDir, variants, audioName, j.AudioBitrateKbps, probe.DurationSeconds, hasAudio); err != nil {
 		return fmt.Errorf("write DASH manifest: %w", err)
 	}
 
