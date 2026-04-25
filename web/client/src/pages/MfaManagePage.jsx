@@ -430,7 +430,7 @@ export default function MfaManagePage() {
               <span className="text-muted text-sm">Set an email address on your profile before enabling MFA.</span>
             )}
           </div>
-          <label className="toggle-switch" style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: canToggle && !forceEnabled ? 'pointer' : 'not-allowed' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '10px', flexShrink: 0, cursor: canToggle && !forceEnabled ? 'pointer' : 'not-allowed' }}>
             <span style={{ fontSize: '14px', fontWeight: 500 }}>
               {mfaEnabled ? 'Enabled' : 'Disabled'}
             </span>

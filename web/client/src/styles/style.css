@@ -680,9 +680,9 @@ textarea.form-control {
 .sidebar-link {
     display: flex;
     align-items: center;
-    padding: 10px 20px;
+    padding: 12px 20px;
     color: #94a3b8;
-    font-size: 14px;
+    font-size: 16px;
     transition: all 0.15s;
     text-decoration: none;
 }
@@ -697,7 +697,8 @@ textarea.form-control {
 }
 .sidebar-icon {
     margin-right: 10px;
-    font-size: 16px;
+    display: inline-flex;
+    align-items: center;
 }
 .admin-content {
     flex: 1;

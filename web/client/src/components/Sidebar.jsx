@@ -1,19 +1,33 @@
 import { NavLink } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import {
+  ProfileIcon,
+  MaterialsIcon,
+  VideosIcon,
+  CoursesIcon,
+  EnrollmentIcon,
+  UsersIcon,
+  InvitationIcon,
+  RolesIcon,
+  StatsIcon,
+  TranscodingIcon,
+  SettingsIcon,
+  MfaIcon,
+} from './SidebarIcons';
 
 const links = [
-  { to: '/profile', label: 'Profile', icon: '\u{1F464}', permission: null },
-  { to: '/admin/materials', label: 'Materials', icon: '\u{1F5C2}\uFE0F', permission: 'accessAttachments' },
-  { to: '/admin/videos', label: 'Videos', icon: '\u{1F3AC}', permissionAny: ['uploadVideo', 'changeVideo'] },
-  { to: '/admin/courses', label: 'Courses', icon: '\u{1F4DA}', permission: 'manageCourse' },
-  { to: '/admin/enrollment', label: 'Enrollment', icon: '\u{1F4CB}', permission: 'manageEnrolment' },
-  { to: '/admin/users', label: 'Users', icon: '\u{1F465}', permission: 'manageUser' },
-  { to: '/admin/invitations', label: 'Invitation Codes', icon: '\u{1F511}', permission: 'inviteUser' },
-  { to: '/admin/roles', label: 'Roles', icon: '\u{1F510}', permission: 'manageRoles' },
-  { to: '/admin/playback-stats', label: 'Playback Stats', icon: '\u{1F4CA}', permission: 'viewPlaybackStat' },
-  { to: '/admin/transcoding', label: 'Transcoding', icon: '\u2699', permission: 'manageSite' },
-  { to: '/admin/settings', label: 'Settings', icon: '\u2699', permission: 'manageSite' },
-  { to: '/admin/mfa-settings', label: 'MFA Settings', icon: '\uD83D\uDD12', permission: 'manageSiteMFA' },
+  { to: '/profile', label: 'Profile', Icon: ProfileIcon, permission: null },
+  { to: '/admin/materials', label: 'Materials', Icon: MaterialsIcon, permission: 'accessAttachments' },
+  { to: '/admin/videos', label: 'Videos', Icon: VideosIcon, permissionAny: ['uploadVideo', 'changeVideo'] },
+  { to: '/admin/courses', label: 'Courses', Icon: CoursesIcon, permission: 'manageCourse' },
+  { to: '/admin/enrollment', label: 'Enrollment', Icon: EnrollmentIcon, permission: 'manageEnrolment' },
+  { to: '/admin/users', label: 'Users', Icon: UsersIcon, permission: 'manageUser' },
+  { to: '/admin/invitations', label: 'Invitation Codes', Icon: InvitationIcon, permission: 'inviteUser' },
+  { to: '/admin/roles', label: 'Roles', Icon: RolesIcon, permission: 'manageRoles' },
+  { to: '/admin/playback-stats', label: 'Playback Stats', Icon: StatsIcon, permission: 'viewPlaybackStat' },
+  { to: '/admin/transcoding', label: 'Transcoding', Icon: TranscodingIcon, permission: 'manageSite' },
+  { to: '/admin/settings', label: 'Settings', Icon: SettingsIcon, permission: 'manageSite' },
+  { to: '/admin/mfa-settings', label: 'MFA Settings', Icon: MfaIcon, permission: 'manageSiteMFA' },
 ];
 
 export default function Sidebar({ open, onClose }) {
@@ -29,6 +43,7 @@ export default function Sidebar({ open, onClose }) {
           if (link.permissionAny) {
             if (!link.permissionAny.some(p => perms[p])) return null;
           } else if (link.permission && !perms[link.permission]) return null;
+          const Icon = link.Icon;
           return (
             <NavLink
               key={link.to}
@@ -36,7 +51,7 @@ export default function Sidebar({ open, onClose }) {
               className={({ isActive }) => `sidebar-link${isActive ? ' active' : ''}`}
               onClick={onClose}
             >
-              <span className="sidebar-icon">{link.icon}</span> {link.label}
+              <span className="sidebar-icon"><Icon /></span> {link.label}
             </NavLink>
           );
         })}
