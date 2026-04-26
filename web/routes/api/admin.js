@@ -273,7 +273,7 @@ router.get('/admin/videos/:courseId', requireAuth, checkAnyPermission('uploadVid
         );
 
         res.json({
-            course: { course_id: courseRows[0].course_id, course_name: courseRows[0].course_name },
+            course: { course_id: course.course_id, course_name: course.course_name },
             videos: videos.map(sanitizeAdminVideo),
             total,
             page,
