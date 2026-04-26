@@ -132,6 +132,7 @@ router.get('/admin/courses/:courseId', requireAuth, checkPermission('changeCours
         }
 
         const videoResult = await listCourseVideos(req.params.courseId, 1, 100);
+        await require('../../services/cache/transcodeProgressCache').applyLiveOverlayToVideos(videoResult.videos);
 
         res.json({ course, videos: videoResult.videos.map(sanitizeAdminVideo) });
     } catch (err) {
@@ -148,6 +149,7 @@ router.get('/admin/courses/:courseId/edit', requireAuth, checkPermission('change
             return res.status(404).json({ error: 'Course not found.' });
         }
         const videoResult = await listCourseVideos(req.params.courseId, 1, 100);
+        await require('../../services/cache/transcodeProgressCache').applyLiveOverlayToVideos(videoResult.videos);
         const globalProfiles = await getGlobalProfiles();
         const courseProfiles = course.use_custom_profiles ? await getCourseProfiles(req.params.courseId) : [];
         const audioNormalization = await getAudioNormalizationSettings();
@@ -271,6 +273,7 @@ router.get('/admin/videos/:courseId', requireAuth, checkAnyPermission('uploadVid
              LIMIT ${parseInt(limit)} OFFSET ${parseInt(offset)}`,
             [courseId]
         );
+        await require('../../services/cache/transcodeProgressCache').applyLiveOverlayToVideos(videos);
 
         res.json({
             course: { course_id: course.course_id, course_name: course.course_name },

@@ -6,17 +6,10 @@ const { getClientIp } = require('../../middleware/auth');
 const {
     reserveTasks, leaseTasks, reportJobStatuses,
     completeTask, generateUploadUrls,
-    resetStaleTasks
 } = require('../../services/processingService');
 
-// Reset stale tasks on every lease poll (simple approach — cheap query).
-async function checkStaleTasks() {
-    try {
-        await resetStaleTasks();
-    } catch (err) {
-        console.error('Failed to reset stale tasks:', err.message);
-    }
-}
+// Stale-task reset moved to a 60s setInterval in server.js — no longer a
+// per-poll cost on every /worker/tasks/available hit.
 
 // POST /api/worker/auth — issue a bearer token.
 // No middleware on this route; it's the entry point.
@@ -45,8 +38,6 @@ router.post('/worker/auth', async (req, res) => {
 // GET /api/worker/tasks/available?availableSlot=N — reserve up to N tasks atomically.
 router.get('/worker/tasks/available', requireWorkerSession, async (req, res) => {
     try {
-        await checkStaleTasks();
-
         const slotRaw = parseInt(req.query.availableSlot, 10);
         const slots = Number.isFinite(slotRaw) && slotRaw > 0 ? Math.min(slotRaw, 32) : 0;
         if (slots <= 0) {

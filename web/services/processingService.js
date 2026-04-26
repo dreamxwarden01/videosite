@@ -318,9 +318,9 @@ async function reserveTasks(maxCount) {
 
     const pool = getPool();
 
-    // Reset expired pending + stale tasks first
-    await resetExpiredPendingTasks();
-    await resetStaleTasks();
+    // Stale-task reset and pending-TTL reset are handled by a 60s timer in
+    // server.js — no longer per-poll. The in-process per-job timer
+    // (startStaleTimer) still catches mid-flight worker death within 2 min.
 
     const conn = await pool.getConnection();
     try {
@@ -424,7 +424,7 @@ async function leaseTask(videoId, workerKeyId) {
 
     // Seed the heartbeat cache. Subsequent /worker/task/status (running)
     // hits HEXISTS this key as the "is the job alive" gate — no DB query.
-    await transcodeCache.initOnLease(jobId, task.video_id, 'leased', 'worker_downloading');
+    await transcodeCache.initOnLease(jobId, task.video_id, task.hashed_video_id, 'leased', 'worker_downloading');
 
     // Generate presigned download URL
     const { GetObjectCommand } = require('@aws-sdk/client-s3');
@@ -549,7 +549,7 @@ async function reportJobStatuses(jobs) {
                 if (!found) {
                     const task = await getTaskByJobId(jobId);
                     if (task && task.status !== 'completed' && task.status !== 'error') {
-                        await transcodeCache.initOnLease(jobId, task.video_id, mapped.queue, mapped.video);
+                        await transcodeCache.initOnLease(jobId, task.video_id, task.hashed_video_id, mapped.queue, mapped.video);
                         found = await transcodeCache.recordHeartbeat(
                             jobId, mapped.queue, mapped.video, progress, stageKey || 'processing'
                         );
@@ -615,24 +615,28 @@ function hlsContentType(filename) {
     return 'application/octet-stream';
 }
 
-// Generate presigned PUT URLs for uploading HLS output files
+// Generate presigned PUT URLs for uploading HLS output files.
+// Reads hashed_video_id from the transcode-progress cache (populated by
+// initOnLease) to avoid the JOIN on every upload-URL batch. Falls back
+// to DB on cache miss (e.g. Redis cold-restart before any heartbeat).
 async function generateUploadUrls(jobId, filenames) {
-    const pool = getPool();
-
-    // Look up the task and get path components
-    const [rows] = await pool.execute(
-        `SELECT pq.*, v.hashed_video_id
-         FROM processing_queue pq
-         JOIN videos v ON pq.video_id = v.video_id
-         WHERE pq.job_id = ?`,
-        [jobId]
-    );
-
-    if (rows.length === 0) {
-        return null;
+    let hashedVideoId = null;
+    const cached = await transcodeCache.getProgress(jobId);
+    if (cached && cached.hashed_video_id) {
+        hashedVideoId = cached.hashed_video_id;
+    } else {
+        const pool = getPool();
+        const [rows] = await pool.execute(
+            `SELECT v.hashed_video_id
+             FROM processing_queue pq
+             JOIN videos v ON pq.video_id = v.video_id
+             WHERE pq.job_id = ?`,
+            [jobId]
+        );
+        if (rows.length === 0) return null;
+        hashedVideoId = rows[0].hashed_video_id;
     }
 
-    const task = rows[0];
     const { PutObjectCommand } = require('@aws-sdk/client-s3');
     const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
     const { getR2Client, getR2BucketName } = require('../config/r2');
@@ -642,7 +646,7 @@ async function generateUploadUrls(jobId, filenames) {
     const urls = {};
 
     for (const filename of filenames) {
-        const key = `${task.hashed_video_id}/${jobId}/${filename}`;
+        const key = `${hashedVideoId}/${jobId}/${filename}`;
         const contentType = hlsContentType(filename);
         const command = new PutObjectCommand({ Bucket: bucket, Key: key, ContentType: contentType, CacheControl: 'public, max-age=31536000, immutable' });
         urls[filename] = await getSignedUrl(r2, command, { expiresIn: 43200 }); // 12 hours

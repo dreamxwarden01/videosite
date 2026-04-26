@@ -5,6 +5,7 @@ const { getClient } = require('./redis');
 
 const WORKER_TTL_SECONDS = 60 * 60; // 1 hour inactivity (Redis TTL)
 const workerSessionKey = (token) => `session:worker:${token}`;
+const DIRTY_WORKER_SESSIONS = 'dirty:session:worker';
 
 async function generateWorkerKeyPair(label, createdBy) {
     const pool = getPool();
@@ -98,7 +99,11 @@ async function createWorkerSession(keyId, ipAddress) {
     );
     if (oldSessions.length > 0) {
         const redis = getClient();
-        await redis.del(...oldSessions.map(s => workerSessionKey(s.bearer_token)));
+        const oldTokens = oldSessions.map(s => s.bearer_token);
+        await redis.multi()
+            .del(...oldTokens.map(workerSessionKey))
+            .srem(DIRTY_WORKER_SESSIONS, ...oldTokens)
+            .exec();
     }
     await pool.execute(
         'DELETE FROM worker_sessions WHERE worker_key_id = ?',
@@ -156,4 +161,5 @@ module.exports = {
     SESSION_TTL_SECONDS,
     WORKER_TTL_SECONDS,
     workerSessionKey,
+    DIRTY_WORKER_SESSIONS,
 };

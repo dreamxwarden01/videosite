@@ -106,6 +106,7 @@ router.get('/courses/:courseId', requireAuth, async (req, res) => {
              LIMIT ${lim} OFFSET ${off}`,
             [courseId]
         );
+        await require('../../services/cache/transcodeProgressCache').applyLiveOverlayToVideos(videos);
 
         const total = countRows[0].total;
 

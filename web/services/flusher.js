@@ -21,6 +21,8 @@ const BATCH_SIZE = 500;
 
 const DIRTY_SESSION_USER = 'dirty:session:user';
 const SESSION_USER_KEY = (sid) => `session:user:${sid}`;
+const DIRTY_SESSION_WORKER = 'dirty:session:worker';
+const SESSION_WORKER_KEY = (token) => `session:worker:${token}`;
 
 async function flushDirtyUserSessions() {
     const redis = getClient();
@@ -49,6 +51,44 @@ async function flushDirtyUserSessions() {
                 flushed++;
             } catch (err) {
                 console.error(`Session flusher: failed for sid ${sid.slice(0, 8)}…: ${err.message}`);
+                // Leave in dirty set for next cycle.
+            }
+        }
+    }
+    return flushed;
+}
+
+// Drain dirty:session:worker → UPDATE worker_sessions.last_seen. Worker
+// session keys are bearer tokens; the cached hash holds session_id, which
+// is the DB primary key. ip_address is set on session creation and never
+// updated mid-session (any IP mismatch kills the session), so only
+// last_seen is coalesced.
+async function flushDirtyWorkerSessions() {
+    const redis = getClient();
+    const tokens = await redis.smembers(DIRTY_SESSION_WORKER);
+    if (tokens.length === 0) return 0;
+
+    const pool = getPool();
+    let flushed = 0;
+
+    for (let i = 0; i < tokens.length; i += BATCH_SIZE) {
+        const batch = tokens.slice(i, i + BATCH_SIZE);
+        for (const token of batch) {
+            try {
+                const hash = await redis.hgetall(SESSION_WORKER_KEY(token));
+                if (!hash || !hash.last_seen || !hash.session_id) {
+                    await redis.srem(DIRTY_SESSION_WORKER, token);
+                    continue;
+                }
+                const lastSeen = new Date(parseInt(hash.last_seen, 10));
+                await pool.execute(
+                    'UPDATE worker_sessions SET last_seen = ? WHERE session_id = ?',
+                    [lastSeen, hash.session_id]
+                );
+                await redis.srem(DIRTY_SESSION_WORKER, token);
+                flushed++;
+            } catch (err) {
+                console.error(`Worker session flusher: failed for token ${token.slice(0, 8)}…: ${err.message}`);
                 // Leave in dirty set for next cycle.
             }
         }
@@ -165,10 +205,11 @@ function start() {
     intervalHandle = setInterval(async () => {
         try {
             const sessionsN = await flushDirtyUserSessions();
+            const workerSessionsN = await flushDirtyWorkerSessions();
             const watchN = await flushDirtyWatch();
             const transcodeN = await flushDirtyTranscode();
-            if (sessionsN > 0 || watchN > 0 || transcodeN > 0) {
-                console.log(`Flusher: drained ${sessionsN} sessions, ${watchN} watch, ${transcodeN} transcode to DB`);
+            if (sessionsN > 0 || workerSessionsN > 0 || watchN > 0 || transcodeN > 0) {
+                console.log(`Flusher: drained ${sessionsN} user sessions, ${workerSessionsN} worker sessions, ${watchN} watch, ${transcodeN} transcode to DB`);
             }
         } catch (err) {
             console.error('Flusher tick error:', err.message);
@@ -190,12 +231,13 @@ async function flushAll() {
     let total = 0;
     for (let i = 0; i < 5; i++) {
         const s = await flushDirtyUserSessions();
+        const ws = await flushDirtyWorkerSessions();
         const w = await flushDirtyWatch();
         const t = await flushDirtyTranscode();
-        total += s + w + t;
-        if (s === 0 && w === 0 && t === 0) break;
+        total += s + ws + w + t;
+        if (s === 0 && ws === 0 && w === 0 && t === 0) break;
     }
     return total;
 }
 
-module.exports = { start, stop, flushAll, flushDirtyUserSessions, flushDirtyWatch, flushDirtyTranscode };
+module.exports = { start, stop, flushAll, flushDirtyUserSessions, flushDirtyWorkerSessions, flushDirtyWatch, flushDirtyTranscode };

@@ -193,6 +193,21 @@ const server = app.listen(PORT, async () => {
         }
     }, 60 * 60 * 1000);
 
+    // Periodic stale-task / pending-TTL reset. Backstop for the in-process
+    // per-job timer (lost on server restart) and for workers that died
+    // between reserving (queued → pending) and leasing. Runs every 60s
+    // because it's a recovery path — the in-process timer fires at 2 min
+    // for actively-tracked jobs and the pending hold is only 10s.
+    const { resetStaleTasks, resetExpiredPendingTasks } = require('./services/processingService');
+    setInterval(async () => {
+        try {
+            await resetExpiredPendingTasks();
+            await resetStaleTasks();
+        } catch (err) {
+            console.error('Periodic stale-task reset error:', err.message);
+        }
+    }, 60 * 1000);
+
     // Sweep stale upload sessions on startup and restart their timers
     try {
         const { resetStaleUploads } = require('./services/uploadSessionService');

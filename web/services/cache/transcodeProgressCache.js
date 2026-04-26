@@ -19,10 +19,13 @@ const key = (jobId) => `progress:transcode:${jobId}`;
 
 // Populate cache when a job is leased (creates the existence marker so
 // subsequent heartbeats find the job alive without a DB query).
-async function initOnLease(jobId, videoId, queueStatus, videoStatus) {
+// hashed_video_id is stored here so generateUploadUrls can build R2 paths
+// without re-fetching the videos JOIN on every upload-URL batch.
+async function initOnLease(jobId, videoId, hashedVideoId, queueStatus, videoStatus) {
     const redis = getClient();
     await redis.hset(key(jobId), {
         video_id: String(videoId),
+        hashed_video_id: hashedVideoId || '',
         queue_status: queueStatus,
         video_status: videoStatus,
         progress: '0',
@@ -59,6 +62,7 @@ async function getProgress(jobId) {
     if (!hash || Object.keys(hash).length === 0) return null;
     return {
         video_id: hash.video_id ? parseInt(hash.video_id, 10) : null,
+        hashed_video_id: hash.hashed_video_id || null,
         queue_status: hash.queue_status || null,
         video_status: hash.video_status || null,
         progress: hash.progress !== undefined ? parseInt(hash.progress, 10) : null,
@@ -125,6 +129,35 @@ async function clearJobs(jobIds) {
     for (const id of jobIds) await clearJob(id);
 }
 
+// Apply live in-flight progress to a list of DB video rows. Mutates each
+// row's `status` and `processing_progress` from the cached values when an
+// active job is in flight. Returns the same array for chaining.
+//
+// Used by the user / admin video-list endpoints — Phase 6 stopped writing
+// `videos.status` and `videos.processing_progress` per heartbeat (only the
+// initial 'worker_downloading' from leaseTask + the terminal states make
+// it to DB), so without this overlay the list shows "worker downloading 0%"
+// for the entire transcoding run.
+async function applyLiveOverlayToVideos(videoRows) {
+    if (!videoRows || videoRows.length === 0) return videoRows;
+    const jobIds = videoRows
+        .filter(v => v.processing_job_id && v.status !== 'finished' && v.status !== 'error')
+        .map(v => v.processing_job_id);
+    if (jobIds.length === 0) return videoRows;
+
+    const live = await getMany(jobIds);
+    for (const v of videoRows) {
+        if (!v.processing_job_id) continue;
+        const overlay = live[v.processing_job_id];
+        if (!overlay) continue;
+        if (overlay.video_status) v.status = overlay.video_status;
+        if (overlay.progress !== null && overlay.progress !== undefined) {
+            v.processing_progress = overlay.progress;
+        }
+    }
+    return videoRows;
+}
+
 module.exports = {
     initOnLease,
     recordHeartbeat,
@@ -135,4 +168,5 @@ module.exports = {
     removeDirty,
     clearJob,
     clearJobs,
+    applyLiveOverlayToVideos,
 };

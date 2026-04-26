@@ -1,6 +1,6 @@
 const { getPool } = require('../config/database');
 const { getClient } = require('../services/redis');
-const { workerSessionKey, WORKER_TTL_SECONDS } = require('../services/workerAuthService');
+const { workerSessionKey, WORKER_TTL_SECONDS, DIRTY_WORKER_SESSIONS } = require('../services/workerAuthService');
 const { getClientIp } = require('./auth');
 
 // Bearer-token worker session middleware. Looks the token up in Redis first,
@@ -66,24 +66,24 @@ async function requireWorkerSession(req, res, next) {
 
         // IP binding — any mismatch kills the session.
         if (ipAddress !== clientIp) {
-            await redis.del(cacheKey);
+            await redis.multi()
+                .del(cacheKey)
+                .srem(DIRTY_WORKER_SESSIONS, token)
+                .exec();
             const pool = getPool();
             await pool.execute('DELETE FROM worker_sessions WHERE session_id = ?', [sessionId]);
             return res.status(401).json({ error: 'IP mismatch' });
         }
 
-        // Refresh last_seen + sliding TTL in Redis. DB last_seen still updates
-        // on every request until Phase 5's flusher lands.
+        // Refresh last_seen + sliding TTL in Redis only. The flusher
+        // (services/flusher.js) drains dirty:session:worker every 15 min
+        // and writes last_seen back to the DB worker_sessions row.
         const now = Date.now();
         await redis.multi()
             .hset(cacheKey, 'last_seen', String(now))
             .expire(cacheKey, WORKER_TTL_SECONDS)
+            .sadd(DIRTY_WORKER_SESSIONS, token)
             .exec();
-        const pool = getPool();
-        await pool.execute(
-            'UPDATE worker_sessions SET last_seen = NOW() WHERE session_id = ?',
-            [sessionId]
-        );
 
         req.worker = { keyId, sessionId };
         next();
