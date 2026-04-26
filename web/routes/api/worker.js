@@ -53,7 +53,19 @@ router.get('/worker/tasks/available', requireWorkerSession, async (req, res) => 
             return res.json({ tasks: [] });
         }
 
+        // ~99% of polls return empty. Skip the DB SELECT + UPDATE if the
+        // negative cache says so; every add-work path DELs the sentinel.
+        const queueCache = require('../../services/cache/queueCache');
+        if (await queueCache.isLikelyEmpty()) {
+            return res.json({ tasks: [] });
+        }
+
         const videoIds = await reserveTasks(slots);
+        if (videoIds.length === 0) {
+            // DB confirmed empty — cache the result so subsequent polls
+            // short-circuit until new work arrives or the TTL expires.
+            await queueCache.markEmpty();
+        }
         res.json({ tasks: videoIds.map(v => ({ videoId: v })) });
     } catch (err) {
         console.error('Worker tasks/available error:', err);

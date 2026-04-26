@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const { getPool } = require('../config/database');
 const videoCache = require('./cache/videoCache');
 const transcodeCache = require('./cache/transcodeProgressCache');
+const queueCache = require('./cache/queueCache');
 
 // Base62 12-char job ID generator (matches hashed_video_id family).
 // Collision probability in a 62^12 space is astronomically low (~10^-14 at
@@ -119,6 +120,7 @@ async function resetSingleStaleTask(jobId) {
     );
     await videoCache.invalidate(task.video_id);
     await transcodeCache.clearJob(jobId);
+    await queueCache.markHasWork();
 }
 
 async function createTask(videoId) {
@@ -127,6 +129,7 @@ async function createTask(videoId) {
         'INSERT INTO processing_queue (video_id) VALUES (?)',
         [videoId]
     );
+    await queueCache.markHasWork();
 }
 
 async function updateTaskStatus(jobId, status, progress = null, errorMessage = null) {
@@ -299,11 +302,12 @@ async function reportError(jobId, errorMessage) {
 // Reset expired pending tasks (check-then-lease timeout)
 async function resetExpiredPendingTasks() {
     const pool = getPool();
-    await pool.execute(
+    const [result] = await pool.execute(
         `UPDATE processing_queue
          SET status = 'queued', pending_until = NULL
          WHERE status = 'pending' AND pending_until < NOW()`
     );
+    if (result.affectedRows > 0) await queueCache.markHasWork();
 }
 
 // Reserve up to maxCount queued tasks atomically (queued → pending, 10s hold).
@@ -713,6 +717,7 @@ async function retryFailedVideo(videoId) {
     );
     await videoCache.invalidate(videoId);
     if (oldJobId) await transcodeCache.clearJob(oldJobId);
+    await queueCache.markHasWork();
 
     return true;
 }
@@ -784,6 +789,7 @@ async function resetStaleTasks() {
         await transcodeCache.clearJob(task.job_id);
     }
 
+    if (resetCount > 0) await queueCache.markHasWork();
     return resetCount;
 }
 
@@ -858,6 +864,7 @@ async function abortAndRequeue(jobId) {
     );
     await videoCache.invalidate(video_id);
     await transcodeCache.clearJob(job_id);
+    await queueCache.markHasWork();
 
     return true;
 }
