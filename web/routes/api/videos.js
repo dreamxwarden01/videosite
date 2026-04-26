@@ -366,12 +366,17 @@ router.get('/keys/:videoId', requireAuth, async (req, res) => {
     }
 });
 
-// POST /api/videos/:id/refresh-token — refresh HMAC playback token.
+// GET /api/refresh-token/:videoId — refresh HMAC playback token.
 // Hot path during playback (called every few minutes per active viewer), so
 // both the video lookup and the enrollment check go through the cache.
-router.post('/videos/:id/refresh-token', requireAuth, async (req, res) => {
+//
+// Modeled as GET because it generates and returns data without changing
+// server state — symmetric with the initial GET /api/watch/:videoId. Safe
+// from intermediate caching: the /api Cache-Control: no-store middleware
+// (server.js) already prevents browser/CDN reuse.
+router.get('/refresh-token/:videoId', requireAuth, async (req, res) => {
     try {
-        const videoId = parseInt(req.params.id);
+        const videoId = parseInt(req.params.videoId);
         const user = res.locals.user;
 
         // Check playback permission

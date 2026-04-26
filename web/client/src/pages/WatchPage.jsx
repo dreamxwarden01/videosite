@@ -128,12 +128,32 @@ export default function WatchPage() {
       return;
     }
 
+    // Per-effect cleanup state. `cancelled` covers the race between this
+    // effect's async `.then` callbacks resolving and the cleanup function
+    // running (e.g., StrictMode mount/unmount/mount in dev — without this,
+    // the first run's `.then` would still mount a UI overlay AFTER cleanup
+    // destroyed its player, leaving two stacked control bars).
+    //
+    // `destroyedRef` is reset on each effect entry so terminal-error state
+    // from a previous instance (e.g., 401 during a prior refresh) doesn't
+    // poison the current player.
+    destroyedRef.current = false;
+    let cancelled = false;
+    let ui = null;
+    let refreshIntervalId = null;
+    let tickIntervalId = null;
+    let refreshPlayHandler = null;
+    let refreshVisHandler = null;
+    let tickVisHandler = null;
+    let pauseHandler = null;
+
     const videoEl = videoRef.current;
     const player = new shaka.Player();
     playerRef.current = player;
 
     player.attach(videoEl).then(() => {
-      const ui = new shaka.ui.Overlay(player, containerRef.current, videoEl);
+      if (cancelled) return;
+      ui = new shaka.ui.Overlay(player, containerRef.current, videoEl);
       const isTouchDevice = navigator.maxTouchPoints > 0;
       ui.configure({
         playbackRates: [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5],
@@ -182,44 +202,53 @@ export default function WatchPage() {
           return tokenRef.current && validityRef.current > 0 && tokenAge() > validityRef.current / 2;
         }
 
+        // Single-flight refresh: try/finally guarantees `refreshing` is
+        // released regardless of which terminal status fires (401/403/404/
+        // 429), so the lock can never wedge on.
         async function refreshToken() {
           if (refreshing) return;
           refreshing = true;
-          for (let attempt = 0; attempt <= 5; attempt++) {
-            try {
-              if (attempt > 0) await new Promise(r => setTimeout(r, attempt * 1000));
-              const resp = await fetch('/api/videos/' + data.video.video_id + '/refresh-token', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' }
-              });
-              if (resp.ok) {
-                const d = await resp.json();
-                if (d.token) tokenRef.current = d.token;
-                if (d.tokenValiditySeconds > 0) validityRef.current = d.tokenValiditySeconds;
-                break;
-              }
-              if (resp.status === 401) { triggerAuthFailure(); return; }
-              if (resp.status === 429) { destroyAndShowError('Too Many Requests', 'You are being rate limited.'); return; }
-              if (resp.status === 404) { destroyAndShowError('Video Unavailable', 'This video is no longer available.'); return; }
-              if (resp.status === 403) { destroyAndShowError('Access Denied', 'You no longer have permission.'); return; }
-            } catch {}
+          try {
+            for (let attempt = 0; attempt <= 5; attempt++) {
+              try {
+                if (attempt > 0) await new Promise(r => setTimeout(r, attempt * 1000));
+                const resp = await fetch('/api/refresh-token/' + data.video.video_id);
+                if (resp.ok) {
+                  const d = await resp.json();
+                  if (d.token) tokenRef.current = d.token;
+                  if (d.tokenValiditySeconds > 0) validityRef.current = d.tokenValiditySeconds;
+                  return;
+                }
+                if (resp.status === 401) { triggerAuthFailure(); return; }
+                if (resp.status === 429) { destroyAndShowError('Too Many Requests', 'You are being rate limited.'); return; }
+                if (resp.status === 404) { destroyAndShowError('Video Unavailable', 'This video is no longer available.'); return; }
+                if (resp.status === 403) { destroyAndShowError('Access Denied', 'You no longer have permission.'); return; }
+              } catch {}
+            }
+          } finally {
+            refreshing = false;
           }
-          refreshing = false;
         }
 
         function checkAndRefresh() {
-          if (destroyedRef.current) return;
+          if (cancelled || destroyedRef.current) return;
           if (needsRefresh()) refreshToken();
         }
 
-        const refreshInterval = setInterval(() => {
-          if (videoEl.paused || videoEl.ended) return;
+        // Poll every 5s. Skip only when nothing is happening (tab hidden AND
+        // playback paused/ended) — a paused-but-focused user can still scrub
+        // the seek bar, which triggers segment fetches that need a fresh
+        // token. The `play` and `visibilitychange` listeners give immediate
+        // detection on resume / refocus on top of the 5s baseline.
+        refreshIntervalId = setInterval(() => {
+          if (document.hidden && (videoEl.paused || videoEl.ended)) return;
           checkAndRefresh();
-        }, 60000);
+        }, 5000);
 
-        videoEl.addEventListener('play', checkAndRefresh);
-        const visHandler = () => { if (!document.hidden) checkAndRefresh(); };
-        document.addEventListener('visibilitychange', visHandler);
+        refreshPlayHandler = checkAndRefresh;
+        videoEl.addEventListener('play', refreshPlayHandler);
+        refreshVisHandler = () => { if (!document.hidden) checkAndRefresh(); };
+        document.addEventListener('visibilitychange', refreshVisHandler);
       }
 
       // Error handling
@@ -237,6 +266,7 @@ export default function WatchPage() {
       const manifestUrl = pickManifestUrl(data);
       player.load(manifestUrl, data.resumePosition > 0 ? data.resumePosition : undefined)
         .then(() => {
+          if (cancelled) return;
           // Start watch tracking. Reset the shared ref so a second load of this
           // page (route change back to the same video) starts clean.
           const t = trackingRef.current;
@@ -317,17 +347,27 @@ export default function WatchPage() {
             if (t.accumulated >= 10) flushNow();
           }
 
-          setInterval(tick, 1000);
-          document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+          tickIntervalId = setInterval(tick, 1000);
+          tickVisHandler = () => { if (!document.hidden) tick(); };
+          document.addEventListener('visibilitychange', tickVisHandler);
           // Flush on pause so a user who watches 7s and pauses doesn't lose
           // those seconds. Also fires at end-of-stream, which is fine.
-          videoEl.addEventListener('pause', flushNow);
+          pauseHandler = flushNow;
+          videoEl.addEventListener('pause', pauseHandler);
         })
         .catch(handleShakaError);
     });
 
     return () => {
+      cancelled = true;
       destroyedRef.current = true;
+      if (refreshIntervalId) clearInterval(refreshIntervalId);
+      if (tickIntervalId) clearInterval(tickIntervalId);
+      if (refreshPlayHandler) videoEl.removeEventListener('play', refreshPlayHandler);
+      if (refreshVisHandler) document.removeEventListener('visibilitychange', refreshVisHandler);
+      if (tickVisHandler) document.removeEventListener('visibilitychange', tickVisHandler);
+      if (pauseHandler) videoEl.removeEventListener('pause', pauseHandler);
+      try { ui?.destroy(); } catch {}
       try { player.destroy(); } catch {}
     };
   }, [data, videoId, destroyAndShowError]);
