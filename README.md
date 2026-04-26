@@ -52,14 +52,14 @@ Redis sits between the server and DB to absorb hot reads and high-frequency writ
 | Frontend | React 19, Vite 8 |
 | Video Player | Shaka Player (HLS + DASH, CMAF) |
 | Storage | Cloudflare R2 |
-| Worker | Go 1.22, FFmpeg |
+| Worker | Go 1.25, FFmpeg |
 | Auth | Cookie sessions, Argon2, WebAuthn |
 | Email | Nodemailer (SMTP) |
 
 ## Prerequisites
 
 - **Node.js** (v20.19+ or v22.12+) and npm
-- **Go** 1.22+
+- **Go** 1.25+
 - **MySQL** or **MariaDB**
 - **Redis** 6+ — see [Redis configuration](#redis-configuration) below
 - **FFmpeg** and **FFprobe** (in PATH)

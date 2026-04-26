@@ -31,9 +31,10 @@ worker-old/
 worker-macos/
 worker-windows/
 *.md
-!web/README.md
-!worker/CLAUDE.md
+!README.md
 
 # Environment / secrets
 .env
 .env.*
+!.env.example
+!web/.env.example
