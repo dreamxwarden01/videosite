@@ -26,7 +26,8 @@ Browser (React SPA)
     |
     v
 Express Server ---- MySQL/MariaDB
-    |
+    |             \
+    |              `--- Redis (cache, sessions, write coalescing)
     v
 Cloudflare R2 (S3-compatible storage)
     ^
@@ -39,12 +40,15 @@ Go Worker(s) --- FFmpeg
 3. Worker downloads the source from R2, transcodes to multi-bitrate CMAF (fMP4) with HLS and DASH manifests, uploads segments back to R2
 4. Browser streams the video using Shaka Player with HMAC-authenticated URLs — the player picks HLS or DASH based on client capabilities
 
+Redis sits between the server and DB to absorb hot reads and high-frequency writes. Sessions, permissions, settings, and video / course / user / enrollment metadata are read-cached with explicit invalidation. Watch progress (`/api/updatewatch`) and worker transcoding heartbeats land in Redis only and a background flusher drains them to DB every 15 minutes — eliminating per-tick DB writes during active playback and transcoding. An anti-cheat rate limiter on `/api/updatewatch` rejects claimed watch time exceeding wall-clock elapsed.
+
 ## Tech Stack
 
 | Component | Technology |
 |-----------|-----------|
 | Backend | Express 5, Node.js |
 | Database | MySQL / MariaDB |
+| Cache | Redis 6+ (ioredis) |
 | Frontend | React 19, Vite 8 |
 | Video Player | Shaka Player (HLS + DASH, CMAF) |
 | Storage | Cloudflare R2 |
@@ -57,11 +61,35 @@ Go Worker(s) --- FFmpeg
 - **Node.js** (v20.19+ or v22.12+) and npm
 - **Go** 1.22+
 - **MySQL** or **MariaDB**
+- **Redis** 6+ — see [Redis configuration](#redis-configuration) below
 - **FFmpeg** and **FFprobe** (in PATH)
 - **Cloudflare R2** bucket with API credentials
 - (Optional) **Cloudflare Turnstile** site key for CAPTCHA
 
 ## Setup
+
+### Redis configuration
+
+Redis is required (sessions, cache, write coalescing). The server PINGs Redis on boot and exits with a clear error if unreachable. Configure these in `redis.conf` before starting Redis:
+
+```
+maxmemory 8gb                      # cap memory; adjust to taste
+maxmemory-policy volatile-lru      # only evict TTL'd keys — protects dirty progress
+appendonly yes                     # AOF persistence
+appendfsync everysec               # ~1s worst-case loss on crash
+```
+
+`volatile-lru` is important: dirty progress hashes (`progress:watch:*`, `progress:transcode:*`) and the `dirty:*` sets carry **no TTL** so they're never evicted, even under memory pressure. Cache entries (sessions, perms, settings, video / course / user / enrollment metadata — all with TTLs) age out normally. The boot path warns if either setting differs from the recommended values but doesn't block.
+
+Quick install:
+
+```bash
+# macOS
+brew install redis && brew services start redis
+
+# Debian / Ubuntu
+sudo apt install redis-server && sudo systemctl enable --now redis-server
+```
 
 ### Web Server
 
@@ -116,6 +144,7 @@ Copy `web/.env.example` to `web/.env` and fill in:
 | Variable | Description |
 |----------|-------------|
 | `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` | MySQL connection |
+| `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_DB` | Redis connection (password optional, DB defaults to 0) |
 | `R2_ENDPOINT`, `R2_BUCKET_NAME`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | Cloudflare R2 storage |
 | `R2_PUBLIC_DOMAIN` | Custom domain for video delivery |
 | `SESSION_SECRET` | Secret for session encryption |
@@ -129,12 +158,15 @@ Copy `web/.env.example` to `web/.env` and fill in:
 
 ```
 web/
-  server.js              # Express entry point
+  server.js              # Express entry point + graceful shutdown
   config/                # Database, R2, session, email config
   db/                    # Schema and migrations
   middleware/            # Auth, permissions, MFA, installer
   routes/                # API and auth route handlers
   services/              # Business logic
+    cache/               # Per-resource Redis caches (read-through + invalidation)
+    redis.js             # ioredis client + boot connect / sanity warnings
+    flusher.js           # Periodic write-coalescing (sessions, watch, transcode)
   client/                # React SPA (Vite)
     src/
       components/        # Shared UI components
