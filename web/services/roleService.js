@@ -1,4 +1,5 @@
 const { getPool } = require('../config/database');
+const permCache = require('./cache/permissionCache');
 
 async function listRoles() {
     const pool = getPool();
@@ -29,12 +30,14 @@ async function createRole(roleId, roleName, permissionLevel, description = null)
 async function updateRole(roleId, updates) {
     const pool = getPool();
     const conn = await pool.getConnection();
+    let affectedUserIds = [];
+    let newId = null;
     try {
         await conn.beginTransaction();
 
         // If role_id is being changed, we need special handling due to foreign keys
         if (updates.role_id !== undefined && updates.role_id !== roleId) {
-            const newId = updates.role_id;
+            newId = updates.role_id;
 
             const [current] = await conn.execute('SELECT * FROM roles WHERE role_id = ?', [roleId]);
             if (current.length === 0) throw new Error('Role not found');
@@ -62,6 +65,10 @@ async function updateRole(roleId, updates) {
                     [newId, p.permission_key, p.granted]
                 );
             }
+
+            // Capture users about to migrate so we can invalidate their caches
+            const [affected] = await conn.execute('SELECT user_id FROM users WHERE role_id = ?', [roleId]);
+            affectedUserIds = affected.map(r => r.user_id);
 
             // Update users to the new role_id
             await conn.execute('UPDATE users SET role_id = ? WHERE role_id = ?', [newId, roleId]);
@@ -94,6 +101,16 @@ async function updateRole(roleId, updates) {
     } finally {
         conn.release();
     }
+
+    // Always flush the role cache (permission_level may have changed). On a
+    // role-id rename, also flush the new id and every migrated user's caches.
+    await permCache.invalidateRole(roleId);
+    if (newId !== null) {
+        await permCache.invalidateRole(newId);
+        await permCache.invalidateUsers(affectedUserIds);
+        const userCache = require('./cache/userCache');
+        for (const uid of affectedUserIds) await userCache.invalidate(uid);
+    }
 }
 
 async function deleteRole(roleId) {
@@ -106,10 +123,22 @@ async function deleteRole(roleId) {
     if (rows.length === 0) throw new Error('Role not found');
     if (rows[0].is_system) throw new Error('Cannot delete system role');
 
+    // Capture affected users before reassignment so we can invalidate their caches.
+    const [affectedRows] = await pool.execute(
+        'SELECT user_id FROM users WHERE role_id = ?',
+        [roleId]
+    );
+    const affectedUserIds = affectedRows.map(r => r.user_id);
+
     // Reassign any users with this role to the default "user" role (id=2)
     await pool.execute('UPDATE users SET role_id = 2 WHERE role_id = ?', [roleId]);
 
     await pool.execute('DELETE FROM roles WHERE role_id = ?', [roleId]);
+
+    // Invalidate the deleted role's perm cache and every reassigned user's
+    // perm cache (their cached role_id is now stale).
+    await permCache.invalidateRole(roleId);
+    await permCache.invalidateUsers(affectedUserIds);
 }
 
 async function roleIdExists(roleId) {

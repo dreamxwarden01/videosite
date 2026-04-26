@@ -18,22 +18,15 @@ const mfaEmailTemplates = require('./mfaEmailTemplates');
 // ---------------------------------------------------------------------------
 
 async function getSetting(key, defaultValue) {
-    const pool = getPool();
-    const [[row]] = await pool.execute(
-        'SELECT setting_value FROM site_settings WHERE setting_key = ?',
-        [key]
-    );
-    return (row && row.setting_value) || defaultValue;
+    return require('./cache/settingsCache').getSetting(key, defaultValue);
 }
 
 async function getMfaSettings() {
-    const pool = getPool();
-    const [rows] = await pool.execute(
-        "SELECT setting_key, setting_value FROM site_settings WHERE setting_key LIKE 'mfa_%'"
-    );
+    // Pulled from the cached single-blob — filter mfa_* in memory.
+    const all = await require('./cache/settingsCache').getAllSettings();
     const settings = {};
-    for (const row of rows) {
-        settings[row.setting_key] = row.setting_value;
+    for (const [k, v] of Object.entries(all)) {
+        if (k.startsWith('mfa_')) settings[k] = v;
     }
     return settings;
 }

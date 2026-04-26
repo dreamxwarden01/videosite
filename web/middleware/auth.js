@@ -1,5 +1,6 @@
-const { getSession, updateSessionActivity, isSessionValid, deleteSession } = require('../config/session');
-const { resolvePermissions } = require('../services/permissionService');
+const { getSession, updateSessionActivity, isSessionValid, deleteSession, deleteUserSessions } = require('../config/session');
+const { resolveAuthBundle } = require('../services/permissionService');
+const { getUserMeta } = require('../services/cache/userCache');
 
 const SESSION_COOKIE = 'sid';
 
@@ -14,7 +15,9 @@ function getClientIp(req) {
     return req.socket.remoteAddress || null;
 }
 
-// Load user from session cookie on every request
+// Load user from session cookie on every request. The full hot path is now
+// 1 Redis GET (session) + 1 Redis GET (user_meta) + 2 Redis GETs (perms) on
+// cache hit; previously it was 1 DB JOIN + 2 DB queries + 1 DB query.
 async function loadUser(req, res, next) {
     res.locals.user = null;
 
@@ -28,14 +31,7 @@ async function loadUser(req, res, next) {
             return next();
         }
 
-        // Check if user account is active
-        if (!session.is_active) {
-            await deleteSession(sessionId);
-            res.clearCookie(SESSION_COOKIE);
-            return next();
-        }
-
-        // Check session expiry
+        // Absolute TTL check (max_days). Idle TTL is enforced by Redis expiry.
         const valid = await isSessionValid(session);
         if (!valid) {
             await deleteSession(sessionId);
@@ -43,31 +39,38 @@ async function loadUser(req, res, next) {
             return next();
         }
 
-        // Update last activity and IP
-        await updateSessionActivity(sessionId, getClientIp(req));
+        // Look up user metadata from cache (replaces the old session→users JOIN).
+        const userMeta = await getUserMeta(session.user_id);
+        if (!userMeta) {
+            // User row vanished — kill the orphan session.
+            await deleteSession(sessionId);
+            res.clearCookie(SESSION_COOKIE);
+            return next();
+        }
 
-        // Resolve permissions
-        const permissions = await resolvePermissions(session.user_id, session.role_id);
+        // Account deactivated → cascade-clear all sessions / caches for this user.
+        if (!userMeta.is_active) {
+            await deleteUserSessions(session.user_id);
+            res.clearCookie(SESSION_COOKIE);
+            return next();
+        }
+
+        // Update last_seen + ip + ua in Redis. The periodic flusher drains
+        // these to DB every 15 min — the per-request DB write is gone.
+        await updateSessionActivity(sessionId, getClientIp(req), req.headers['user-agent'] || null);
+
+        // Resolve permissions + permission_level in one cached bundle (2 Redis GETs).
+        const { permissions, permission_level } = await resolveAuthBundle(session.user_id);
 
         res.locals.user = {
             user_id: session.user_id,
-            username: session.username,
-            display_name: session.display_name,
-            role_id: session.role_id,
+            username: userMeta.username,
+            display_name: userMeta.display_name,
+            role_id: userMeta.role_id,
             permissions,
-            session_id: sessionId
+            permission_level,
+            session_id: sessionId,
         };
-
-        // Also need permission_level for level checks
-        const { getPool } = require('../config/database');
-        const pool = getPool();
-        const [roleRows] = await pool.execute(
-            'SELECT permission_level FROM roles WHERE role_id = ?',
-            [session.role_id]
-        );
-        if (roleRows.length > 0) {
-            res.locals.user.permission_level = roleRows[0].permission_level;
-        }
     } catch (err) {
         console.error('Error loading user session:', err.message);
         res.clearCookie(SESSION_COOKIE);

@@ -113,7 +113,7 @@ app.use((err, req, res, next) => {
 
 // Start server
 const PORT = parseInt(process.env.PORT || '3000');
-app.listen(PORT, async () => {
+const server = app.listen(PORT, async () => {
     console.log(`VideoSite running on http://localhost:${PORT}`);
 
     // Run database migrations if the app is installed
@@ -123,6 +123,24 @@ app.listen(PORT, async () => {
             await runMigrations();
         } catch (err) {
             console.error('Failed to run migrations:', err.message);
+        }
+    }
+
+    // Connect Redis (required when installed). Fail loud and exit if unreachable —
+    // a half-working cache is harder to debug than a clear startup failure.
+    if (process.env.REDIS_HOST) {
+        try {
+            const redisService = require('./services/redis');
+            await redisService.connect();
+
+            // Start the periodic write-coalescing flusher (drains dirty:session:user
+            // every 15 min into DB). Phase 5 will plug watch + transcode into the
+            // same module.
+            const flusher = require('./services/flusher');
+            flusher.start();
+        } catch (err) {
+            console.error(`Redis is required and unreachable at ${process.env.REDIS_HOST}:${process.env.REDIS_PORT || 6379}: ${err.message}`);
+            process.exit(1);
         }
     }
 
@@ -183,3 +201,49 @@ app.listen(PORT, async () => {
         console.error('Failed to reset stale uploads:', err.message);
     }
 });
+
+// Graceful shutdown — stop accepting requests, drain Redis cleanly, exit.
+// Future phases will add flusher.flushAll() here so coalesced progress lands
+// in DB before exit. Wrap in a deadline so we beat orchestrator SIGKILL grace.
+let shuttingDown = false;
+async function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`${signal} received, shutting down...`);
+
+    const deadline = setTimeout(() => {
+        console.error('Shutdown deadline (25s) exceeded, forcing exit.');
+        process.exit(1);
+    }, 25_000);
+    deadline.unref();
+
+    try {
+        await new Promise((resolve) => server.close(() => resolve()));
+    } catch (err) {
+        console.error('Error closing HTTP server:', err.message);
+    }
+
+    if (process.env.REDIS_HOST) {
+        try {
+            // Stop the flusher's interval and drain any remaining dirty sets
+            // to DB before disconnecting Redis.
+            const flusher = require('./services/flusher');
+            flusher.stop();
+            const drained = await flusher.flushAll();
+            if (drained > 0) console.log(`Flusher: drained ${drained} sessions on shutdown`);
+        } catch (err) {
+            console.error('Error during shutdown flush:', err.message);
+        }
+        try {
+            const redisService = require('./services/redis');
+            await redisService.quit();
+        } catch (err) {
+            console.error('Error during Redis quit:', err.message);
+        }
+    }
+
+    clearTimeout(deadline);
+    process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

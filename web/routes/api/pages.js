@@ -68,28 +68,25 @@ router.get('/courses/:courseId', requireAuth, async (req, res) => {
     try {
         const pool = getPool();
         const user = res.locals.user;
-        const courseId = req.params.courseId;
+        const courseId = parseInt(req.params.courseId);
         const page = parseInt(req.query.page) || 1;
         const ALLOWED_LIMITS = [10, 20, 50];
         const rawLimit = parseInt(req.query.limit);
         const limit = ALLOWED_LIMITS.includes(rawLimit) ? rawLimit : 10;
         const offset = (page - 1) * limit;
 
-        const [courseRows] = await pool.execute(
-            'SELECT * FROM courses WHERE course_id = ? AND is_active = 1',
-            [courseId]
-        );
-        if (courseRows.length === 0) {
+        const courseCache = require('../../services/cache/courseCache');
+        const enrollmentCache = require('../../services/cache/enrollmentCache');
+
+        const course = await courseCache.getCourseMeta(courseId);
+        if (!course || course.is_active !== 1) {
             return res.status(404).json({ error: 'Course not found.' });
         }
 
         // Check course access
         if (!user.permissions.allCourseAccess) {
-            const [enrollment] = await pool.execute(
-                'SELECT 1 FROM enrollments WHERE user_id = ? AND course_id = ?',
-                [user.user_id, courseId]
-            );
-            if (enrollment.length === 0) {
+            const enrolled = await enrollmentCache.isEnrolledInCourse(user.user_id, courseId);
+            if (!enrolled) {
                 return res.status(403).json({ error: 'You are not enrolled in this course.' });
             }
         }
@@ -112,7 +109,6 @@ router.get('/courses/:courseId', requireAuth, async (req, res) => {
 
         const total = countRows[0].total;
 
-        const course = courseRows[0];
         res.json({
             course: {
                 course_id: course.course_id,
@@ -155,27 +151,23 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
             return res.status(403).json({ error: 'Playback is not allowed.', code: 'no_playback_permission' });
         }
 
-        const [videoRows] = await pool.execute(
-            `SELECT v.*, c.course_name, c.course_id
-             FROM videos v JOIN courses c ON v.course_id = c.course_id
-             WHERE v.video_id = ? AND v.status = 'finished'`,
-            [videoId]
-        );
-        if (videoRows.length === 0) {
+        const videoCache = require('../../services/cache/videoCache');
+        const courseCache = require('../../services/cache/courseCache');
+        const enrollmentCache = require('../../services/cache/enrollmentCache');
+
+        const video = await videoCache.getVideoMeta(videoId);
+        if (!video || video.status !== 'finished') {
             return res.status(404).json({ error: 'Video not found or not ready.', code: 'video_not_found' });
         }
 
-        const video = videoRows[0];
-
         if (!user.permissions.allCourseAccess) {
-            const [enrollment] = await pool.execute(
-                'SELECT 1 FROM enrollments WHERE user_id = ? AND course_id = ?',
-                [user.user_id, video.course_id]
-            );
-            if (enrollment.length === 0) {
+            const enrolled = await enrollmentCache.isEnrolledInCourse(user.user_id, video.course_id);
+            if (!enrolled) {
                 return res.status(403).json({ error: 'You are not enrolled in this course.', code: 'no_course_enrollment' });
             }
         }
+
+        const course = await courseCache.getCourseMeta(video.course_id);
 
         const publicDomain = process.env.R2_PUBLIC_DOMAIN;
         const basePath = `/${video.hashed_video_id}/${video.processing_job_id}/`;
@@ -199,12 +191,16 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
         }
 
         let resumePosition = 0;
-        const [watchRows] = await pool.execute(
-            'SELECT last_position FROM watch_progress WHERE user_id = ? AND video_id = ?',
-            [user.user_id, videoId]
-        );
-        if (watchRows.length > 0 && video.duration_seconds) {
-            const pos = watchRows[0].last_position;
+        const watchProgressCache = require('../../services/cache/watchProgressCache');
+        let pos = await watchProgressCache.getLastPosition(user.user_id, videoId);
+        if (pos === null) {
+            const [watchRows] = await pool.execute(
+                'SELECT last_position FROM watch_progress WHERE user_id = ? AND video_id = ?',
+                [user.user_id, videoId]
+            );
+            if (watchRows.length > 0) pos = watchRows[0].last_position;
+        }
+        if (pos !== null && video.duration_seconds) {
             const duration = video.duration_seconds;
             if (pos > duration * 0.05 && pos < duration * 0.90) {
                 resumePosition = pos;
@@ -220,7 +216,7 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
                 lecture_date: video.lecture_date,
                 duration_seconds: video.duration_seconds,
                 course_id: video.course_id,
-                course_name: video.course_name,
+                course_name: course ? course.course_name : null,
             },
             hlsUrl,
             dashUrl,
@@ -247,7 +243,7 @@ router.get('/profile', requireAuth, async (req, res) => {
             deviceName: formatUserAgent(s.user_agent),
             isCurrent: s.session_id === user.session_id,
             ip_address: s.ip_address,
-            last_activity: s.last_activity,
+            last_seen: s.last_seen,
             last_sign_in: s.last_sign_in,
         }));
 
@@ -623,6 +619,7 @@ router.post('/profile/email/confirm', requireAuth, async (req, res) => {
             'UPDATE users SET email = ? WHERE user_id = ?',
             [newEmail, user.user_id]
         );
+        await require('../../services/cache/userCache').invalidate(user.user_id);
 
         // Consume OTP challenge
         await mfaService.consumeChallenge(challengeId);

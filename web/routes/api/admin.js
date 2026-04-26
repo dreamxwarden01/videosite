@@ -245,14 +245,12 @@ router.delete('/admin/courses/:courseId/transcoding-profiles', requireAuth, chec
 router.get('/admin/videos/:courseId', requireAuth, checkAnyPermission('uploadVideo', 'changeVideo'), requireCourseAccess, async (req, res) => {
     try {
         const pool = getPool();
-        const courseId = req.params.courseId;
+        const courseId = parseInt(req.params.courseId);
 
         // Verify course exists and is active
-        const [courseRows] = await pool.execute(
-            'SELECT course_id, course_name FROM courses WHERE course_id = ? AND is_active = 1',
-            [courseId]
-        );
-        if (courseRows.length === 0) {
+        const courseCache = require('../../services/cache/courseCache');
+        const course = await courseCache.getCourseMeta(courseId);
+        if (!course || course.is_active !== 1) {
             return res.status(404).json({ error: 'Course not found.' });
         }
 
@@ -307,9 +305,7 @@ router.get('/admin/users', requireAuth, checkPermission('manageUser'), requireMf
 router.get('/admin/users/new', requireAuth, checkPermission('addUser'), requireMfaForScenario('user'), async (req, res) => {
     try {
         const roles = await getAssignableRoles(res.locals.user.permission_level);
-        const pool = getPool();
-        const [[row]] = await pool.execute("SELECT setting_value FROM site_settings WHERE setting_key = 'registration_default_role'");
-        const defaultRoleId = row ? row.setting_value : '2';
+        const defaultRoleId = await require('../../services/cache/settingsCache').getSetting('registration_default_role', '2');
         res.json({ roles, defaultRoleId });
     } catch (err) {
         console.error('API new user form error:', err);
@@ -557,7 +553,7 @@ router.get('/admin/users/:id/sessions', requireAuth, checkPermission('changeUser
         const sanitized = sessions.map(s => ({
             deviceName: formatUserAgent(s.user_agent),
             ip_address: s.ip_address,
-            last_activity: s.last_activity,
+            last_seen: s.last_seen,
             last_sign_in: s.last_sign_in,
             created_at: s.created_at,
         }));
@@ -642,18 +638,13 @@ router.post('/admin/enrollment', requireAuth, checkPermission('manageEnrolment')
             return res.status(400).json({ error: 'User and course are required' });
         }
 
-        // Check target user's permission level
-        const pool = getPool();
-        const [userRows] = await pool.execute(
-            'SELECT r.permission_level FROM users u JOIN roles r ON u.role_id = r.role_id WHERE u.user_id = ?',
-            [userId]
-        );
-
-        if (userRows.length === 0) {
+        // Check target user's permission level via the cached two-tier resolver
+        // (user:perms → role:perms) — no DB JOIN per enrollment change.
+        const targetBundle = await require('../../services/permissionService').resolveAuthBundle(parseInt(userId));
+        if (!targetBundle.role_id) {
             return res.status(404).json({ error: 'User not found' });
         }
-
-        if (res.locals.user.permission_level >= userRows[0].permission_level) {
+        if (res.locals.user.permission_level >= targetBundle.permission_level) {
             return res.status(403).json({ error: 'Cannot manage enrollment for users with equal or higher authority' });
         }
 
@@ -1033,6 +1024,7 @@ router.put('/admin/settings', requireAuth, checkPermission('manageSite'), requir
                 [key, value]
             );
         }
+        await require('../../services/cache/settingsCache').invalidate();
 
         res.status(204).end();
     } catch (err) {
@@ -1244,11 +1236,35 @@ router.delete('/admin/invitations/:code', requireAuth, checkPermission('inviteUs
 // ==========================================================================
 
 // GET /api/admin/playback-stats — query params: userId, courseId
+//
+// All three result sets (users, userCourses, courseVideos) are DB aggregates
+// overlaid with pending entries from progress:watch:* — so the page reflects
+// up-to-the-second activity, not 15-min-stale flushed data. The overlay also
+// surfaces courses/videos that have only Redis-pending data and no DB row yet.
 router.get('/admin/playback-stats', requireAuth, checkPermission('viewPlaybackStat'), requireMfaForScenario('playback_stats'), async (req, res) => {
     try {
         const pool = getPool();
-        const userId = req.query.userId;
-        const courseId = req.query.courseId;
+        const userIdParam = req.query.userId;
+        const courseIdParam = req.query.courseId;
+        const watchProgressCache = require('../../services/cache/watchProgressCache');
+        const videoCacheMod = require('../../services/cache/videoCache');
+        const courseCacheMod = require('../../services/cache/courseCache');
+
+        // Pull every pending watch entry once; we'll join against it three
+        // different ways below.
+        const pending = await watchProgressCache.getAllPending();
+        // Build per-user → {delta, max_updated_at} for the users table.
+        const pendingByUser = {};
+        // Build per-(user,video) → entry for the per-course / per-video tables.
+        for (const [memberId, data] of Object.entries(pending)) {
+            const [uidStr] = memberId.split(':');
+            const uid = parseInt(uidStr, 10);
+            if (!pendingByUser[uid]) pendingByUser[uid] = { delta: 0, max_updated_at: 0 };
+            pendingByUser[uid].delta += data.delta;
+            if (data.updated_at > pendingByUser[uid].max_updated_at) {
+                pendingByUser[uid].max_updated_at = data.updated_at;
+            }
+        }
 
         // User list with total watch time
         const [users] = await pool.execute(
@@ -1261,12 +1277,25 @@ router.get('/admin/playback-stats', requireAuth, checkPermission('viewPlaybackSt
              ORDER BY total_watch_seconds DESC`
         );
 
+        for (const u of users) {
+            const p = pendingByUser[u.user_id];
+            if (!p) continue;
+            u.total_watch_seconds = parseFloat(u.total_watch_seconds) + p.delta;
+            const lastWatchMs = u.last_watch_at ? new Date(u.last_watch_at).getTime() : 0;
+            if (p.max_updated_at > lastWatchMs) {
+                u.last_watch_at = new Date(p.max_updated_at);
+            }
+        }
+        users.sort((a, b) => parseFloat(b.total_watch_seconds) - parseFloat(a.total_watch_seconds));
+
         let userCourses = null;
         let courseVideos = null;
         let selectedUser = null;
         let selectedCourse = null;
 
-        if (userId) {
+        if (userIdParam) {
+            const userId = parseInt(userIdParam);
+
             // Get user info
             const [userRows] = await pool.execute(
                 'SELECT user_id, username, display_name FROM users WHERE user_id = ?',
@@ -1275,7 +1304,23 @@ router.get('/admin/playback-stats', requireAuth, checkPermission('viewPlaybackSt
             selectedUser = userRows[0] || null;
 
             if (selectedUser) {
-                // Get courses with watch stats for this user
+                // Group this user's pending entries by course_id (via videoCache).
+                const pendingByCourse = {};
+                for (const [memberId, data] of Object.entries(pending)) {
+                    const [uidStr, vidStr] = memberId.split(':');
+                    if (parseInt(uidStr) !== userId) continue;
+                    const vid = parseInt(vidStr);
+                    const meta = await videoCacheMod.getVideoMeta(vid);
+                    if (!meta) continue;
+                    const cid = meta.course_id;
+                    if (!pendingByCourse[cid]) pendingByCourse[cid] = { delta: 0, max_updated_at: 0 };
+                    pendingByCourse[cid].delta += data.delta;
+                    if (data.updated_at > pendingByCourse[cid].max_updated_at) {
+                        pendingByCourse[cid].max_updated_at = data.updated_at;
+                    }
+                }
+
+                // Get courses with watch stats for this user (DB aggregate).
                 const [courses] = await pool.execute(
                     `SELECT c.course_id, c.course_name,
                             COALESCE(SUM(wp.watch_seconds), 0) as total_watch_seconds,
@@ -1288,11 +1333,43 @@ router.get('/admin/playback-stats', requireAuth, checkPermission('viewPlaybackSt
                      ORDER BY last_watch_at DESC`,
                     [userId]
                 );
+
+                const presentCourseIds = new Set(courses.map(c => c.course_id));
+                for (const c of courses) {
+                    const p = pendingByCourse[c.course_id];
+                    if (!p) continue;
+                    c.total_watch_seconds = parseFloat(c.total_watch_seconds) + p.delta;
+                    const lastWatchMs = c.last_watch_at ? new Date(c.last_watch_at).getTime() : 0;
+                    if (p.max_updated_at > lastWatchMs) {
+                        c.last_watch_at = new Date(p.max_updated_at);
+                    }
+                }
+                // Courses with only pending data (no DB row yet) need to be added.
+                for (const [cidStr, p] of Object.entries(pendingByCourse)) {
+                    const cid = parseInt(cidStr);
+                    if (presentCourseIds.has(cid)) continue;
+                    const courseMeta = await courseCacheMod.getCourseMeta(cid);
+                    if (!courseMeta) continue;
+                    courses.push({
+                        course_id: cid,
+                        course_name: courseMeta.course_name,
+                        total_watch_seconds: p.delta,
+                        last_watch_at: p.max_updated_at ? new Date(p.max_updated_at) : null,
+                    });
+                }
+                courses.sort((a, b) => {
+                    const ta = a.last_watch_at ? new Date(a.last_watch_at).getTime() : 0;
+                    const tb = b.last_watch_at ? new Date(b.last_watch_at).getTime() : 0;
+                    return tb - ta;
+                });
                 userCourses = courses;
             }
         }
 
-        if (userId && courseId) {
+        if (userIdParam && courseIdParam) {
+            const userId = parseInt(userIdParam);
+            const courseId = parseInt(courseIdParam);
+
             // Get per-video stats for this user + course
             const [courseRows] = await pool.execute(
                 'SELECT course_id, course_name FROM courses WHERE course_id = ?',
@@ -1310,6 +1387,14 @@ router.get('/admin/playback-stats', requireAuth, checkPermission('viewPlaybackSt
                  ORDER BY COALESCE(v.lecture_date, v.created_at) DESC`,
                 [userId, courseId]
             );
+
+            for (const v of videos) {
+                const p = pending[`${userId}:${v.video_id}`];
+                if (!p) continue;
+                v.watch_seconds = parseFloat(v.watch_seconds) + p.delta;
+                v.last_position = p.last_position; // freshest
+                v.last_watch_at = new Date(p.updated_at);
+            }
             courseVideos = videos;
         }
 
@@ -1332,6 +1417,7 @@ router.delete('/admin/playback-stats', requireAuth, checkPermission('clearPlayba
     try {
         const pool = getPool();
         await pool.execute('DELETE FROM watch_progress');
+        await require('../../services/cache/watchProgressCache').clearAll();
         res.status(204).end();
     } catch (err) {
         console.error('API clear playback stats error:', err);
@@ -1363,25 +1449,34 @@ router.get('/admin/transcoding/jobs', requireAuth, checkPermission('manageSite')
              ORDER BY pq.created_at DESC`
         );
 
+        // Overlay live progress from Redis for any in-flight job (heartbeats
+        // land in Redis only between flushes — DB last_heartbeat / progress
+        // can lag by up to one flush cycle).
+        const transcodeCache = require('../../services/cache/transcodeProgressCache');
+        const liveJobIds = rows.filter(r => r.job_id && r.status !== 'completed' && r.status !== 'error')
+            .map(r => r.job_id);
+        const live = await transcodeCache.getMany(liveJobIds);
+
         // Categorize jobs
         const errorJobs = [];
         const activeJobs = [];
         const finishedJobs = [];
 
         for (const row of rows) {
+            const overlay = row.job_id ? live[row.job_id] : null;
             const job = {
                 taskId: row.task_id,
                 jobId: row.job_id,
                 videoId: row.video_id,
                 videoTitle: row.video_title,
                 courseName: row.course_name,
-                status: row.status,
-                videoStatus: row.video_status,
-                progress: row.video_progress || row.progress || 0,
+                status: overlay?.queue_status || row.status,
+                videoStatus: overlay?.video_status || row.video_status,
+                progress: overlay?.progress ?? row.video_progress ?? row.progress ?? 0,
                 errorMessage: row.error_message,
                 uploadTime: row.upload_time,
                 leasedAt: row.leased_at,
-                lastHeartbeat: row.last_heartbeat,
+                lastHeartbeat: overlay?.last_heartbeat ? new Date(overlay.last_heartbeat) : row.last_heartbeat,
                 errorAt: row.error_at,
                 updatedAt: row.updated_at
             };

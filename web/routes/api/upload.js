@@ -318,12 +318,14 @@ router.post('/upload/:uploadId/complete', requireAuth, checkPermission('uploadVi
                  WHERE video_id = ?`,
                 [session.object_key, session.original_filename, session.file_size_bytes, videoId]
             );
+            await require('../../services/cache/videoCache').invalidate(videoId);
 
             // Create new processing task
             await createTask(videoId);
 
-            // Clear stale watch progress
+            // Clear stale watch progress (DB + Redis cache)
             await pool.execute('DELETE FROM watch_progress WHERE video_id = ?', [videoId]);
+            await require('../../services/cache/watchProgressCache').clearForVideo(videoId);
         }
 
         await markCompleted(session.upload_id, videoId);

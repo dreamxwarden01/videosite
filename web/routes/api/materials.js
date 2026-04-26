@@ -59,13 +59,13 @@ router.get('/materials/courses/:courseId', requireAuth, checkPermission('accessA
             return res.status(403).json({ error: 'You are not enrolled in this course.' });
         }
 
-        const pool = getPool();
-        const [courseRows] = await pool.execute('SELECT course_name FROM courses WHERE course_id = ? AND is_active = 1', [courseId]);
-        if (courseRows.length === 0) return res.status(404).json({ error: 'Course not found.' });
+        const courseCache = require('../../services/cache/courseCache');
+        const course = await courseCache.getCourseMeta(courseId);
+        if (!course || course.is_active !== 1) return res.status(404).json({ error: 'Course not found.' });
 
         const materials = await getMaterialsByCourse(courseId);
         res.json({
-            courseName: courseRows[0].course_name,
+            courseName: course.course_name,
             materials: materials.map(m => ({
                 material_id: m.material_id,
                 filename: m.filename,

@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS user_permission_overrides (
 CREATE TABLE IF NOT EXISTS sessions (
     session_id   VARCHAR(128) PRIMARY KEY,
     user_id      INT UNSIGNED NOT NULL,
-    last_activity DATETIME    NOT NULL,
+    last_seen     DATETIME    NOT NULL,
     last_sign_in DATETIME     NOT NULL,
     user_agent   VARCHAR(255) DEFAULT NULL,
     ip_address   VARCHAR(45)  DEFAULT NULL,

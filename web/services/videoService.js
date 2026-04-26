@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const { getPool } = require('../config/database');
 const { ListObjectsV2Command, DeleteObjectsCommand } = require('@aws-sdk/client-s3');
 const { getR2Client, getR2BucketName } = require('../config/r2');
+const videoCache = require('./cache/videoCache');
 
 // --- R2 retry + concurrency settings ---
 const R2_MAX_ATTEMPTS = 6;        // 1 original + 5 retries
@@ -134,6 +135,8 @@ async function updateVideo(videoId, updates) {
         `UPDATE videos SET ${fields.join(', ')} WHERE video_id = ?`,
         values
     );
+
+    await videoCache.invalidate(videoId);
 }
 
 /**
@@ -177,6 +180,13 @@ async function deleteVideo(videoId) {
 
     // 4. Delete DB record (FK cascade removes processing_queue → worker gets 404)
     await pool.execute('DELETE FROM videos WHERE video_id = ?', [videoId]);
+    await videoCache.invalidate(videoId);
+    await require('./cache/watchProgressCache').clearForVideo(videoId);
+    // Drop the heartbeat cache for any active job — the worker's next status
+    // ping will see the missing alive-gate and abort.
+    if (taskRows.length > 0 && taskRows[0].job_id) {
+        await require('./cache/transcodeProgressCache').clearJob(taskRows[0].job_id);
+    }
 
     // 5. R2 cleanup (fire-and-forget, don't block API response)
     if (videoRows.length > 0) {

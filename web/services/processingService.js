@@ -1,5 +1,7 @@
 const crypto = require('crypto');
 const { getPool } = require('../config/database');
+const videoCache = require('./cache/videoCache');
+const transcodeCache = require('./cache/transcodeProgressCache');
 
 // Base62 12-char job ID generator (matches hashed_video_id family).
 // Collision probability in a 62^12 space is astronomically low (~10^-14 at
@@ -32,7 +34,10 @@ async function generateJobId() {
 // Each active job gets a 2-minute timer that resets on every heartbeat.
 // When the timer fires, the job is checked and reset if truly stale.
 const staleTimers = new Map(); // jobId → timeoutId
-const STALE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
+// 2 minutes of no heartbeat = stale. The check reads last_heartbeat from
+// Redis (the source of truth for live workers); DB last_heartbeat lags by
+// one flush cycle and isn't reliable here.
+const STALE_TIMEOUT_MS = 2 * 60 * 1000;
 
 function startStaleTimer(jobId) {
     clearStaleTimer(jobId);
@@ -62,6 +67,15 @@ async function resetSingleStaleTask(jobId) {
     const pool = getPool();
     const { cleanR2Prefix } = require('./videoService');
 
+    // Double-check staleness via Redis (the source of truth for live workers).
+    // The in-process timer fires after STALE_TIMEOUT_MS of no in-process
+    // heartbeat, but a late heartbeat could have just landed in Redis between
+    // the timer schedule and now — so we re-read last_heartbeat from cache.
+    const cached = await transcodeCache.getProgress(jobId);
+    if (cached && cached.last_heartbeat && Date.now() - cached.last_heartbeat < STALE_TIMEOUT_MS) {
+        return; // Heartbeat is fresh — not stale.
+    }
+
     // Get task details (need hashed paths for R2 cleanup)
     const [rows] = await pool.execute(
         `SELECT pq.video_id, pq.job_id, v.hashed_video_id
@@ -75,18 +89,16 @@ async function resetSingleStaleTask(jobId) {
 
     const task = rows[0];
 
-    // Atomically reset — re-checks staleness to avoid race with a late heartbeat
     const [result] = await pool.execute(
         `UPDATE processing_queue
          SET status = 'queued', job_id = NULL, worker_key_id = NULL,
              leased_at = NULL, last_heartbeat = NULL, pending_until = NULL,
              progress = 0, error_message = NULL, error_at = NULL
-         WHERE job_id = ? AND status IN ('leased', 'processing')
-         AND last_heartbeat < DATE_SUB(NOW(), INTERVAL 2 MINUTE)`,
+         WHERE job_id = ? AND status IN ('leased', 'processing')`,
         [jobId]
     );
 
-    if (result.affectedRows === 0) return; // Heartbeat came in — not stale
+    if (result.affectedRows === 0) return; // Job state changed concurrently.
 
     console.log(`Stale timer: reset job ${jobId} (video ${task.video_id})`);
 
@@ -105,6 +117,8 @@ async function resetSingleStaleTask(jobId) {
          WHERE video_id = ? AND status IN ('worker_downloading', 'processing', 'worker_uploading')`,
         [task.video_id]
     );
+    await videoCache.invalidate(task.video_id);
+    await transcodeCache.clearJob(jobId);
 }
 
 async function createTask(videoId) {
@@ -204,6 +218,7 @@ async function updateTaskStatus(jobId, status, progress = null, errorMessage = n
 
 async function completeTask(jobId, durationSeconds = null) {
     clearStaleTimer(jobId);
+    await transcodeCache.clearJob(jobId);
     const pool = getPool();
 
     const [result] = await pool.execute(
@@ -401,6 +416,11 @@ async function leaseTask(videoId, workerKeyId) {
             [jobId, task.video_id]
         );
     }
+    await videoCache.invalidate(task.video_id);
+
+    // Seed the heartbeat cache. Subsequent /worker/task/status (running)
+    // hits HEXISTS this key as the "is the job alive" gate — no DB query.
+    await transcodeCache.initOnLease(jobId, task.video_id, 'leased', 'worker_downloading');
 
     // Generate presigned download URL
     const { GetObjectCommand } = require('@aws-sdk/client-s3');
@@ -507,37 +527,42 @@ async function reportJobStatuses(jobs) {
         let found = false;
         try {
             if (status === 'running') {
+                // Heartbeat hot path: write to Redis only. The cache's
+                // existence (set on lease, cleared on terminal/abort/delete)
+                // is the alive-gate — no DB query per heartbeat. The flusher
+                // drains dirty:transcode every 15 min into processing_queue.
                 const stageKey = (job.stage || '').toLowerCase();
                 const mapped = stageMap[stageKey] || stageMap.processing;
                 const progress = typeof job.progress === 'number' ? job.progress : null;
 
-                const r = await updateTaskStatus(jobId, mapped.queue, progress);
-                found = !!r.found;
+                found = await transcodeCache.recordHeartbeat(
+                    jobId, mapped.queue, mapped.video, progress, stageKey || 'processing'
+                );
 
-                if (found) {
-                    // Also push the mapped video status (updateTaskStatus maps
-                    // queue→video but not for worker_uploading). duration_seconds
-                    // is NOT written here — completeTask writes it once at the
-                    // end of the job, which keeps the status path to a single
-                    // write per tick.
+                // Cache miss path: Redis may have cold-restarted while a
+                // healthy worker was still running. Re-check the DB; if the
+                // job exists and isn't terminal, warm the cache and proceed.
+                if (!found) {
                     const task = await getTaskByJobId(jobId);
-                    if (task) {
-                        const pool = getPool();
-                        const setParts = ['status = ?'];
-                        const vals = [mapped.video];
-                        if (progress !== null) { setParts.push('processing_progress = ?'); vals.push(progress); }
-                        vals.push(task.video_id);
-                        await pool.execute(
-                            `UPDATE videos SET ${setParts.join(', ')} WHERE video_id = ?`,
-                            vals
+                    if (task && task.status !== 'completed' && task.status !== 'error') {
+                        await transcodeCache.initOnLease(jobId, task.video_id, mapped.queue, mapped.video);
+                        found = await transcodeCache.recordHeartbeat(
+                            jobId, mapped.queue, mapped.video, progress, stageKey || 'processing'
                         );
                     }
                 }
+
+                // Refresh the in-process stale timer so an abandoned worker
+                // is detected without waiting for the poll-based sweep.
+                if (found) startStaleTimer(jobId);
             } else if (status === 'failed') {
+                // Terminal: write DB immediately, drop the cache.
                 const r = await reportError(jobId, job.errorMessage || 'Unknown error');
                 found = !!r.found;
+                await transcodeCache.clearJob(jobId);
             } else if (status === 'aborted') {
                 found = await abortAndRequeue(jobId);
+                await transcodeCache.clearJob(jobId);
             } else {
                 // Unknown status value — treat as ack:false so worker drops it.
                 found = false;
@@ -686,41 +711,55 @@ async function retryFailedVideo(videoId) {
          WHERE video_id = ?`,
         [videoId]
     );
+    await videoCache.invalidate(videoId);
+    if (oldJobId) await transcodeCache.clearJob(oldJobId);
 
     return true;
 }
 
-// Reset stale tasks (no heartbeat for 2+ minutes) — poll-based fallback.
-// Handles R2 cleanup and full field reset. Per-task atomic to avoid races.
+// Reset stale tasks (no heartbeat for STALE_TIMEOUT_MS) — poll-based fallback.
+// Backstop for the in-process timer (which is lost on server restart). Reads
+// last_heartbeat from Redis (source of truth for live workers); the DB
+// last_heartbeat lags by one flush cycle and isn't reliable here.
 async function resetStaleTasks() {
     const pool = getPool();
     const { cleanR2Prefix } = require('./videoService');
 
-    // Find stale tasks (need details before we lose the job_id)
-    const [staleTasks] = await pool.execute(
+    // Pull every in-flight task from DB; we'll filter by Redis next.
+    const [inFlight] = await pool.execute(
         `SELECT pq.job_id, pq.video_id, v.hashed_video_id
          FROM processing_queue pq
          JOIN videos v ON pq.video_id = v.video_id
-         WHERE pq.status IN ('leased', 'processing')
-         AND pq.last_heartbeat < DATE_SUB(NOW(), INTERVAL 2 MINUTE)`
+         WHERE pq.status IN ('leased', 'processing') AND pq.job_id IS NOT NULL`
     );
+
+    if (inFlight.length === 0) return 0;
+
+    const now = Date.now();
+    const staleTasks = [];
+    for (const task of inFlight) {
+        const cached = await transcodeCache.getProgress(task.job_id);
+        // If cache is missing entirely (e.g. Redis restart), be conservative
+        // and skip — the worker's next heartbeat will repopulate via the
+        // recordHeartbeat fallback path.
+        if (!cached || !cached.last_heartbeat) continue;
+        if (now - cached.last_heartbeat > STALE_TIMEOUT_MS) staleTasks.push(task);
+    }
 
     if (staleTasks.length === 0) return 0;
 
     let resetCount = 0;
     for (const task of staleTasks) {
-        // Atomically reset this specific task (re-checks staleness to avoid race)
         const [result] = await pool.execute(
             `UPDATE processing_queue
              SET status = 'queued', job_id = NULL, worker_key_id = NULL,
                  leased_at = NULL, last_heartbeat = NULL, pending_until = NULL,
                  progress = 0, error_message = NULL, error_at = NULL
-             WHERE job_id = ? AND status IN ('leased', 'processing')
-             AND last_heartbeat < DATE_SUB(NOW(), INTERVAL 2 MINUTE)`,
+             WHERE job_id = ? AND status IN ('leased', 'processing')`,
             [task.job_id]
         );
 
-        if (result.affectedRows === 0) continue; // Heartbeat arrived — skip
+        if (result.affectedRows === 0) continue; // Job state changed concurrently.
 
         resetCount++;
         clearStaleTimer(task.job_id);
@@ -741,6 +780,8 @@ async function resetStaleTasks() {
              WHERE video_id = ? AND status IN ('worker_downloading', 'processing', 'worker_uploading')`,
             [task.video_id]
         );
+        await videoCache.invalidate(task.video_id);
+        await transcodeCache.clearJob(task.job_id);
     }
 
     return resetCount;
@@ -815,6 +856,8 @@ async function abortAndRequeue(jobId) {
          WHERE video_id = ?`,
         [video_id]
     );
+    await videoCache.invalidate(video_id);
+    await transcodeCache.clearJob(job_id);
 
     return true;
 }

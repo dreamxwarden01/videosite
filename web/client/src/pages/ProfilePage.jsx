@@ -521,7 +521,7 @@ export default function ProfilePage() {
               <tr>
                 <th>Device</th>
                 <th>IP Address</th>
-                <th>Last Activity</th>
+                <th>Last Seen</th>
                 <th>Signed In</th>
               </tr>
             </thead>
@@ -533,7 +533,7 @@ export default function ProfilePage() {
                     {s.isCurrent && <strong> (current)</strong>}
                   </td>
                   <td>{s.ip_address || 'Unknown'}</td>
-                  <td>{new Date(s.last_activity).toLocaleString()}</td>
+                  <td>{new Date(s.last_seen).toLocaleString()}</td>
                   <td>{new Date(s.last_sign_in).toLocaleString()}</td>
                 </tr>
               ))}

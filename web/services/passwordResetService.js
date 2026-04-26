@@ -15,15 +15,10 @@ function getBackoffSeconds(totalSent) {
 }
 
 // ---------------------------------------------------------------------------
-// Helper — read a site setting
+// Helper — read a site setting (delegates to the cached layer)
 // ---------------------------------------------------------------------------
 async function getSetting(key, defaultValue) {
-    const pool = getPool();
-    const [[row]] = await pool.execute(
-        'SELECT setting_value FROM site_settings WHERE setting_key = ?',
-        [key]
-    );
-    return (row && row.setting_value) || defaultValue;
+    return require('./cache/settingsCache').getSetting(key, defaultValue);
 }
 
 // ---------------------------------------------------------------------------

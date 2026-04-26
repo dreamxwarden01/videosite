@@ -1,6 +1,10 @@
 const crypto = require('crypto');
 const argon2 = require('argon2');
 const { getPool } = require('../config/database');
+const { getClient } = require('./redis');
+
+const WORKER_TTL_SECONDS = 60 * 60; // 1 hour inactivity (Redis TTL)
+const workerSessionKey = (token) => `session:worker:${token}`;
 
 async function generateWorkerKeyPair(label, createdBy) {
     const pool = getPool();
@@ -87,6 +91,15 @@ async function createWorkerSession(keyId, ipAddress) {
     const pool = getPool();
 
     // Revoke any existing sessions for this key (one active session per key).
+    // Look them up first so we can clear matching Redis entries.
+    const [oldSessions] = await pool.execute(
+        'SELECT bearer_token FROM worker_sessions WHERE worker_key_id = ?',
+        [keyId]
+    );
+    if (oldSessions.length > 0) {
+        const redis = getClient();
+        await redis.del(...oldSessions.map(s => workerSessionKey(s.bearer_token)));
+    }
     await pool.execute(
         'DELETE FROM worker_sessions WHERE worker_key_id = ?',
         [keyId]
@@ -100,6 +113,19 @@ async function createWorkerSession(keyId, ipAddress) {
          VALUES (?, ?, ?, ?)`,
         [sessionId, keyId, bearerToken, ipAddress || '']
     );
+
+    // Mirror to Redis for hot-path lookup. The plan's `dirty:session:worker`
+    // set will be wired in Phase 5 when the periodic flusher lands.
+    const redis = getClient();
+    await redis.multi()
+        .hset(workerSessionKey(bearerToken), {
+            session_id: sessionId,
+            worker_key_id: keyId,
+            ip_address: ipAddress || '',
+            last_seen: String(Date.now()),
+        })
+        .expire(workerSessionKey(bearerToken), WORKER_TTL_SECONDS)
+        .exec();
 
     await pool.execute(
         'UPDATE worker_access_keys SET last_used_at = NOW() WHERE key_id = ?',
@@ -127,5 +153,7 @@ module.exports = {
     listWorkerKeys,
     createWorkerSession,
     cleanupExpiredWorkerSessions,
-    SESSION_TTL_SECONDS
+    SESSION_TTL_SECONDS,
+    WORKER_TTL_SECONDS,
+    workerSessionKey,
 };

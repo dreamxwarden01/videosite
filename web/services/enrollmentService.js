@@ -1,5 +1,6 @@
 const { getPool } = require('../config/database');
 const { resolvePermissions } = require('./permissionService');
+const enrollmentCache = require('./cache/enrollmentCache');
 
 async function addEnrollment(userId, courseId) {
     const pool = getPool();
@@ -7,6 +8,7 @@ async function addEnrollment(userId, courseId) {
         `INSERT IGNORE INTO enrollments (user_id, course_id) VALUES (?, ?)`,
         [userId, courseId]
     );
+    await enrollmentCache.invalidateUser(userId);
 }
 
 async function removeEnrollment(userId, courseId) {
@@ -49,6 +51,8 @@ async function removeEnrollment(userId, courseId) {
     } finally {
         conn.release();
     }
+
+    await enrollmentCache.invalidateUser(userId);
 }
 
 async function isEnrolled(userId, courseId) {

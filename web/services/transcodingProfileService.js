@@ -108,6 +108,7 @@ async function saveAudioNormalizationSettings({ target, peak, maxGain }) {
     await pool.execute(`INSERT INTO site_settings (setting_key, setting_value) VALUES ('audio_normalization_target', ?) ON DUPLICATE KEY UPDATE setting_value = ?`, [target, target]);
     await pool.execute(`INSERT INTO site_settings (setting_key, setting_value) VALUES ('audio_normalization_peak', ?) ON DUPLICATE KEY UPDATE setting_value = ?`, [peak, peak]);
     await pool.execute(`INSERT INTO site_settings (setting_key, setting_value) VALUES ('audio_normalization_max_gain', ?) ON DUPLICATE KEY UPDATE setting_value = ?`, [maxGain, maxGain]);
+    await require('./cache/settingsCache').invalidate();
 }
 
 /**
@@ -134,6 +135,7 @@ async function saveAudioBitrateDefault(kbps) {
          ON DUPLICATE KEY UPDATE setting_value = ?`,
         [v, v]
     );
+    await require('./cache/settingsCache').invalidate();
 }
 
 /** Validate a site-wide audio bitrate. Returns array of errors (empty = ok). */

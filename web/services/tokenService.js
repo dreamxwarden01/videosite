@@ -33,13 +33,10 @@ const DEFAULT_TOKEN_VALIDITY_SECONDS = 600; // 10 minutes
 // Internal DB helpers
 // ---------------------------------------------------------------------------
 
+// Delegates to the cached layer — hot path: token generation runs on every
+// playback start and every refresh-token call.
 async function getSetting(key, defaultValue = null) {
-    const pool = getPool();
-    const [rows] = await pool.execute(
-        'SELECT setting_value FROM site_settings WHERE setting_key = ?',
-        [key]
-    );
-    return rows.length > 0 ? rows[0].setting_value : defaultValue;
+    return require('./cache/settingsCache').getSetting(key, defaultValue);
 }
 
 async function setSetting(key, value) {
@@ -48,6 +45,7 @@ async function setSetting(key, value) {
         'INSERT INTO site_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)',
         [key, value]
     );
+    await require('./cache/settingsCache').invalidate();
 }
 
 // ---------------------------------------------------------------------------

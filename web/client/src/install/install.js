@@ -51,6 +51,37 @@
             <div class="field-err" data-for="dbName" style="display: none; color: #dc3545; font-size: 13px; margin-top: 4px;"></div>
           </div>
 
+          <h2 style="margin: 24px 0 12px; font-size: 16px;">Redis Configuration</h2>
+          <p style="color: #9ca3af; font-size: 13px; margin-bottom: 12px;">Required — used for sessions, permission cache, progress coalescing, and rate limits.</p>
+          <div style="display: flex; gap: 8px;">
+            <div style="flex: 3;">
+              <label for="redisHost" style="display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500;">Host <span style="color: #9ca3af; font-weight: 400; font-size: 12px;">required</span></label>
+              <input type="text" id="redisHost" name="redisHost" value="localhost" required data-nospace
+                style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; box-sizing: border-box;">
+              <div class="field-err" data-for="redisHost" style="display: none; color: #dc3545; font-size: 13px; margin-top: 4px;"></div>
+            </div>
+            <div style="flex: 1;">
+              <label for="redisPort" style="display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500;">Port <span style="color: #9ca3af; font-weight: 400; font-size: 12px;">required</span></label>
+              <input type="text" id="redisPort" name="redisPort" value="6379" required data-nospace
+                style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; box-sizing: border-box;">
+              <div class="field-err" data-for="redisPort" style="display: none; color: #dc3545; font-size: 13px; margin-top: 4px;"></div>
+            </div>
+          </div>
+          <div style="display: flex; gap: 8px; margin-top: 12px;">
+            <div style="flex: 3;">
+              <label for="redisPassword" style="display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500;">Password <span style="color: #9ca3af; font-weight: 400; font-size: 12px;">optional</span></label>
+              <input type="password" id="redisPassword" name="redisPassword" data-nospace
+                style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; box-sizing: border-box;">
+              <div class="field-err" data-for="redisPassword" style="display: none; color: #dc3545; font-size: 13px; margin-top: 4px;"></div>
+            </div>
+            <div style="flex: 1;">
+              <label for="redisDb" style="display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500;">DB</label>
+              <input type="text" id="redisDb" name="redisDb" value="0" data-nospace
+                style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; box-sizing: border-box;">
+              <div class="field-err" data-for="redisDb" style="display: none; color: #dc3545; font-size: 13px; margin-top: 4px;"></div>
+            </div>
+          </div>
+
           <h2 style="margin: 24px 0 12px; font-size: 16px;">Cloudflare R2 Configuration</h2>
           <div style="margin-top: 12px;">
             <label for="r2Endpoint" style="display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500;">Endpoint URL <span style="color: #9ca3af; font-weight: 400; font-size: 12px;">required</span></label>

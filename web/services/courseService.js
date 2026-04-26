@@ -1,4 +1,6 @@
 const { getPool } = require('../config/database');
+const videoCache = require('./cache/videoCache');
+const courseCache = require('./cache/courseCache');
 
 async function createCourse(courseName, description, createdBy) {
     const pool = getPool();
@@ -36,6 +38,8 @@ async function updateCourse(courseId, updates) {
         `UPDATE courses SET ${fields.join(', ')} WHERE course_id = ?`,
         values
     );
+
+    await courseCache.invalidate(courseId);
 }
 
 /**
@@ -72,10 +76,20 @@ async function deleteCourse(courseId) {
     for (const job of activeJobs) {
         clearStaleTimer(job.job_id);
     }
+    // Drop heartbeat cache so workers' next status ping detects the abort.
+    await require('./cache/transcodeProgressCache').clearJobs(activeJobs.map(j => j.job_id));
 
     // 5. Delete course record — FK cascade deletes videos, processing_queue,
     //    watch_progress, enrollments → workers get 404
     await pool.execute('DELETE FROM courses WHERE course_id = ?', [courseId]);
+
+    // Invalidate cached video meta for every cascade-deleted video, plus the course itself.
+    const videoIds = videos.map(v => v.video_id);
+    await videoCache.invalidateMany(videoIds);
+    await courseCache.invalidate(courseId);
+    // Also drop watch-progress cache for the cascade-deleted videos so resume
+    // doesn't point to a vanished row.
+    await require('./cache/watchProgressCache').clearForVideos(videoIds);
 
     // 6. R2 cleanup for all video prefixes (fire-and-forget)
     const processingStatuses = ['worker_downloading', 'processing', 'worker_uploading'];

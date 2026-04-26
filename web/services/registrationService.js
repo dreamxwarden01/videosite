@@ -13,12 +13,7 @@ const TOKEN_REUSE_MINUTES = 5; // Resend same token within this window
 // ---------------------------------------------------------------------------
 
 async function getSetting(key, defaultValue) {
-    const pool = getPool();
-    const [[row]] = await pool.execute(
-        'SELECT setting_value FROM site_settings WHERE setting_key = ?',
-        [key]
-    );
-    return (row && row.setting_value) || defaultValue;
+    return require('./cache/settingsCache').getSetting(key, defaultValue);
 }
 
 async function checkRegistrationEnabled() {

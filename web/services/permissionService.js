@@ -1,121 +1,73 @@
 const { getPool } = require('../config/database');
+const { ALL_PERMISSIONS } = require('./permissionConstants');
+const cache = require('./cache/permissionCache');
 
-// All permission keys in the system
-const ALL_PERMISSIONS = [
-    'allowPlayback',
-    'changeOwnPassword',
-    'allCourseAccess',
-    'manageCourse',
-    'addCourse',
-    'changeCourse',
-    'deleteCourse',
-    'manageEnrolment',
-    'uploadVideo',
-    'changeVideo',
-    'deleteVideo',
-    'manageUser',
-    'addUser',
-    'changeUser',
-    'deleteUser',
-    'viewPlaybackStat',
-    'clearPlaybackStat',
-    'changeUserPermission',
-    'manageSite',
-    'manageRoles',
-    'inviteUser',
-    'requireMFA',
-    'manageSiteMFA',
-    'accessAttachments',
-    'uploadAttachments',
-    'deleteAttachments'
-];
+// Resolve effective permissions for a user.
+//   1. Read user's role_id + overrides (cached, 30min)
+//   2. Read role's permission map (cached, 24h)
+//   3. Merge: role baseline → overrides override
+//
+// roleId is accepted for backwards compatibility but ignored — the cached
+// user record is the source of truth post-invalidation.
+async function resolvePermissions(userId, _roleId) {
+    const bundle = await resolveAuthBundle(userId);
+    return bundle.permissions;
+}
 
-// Resolve effective permissions for a user
-// 1. Check user_permission_overrides (1=true, 2=false)
-// 2. Fall through to role_permissions
-// 3. Default to false
-async function resolvePermissions(userId, roleId) {
-    const pool = getPool();
-
-    const [rolePerms] = await pool.execute(
-        'SELECT permission_key, granted FROM role_permissions WHERE role_id = ?',
-        [roleId]
-    );
-
-    const [overrides] = await pool.execute(
-        'SELECT permission_key, override_value FROM user_permission_overrides WHERE user_id = ?',
-        [userId]
-    );
-
-    const effective = {};
-
-    // Start with all permissions as false
-    for (const key of ALL_PERMISSIONS) {
-        effective[key] = false;
+// Auth-middleware variant: returns permissions plus permission_level + role_id
+// in one shot, so the middleware avoids a third DB query for the level.
+async function resolveAuthBundle(userId) {
+    const userCache = await cache.getUserPerms(userId);
+    if (!userCache) {
+        // No such user — return zero permissions
+        const empty = {};
+        for (const key of ALL_PERMISSIONS) empty[key] = false;
+        return { permissions: empty, permission_level: 0, role_id: null };
     }
 
-    // Apply role permissions
-    for (const rp of rolePerms) {
-        effective[rp.permission_key] = rp.granted === 1;
-    }
+    const roleCache = await cache.getRolePerms(userCache.role_id);
 
-    // Apply user overrides (take precedence)
-    for (const ov of overrides) {
-        if (ov.override_value === 1) {
-            effective[ov.permission_key] = true;
-        } else if (ov.override_value === 2) {
-            effective[ov.permission_key] = false;
+    const effective = { ...roleCache.permissions };
+    if (userCache.hasOverrides && userCache.overrides) {
+        for (const [key, value] of Object.entries(userCache.overrides)) {
+            if (value === 1) effective[key] = true;
+            else if (value === 2) effective[key] = false;
         }
     }
 
-    return effective;
+    return {
+        permissions: effective,
+        permission_level: roleCache.permission_level,
+        role_id: userCache.role_id,
+    };
 }
 
-// Get role permissions only (for role management)
+// Get role permissions only (used by admin "view role" UI). Cache-backed.
 async function getRolePermissions(roleId) {
-    const pool = getPool();
-    const [rows] = await pool.execute(
-        'SELECT permission_key, granted FROM role_permissions WHERE role_id = ?',
-        [roleId]
-    );
-
-    const perms = {};
-    for (const key of ALL_PERMISSIONS) {
-        perms[key] = false;
-    }
-    for (const row of rows) {
-        perms[row.permission_key] = row.granted === 1;
-    }
-    return perms;
+    const roleCache = await cache.getRolePerms(roleId);
+    return roleCache.permissions;
 }
 
-// Get user overrides only (for user management)
+// Get user overrides only (used by admin "view user permissions" UI).
+// Returns a map of permission_key → override_value (1 or 2). No entries for
+// permissions the user inherits unchanged.
 async function getUserOverrides(userId) {
-    const pool = getPool();
-    const [rows] = await pool.execute(
-        'SELECT permission_key, override_value FROM user_permission_overrides WHERE user_id = ?',
-        [userId]
-    );
-
-    const overrides = {};
-    for (const row of rows) {
-        overrides[row.permission_key] = row.override_value;
-    }
-    return overrides;
+    const userCache = await cache.getUserPerms(userId);
+    if (!userCache || !userCache.hasOverrides) return {};
+    return userCache.overrides || {};
 }
 
-// Set a user permission override
+// Set a user permission override (admin action). Invalidates user cache only —
+// the role cache is unaffected.
 async function setUserOverride(userId, permissionKey, value) {
     const pool = getPool();
 
     if (value === 0) {
-        // Remove override (inherit from role)
         await pool.execute(
             'DELETE FROM user_permission_overrides WHERE user_id = ? AND permission_key = ?',
             [userId, permissionKey]
         );
     } else {
-        // Upsert override
         await pool.execute(
             `INSERT INTO user_permission_overrides (user_id, permission_key, override_value)
              VALUES (?, ?, ?)
@@ -123,9 +75,12 @@ async function setUserOverride(userId, permissionKey, value) {
             [userId, permissionKey, value]
         );
     }
+
+    await cache.invalidateUser(userId);
 }
 
-// Set role permissions (replace all)
+// Set role permissions (replace all). Invalidates only that role's cache;
+// users in the role pick up the new values on their next request.
 async function setRolePermissions(roleId, permissions) {
     const pool = getPool();
     const conn = await pool.getConnection();
@@ -147,13 +102,20 @@ async function setRolePermissions(roleId, permissions) {
     } finally {
         conn.release();
     }
+
+    await cache.invalidateRole(roleId);
 }
 
 module.exports = {
     ALL_PERMISSIONS,
     resolvePermissions,
+    resolveAuthBundle,
     getRolePermissions,
     getUserOverrides,
     setUserOverride,
-    setRolePermissions
+    setRolePermissions,
+    // Re-exported for callers that need to invalidate without a write
+    invalidateUserCache: cache.invalidateUser,
+    invalidateRoleCache: cache.invalidateRole,
+    invalidateUsersCache: cache.invalidateUsers,
 };

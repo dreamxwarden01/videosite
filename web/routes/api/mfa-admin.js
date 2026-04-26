@@ -27,6 +27,7 @@ async function upsertSetting(key, value) {
     'INSERT INTO site_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)',
     [key, String(value)]
   );
+  await require('../../services/cache/settingsCache').invalidate();
 }
 
 // ---------------------------------------------------------------------------

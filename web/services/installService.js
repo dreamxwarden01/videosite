@@ -47,6 +47,13 @@ DB_USER=${config.dbUser}
 DB_PASSWORD=${config.dbPassword}
 DB_NAME=${config.dbName}
 
+# Redis (required — sessions, permission cache, progress coalescing, rate limits).
+# Configure server with maxmemory-policy volatile-lru and appendonly yes.
+REDIS_HOST=${config.redisHost}
+REDIS_PORT=${config.redisPort}
+REDIS_PASSWORD=${config.redisPassword || ''}
+REDIS_DB=${config.redisDb || '0'}
+
 # R2
 R2_ENDPOINT=${config.r2Endpoint}
 R2_BUCKET_NAME=${config.r2BucketName}

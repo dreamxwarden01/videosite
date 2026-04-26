@@ -442,6 +442,7 @@ router.post('/api/auth/mfa/enrollment/email/confirm', async (req, res) => {
 
         // Set email on user
         await pool.execute('UPDATE users SET email = ? WHERE user_id = ?', [newEmail, userId]);
+        await require('../services/cache/userCache').invalidate(userId);
 
         // Consume challenge and enable MFA
         await mfaService.consumeChallenge(challengeId);

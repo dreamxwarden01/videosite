@@ -1,5 +1,7 @@
 const argon2 = require('argon2');
 const { getPool } = require('../config/database');
+const permCache = require('./cache/permissionCache');
+const userCache = require('./cache/userCache');
 
 async function hashPassword(password) {
     return argon2.hash(password, { type: argon2.argon2id });
@@ -72,11 +74,21 @@ async function updateUser(userId, updates) {
         `UPDATE users SET ${fields.join(', ')} WHERE user_id = ?`,
         values
     );
+
+    // Invalidate cached permissions when role_id changes; invalidate user_meta
+    // for any field change (callers always read meta on auth, so it must reflect
+    // the latest display_name / email / is_active / role_id).
+    if (updates.role_id !== undefined) {
+        await permCache.invalidateUser(userId);
+    }
+    await userCache.invalidate(userId);
 }
 
 async function deleteUser(userId) {
     const pool = getPool();
     await pool.execute('DELETE FROM users WHERE user_id = ?', [userId]);
+    await permCache.invalidateUser(userId);
+    await userCache.invalidate(userId);
 }
 
 async function listUsers(actingUserLevel, page = 1, limit = 10) {

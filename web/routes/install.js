@@ -12,6 +12,7 @@ const {
 const { createUser } = require('../services/userService');
 const { markInstalled: markInstalledCache } = require('../middleware/installer');
 const { resetPool } = require('../config/database');
+const redisService = require('../services/redis');
 
 // GET /install — serve standalone install page
 router.get('/install', (req, res) => {
@@ -24,6 +25,7 @@ router.post('/api/install', async (req, res) => {
     try {
         const {
             dbHost, dbPort, dbUser, dbPassword, dbName,
+            redisHost, redisPort, redisPassword, redisDb,
             r2Endpoint, r2BucketName, r2AccessKeyId, r2SecretAccessKey, r2PublicDomain,
             siteName, siteHostname, siteProtocol,
             adminUsername, adminDisplayName, adminPassword, adminPasswordConfirm,
@@ -34,6 +36,7 @@ router.post('/api/install', async (req, res) => {
         // Validation
         const errors = [];
         if (!dbHost || !dbPort || !dbUser || !dbPassword || !dbName) errors.push('All database fields are required');
+        if (!redisHost || !redisPort) errors.push('Redis host and port are required');
         if (!r2Endpoint || !r2BucketName || !r2AccessKeyId || !r2SecretAccessKey || !r2PublicDomain) errors.push('All R2 fields are required');
         if (!siteName || !siteHostname) errors.push('Site name and hostname are required');
         // Admin username validation
@@ -81,6 +84,18 @@ router.post('/api/install', async (req, res) => {
             return res.status(422).json({ success: false, error: 'Database connection failed: ' + err.message });
         }
 
+        // Test Redis connection
+        try {
+            await redisService.testConnection({
+                host: redisHost,
+                port: redisPort || '6379',
+                password: redisPassword,
+                db: redisDb || '0',
+            });
+        } catch (err) {
+            return res.status(422).json({ success: false, error: 'Redis connection failed: ' + err.message });
+        }
+
         // Test R2 connection
         try {
             const testClient = new S3Client({
@@ -101,6 +116,7 @@ router.post('/api/install', async (req, res) => {
         const mfaEncryptionKey = generateMfaEncryptionKey();
         writeEnvFile({
             dbHost, dbPort: dbPort || '3306', dbUser, dbPassword, dbName,
+            redisHost, redisPort: redisPort || '6379', redisPassword: redisPassword || '', redisDb: redisDb || '0',
             r2Endpoint, r2BucketName, r2AccessKeyId, r2SecretAccessKey,
             r2PublicDomain: (r2PublicDomain || '').trim().replace(/^https?:\/\//, '').split('/')[0],
             sessionSecret,
@@ -113,6 +129,14 @@ router.post('/api/install', async (req, res) => {
         // Reload env vars
         require('dotenv').config({ override: true });
         resetPool();
+
+        // Connect Redis on the running process so endpoints work without restart
+        try {
+            await redisService.connect();
+        } catch (err) {
+            console.error('Post-install Redis connect failed:', err.message);
+            return res.status(500).json({ success: false, error: 'Installation completed but Redis connection failed. Restart the server and check REDIS_* env vars.' });
+        }
 
         // Create superadmin user
         const mysql = require('mysql2/promise');

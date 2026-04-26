@@ -6,6 +6,9 @@ const { getVideoById, updateVideo, deleteVideo, cleanR2Prefix } = require('../..
 const { generateToken, getTokenValiditySeconds } = require('../../services/tokenService');
 const { retryFailedVideo } = require('../../services/processingService');
 const { checkPermission } = require('../../middleware/permissions');
+const videoCache = require('../../services/cache/videoCache');
+const enrollmentCache = require('../../services/cache/enrollmentCache');
+const watchProgressCache = require('../../services/cache/watchProgressCache');
 
 // GET /api/videos/:id/playback
 router.get('/videos/:id/playback', requireAuth, async (req, res) => {
@@ -17,19 +20,15 @@ router.get('/videos/:id/playback', requireAuth, async (req, res) => {
             return res.json({ hlsUrl: null, isPlaybackAllowed: false, resumePosition: null });
         }
 
-        const video = await getVideoById(videoId);
+        const video = await videoCache.getVideoMeta(videoId);
         if (!video || video.status !== 'finished') {
             return res.status(404).json({ error: 'Video not found or not ready' });
         }
 
         // Check course access
         if (!user.permissions.allCourseAccess) {
-            const pool = getPool();
-            const [enrollment] = await pool.execute(
-                'SELECT 1 FROM enrollments WHERE user_id = ? AND course_id = ?',
-                [user.user_id, video.course_id]
-            );
-            if (enrollment.length === 0) {
+            const enrolled = await enrollmentCache.isEnrolledInCourse(user.user_id, video.course_id);
+            if (!enrolled) {
                 return res.status(403).json({ error: 'Not enrolled in this course' });
             }
         }
@@ -54,15 +53,18 @@ router.get('/videos/:id/playback', requireAuth, async (req, res) => {
             }
         }
 
-        // Get resume position
+        // Get resume position — Redis first (freshest), DB fallback.
         let resumePosition = null;
-        const pool = getPool();
-        const [watchRows] = await pool.execute(
-            'SELECT last_position FROM watch_progress WHERE user_id = ? AND video_id = ?',
-            [user.user_id, videoId]
-        );
-        if (watchRows.length > 0 && video.duration_seconds) {
-            const pos = watchRows[0].last_position;
+        let pos = await watchProgressCache.getLastPosition(user.user_id, videoId);
+        if (pos === null) {
+            const pool = getPool();
+            const [watchRows] = await pool.execute(
+                'SELECT last_position FROM watch_progress WHERE user_id = ? AND video_id = ?',
+                [user.user_id, videoId]
+            );
+            if (watchRows.length > 0) pos = watchRows[0].last_position;
+        }
+        if (pos !== null && video.duration_seconds) {
             const duration = video.duration_seconds;
             if (pos > duration * 0.05 && pos < duration * 0.90) {
                 resumePosition = pos;
@@ -119,7 +121,7 @@ router.post('/updatewatch', requireAuth, async (req, res) => {
         }
 
         // position: finite, non-negative. Upper bound against duration is
-        // checked after the DB lookup.
+        // checked after the lookup.
         const positionNum = Number(position);
         if (!Number.isFinite(positionNum) || positionNum < 0) {
             return res.status(422).json({ error: 'invalid position' });
@@ -136,15 +138,8 @@ router.post('/updatewatch', requireAuth, async (req, res) => {
         }
         const credit = deltaNum > 60 ? 0 : deltaNum;
 
-        const pool = getPool();
-
-        // Fetch course_id and duration_seconds in one trip — duration gates
-        // the position range check below.
-        const [videoRows] = await pool.execute(
-            'SELECT course_id, duration_seconds FROM videos WHERE video_id = ?',
-            [videoIdNum]
-        );
-        if (videoRows.length === 0) {
+        const video = await videoCache.getVideoMeta(videoIdNum);
+        if (!video) {
             return res.status(404).json({ error: 'Video not found' });
         }
 
@@ -155,36 +150,30 @@ router.post('/updatewatch', requireAuth, async (req, res) => {
         // skips the upper-bound check; no legitimate playback flow reaches
         // here with duration still unset, but there's no reason to
         // hard-fail if we ever do.
-        const duration = videoRows[0].duration_seconds;
+        const duration = video.duration_seconds;
         if (duration !== null && positionNum > duration + 1) {
             return res.status(422).json({ error: 'position exceeds video duration' });
         }
 
-        // Check course access
+        // Check course access (cache-backed)
         if (!user.permissions.allCourseAccess) {
-            const [enrollment] = await pool.execute(
-                'SELECT 1 FROM enrollments WHERE user_id = ? AND course_id = ?',
-                [user.user_id, videoRows[0].course_id]
-            );
-            if (enrollment.length === 0) {
+            const enrolled = await enrollmentCache.isEnrolledInCourse(user.user_id, video.course_id);
+            if (!enrolled) {
                 return res.status(403).json({ error: 'No access to this course' });
             }
         }
 
-        // Always upsert — credit may be 0, in which case watch_seconds is
-        // unchanged (watch_seconds + 0) but last_position still refreshes. That
-        // handles pause-with-no-new-playback (user scrubbed while paused) and
-        // silently-dropped delta>60 reports (position is still trusted — it's
-        // a harmless number, unlike the watch-time claim which we capped).
-        await pool.execute(
-            `INSERT INTO watch_progress (user_id, video_id, watch_seconds, last_position, last_watch_at)
-             VALUES (?, ?, ?, ?, NOW())
-             ON DUPLICATE KEY UPDATE
-                watch_seconds = watch_seconds + ?,
-                last_position = VALUES(last_position),
-                last_watch_at = NOW()`,
-            [user.user_id, videoIdNum, credit, positionNum, credit]
-        );
+        // Anti-cheat rate limit: if claimed delta exceeds wall-clock elapsed
+        // since the last report (with 1s tolerance), drop credit to 0. Always
+        // refreshes the 120s window — a paused viewer who resumes after 2+
+        // min starts fresh.
+        const finalCredit = await watchProgressCache.applyRateLimit(user.user_id, videoIdNum, credit);
+
+        // Write to Redis, not DB. The flusher drains dirty:watch every 15 min
+        // and applies the accumulated `delta` against watch_progress.watch_seconds
+        // in a single UPSERT per (user, video). Credit may be 0 (position-only
+        // flush) — last_position still updates so resume keeps tracking the user.
+        await watchProgressCache.recordProgress(user.user_id, videoIdNum, positionNum, finalCredit);
 
         res.status(204).end();
     } catch (err) {
@@ -377,10 +366,11 @@ router.get('/keys/:videoId', requireAuth, async (req, res) => {
     }
 });
 
-// POST /api/videos/:id/refresh-token — refresh HMAC playback token
+// POST /api/videos/:id/refresh-token — refresh HMAC playback token.
+// Hot path during playback (called every few minutes per active viewer), so
+// both the video lookup and the enrollment check go through the cache.
 router.post('/videos/:id/refresh-token', requireAuth, async (req, res) => {
     try {
-        const pool = getPool();
         const videoId = parseInt(req.params.id);
         const user = res.locals.user;
 
@@ -389,24 +379,15 @@ router.post('/videos/:id/refresh-token', requireAuth, async (req, res) => {
             return res.status(403).json({ error: 'Playback not allowed' });
         }
 
-        // Get video path components
-        const [videoRows] = await pool.execute(
-            `SELECT hashed_video_id, processing_job_id, course_id FROM videos WHERE video_id = ?`,
-            [videoId]
-        );
-        if (videoRows.length === 0) {
+        const video = await videoCache.getVideoMeta(videoId);
+        if (!video) {
             return res.status(404).json({ error: 'Video not found' });
         }
 
-        const video = videoRows[0];
-
         // Check course access
         if (!user.permissions.allCourseAccess) {
-            const [enrollment] = await pool.execute(
-                'SELECT 1 FROM enrollments WHERE user_id = ? AND course_id = ?',
-                [user.user_id, video.course_id]
-            );
-            if (enrollment.length === 0) {
+            const enrolled = await enrollmentCache.isEnrolledInCourse(user.user_id, video.course_id);
+            if (!enrolled) {
                 return res.status(403).json({ error: 'Not enrolled' });
             }
         }

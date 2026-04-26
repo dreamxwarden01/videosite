@@ -654,6 +654,17 @@ async function runMigrations() {
                         ADD COLUMN otp_generated_at DATETIME DEFAULT NULL AFTER otp_value
                     `);
                 }
+            },
+            {
+                id: '029_rename_session_last_activity_to_last_seen',
+                up: async () => {
+                    // Match the worker_sessions naming. Backend / frontend /
+                    // API responses all switch to last_seen in lockstep.
+                    await pool.execute(`
+                        ALTER TABLE sessions
+                        CHANGE COLUMN last_activity last_seen DATETIME NOT NULL
+                    `);
+                }
             }
         ];
 
