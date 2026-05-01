@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { apiGet, apiPost, setAuthFailureHandler } from '../api';
+import { apiGet, apiPost, setAuthFailureHandler, markSigningOut } from '../api';
 
 const AuthContext = createContext(null);
 
@@ -37,6 +37,11 @@ export function AuthProvider({ children }) {
     } catch {
       // ignore
     }
+    // Mark first so WatchPage's pagehide handler skips its sendBeacon — the
+    // session is dead, the server would 401 the report anyway. Set AFTER the
+    // logout call so a network failure on logout (cookie still alive) doesn't
+    // permanently latch the flag and silence future watch reports on retry.
+    markSigningOut();
     // Full reload to /login — don't setUser(null) first, that would trigger
     // ProtectedRoute's redirect with returnTo before the reload completes (flash)
     window.location.href = '/login';

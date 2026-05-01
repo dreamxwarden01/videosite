@@ -173,38 +173,37 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
         const publicDomain = process.env.R2_PUBLIC_DOMAIN;
         const basePath = `/${video.hashed_video_id}/${video.processing_job_id}/`;
         const videoType = video.video_type || 'ts';
-        let hlsUrl = `https://${publicDomain}${basePath}master.m3u8`;
-        let dashUrl = null;
 
         const hmacToken = await generateToken(basePath);
         const tokenValiditySeconds = await getTokenValiditySeconds();
-        if (hmacToken) {
-            hlsUrl += `?verify=${encodeURIComponent(hmacToken)}`;
-        }
 
-        // CMAF videos also expose a DASH manifest for Shaka on non-Apple clients.
-        // WatchPage picks between hlsUrl and dashUrl based on UA.
-        if (videoType === 'cmaf') {
-            dashUrl = `https://${publicDomain}${basePath}manifest.mpd`;
-            if (hmacToken) {
-                dashUrl += `?verify=${encodeURIComponent(hmacToken)}`;
-            }
-        }
-
+        // Resume position rules:
+        //   1. Videos shorter than 120s always restart from the beginning —
+        //      a "resume" 5–10s into a 60s video is more annoying than useful.
+        //   2. The existing 5% / 90% guard rails still apply: positions in
+        //      the opening intro (< 5%) or the outro (> 90%) round to "play
+        //      from the start" / "let it auto-advance," respectively.
+        //   3. Within the qualifying band we resume 3s before the last
+        //      reported position. The position we record on pause and on
+        //      page-hide is the exact frame the user quit at, so resuming
+        //      there feels jarring — replaying the last 3s gives them a
+        //      bit of context to catch up without manually rewinding.
         let resumePosition = 0;
-        const watchProgressCache = require('../../services/cache/watchProgressCache');
-        let pos = await watchProgressCache.getLastPosition(user.user_id, videoId);
-        if (pos === null) {
-            const [watchRows] = await pool.execute(
-                'SELECT last_position FROM watch_progress WHERE user_id = ? AND video_id = ?',
-                [user.user_id, videoId]
-            );
-            if (watchRows.length > 0) pos = watchRows[0].last_position;
-        }
-        if (pos !== null && video.duration_seconds) {
-            const duration = video.duration_seconds;
-            if (pos > duration * 0.05 && pos < duration * 0.90) {
-                resumePosition = pos;
+        if (video.duration_seconds && video.duration_seconds >= 120) {
+            const watchProgressCache = require('../../services/cache/watchProgressCache');
+            let pos = await watchProgressCache.getLastPosition(user.user_id, videoId);
+            if (pos === null) {
+                const [watchRows] = await pool.execute(
+                    'SELECT last_position FROM watch_progress WHERE user_id = ? AND video_id = ?',
+                    [user.user_id, videoId]
+                );
+                if (watchRows.length > 0) pos = watchRows[0].last_position;
+            }
+            if (pos !== null) {
+                const duration = video.duration_seconds;
+                if (pos > duration * 0.05 && pos < duration * 0.90) {
+                    resumePosition = Math.max(0, pos - 3);
+                }
             }
         }
 
@@ -219,8 +218,13 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
                 course_id: video.course_id,
                 course_name: course ? course.course_name : null,
             },
-            hlsUrl,
-            dashUrl,
+            // Client constructs the manifest URL itself: pick master.m3u8 or
+            // manifest.mpd based on videoType + UA, then prepend
+            // `https://${r2PublicDomain}` and append `?verify=${hmacToken}`.
+            // Server returns the building blocks rather than two pre-built
+            // URLs so the bundle decides HLS vs DASH locally — no UA sniffing
+            // needed on the server.
+            videoPath: basePath,
             videoType,
             resumePosition,
             hmacToken: hmacToken || '',

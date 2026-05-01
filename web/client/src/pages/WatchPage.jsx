@@ -3,7 +3,7 @@ import { useParams, Link } from 'react-router-dom';
 import { useSite } from '../context/SiteContext';
 import { useAuth } from '../context/AuthContext';
 import { useToast } from '../context/ToastContext';
-import { apiGet, apiPost, triggerAuthFailure } from '../api';
+import { apiGet, apiPost, triggerAuthFailure, isSigningOut } from '../api';
 import LoadingSpinner from '../components/LoadingSpinner';
 
 // isAppleDevice returns true for clients whose video stack prefers HLS over
@@ -27,18 +27,25 @@ function isAppleDevice() {
   return false;
 }
 
-// pickManifestUrl chooses HLS or DASH based on videoType + UA.
-//   - legacy TS: always the HLS master URL (hlsUrl). No DASH for TS.
-//   - CMAF + Apple: HLS master URL; Safari delegates to <video> native HLS.
-//   - CMAF + non-Apple: DASH MPD URL; Shaka handles the segments directly.
+// pickManifestUrl assembles the manifest URL from the building blocks the
+// server returns — videoPath, videoType, r2PublicDomain, hmacToken — instead
+// of consuming a pre-built hlsUrl/dashUrl pair. Lets the bundle pick HLS vs
+// DASH locally so the server doesn't need to UA-sniff.
 //
-// Falls back to hlsUrl if dashUrl is missing — protects the page in the
-// transitional window where a server response may not yet include the field.
+//   - legacy TS: always master.m3u8. No DASH manifest exists for TS.
+//   - CMAF + Apple: master.m3u8; Safari delegates to <video> native HLS.
+//   - CMAF + non-Apple: manifest.mpd; Shaka handles the DASH segments.
+//
+// The networking-engine request filter (registered later) overwrites
+// `?verify=` with the freshest token on every request, so the value baked
+// into the initial URL is fine to be the first-load token — refresh handles
+// long-running playback.
 function pickManifestUrl(data) {
-  if (data.videoType === 'cmaf' && !isAppleDevice() && data.dashUrl) {
-    return data.dashUrl;
-  }
-  return data.hlsUrl;
+  const useDash = data.videoType === 'cmaf' && !isAppleDevice();
+  const file = useDash ? 'manifest.mpd' : 'master.m3u8';
+  const base = `https://${data.r2PublicDomain}${data.videoPath}${file}`;
+  if (!data.hmacToken) return base;
+  return `${base}?verify=${encodeURIComponent(data.hmacToken)}`;
 }
 
 export default function WatchPage() {
@@ -146,6 +153,14 @@ export default function WatchPage() {
     let refreshVisHandler = null;
     let tickVisHandler = null;
     let pauseHandler = null;
+    let pagehideHandler = null;
+    // Beacon flush — populated inside player.load().then once tracking state
+    // is initialized. Used by both the pagehide handler (tab close, full
+    // reload) and this effect's cleanup (client-side route nav, e.g. clicking
+    // the site title or username). Beacon is fire-and-forget so it survives
+    // unmount and unload alike; regular flushNow is reserved for tick/pause
+    // where we still care about the response status.
+    let flushBeacon = null;
 
     const videoEl = videoRef.current;
     const player = new shaka.Player();
@@ -331,6 +346,58 @@ export default function WatchPage() {
 
           flushWatchRef.current = flushNow;
 
+          // Beacon-based flush for page-going-away cases (tab close, full
+          // reload, client-side route nav). Uses sendBeacon so the request
+          // survives even after the JS context is torn down — a regular
+          // fetch would be cancelled when the page unloads.
+          //
+          // Suppressed when:
+          //   - tracking is stopped (401/403/429 already terminated us), or
+          //   - the user just clicked Sign Out (cookie's about to die — the
+          //     server would 401 the report anyway), or
+          //   - there's no accumulated time to credit (sendBeacon costs the
+          //     server a parsed request — skip the no-op).
+          //
+          // Zeroes accumulated up-front like flushNow does. No rollback path:
+          // sendBeacon delivery is best-effort and we don't get a response
+          // status, so any failure is silently lost (acceptable — this only
+          // fires on terminal navigation, no future flush would retry anyway).
+          flushBeacon = function () {
+            if (t.stopped || destroyedRef.current || isSigningOut()) return;
+            const delta = Math.max(0, t.accumulated);
+            if (delta <= 0) return;
+            t.accumulated = 0;
+            const pos = videoEl.currentTime;
+            const body = JSON.stringify({
+              video_id: parseInt(videoId),
+              position: pos,
+              delta,
+            });
+            try {
+              const blob = new Blob([body], { type: 'application/json' });
+              if (navigator.sendBeacon && navigator.sendBeacon('/api/updatewatch', blob)) {
+                return;
+              }
+            } catch {}
+            // sendBeacon unavailable, threw, or refused (queue full / payload
+            // too large) — fall back to keepalive fetch so the request still
+            // outlives the page. Errors swallowed: nothing useful to do here.
+            try {
+              fetch('/api/updatewatch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body,
+                keepalive: true,
+              }).catch(() => {});
+            } catch {}
+          };
+
+          // pagehide fires for tab close, window close, full-page nav
+          // (window.location.href), and bfcache transitions. More reliable
+          // than beforeunload across browsers, especially on mobile Safari.
+          pagehideHandler = flushBeacon;
+          window.addEventListener('pagehide', pagehideHandler);
+
           function tick() {
             if (t.stopped || destroyedRef.current) return;
             const now = Date.now();
@@ -360,6 +427,15 @@ export default function WatchPage() {
 
     return () => {
       cancelled = true;
+      // Last-chance flush for client-side route nav (header site title,
+      // username link, sidebar links, programmatic Navigate). Page stays
+      // alive after unmount, but we still use the beacon path because the
+      // tracking state is captured in this effect's closure — once cleanup
+      // returns it's gone, and the response status wouldn't be actionable
+      // (we're navigating away). Must run BEFORE destroyedRef is flipped
+      // since flushBeacon short-circuits on it. No-op if Sign Out fired
+      // (isSigningOut latched) or tracking already terminated (t.stopped).
+      try { flushBeacon?.(); } catch {}
       destroyedRef.current = true;
       if (refreshIntervalId) clearInterval(refreshIntervalId);
       if (tickIntervalId) clearInterval(tickIntervalId);
@@ -367,6 +443,7 @@ export default function WatchPage() {
       if (refreshVisHandler) document.removeEventListener('visibilitychange', refreshVisHandler);
       if (tickVisHandler) document.removeEventListener('visibilitychange', tickVisHandler);
       if (pauseHandler) videoEl.removeEventListener('pause', pauseHandler);
+      if (pagehideHandler) window.removeEventListener('pagehide', pagehideHandler);
       try { ui?.destroy(); } catch {}
       try { player.destroy(); } catch {}
     };

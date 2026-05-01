@@ -11,6 +11,13 @@ let onAuthFailure = null;
 export function setAuthFailureHandler(fn) { onAuthFailure = fn; }
 export function triggerAuthFailure() { if (onAuthFailure) onAuthFailure(); }
 
+// Module-level sign-out latch. Set right before AuthContext.logout flips
+// window.location, read by WatchPage's pagehide flush so a logged-out user's
+// final beacon doesn't fire (cookie's already gone, server would 401 anyway).
+let signingOut = false;
+export function markSigningOut() { signingOut = true; }
+export function isSigningOut() { return signingOut; }
+
 export async function apiFetch(url, options = {}) {
   const { body, headers: extraHeaders, ...rest } = options;
 
