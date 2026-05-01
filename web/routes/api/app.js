@@ -4,11 +4,23 @@ const { getPool } = require('../../config/database');
 const { resolvePermissions } = require('../../services/permissionService');
 
 // GET /api/me — current session user + permissions
+//
+// Permissions are sent as an array of granted keys, not the 27-key boolean
+// map the server uses internally — typical user has 3-5 grants, so the array
+// drops ~90% of the payload (~600 → ~50 bytes). Client (AuthContext.refresh)
+// rehydrates back to `{ key: true, ... }` so the existing
+// `user.permissions.X` truthy checks at all call sites work unchanged.
+//
+// Server-internal `res.locals.user.permissions` keeps the full keyed shape —
+// only the wire format changes here. Admin role/user permission-edit
+// endpoints still send the full map (they need explicit-false vs inherit).
 router.get('/me', async (req, res) => {
     const user = res.locals.user;
     if (!user) {
         return res.json({ user: null });
     }
+
+    const granted = Object.keys(user.permissions).filter(k => user.permissions[k]);
 
     res.json({
         user: {
@@ -16,7 +28,7 @@ router.get('/me', async (req, res) => {
             username: user.username,
             display_name: user.display_name,
             role_id: user.role_id,
-            permissions: user.permissions,
+            permissions: granted,
             permission_level: user.permission_level,
         }
     });

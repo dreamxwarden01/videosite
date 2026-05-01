@@ -13,6 +13,16 @@ export function AuthProvider({ children }) {
     try {
       const { data, ok } = await apiGet('/api/me');
       if (ok && data && data.user) {
+        // Server sends `permissions` as a list of granted keys (compact wire
+        // format). Rehydrate to `{ key: true, ... }` here so the rest of the
+        // app keeps using `user.permissions.X` truthy checks unchanged. Object
+        // shape is also accepted as a fallback in case a stale server still
+        // sends the full map — covers rolling-deploy windows.
+        if (Array.isArray(data.user.permissions)) {
+          data.user.permissions = Object.fromEntries(
+            data.user.permissions.map(k => [k, true])
+          );
+        }
         setUser(data.user);
       } else {
         setUser(null);
