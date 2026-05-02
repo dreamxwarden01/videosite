@@ -1,11 +1,35 @@
 import { useState, useEffect, useRef } from 'react';
 import { Link, useSearchParams, useNavigate } from 'react-router-dom';
+import { startAuthentication } from '@simplewebauthn/browser';
 import { useAuth } from '../context/AuthContext';
 import { useSite } from '../context/SiteContext';
 import { useToast } from '../context/ToastContext';
 import { apiPost } from '../api';
 import Header from '../components/Header';
 import MfaChallengeUI from '../components/MfaChallengeUI';
+
+// Best-effort cleanup hint to the user's credential manager that a
+// credential ID we just received isn't recognized server-side. Chrome /
+// Edge / Google Password Manager / 1Password / Bitwarden act on this;
+// Apple Keychain partially; Firefox + hardware keys ignore. Always wrap
+// in feature detection — this method is WebAuthn L3 (2024+).
+function signalUnknownCredential(credentialId) {
+  if (!credentialId) return;
+  if (typeof PublicKeyCredential === 'undefined') return;
+  if (typeof PublicKeyCredential.signalUnknownCredential !== 'function') return;
+  PublicKeyCredential.signalUnknownCredential({
+    rpId: window.location.hostname,
+    credentialId
+  }).catch(() => { /* best-effort, never block login UX */ });
+}
+
+// WebAuthn supported at all? Used to hide the "Sign in with passkey"
+// button on browsers that wouldn't be able to honor it (very rare in 2026
+// but a clean degradation).
+function isWebAuthnSupported() {
+  return typeof window !== 'undefined'
+    && typeof window.PublicKeyCredential !== 'undefined';
+}
 
 export default function LoginPage() {
   const { user, refresh } = useAuth();
@@ -21,11 +45,17 @@ export default function LoginPage() {
   // Tracks whether login was completed on this page (prevents useEffect redirect race)
   const loginCompleted = useRef(false);
 
-  // Phase: 'credentials' | 'mfa-verify' | 'enrollment-loading' | 'enrollment-email' | 'enrollment-email-verify' | 'enrollment-verify'
+  // Phase: 'credentials' | 'mfa-verify' | 'enrollment-loading' | 'enrollment-email' | 'enrollment-email-verify' | 'enrollment-verify' | 'passkey' | 'passkey-error'
   const [phase, setPhase] = useState('credentials');
   const [mfaData, setMfaData] = useState(null); // { challengeId, allowedMethods, maskedEmail, returnTo }
   const [returnTo, setReturnTo] = useState('/');
   const [loginChallengeId, setLoginChallengeId] = useState(null); // bmfa challenge from login for enrollment
+
+  // Passkey error message shown on the 'passkey-error' phase. Set by
+  // attemptPasskeyLogin before transitioning. Plain string for now; we
+  // could add a richer shape later (e.g. with a "remove passkey from
+  // device" link) but the message itself already explains the next step.
+  const [passkeyError, setPasskeyError] = useState('');
 
   // Enrollment email setup state
   const [enrollEmail, setEnrollEmail] = useState('');
@@ -114,6 +144,83 @@ export default function LoginPage() {
   const handleMfaCancel = () => {
     setPhase('credentials');
     setMfaData(null);
+  };
+
+  // ---- Passkey "quick sign in" (username-less, single round trip) ----
+  //
+  // 1. POST /api/auth/passkey/options → { challengeHandle, options }
+  // 2. startAuthentication shows the OS picker; user selects + verifies
+  // 3. POST /api/auth/passkey/verify with { challengeHandle, credential }
+  // 4. On 200: session cookie is set server-side, refresh user, navigate
+  //
+  // Errors map to the 'passkey-error' phase with a tailored message.
+  // User cancellation (NotAllowedError / AbortError) is silent — back to
+  // the credentials view, no toast, no error.
+  const attemptPasskeyLogin = async () => {
+    setPasskeyError('');
+    setPhase('passkey');
+    const rt = searchParams.get('returnTo') || '/';
+
+    let assertion;
+    try {
+      const { data: optsData, ok: optsOk } = await apiPost('/api/auth/passkey/options', {});
+      if (!optsOk || !optsData || !optsData.options) {
+        setPasskeyError('Couldn’t start passkey sign-in. Please try again.');
+        setPhase('passkey-error');
+        return;
+      }
+      assertion = await startAuthentication({ optionsJSON: optsData.options });
+
+      const { data, status, ok } = await apiPost('/api/auth/passkey/verify', {
+        challengeHandle: optsData.challengeHandle,
+        credential: assertion,
+        returnTo: rt
+      });
+
+      if (ok) {
+        loginCompleted.current = true;
+        await refresh();
+        navigate(data?.returnTo || '/', { replace: true });
+        return;
+      }
+
+      // Translate server error codes into user-facing messages + cleanup
+      // hints. The credentialId is echoed back on 404 so we can fire
+      // signalUnknownCredential without holding a reference across the
+      // round trip ourselves.
+      const code = data?.error;
+      if (status === 404 && code === 'unknown_credential') {
+        signalUnknownCredential(data?.credentialId || assertion?.id);
+        setPasskeyError(
+          'This passkey isn’t recognized for any account here. ' +
+          'You can sign in with your password instead, or remove this ' +
+          'passkey from your device’s password manager.'
+        );
+      } else if (status === 410 && code === 'revoked') {
+        // No cleanup signal — admin may unrevoke.
+        setPasskeyError('This passkey has been revoked. Please sign in with your password.');
+      } else if (status === 401 && code === 'inactive_user') {
+        setPasskeyError('This account is deactivated.');
+      } else if (status === 401 && code === 'verification_failed') {
+        setPasskeyError('Couldn’t verify your passkey. Try again or sign in with your password.');
+      } else if (status === 429) {
+        setPasskeyError('Too many sign-in attempts. Please wait a moment and try again.');
+      } else {
+        setPasskeyError('Sign-in failed. Please try again or use your password.');
+      }
+      setPhase('passkey-error');
+    } catch (err) {
+      // User cancelled the OS picker, or no credential available, or the
+      // browser refused the call. NotAllowedError covers cancellation +
+      // "no available credentials"; AbortError covers timeout / abort.
+      const name = err && err.name;
+      if (name === 'NotAllowedError' || name === 'AbortError') {
+        setPhase('credentials');
+        return;
+      }
+      setPasskeyError('Sign-in failed. Please try again or use your password.');
+      setPhase('passkey-error');
+    }
   };
 
   // ---- Enrollment flow ----
@@ -314,6 +421,87 @@ export default function LoginPage() {
                     {submitting ? 'Signing in...' : 'Sign In'}
                   </button>
                 </form>
+
+                {/* Passkey "quick sign in" — only show on browsers that
+                    actually support WebAuthn. Hidden on truly ancient ones
+                    rather than showing a dead button. */}
+                {isWebAuthnSupported() && (
+                  <>
+                    <div className="login-or-divider">or</div>
+                    <button
+                      type="button"
+                      className="btn btn-passkey"
+                      style={{ width: '100%' }}
+                      onClick={attemptPasskeyLogin}
+                      disabled={submitting}
+                    >
+                      <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                        {/* Person silhouette + key — monochrome, matches sidebar SVG style */}
+                        <circle cx="7.5" cy="6" r="2.5" stroke="currentColor" strokeWidth="1.6" fill="none"/>
+                        <path d="M2.5 16c0-2.8 2.2-4.5 5-4.5s5 1.7 5 4.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/>
+                        <circle cx="14.5" cy="11" r="2" stroke="currentColor" strokeWidth="1.6" fill="none"/>
+                        <path d="M16 12.4 L18.5 14.9 M17.2 13.6 L18 12.8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/>
+                      </svg>
+                      Sign in with passkey
+                    </button>
+                  </>
+                )}
+              </>
+            )}
+
+            {phase === 'passkey' && (
+              <>
+                <h2 style={{ marginBottom: '8px', textAlign: 'center' }}>Use your passkey</h2>
+                <p style={{ textAlign: 'center', color: '#555', marginBottom: '8px' }}>
+                  Your device will prompt you to verify your identity
+                </p>
+                <p style={{ textAlign: 'center', color: '#6b7280', fontSize: '13px', marginBottom: '24px' }}>
+                  Use your fingerprint, face, or security key to continue
+                </p>
+
+                <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '20px' }}>
+                  <div className="spinner" />
+                </div>
+
+                <button
+                  className="btn btn-secondary"
+                  style={{ width: '100%', justifyContent: 'center' }}
+                  onClick={() => setPhase('credentials')}
+                >
+                  Back
+                </button>
+              </>
+            )}
+
+            {phase === 'passkey-error' && (
+              <>
+                <h2 style={{ marginBottom: '8px', textAlign: 'center' }}>Sign-in failed</h2>
+                <p style={{ textAlign: 'center', color: '#555', marginBottom: '24px' }}>
+                  {passkeyError || 'Something went wrong when trying to verify with your passkey.'}
+                </p>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                  <button
+                    className="btn btn-primary"
+                    style={{ width: '100%', justifyContent: 'center' }}
+                    onClick={attemptPasskeyLogin}
+                  >
+                    Try again
+                  </button>
+                  {/* White (not grey) "go back" — visually consistent with
+                      the passkey entry button on the credentials view, so
+                      the secondary action doesn't compete with the blue
+                      primary "Try again" above. Reuses .btn-passkey since
+                      it's already the project's white-outlined button
+                      style; the SVG slot is just empty. */}
+                  <button
+                    className="btn btn-passkey"
+                    style={{ width: '100%' }}
+                    onClick={() => { setPasskeyError(''); setPhase('credentials'); }}
+                  >
+                    Sign in with password
+                  </button>
+                </div>
               </>
             )}
 

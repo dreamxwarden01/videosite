@@ -336,6 +336,48 @@ tbody tr:hover {
 .btn-link:hover {
     color: #fff;
 }
+/* Login page: passkey "quick sign in" button — white surface with a thin
+   grey border, distinguishes from the dark primary "Sign In" above it. */
+.btn-passkey {
+    background: #fff;
+    color: #111;
+    border: 1px solid #d1d5db;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+}
+.btn-passkey:hover {
+    background: #f9fafb;
+    text-decoration: none;
+    color: #111;
+}
+.btn-passkey:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+.btn-passkey svg {
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+}
+/* "or" separator between password sign-in and passkey sign-in. Two
+   horizontal rules with the word centered between them. */
+.login-or-divider {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    color: #6b7280;
+    font-size: 13px;
+    margin: 16px 0;
+}
+.login-or-divider::before,
+.login-or-divider::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: #e5e7eb;
+}
 
 /* === Forms === */
 .form-group {

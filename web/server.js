@@ -47,6 +47,7 @@ const apiUploadRoutes = require('./routes/api/upload');
 const apiVideoRoutes = require('./routes/api/videos');
 const apiWorkerRoutes = require('./routes/api/worker');
 const mfaAuthRoutes = require('./routes/mfa-auth');
+const passkeyLoginRoutes = require('./routes/passkey-login');
 const apiMfaAdminRoutes = require('./routes/api/mfa-admin');
 const apiMfaRoutes = require('./routes/api/mfa');
 const passwordResetRoutes = require('./routes/password-reset');
@@ -55,6 +56,7 @@ const apiMaterialRoutes = require('./routes/api/materials');
 app.use(installRoutes);
 app.use(authRoutes);
 app.use(mfaAuthRoutes);
+app.use(passkeyLoginRoutes);
 app.use(registerRoutes);
 app.use(passwordResetRoutes);
 

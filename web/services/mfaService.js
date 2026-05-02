@@ -690,7 +690,14 @@ async function generatePasskeyRegOptions(userId, challengeId) {
         userName: user.username,
         excludeCredentials,
         authenticatorSelection: {
-            residentKey: 'preferred',
+            // 'required' (not 'preferred') so every new passkey is a
+            // discoverable credential — needed for the username-less "quick
+            // sign in" flow. Authenticators that can't store discoverable
+            // creds (mostly old YubiKey 4-series and U2F-only keys) will
+            // fail registration; in 2026 this is essentially zero modern
+            // devices. Existing 'preferred'-era passkeys are unaffected and
+            // most are discoverable in practice.
+            residentKey: 'required',
             userVerification: 'required'
         }
     });
@@ -824,6 +831,127 @@ async function verifyPasskeyAuth(userId, challengeId, credential) {
     await markChallengeVerified(challengeId, 'passkey');
 
     return { valid: true };
+}
+
+// ---------------------------------------------------------------------------
+// Passkey-only ("quick sign in") — discoverable credential flow.
+//
+// Distinct from verifyPasskeyAuth above (which is the MFA second-factor
+// step that already knows the user). Here we don't have a user yet — the
+// authenticator returns a credential ID we look up to discover who's signing
+// in. The challenge lives in Redis (passkeyChallengeCache), not in
+// mfa_challenges, because mfa_challenges.user_id is NOT NULL.
+// ---------------------------------------------------------------------------
+
+async function generatePasskeyLoginOptions() {
+    const passkeyChallengeCache = require('./cache/passkeyChallengeCache');
+    const config = await getWebAuthnConfig();
+
+    // Empty allowCredentials → discoverable flow. The OS / browser shows the
+    // user a picker of credentials registered for this rpID and returns the
+    // selected credential's ID + assertion. userVerification: 'required'
+    // means the authenticator must verify the user (biometric / PIN), so a
+    // successful assertion is MFA-strength on its own.
+    const options = await generateAuthenticationOptions({
+        rpID: config.rpID,
+        userVerification: 'required',
+        allowCredentials: []
+    });
+
+    const challengeHandle = await passkeyChallengeCache.create(options.challenge);
+    return { challengeHandle, options };
+}
+
+// Returns { valid: true, userId } on success, or:
+//   { valid: false, code: 'unknown_credential' }   — challenge expired, or
+//                                                    credential not in DB
+//   { valid: false, code: 'revoked' }              — credential row exists
+//                                                    but is_active = 0
+//   { valid: false, code: 'inactive_user' }        — owner's account is
+//                                                    deactivated
+//   { valid: false, code: 'verification_failed' }  — signature / counter /
+//                                                    origin / rpID mismatch
+//
+// 'unknown_credential' is also returned for a missing/expired Redis handle
+// — the client treats both as the same situation: this assertion can't be
+// matched to anything, suggest manual passkey cleanup. (We don't leak a
+// distinction between "challenge expired" and "credential not found";
+// neither is exploitable but both look the same to the user.)
+async function verifyPasskeyLoginAssertion(challengeHandle, credential) {
+    const passkeyChallengeCache = require('./cache/passkeyChallengeCache');
+    const userCache = require('./cache/userCache');
+    const config = await getWebAuthnConfig();
+
+    // One-shot consume — second attempt with the same handle gets null.
+    const expectedChallenge = await passkeyChallengeCache.take(challengeHandle);
+    if (!expectedChallenge) {
+        return { valid: false, code: 'unknown_credential' };
+    }
+
+    if (!credential || typeof credential.id !== 'string') {
+        return { valid: false, code: 'unknown_credential' };
+    }
+
+    const pool = getPool();
+
+    // Look up by credential_id alone — uq_credential index gives O(1).
+    // Fetch is_active separately so we can distinguish "no such credential"
+    // from "credential exists but disabled".
+    const [[passkey]] = await pool.execute(
+        "SELECT id, user_id, public_key, sign_count, is_active FROM user_mfa_methods WHERE credential_id = ? AND method_type = 'passkey'",
+        [credential.id]
+    );
+
+    if (!passkey) {
+        return { valid: false, code: 'unknown_credential' };
+    }
+    if (!passkey.is_active) {
+        return { valid: false, code: 'revoked' };
+    }
+
+    // Owner status: a passkey for a deactivated account must not log in.
+    // userCache hits Redis first; cold-start falls back to DB.
+    const userMeta = await userCache.getUserMeta(passkey.user_id);
+    if (!userMeta || !userMeta.is_active) {
+        return { valid: false, code: 'inactive_user' };
+    }
+
+    const publicKeyBuffer = Buffer.from(passkey.public_key, 'base64');
+
+    let verification;
+    try {
+        verification = await verifyAuthenticationResponse({
+            response: credential,
+            expectedChallenge,
+            expectedOrigin: config.origin,
+            expectedRPID: config.rpID,
+            requireUserVerification: true,
+            credential: {
+                id: credential.id,
+                publicKey: publicKeyBuffer,
+                counter: passkey.sign_count
+            }
+        });
+    } catch (err) {
+        // verifyAuthenticationResponse throws on any structural / signature
+        // problem — treat as a verification failure, not a server error.
+        return { valid: false, code: 'verification_failed' };
+    }
+
+    if (!verification.verified) {
+        return { valid: false, code: 'verification_failed' };
+    }
+
+    // Bump sign_count + last_used_at. Counter advancement is required by
+    // WebAuthn spec for clone detection (matters for hardware keys; platform
+    // authenticators usually report 0 always, which is also fine).
+    const newCounter = verification.authenticationInfo.newCounter;
+    await pool.execute(
+        'UPDATE user_mfa_methods SET sign_count = ?, last_used_at = NOW() WHERE id = ?',
+        [newCounter, passkey.id]
+    );
+
+    return { valid: true, userId: passkey.user_id };
 }
 
 // ---------------------------------------------------------------------------
@@ -1217,12 +1345,16 @@ module.exports = {
     recordTotpFailedAttempt,
     clearTotpRateLimit,
 
-    // Passkey (WebAuthn)
+    // Passkey (WebAuthn) — MFA second-factor flow (user already known)
     getWebAuthnConfig,
     generatePasskeyRegOptions,
     verifyPasskeyRegistration,
     generatePasskeyAuthOptions,
     verifyPasskeyAuth,
+
+    // Passkey (WebAuthn) — discoverable / username-less login
+    generatePasskeyLoginOptions,
+    verifyPasskeyLoginAssertion,
 
     // User MFA state
     getHighestMethodLevel,
