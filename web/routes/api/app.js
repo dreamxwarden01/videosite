@@ -48,8 +48,12 @@ router.get('/settings/public', async (req, res) => {
             settings[row.setting_key] = row.setting_value;
         }
 
-        // Turnstile site key from env (not secret key)
-        const turnstileSiteKey = process.env.TURNSTILE_SITE_KEY || '';
+        // Turnstile site key — null when not enabled site-wide (either env
+        // var blank). Client uses null to mean "don't render the widget" and
+        // also "no token needed for protected submits". Empty string would
+        // be ambiguous; null is unambiguous.
+        const { isTurnstileEnabled } = require('../../services/turnstileService');
+        const turnstileSiteKey = isTurnstileEnabled() ? process.env.TURNSTILE_SITE_KEY : null;
 
         res.json({
             siteName: settings.site_name || 'VideoSite',
@@ -61,7 +65,7 @@ router.get('/settings/public', async (req, res) => {
         console.error('Failed to load public settings:', err);
         res.json({
             siteName: 'VideoSite',
-            turnstileSiteKey: '',
+            turnstileSiteKey: null,
             registrationEnabled: false,
             invitationRequired: true,
         });

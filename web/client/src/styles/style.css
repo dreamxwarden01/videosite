@@ -361,6 +361,15 @@ tbody tr:hover {
     height: 18px;
     flex-shrink: 0;
 }
+/* Small grey label above the Turnstile widget — same color/size as the
+   "Forgot password?" link. Rendered alongside the widget itself so it
+   only appears when Turnstile is configured. */
+.turnstile-label {
+    font-size: 13px;
+    color: #6b7280;
+    margin-bottom: 6px;
+}
+
 /* "or" separator between password sign-in and passkey sign-in. Two
    horizontal rules with the word centered between them. */
 .login-or-divider {

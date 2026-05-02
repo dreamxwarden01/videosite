@@ -18,6 +18,7 @@ const router = express.Router();
 const { createSession, getSessionMaxDays } = require('../config/session');
 const { SESSION_COOKIE, getClientIp } = require('../middleware/auth');
 const mfaService = require('../services/mfaService');
+const { verifyTurnstileToken } = require('../services/turnstileService');
 
 // Match auth.js: returnTo must be a same-site relative path.
 function sanitizeReturnTo(returnTo) {
@@ -31,11 +32,25 @@ function sanitizeReturnTo(returnTo) {
 // Generates a WebAuthn assertion challenge with empty allowCredentials,
 // stores the challenge in Redis under a one-shot handle, and returns both
 // to the client. The client passes the handle back unchanged in /verify.
+//
+// Turnstile gate — same shape as /api/login. We gate /options instead of
+// /verify because the Redis challenge handle is itself one-shot, so once
+// /options has succeeded the bot still needs to produce a real WebAuthn
+// assertion to do anything useful. Turnstile-on-/options is sufficient.
 router.post('/api/auth/passkey/options', async (req, res) => {
     try {
         // Refuse to overwrite a real session — user is already signed in.
         if (res.locals.user) {
             return res.status(400).json({ error: 'already_signed_in' });
+        }
+
+        const { turnstileToken } = req.body || {};
+        const ip = getClientIp(req);
+        const turnstileResult = await verifyTurnstileToken(turnstileToken, ip);
+        if (!turnstileResult.success) {
+            return res.status(422).json({
+                errors: { turnstile: 'Human verification failed. Please try again.' }
+            });
         }
 
         const { challengeHandle, options } = await mfaService.generatePasskeyLoginOptions();

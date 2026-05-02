@@ -13,7 +13,7 @@ function isValidEmail(email) {
 
 export default function RegisterPage() {
   const { user } = useAuth();
-  const { siteName, invitationRequired, turnstileSiteKey } = useSite();
+  const { siteName, invitationRequired, turnstileSiteKey, refreshSiteSettings } = useSite();
   const { showToast } = useToast();
   const navigate = useNavigate();
 
@@ -148,17 +148,19 @@ export default function RegisterPage() {
   const resendEnabled = !limitReached && countdown <= 0 && (token2 || !turnstileSiteKey) && !submitting;
 
   // --- Continue button (step 1) ---
+  // Token-clear + widget reset happens ONLY on failure. Pre-emptive clears
+  // before the fetch were causing the widget to flash even on success and
+  // weren't needed (success navigates the user away). On 422/turnstile,
+  // also re-fetch /api/settings/public if the local site key was null —
+  // server tells us Turnstile just got enabled.
   const handleContinue = async () => {
     if (submitting) return;
     setSubmitting(true);
 
-    const tokenToSend = token1;
-    setToken1(null);
-
     let gotError = false;
 
     try {
-      const body = { email: email.trim(), turnstileToken: tokenToSend };
+      const body = { email: email.trim(), turnstileToken: token1 };
       if (invitationRequired) body.invitationCode = code;
 
       const { data, status, ok } = await apiPost('/api/register/start', body);
@@ -167,7 +169,6 @@ export default function RegisterPage() {
         setStep(2);
         startResendCountdown(data.resend_backoff || 0);
         setSubmitting(false);
-        resetRef1.current?.();
         return;
       }
 
@@ -186,7 +187,12 @@ export default function RegisterPage() {
       } else if (status === 422 && data?.errors) {
         if (data.errors.email) { setEmailError(data.errors.email); setEmailValid(false); }
         if (data.errors.invitationCode) { setCodeError(data.errors.invitationCode); setCodeValid(false); }
-        if (data.errors.turnstile) showToast(data.errors.turnstile);
+        if (data.errors.turnstile) {
+          showToast(data.errors.turnstile);
+          // Server says Turnstile is required but our local state didn't
+          // know — refresh and the widget will mount on the next render.
+          if (!turnstileSiteKey) await refreshSiteSettings();
+        }
       } else if (data?.message) {
         showToast(data.message);
       } else {
@@ -197,7 +203,10 @@ export default function RegisterPage() {
       showToast('Unable to reach the server. Please check your connection.');
     }
 
-    if (gotError) resetRef1.current?.();
+    if (gotError) {
+      setToken1(null);
+      resetRef1.current?.();
+    }
     setSubmitting(false);
   };
 
@@ -206,13 +215,10 @@ export default function RegisterPage() {
     if (submitting || countdown > 0) return;
     setSubmitting(true);
 
-    const tokenToSend = token2;
-    setToken2(null);
-
     let gotError = false;
 
     try {
-      const body = { email: email.trim(), turnstileToken: tokenToSend };
+      const body = { email: email.trim(), turnstileToken: token2 };
       if (invitationRequired) body.invitationCode = code;
 
       const { data, status, ok } = await apiPost('/api/register/start', body);
@@ -220,6 +226,13 @@ export default function RegisterPage() {
       if (ok && data) {
         showToast('Verification email resent.', 'success');
         startResendCountdown(data.resend_backoff || 0);
+        // Defensive: when backoff > 0, the countdown unmounts the widget
+        // so the next mount produces a fresh challenge automatically.
+        // When backoff is 0 or omitted, the widget stays mounted —
+        // explicit reset here ensures the user gets a fresh token even
+        // in that edge case so a subsequent resend isn't sent with a
+        // stale (server-consumed) token.
+        resetRef2.current?.();
         setSubmitting(false);
         return;
       }
@@ -236,6 +249,9 @@ export default function RegisterPage() {
         } else {
           showToast('Too many requests. Please wait a moment and try again.');
         }
+      } else if (status === 422 && data?.errors?.turnstile) {
+        showToast(data.errors.turnstile);
+        if (!turnstileSiteKey) await refreshSiteSettings();
       } else if (data?.message) {
         showToast(data.message);
       } else {
@@ -246,7 +262,10 @@ export default function RegisterPage() {
       showToast('Unable to reach the server. Please check your connection.');
     }
 
-    if (gotError) resetRef2.current?.();
+    if (gotError) {
+      setToken2(null);
+      resetRef2.current?.();
+    }
     setSubmitting(false);
   };
 

@@ -65,5 +65,14 @@ export default function Turnstile({ onToken, onExpire, onError, resetRef }) {
 
   if (!turnstileSiteKey) return null;
 
-  return <div ref={containerRef} style={{ marginBottom: '16px' }} />;
+  // Label appears the moment we know the widget will render (i.e., site
+  // key is set), not after the widget has actually loaded. So if Turnstile
+  // is enabled but the script is still downloading, the user already sees
+  // the label and an empty placeholder area below it.
+  return (
+    <>
+      <div className="turnstile-label">Let us know you are human</div>
+      <div ref={containerRef} style={{ marginBottom: '16px' }} />
+    </>
+  );
 }

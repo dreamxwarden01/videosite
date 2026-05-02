@@ -7,6 +7,7 @@ import { useToast } from '../context/ToastContext';
 import { apiPost } from '../api';
 import Header from '../components/Header';
 import MfaChallengeUI from '../components/MfaChallengeUI';
+import Turnstile from '../components/Turnstile';
 
 // Best-effort cleanup hint to the user's credential manager that a
 // credential ID we just received isn't recognized server-side. Chrome /
@@ -23,7 +24,7 @@ function signalUnknownCredential(credentialId) {
   }).catch(() => { /* best-effort, never block login UX */ });
 }
 
-// WebAuthn supported at all? Used to hide the "Sign in with passkey"
+// WebAuthn supported at all? Used to hide the "Sign in with a passkey"
 // button on browsers that wouldn't be able to honor it (very rare in 2026
 // but a clean degradation).
 function isWebAuthnSupported() {
@@ -33,7 +34,7 @@ function isWebAuthnSupported() {
 
 export default function LoginPage() {
   const { user, refresh } = useAuth();
-  const { siteName } = useSite();
+  const { siteName, turnstileSiteKey, refreshSiteSettings } = useSite();
   const { showToast } = useToast();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -41,6 +42,19 @@ export default function LoginPage() {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
+
+  // Turnstile state — shared by both the password Sign In and the
+  // "Sign in with a passkey" button. Both submit paths send the same
+  // token, and a single widget is rendered between the password input
+  // and the Sign In button so the visual ownership of the CAPTCHA
+  // applies to whichever button the user clicks.
+  const [turnstileToken, setTurnstileToken] = useState(null);
+  const turnstileResetRef = useRef(null);
+  // Both buttons are gated together: when Turnstile is enabled and we
+  // don't yet have a token, neither button is clickable. When Turnstile
+  // is off site-wide (turnstileSiteKey null), the gate is false and
+  // buttons stay enabled exactly as before.
+  const turnstileGate = !!turnstileSiteKey && !turnstileToken;
 
   // Tracks whether login was completed on this page (prevents useEffect redirect race)
   const loginCompleted = useRef(false);
@@ -85,17 +99,21 @@ export default function LoginPage() {
     setSubmitting(true);
 
     const rt = searchParams.get('returnTo') || '/';
+    let gotError = false;
+    let turnstileFailedWithStaleSiteKey = false;
 
     try {
-      const { data, status, ok } = await apiPost('/api/login', { username, password, returnTo: rt });
+      const { data, status, ok } = await apiPost('/api/login', {
+        username,
+        password,
+        returnTo: rt,
+        turnstileToken,
+      });
 
       if (status === 429) {
         showToast('Too many login attempts. Please wait a moment and try again.');
-        setSubmitting(false);
-        return;
-      }
-
-      if (ok && data) {
+        gotError = true;
+      } else if (ok && data) {
         // MFA verification (user has MFA enabled)
         if (data.requireMFA) {
           setMfaData({
@@ -124,13 +142,26 @@ export default function LoginPage() {
         await refresh();
         navigate(data.returnTo || '/', { replace: true });
         return;
+      } else if (status === 422 && data?.errors?.turnstile) {
+        showToast(data.errors.turnstile);
+        gotError = true;
+        // Server requires Turnstile but we cached it as off — refresh
+        // settings so the widget mounts on the next render.
+        if (!turnstileSiteKey) turnstileFailedWithStaleSiteKey = true;
+      } else {
+        showToast(data?.message || 'Login failed');
+        gotError = true;
       }
-
-      showToast(data?.message || 'Login failed');
     } catch {
       showToast('Unable to reach the server. Please check your connection.');
+      gotError = true;
     }
 
+    if (gotError) {
+      setTurnstileToken(null);
+      turnstileResetRef.current?.();
+      if (turnstileFailedWithStaleSiteKey) await refreshSiteSettings();
+    }
     setSubmitting(false);
   };
 
@@ -163,7 +194,43 @@ export default function LoginPage() {
 
     let assertion;
     try {
-      const { data: optsData, ok: optsOk } = await apiPost('/api/auth/passkey/options', {});
+      // /options carries the Turnstile token. /verify doesn't need one
+      // because it's already gated by a one-shot Redis challenge handle
+      // that only /options can mint.
+      const { data: optsData, status: optsStatus, ok: optsOk } = await apiPost('/api/auth/passkey/options', {
+        turnstileToken,
+      });
+
+      // Turnstile token is one-shot consumed by /options regardless of
+      // whether the rest of the flow succeeds. Refresh the widget RIGHT
+      // NOW so any subsequent attempt (after OS-picker cancel, after a
+      // /verify failure, or even after this same call's error branches
+      // below) has a fresh token waiting on the credentials view. The
+      // user is still looking at the passkey loading overlay during the
+      // OS prompt, so the widget refresh is invisible to them.
+      setTurnstileToken(null);
+      turnstileResetRef.current?.();
+
+      // 429 first — covers Cloudflare's HTML 429 (where data is null
+      // because apiFetch only parses JSON content types). Without this
+      // explicit branch, the code-based checks below would all fail and
+      // fall through to a generic passkey-error.
+      if (optsStatus === 429) {
+        showToast('Too many sign-in attempts. Please wait a moment and try again.');
+        setPhase('credentials');
+        return;
+      }
+
+      // Turnstile rejection — surface as a toast on the credentials view
+      // (so the user can see the refreshed widget) instead of dropping
+      // into the passkey-error phase.
+      if (optsStatus === 422 && optsData?.errors?.turnstile) {
+        showToast(optsData.errors.turnstile);
+        if (!turnstileSiteKey) await refreshSiteSettings();
+        setPhase('credentials');
+        return;
+      }
+
       if (!optsOk || !optsData || !optsData.options) {
         setPasskeyError('Couldn’t start passkey sign-in. Please try again.');
         setPhase('passkey-error');
@@ -181,6 +248,15 @@ export default function LoginPage() {
         loginCompleted.current = true;
         await refresh();
         navigate(data?.returnTo || '/', { replace: true });
+        return;
+      }
+
+      // 429 first — same Cloudflare-HTML reasoning as above. Widget was
+      // already refreshed when /options completed, so no extra reset
+      // needed here; we just hand control back to credentials.
+      if (status === 429) {
+        showToast('Too many sign-in attempts. Please wait a moment and try again.');
+        setPhase('credentials');
         return;
       }
 
@@ -203,8 +279,6 @@ export default function LoginPage() {
         setPasskeyError('This account is deactivated.');
       } else if (status === 401 && code === 'verification_failed') {
         setPasskeyError('Couldn’t verify your passkey. Try again or sign in with your password.');
-      } else if (status === 429) {
-        setPasskeyError('Too many sign-in attempts. Please wait a moment and try again.');
       } else {
         setPasskeyError('Sign-in failed. Please try again or use your password.');
       }
@@ -381,7 +455,7 @@ export default function LoginPage() {
           <div className="card login-card" style={{ maxWidth: 'none' }}>
             {phase === 'credentials' && (
               <>
-                <h2 style={{ marginBottom: '20px', textAlign: 'center' }}>Sign In</h2>
+                <h2 style={{ marginBottom: '20px', textAlign: 'center' }}>Welcome</h2>
                 <form onSubmit={handleSubmit}>
                   <div className="form-group">
                     <label htmlFor="username">Username or Email Address</label>
@@ -412,11 +486,22 @@ export default function LoginPage() {
                       onChange={(e) => setPassword(e.target.value.replace(/\s/g, ''))}
                     />
                   </div>
+                  {/* Turnstile widget gates BOTH the password Sign In button
+                      and the "Sign in with a passkey" button below. The
+                      widget itself only renders when turnstileSiteKey is
+                      set; otherwise this block produces nothing and the
+                      buttons stay enabled. */}
+                  <Turnstile
+                    onToken={setTurnstileToken}
+                    onExpire={() => setTurnstileToken(null)}
+                    onError={() => setTurnstileToken(null)}
+                    resetRef={turnstileResetRef}
+                  />
                   <button
                     type="submit"
                     className="btn btn-primary"
                     style={{ width: '100%', justifyContent: 'center' }}
-                    disabled={submitting}
+                    disabled={submitting || turnstileGate}
                   >
                     {submitting ? 'Signing in...' : 'Sign In'}
                   </button>
@@ -433,16 +518,19 @@ export default function LoginPage() {
                       className="btn btn-passkey"
                       style={{ width: '100%' }}
                       onClick={attemptPasskeyLogin}
-                      disabled={submitting}
+                      disabled={submitting || turnstileGate}
                     >
                       <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                        {/* Person silhouette + key — monochrome, matches sidebar SVG style */}
-                        <circle cx="7.5" cy="6" r="2.5" stroke="currentColor" strokeWidth="1.6" fill="none"/>
-                        <path d="M2.5 16c0-2.8 2.2-4.5 5-4.5s5 1.7 5 4.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/>
-                        <circle cx="14.5" cy="11" r="2" stroke="currentColor" strokeWidth="1.6" fill="none"/>
-                        <path d="M16 12.4 L18.5 14.9 M17.2 13.6 L18 12.8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/>
+                        {/* Person silhouette (slightly slimmed) + vertical key
+                            on the right with two equal teeth at the bottom. */}
+                        <circle cx="7.5" cy="6" r="2.3" stroke="currentColor" strokeWidth="1.6" fill="none"/>
+                        <path d="M3.5 16c0-2.8 1.8-4.5 4-4.5s4 1.7 4 4.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/>
+                        <circle cx="15.2" cy="7" r="2" stroke="currentColor" strokeWidth="1.6" fill="none"/>
+                        <path d="M15.2 9 v7.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/>
+                        <path d="M15.2 13 h1.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/>
+                        <path d="M15.2 15 h1.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/>
                       </svg>
-                      Sign in with passkey
+                      Sign in with a passkey
                     </button>
                   </>
                 )}

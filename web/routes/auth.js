@@ -5,6 +5,7 @@ const { createSession, deleteSession, getSessionMaxDays } = require('../config/s
 const { SESSION_COOKIE, getClientIp } = require('../middleware/auth');
 const mfaService = require('../services/mfaService');
 const { resolvePermissions } = require('../services/permissionService');
+const { verifyTurnstileToken } = require('../services/turnstileService');
 
 // Validate returnTo: must be a same-site relative path
 function sanitizeReturnTo(returnTo) {
@@ -21,8 +22,22 @@ router.post('/api/login', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Already logged in.' });
         }
 
-        const { username, password, returnTo } = req.body;
+        const { username, password, returnTo, turnstileToken } = req.body;
         const safeReturnTo = sanitizeReturnTo(returnTo);
+
+        // Turnstile first — token is consumed by Cloudflare even if later
+        // validations (username/password mismatch, deactivated account,
+        // etc.) fail. When TURNSTILE_*_KEY env vars are unset, the helper
+        // short-circuits with success, leaving the rest of the path
+        // unchanged for self-hosted / dev deploys without a CAPTCHA.
+        const ip = getClientIp(req);
+        const turnstileResult = await verifyTurnstileToken(turnstileToken, ip);
+        if (!turnstileResult.success) {
+            return res.status(422).json({
+                success: false,
+                errors: { turnstile: 'Human verification failed. Please try again.' }
+            });
+        }
 
         if (!username || !password) {
             return res.status(401).json({
@@ -67,7 +82,6 @@ router.post('/api/login', async (req, res) => {
 
         // --- MFA check ---
         const userAgent = req.headers['user-agent'] || null;
-        const ip = getClientIp(req);
         const mfaLoginPolicy = await mfaService.getScenarioPolicy('login');
         const userMfaEnabled = await mfaService.isUserMfaEnabled(user.user_id);
         const userPermissions = await resolvePermissions(user.user_id, user.role_id);

@@ -10,7 +10,7 @@ import PasswordRules, { checkPasswordComplexity } from '../components/PasswordRu
 
 export default function RegisterCompletePage() {
   const { user, refresh } = useAuth();
-  const { siteName, turnstileSiteKey } = useSite();
+  const { siteName, turnstileSiteKey, refreshSiteSettings } = useSite();
   const { showToast } = useToast();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -120,14 +120,15 @@ export default function RegisterCompletePage() {
   const allValid = validity.username && validity.displayName && validity.password && validity.confirmPassword;
   const registerEnabled = allValid && (turnstileToken || !turnstileSiteKey) && !submitting;
 
+  // Token-clear + widget reset only on failure. Pre-emptive clear was
+  // causing the widget to flash even on successful submits and wasn't
+  // needed (success navigates the user away).
   const handleRegister = async () => {
     if (submitting) return;
     setSubmitting(true);
 
-    const tokenToSend = turnstileToken;
-    setTurnstileToken(null);
-
     let gotError = false;
+    let turnstileFailedWithStaleSiteKey = false;
 
     try {
       const { data, status, ok } = await apiPost('/api/register/complete', {
@@ -137,7 +138,7 @@ export default function RegisterCompletePage() {
         displayName: displayName.trim(),
         password,
         confirmPassword,
-        turnstileToken: tokenToSend,
+        turnstileToken,
       });
 
       if (ok && data) {
@@ -157,6 +158,9 @@ export default function RegisterCompletePage() {
         for (const [key, msg] of Object.entries(data.errors)) {
           if (key === '_general' || key === 'turnstile') {
             showToast(msg);
+            if (key === 'turnstile' && !turnstileSiteKey) {
+              turnstileFailedWithStaleSiteKey = true;
+            }
           } else {
             setFieldError(key, msg);
             setFieldValid(key, false);
@@ -170,7 +174,13 @@ export default function RegisterCompletePage() {
       showToast('Unable to reach the server. Please check your connection.');
     }
 
-    if (gotError) resetRef.current?.();
+    if (gotError) {
+      setTurnstileToken(null);
+      resetRef.current?.();
+      // Server told us Turnstile is required but our cached settings said
+      // it wasn't — refresh so the widget mounts on the next render.
+      if (turnstileFailedWithStaleSiteKey) await refreshSiteSettings();
+    }
     setSubmitting(false);
   };
 

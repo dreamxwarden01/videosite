@@ -9,7 +9,7 @@ import Turnstile from '../components/Turnstile';
 
 export default function ResetPasswordPage() {
   const { user } = useAuth();
-  const { siteName } = useSite();
+  const { siteName, turnstileSiteKey, refreshSiteSettings } = useSite();
   const { showToast } = useToast();
   const navigate = useNavigate();
 
@@ -54,8 +54,11 @@ export default function ResetPasswordPage() {
       if (status === 422 && data?.errors) {
         if (data.errors.turnstile) {
           showToast(data.errors.turnstile);
-          if (resetRef.current) resetRef.current();
           setTurnstileToken(null);
+          if (resetRef.current) resetRef.current();
+          // Server says Turnstile is required but we cached it as off —
+          // re-fetch so the widget mounts on the next render.
+          if (!turnstileSiteKey) await refreshSiteSettings();
         }
         if (data.errors.email) {
           setEmailError(data.errors.email);
@@ -67,17 +70,27 @@ export default function ResetPasswordPage() {
       // Cloudflare 429 (HTML, data is null)
       if (status === 429) {
         showToast('Too many requests. Please wait a moment and try again.');
-        if (resetRef.current) resetRef.current();
         setTurnstileToken(null);
+        if (resetRef.current) resetRef.current();
         setSubmitting(false);
         return;
       }
 
-      // Show sent confirmation regardless of actual result
+      // Show sent confirmation regardless of actual result. (5xx and
+      // any other unhandled status falls here — by design, we don't
+      // surface server-side failures so attackers can't probe whether
+      // an email exists.) Widget doesn't need refreshing because the
+      // user is leaving this view.
       setSentEmail(email.trim().toLowerCase());
       setPhase('sent');
     } catch {
+      // Network failure — fetch rejected (offline, DNS, TLS, etc.).
+      // User stays on the form and can retry. Refresh the widget so
+      // the next attempt has a fresh token instead of one that may
+      // already have been consumed by Cloudflare's siteverify.
       showToast('Unable to reach the server. Please check your connection.');
+      setTurnstileToken(null);
+      if (resetRef.current) resetRef.current();
     }
 
     setSubmitting(false);
@@ -124,7 +137,7 @@ export default function ResetPasswordPage() {
                     type="submit"
                     className="btn btn-primary"
                     style={{ width: '100%', justifyContent: 'center' }}
-                    disabled={submitting || !turnstileToken}
+                    disabled={submitting || (turnstileSiteKey && !turnstileToken)}
                   >
                     {submitting ? 'Sending...' : 'Continue'}
                   </button>
