@@ -1604,6 +1604,54 @@ tr.clickable-row:hover { background-color: #f9fafb; }
   }
 }
 
+/* === Profile page — Account tab info table === */
+.profile-info-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.profile-info-table tr + tr td {
+  border-top: 1px solid #f1f3f5;
+}
+.profile-info-table td {
+  padding: 12px 0;
+  vertical-align: middle;
+}
+.profile-info-table .profile-info-key {
+  width: 150px;
+  font-weight: 500;
+  color: #374151;
+}
+
+/* === Profile page — MFA tab section blocks === */
+/* No outer card chrome (the tab itself is the card) — sections stack
+   with subtle dividers, matching the security tab on UserEditPage. */
+.profile-mfa-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+.profile-mfa-section {
+  padding-bottom: 24px;
+  border-bottom: 1px solid #e5e7eb;
+}
+.profile-mfa-section:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+.profile-mfa-section-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+.profile-mfa-section-title {
+  margin: 0 0 2px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #111827;
+}
+
 /* Playback-disabled banner — mounted by AppShell on /, /course/:id,
    /watch/:id when the current user lacks the allowPlayback permission. */
 .playback-disabled-banner {

@@ -18,8 +18,18 @@ function sanitizeReturnTo(returnTo) {
 // POST /api/login
 router.post('/api/login', async (req, res) => {
     try {
+        // Already-logged-in fast path: the client's /api/me check is async, so
+        // a user with two /login tabs (or one rapid double-click) can submit
+        // before the SPA realises the cookie is already valid. Treat it as a
+        // no-op success — don't mint a new session, don't run Turnstile or
+        // password checks, and override returnTo so the client lands on home
+        // (matching the same-page redirect rule when /api/me returns user).
         if (res.locals.user) {
-            return res.status(400).json({ success: false, message: 'Already logged in.' });
+            return res.json({
+                success: true,
+                returnTo: '/',
+                message: 'Login successful'
+            });
         }
 
         const { username, password, returnTo, turnstileToken } = req.body;

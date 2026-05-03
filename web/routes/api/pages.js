@@ -296,7 +296,95 @@ router.put('/profile/display-name', requireAuth, async (req, res) => {
     }
 });
 
+// POST /api/profile/password/preflight — check what identity verification is
+// needed to change own password. Mirrors /api/profile/email/preflight.
+router.post('/profile/password/preflight', requireAuth, async (req, res) => {
+    try {
+        const user = res.locals.user;
+        if (!user.permissions.changeOwnPassword) {
+            return res.status(403).json({ error: 'Permission denied' });
+        }
+
+        const pool = getPool();
+        const [[userRow]] = await pool.execute(
+            'SELECT email, mfa_enabled FROM users WHERE user_id = ?',
+            [user.user_id]
+        );
+        const hasExistingEmail = !!(userRow && userRow.email);
+        const mfaEnabled = !!(userRow && userRow.mfa_enabled);
+
+        if (mfaEnabled) {
+            const bmfaToken = await mfaService.ensureBmfa(req, res);
+
+            // Check for existing verified, unconsumed, one-time challenge for
+            // this same operation. Lets the user retry the password submit
+            // without re-verifying if their previous attempt failed late.
+            const [[existing]] = await pool.execute(
+                `SELECT id FROM mfa_challenges
+                 WHERE user_id = ? AND context_type = 'bmfa' AND context_id = ?
+                   AND status = 'verified' AND can_reuse = 0 AND mfa_level >= 0
+                   AND message_type = 'mfa_change' AND message_operation = 'password_change_identity'
+                   AND expires_at > NOW()
+                 LIMIT 1`,
+                [user.user_id, bmfaToken]
+            );
+
+            if (existing) {
+                return res.json({ needsChallenge: false, existingChallengeId: existing.id });
+            }
+
+            // Confirm user has at least one usable level-0 method
+            const userMethods = await mfaService.getUserMfaMethodTypes(user.user_id);
+            const allowedMethods = mfaService.getAllowedMethodsForLevel(0);
+            const overlap = userMethods.filter(m => allowedMethods.includes(m));
+            if (overlap.length === 0) {
+                return res.status(422).json({ error: 'No MFA methods available. Please set up MFA first.' });
+            }
+
+            const challenge = await mfaService.createChallenge({
+                userId: user.user_id,
+                contextType: 'bmfa',
+                contextId: bmfaToken,
+                mfaLevel: 0,
+                messageType: 'mfa_change',
+                messageOperation: 'password_change_identity',
+                canReuse: false,
+            });
+
+            const filteredMethods = challenge.allowedMethods.filter(m => {
+                if (m === 'email') return hasExistingEmail;
+                return userMethods.includes(m);
+            });
+
+            const maskedEmailValue = hasExistingEmail ? maskEmail(userRow.email) : null;
+
+            return res.json({
+                needsChallenge: true,
+                challengeId: challenge.id,
+                allowedMethods: filteredMethods,
+                maskedEmail: maskedEmailValue,
+                pendingTtlSeconds: challenge.pendingTtlSeconds,
+            });
+        }
+
+        // No MFA — caller must re-enter current password to authenticate
+        return res.json({ needsChallenge: false, needsPassword: true });
+    } catch (err) {
+        console.error('API profile/password/preflight error:', err);
+        res.status(500).json({ error: 'Failed to check password change requirements' });
+    }
+});
+
 // POST /api/profile/password — change own password
+//
+// Identity verification:
+//   - If MFA is enabled: a verified, one-time MFA challenge ID
+//     (message_operation = 'password_change_identity') must be supplied in the
+//     body as `mfaChallengeId`. The challenge is consumed on success.
+//   - If MFA is not enabled: `currentPassword` must be supplied and verified.
+//
+// signOutOthers (default true): when true, terminates every other session
+// belonging to this user. When false, keeps other sessions alive.
 router.post('/profile/password', requireAuth, async (req, res) => {
     try {
         const user = res.locals.user;
@@ -304,12 +392,12 @@ router.post('/profile/password', requireAuth, async (req, res) => {
             return res.status(403).json({ error: 'Permission denied' });
         }
 
-        const { currentPassword, newPassword, confirmPassword } = req.body;
+        const { currentPassword, newPassword, confirmPassword, mfaChallengeId, signOutOthers } = req.body;
 
-        if (!currentPassword || !newPassword || !confirmPassword) {
-            return res.status(422).json({ error: 'All fields are required' });
+        if (!newPassword || !confirmPassword) {
+            return res.status(422).json({ error: 'New password is required' });
         }
-        if (/\s/.test(currentPassword) || /\s/.test(newPassword) || /\s/.test(confirmPassword)) {
+        if (/\s/.test(newPassword) || /\s/.test(confirmPassword)) {
             return res.status(422).json({ error: 'Spaces are not allowed in passwords' });
         }
         if (newPassword !== confirmPassword) {
@@ -319,17 +407,58 @@ router.post('/profile/password', requireAuth, async (req, res) => {
             return res.status(422).json({ error: 'Password must be at least 8 characters' });
         }
 
-        const fullUser = await getUserById(user.user_id);
-        const valid = await verifyPassword(fullUser.password_hash, currentPassword);
-        if (!valid) {
-            return res.status(422).json({ error: 'Current password is incorrect' });
+        const pool = getPool();
+        const [[userRow]] = await pool.execute(
+            'SELECT mfa_enabled FROM users WHERE user_id = ?',
+            [user.user_id]
+        );
+        const mfaEnabled = !!(userRow && userRow.mfa_enabled);
+
+        // Identity verification — branches on user's current MFA state.
+        if (mfaEnabled) {
+            if (!mfaChallengeId) {
+                return res.status(403).json({ error: 'MFA verification required' });
+            }
+            const bmfaToken = await mfaService.ensureBmfa(req, res);
+            const validation = await validateChallenge(mfaChallengeId, user.user_id, bmfaToken, 0);
+            if (!validation.valid) {
+                return res.status(403).json({ error: validation.reason || 'Invalid MFA challenge' });
+            }
+            // Defensive: make sure this challenge was minted for the password
+            // flow specifically — validateChallenge is generic and would
+            // otherwise accept a same-level challenge from a different op
+            // (e.g. an unconsumed email-change identity challenge).
+            if (validation.challenge.message_operation !== 'password_change_identity') {
+                return res.status(403).json({ error: 'Wrong challenge type' });
+            }
+        } else {
+            if (!currentPassword) {
+                return res.status(422).json({ error: 'Current password is required' });
+            }
+            const fullUser = await getUserById(user.user_id);
+            const valid = await verifyPassword(fullUser.password_hash, currentPassword);
+            if (!valid) {
+                return res.status(422).json({ error: 'Current password is incorrect' });
+            }
         }
 
         await updateUser(user.user_id, { password: newPassword });
         // Track password change timestamp
-        const pool = require('../config/database').getPool();
         await pool.execute('UPDATE users SET password_changed_at = NOW() WHERE user_id = ?', [user.user_id]);
-        await deleteUserSessions(user.user_id, user.session_id);
+
+        // Consume the one-time MFA challenge after the password has changed,
+        // so a transient error during update doesn't burn the verification.
+        if (mfaEnabled && mfaChallengeId) {
+            await consumeChallenge(mfaChallengeId);
+            const bmfaToken = await mfaService.ensureBmfa(req, res);
+            await mfaService.rotateBmfaIfNeeded(req, res, bmfaToken);
+        }
+
+        // signOutOthers defaults to true when omitted (matches legacy
+        // behaviour). Only false when client explicitly opts out.
+        if (signOutOthers !== false) {
+            await deleteUserSessions(user.user_id, user.session_id);
+        }
         res.json({ success: true, message: 'Password changed successfully' });
     } catch (err) {
         console.error('API password change error:', err);

@@ -1,4 +1,4 @@
-import { Routes, Route } from 'react-router-dom';
+import { Routes, Route, Navigate } from 'react-router-dom';
 import { SiteProvider } from './context/SiteContext';
 import { AuthProvider } from './context/AuthContext';
 import { ToastProvider } from './context/ToastContext';
@@ -16,7 +16,6 @@ import HomePage from './pages/HomePage';
 import CoursePage from './pages/CoursePage';
 import WatchPage from './pages/WatchPage';
 import ProfilePage from './pages/ProfilePage';
-import MfaManagePage from './pages/MfaManagePage';
 import NotFoundPage from './pages/NotFoundPage';
 
 // Admin pages
@@ -57,7 +56,9 @@ export default function App() {
                   <Route path="/course/:courseId" element={<CoursePage />} />
                   <Route path="/watch/:videoId" element={<WatchPage />} />
                   <Route path="/profile" element={<ProfilePage />} />
-                  <Route path="/profile/security/mfa" element={<MfaManagePage />} />
+                  {/* Legacy MFA route — now a tab on /profile. Redirect via
+                      Navigate so existing bookmarks land on the right tab. */}
+                  <Route path="/profile/security/mfa" element={<Navigate to="/profile?tab=mfa" replace />} />
 
                   {/* Admin */}
                   <Route path="/admin/courses" element={<CoursesPage />} />

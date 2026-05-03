@@ -87,9 +87,12 @@ export default function LoginPage() {
     document.title = `Sign In - ${siteName}`;
   }, [siteName]);
 
-  // If already logged in (not from a login just completed on this page), redirect
+  // If already logged in (not from a login just completed on this page),
+  // redirect to home. We deliberately ignore returnTo here — the user landed
+  // on /login while already authenticated (second tab, browser back, etc.),
+  // not from a deep-link guard, so dropping them on / is the safer default.
   useEffect(() => {
-    if (user && !loginCompleted.current) navigate('/profile', { replace: true });
+    if (user && !loginCompleted.current) navigate('/', { replace: true });
   }, [user, navigate]);
 
 

@@ -1,15 +1,25 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Link } from 'react-router-dom';
-import { useSite } from '../context/SiteContext';
 import { useToast } from '../context/ToastContext';
 import { apiGet, apiPost, apiFetch } from '../api';
 import { startRegistration } from '@simplewebauthn/browser';
 import useMfaChallenge from '../hooks/useMfaChallenge';
-import MfaChallengeUI from '../components/MfaChallengeUI';
-import LoadingSpinner from '../components/LoadingSpinner';
+import MfaChallengeUI from './MfaChallengeUI';
+import LoadingSpinner from './LoadingSpinner';
 
-export default function MfaManagePage() {
-  const { siteName } = useSite();
+/**
+ * MfaManagementPanel — the "Multi-Factor Authentication" tab body.
+ *
+ * Extracted out of the (now removed) standalone MfaManagePage so it can
+ * live inline as a tab in ProfilePage. Owns its own MFA challenge hook
+ * (mfaState modal) — anything in here that mutates an active method has
+ * to pass the level-1 challenge gate, regardless of which tab the user
+ * happened to land on.
+ *
+ * `onChange` lets the parent know when the MFA enable state may have
+ * shifted, so other parts of the profile (e.g. the security overview
+ * cached in the parent) can refresh.
+ */
+export default function MfaManagementPanel({ onChange }) {
   const { showToast } = useToast();
 
   const [loading, setLoading] = useState(true);
@@ -45,12 +55,7 @@ export default function MfaManagePage() {
   const [renameLabel, setRenameLabel] = useState('');
   const [savingRename, setSavingRename] = useState(false);
 
-  // MFA challenge via hook (for enable/disable, setup, etc.)
   const { mfaFetch, mfaState, onMfaSuccess, onMfaCancel, lastChallengeId } = useMfaChallenge();
-
-  useEffect(() => {
-    document.title = `MFA Settings - ${siteName}`;
-  }, [siteName]);
 
   const loadData = useCallback(async () => {
     try {
@@ -78,7 +83,6 @@ export default function MfaManagePage() {
 
   useEffect(() => { loadData(); }, [loadData]);
 
-
   /* ------------------------------------------------------------------ */
   /*  Enable / Disable toggle                                           */
   /* ------------------------------------------------------------------ */
@@ -100,15 +104,12 @@ export default function MfaManagePage() {
       showToast(mfaEnabled ? 'MFA disabled.' : 'MFA enabled.', 'success');
       setMfaEnabled(!mfaEnabled);
       loadData();
+      onChange?.();
     } else {
       showToast(data?.error || `Failed to ${mfaEnabled ? 'disable' : 'enable'} MFA.`);
     }
     setToggling(false);
   };
-
-  /* ------------------------------------------------------------------ */
-  /*  (MFA challenge is now handled via useMfaChallenge hook / mfaFetch) */
-  /* ------------------------------------------------------------------ */
 
   /* ------------------------------------------------------------------ */
   /*  Authenticator setup                                               */
@@ -148,7 +149,6 @@ export default function MfaManagePage() {
       code: authCode,
       label: authLabel || 'Authenticator',
     };
-    // Pass the challenge ID from the setup step if available
     if (lastChallengeId) {
       body.challengeId = lastChallengeId;
     }
@@ -160,6 +160,7 @@ export default function MfaManagePage() {
       setShowAuthSetup(false);
       setAuthSetup(null);
       loadData();
+      onChange?.();
     } else {
       showToast(data?.error || 'Invalid code. Please try again.');
     }
@@ -186,6 +187,7 @@ export default function MfaManagePage() {
       setVerifyingMethodId(null);
       setVerifyCode('');
       loadData();
+      onChange?.();
     } else {
       showToast(data?.error || 'Invalid code. Please try again.');
     }
@@ -196,14 +198,12 @@ export default function MfaManagePage() {
   /*  Passkey registration                                              */
   /* ------------------------------------------------------------------ */
 
-  // Determine if passkey verification will be needed for the MFA challenge
   const activePasskeyCount = methods.filter(m => m.method_type === 'passkey' && !!m.is_active).length;
   const needsPasskeyVerify = mfaEnabled && activePasskeyCount > 0;
 
   const handleAddPasskey = async () => {
     if (registeringPasskey) return;
 
-    // If MFA is on and user has passkeys, prompt to prepare existing key first
     if (needsPasskeyVerify && !passkeyPhase) {
       setPasskeyPhase('pre-verify');
       return;
@@ -234,7 +234,6 @@ export default function MfaManagePage() {
         return;
       }
 
-      // If we needed passkey verify, pause before registration to let user swap keys
       if (needsPasskeyVerify) {
         setPendingRegOptions(options);
         setPasskeyPhase('pre-register');
@@ -242,7 +241,6 @@ export default function MfaManagePage() {
         return;
       }
 
-      // No MFA or no existing passkeys — go straight to registration
       await completePasskeyRegistration(options);
     } catch {
       showToast('Passkey registration failed.');
@@ -285,6 +283,7 @@ export default function MfaManagePage() {
         setPasskeyLabel('');
         setShowPasskeyLabel(false);
         loadData();
+        onChange?.();
       } else {
         showToast(data?.error || 'Failed to register passkey.');
       }
@@ -315,25 +314,25 @@ export default function MfaManagePage() {
       if (ok) {
         showToast('MFA method removed.', 'success');
         loadData();
+        onChange?.();
       } else {
         showToast(data?.error || 'Failed to remove method.');
       }
       return;
     }
 
-    // Active methods: use mfaFetch which handles 403 challenge automatically
     const { data, ok, status } = await mfaFetch(`/api/mfa/methods/${methodId}`, {
       method: 'DELETE',
     });
 
     if (status === 403 && !ok) {
-      // mfaFetch handles the challenge modal; will retry automatically
       return;
     }
 
     if (ok) {
       showToast('MFA method removed.', 'success');
       loadData();
+      onChange?.();
     } else {
       showToast(data?.error || 'Failed to remove method.');
     }
@@ -363,7 +362,6 @@ export default function MfaManagePage() {
     });
 
     if (status === 403 && !ok) {
-      // mfaFetch handles the challenge modal; will retry automatically
       setSavingRename(false);
       return;
     }
@@ -404,79 +402,68 @@ export default function MfaManagePage() {
   const authenticators = [...activeAuthenticators.sort(sortByLastUsed), ...inactiveAuthenticators];
   const passkeys = [...activePasskeys.sort(sortByLastUsed), ...inactivePasskeys];
 
-  // Toggle state logic
   const canToggle = mfaEnabled || hasEmail;
   const forceEnabled = requireMFA && mfaEnabled;
 
   return (
     <>
-      <div style={{ marginBottom: '24px' }}>
-        <Link to="/profile" style={{ textDecoration: 'none', color: 'var(--color-primary, #2563eb)' }}>
-          &larr; Back to Profile
-        </Link>
-      </div>
-
-      <h1 style={{ marginBottom: '24px' }}>Multi-Factor Authentication</h1>
-
-      {/* Enable/Disable toggle */}
-      <div className="card">
-        <div className="card-header">
-          <div>
-            <h2 style={{ marginBottom: '4px' }}>MFA Status</h2>
-            {forceEnabled && (
-              <span className="text-muted text-sm">Your role requires MFA to be enabled.</span>
-            )}
-            {!hasEmail && !mfaEnabled && (
-              <span className="text-muted text-sm">Set an email address on your profile before enabling MFA.</span>
-            )}
-          </div>
-          <label style={{ display: 'flex', alignItems: 'center', gap: '10px', flexShrink: 0, cursor: canToggle && !forceEnabled ? 'pointer' : 'not-allowed' }}>
-            <span style={{ fontSize: '14px', fontWeight: 500 }}>
-              {mfaEnabled ? 'Enabled' : 'Disabled'}
-            </span>
-            <div
-              role="switch"
-              aria-checked={mfaEnabled}
-              tabIndex={0}
-              onClick={canToggle && !forceEnabled && !toggling ? handleToggleMfa : undefined}
-              onKeyDown={(e) => {
-                if ((e.key === 'Enter' || e.key === ' ') && canToggle && !forceEnabled && !toggling) {
-                  e.preventDefault();
-                  handleToggleMfa();
-                }
-              }}
-              style={{
-                width: '44px',
-                height: '24px',
-                borderRadius: '12px',
-                backgroundColor: mfaEnabled ? '#16a34a' : '#d1d5db',
-                position: 'relative',
-                transition: 'background-color 0.2s',
-                opacity: (canToggle && !forceEnabled) ? 1 : 0.5,
-              }}
-            >
-              <div style={{
-                width: '18px',
-                height: '18px',
-                borderRadius: '50%',
-                backgroundColor: '#fff',
-                position: 'absolute',
-                top: '3px',
-                left: mfaEnabled ? '23px' : '3px',
-                transition: 'left 0.2s',
-                boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
-              }} />
+      <div className="profile-mfa-panel">
+        {/* Status / toggle */}
+        <div className="profile-mfa-section">
+          <div className="profile-mfa-section-header">
+            <div>
+              <h3 className="profile-mfa-section-title">MFA Status</h3>
+              {forceEnabled && (
+                <span className="text-muted text-sm">Your role requires MFA to be enabled.</span>
+              )}
+              {!hasEmail && !mfaEnabled && (
+                <span className="text-muted text-sm">Set an email address on the Account tab before enabling MFA.</span>
+              )}
             </div>
-          </label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '10px', flexShrink: 0, cursor: canToggle && !forceEnabled ? 'pointer' : 'not-allowed' }}>
+              <span style={{ fontSize: '14px', fontWeight: 500 }}>
+                {mfaEnabled ? 'Enabled' : 'Disabled'}
+              </span>
+              <div
+                role="switch"
+                aria-checked={mfaEnabled}
+                tabIndex={0}
+                onClick={canToggle && !forceEnabled && !toggling ? handleToggleMfa : undefined}
+                onKeyDown={(e) => {
+                  if ((e.key === 'Enter' || e.key === ' ') && canToggle && !forceEnabled && !toggling) {
+                    e.preventDefault();
+                    handleToggleMfa();
+                  }
+                }}
+                style={{
+                  width: '44px',
+                  height: '24px',
+                  borderRadius: '12px',
+                  backgroundColor: mfaEnabled ? '#16a34a' : '#d1d5db',
+                  position: 'relative',
+                  transition: 'background-color 0.2s',
+                  opacity: (canToggle && !forceEnabled) ? 1 : 0.5,
+                }}
+              >
+                <div style={{
+                  width: '18px',
+                  height: '18px',
+                  borderRadius: '50%',
+                  backgroundColor: '#fff',
+                  position: 'absolute',
+                  top: '3px',
+                  left: mfaEnabled ? '23px' : '3px',
+                  transition: 'left 0.2s',
+                  boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
+                }} />
+              </div>
+            </label>
+          </div>
         </div>
-      </div>
 
-      {/* Email section */}
-      <div className="card">
-        <div className="card-header">
-          <h2>Email Verification</h2>
-        </div>
-        <div style={{ padding: '0 16px 16px' }}>
+        {/* Email section */}
+        <div className="profile-mfa-section">
+          <h3 className="profile-mfa-section-title">Email Verification</h3>
           {hasEmail ? (
             <>
               <p style={{ marginBottom: '4px' }}>
@@ -488,303 +475,303 @@ export default function MfaManagePage() {
             </>
           ) : (
             <p className="text-muted">
-              No email address set. <Link to="/profile">Set your email</Link> to use email verification.
+              No email address set. Set your email on the Account tab to use email verification.
             </p>
           )}
         </div>
-      </div>
 
-      {/* Authenticator section */}
-      <div className="card">
-        <div className="card-header">
-          <div>
-            <h2>Authenticator Apps</h2>
-            <p className="text-muted text-sm" style={{ marginTop: '2px' }}>
-              {activeAuthenticators.length} of {MAX_AUTHENTICATORS} active
-              {inactiveAuthenticators.length > 0 && `, ${inactiveAuthenticators.length} pending`}
-            </p>
+        {/* Authenticator section */}
+        <div className="profile-mfa-section">
+          <div className="profile-mfa-section-header">
+            <div>
+              <h3 className="profile-mfa-section-title">Authenticator Apps</h3>
+              <p className="text-muted text-sm" style={{ marginTop: '2px' }}>
+                {activeAuthenticators.length} of {MAX_AUTHENTICATORS} active
+                {inactiveAuthenticators.length > 0 && `, ${inactiveAuthenticators.length} pending`}
+              </p>
+            </div>
+            <button className="btn btn-sm btn-primary" onClick={handleStartAuthSetup} disabled={showAuthSetup || authAtCap}>
+              {authAtCap ? 'Limit reached' : 'Add authenticator'}
+            </button>
           </div>
-          <button className="btn btn-sm btn-primary" onClick={handleStartAuthSetup} disabled={showAuthSetup || authAtCap}>
-            {authAtCap ? 'Limit reached' : 'Add authenticator'}
-          </button>
+
+          {authenticators.length > 0 && (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Label</th>
+                    <th>Status</th>
+                    <th>Last Used</th>
+                    <th>Added</th>
+                    <th style={{ width: '160px' }}></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {authenticators.map(m => {
+                    const inactive = !m.is_active;
+                    const isRenaming = renamingMethodId === m.id;
+                    return (
+                      <tr key={m.id} style={inactive ? { opacity: 0.75 } : undefined}>
+                        <td>
+                          {isRenaming ? (
+                            <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                              <input
+                                type="text"
+                                className="form-control"
+                                value={renameLabel}
+                                onChange={(e) => setRenameLabel(e.target.value.slice(0, 100))}
+                                onKeyDown={(e) => { if (e.key === 'Enter') handleRename(m.id); if (e.key === 'Escape') cancelRename(); }}
+                                style={{ width: '160px', fontSize: '13px', padding: '4px 8px' }}
+                                autoFocus
+                              />
+                              <button className="btn btn-sm btn-primary" disabled={savingRename || !renameLabel.trim()} onClick={() => handleRename(m.id)}>
+                                {savingRename ? '...' : 'Save'}
+                              </button>
+                              <button className="btn btn-sm btn-secondary" onClick={cancelRename}>Cancel</button>
+                            </div>
+                          ) : (
+                            <span style={{ cursor: 'pointer' }} title="Click to rename" onClick={() => startRename(m)}>
+                              {m.label || 'Authenticator'}
+                            </span>
+                          )}
+                        </td>
+                        <td>
+                          {inactive ? (
+                            <span style={{
+                              display: 'inline-block', padding: '2px 8px', borderRadius: '10px',
+                              fontSize: '11px', fontWeight: 600, color: '#92400e',
+                              backgroundColor: '#fef3c7',
+                            }}>Pending</span>
+                          ) : (
+                            <span style={{
+                              display: 'inline-block', padding: '2px 8px', borderRadius: '10px',
+                              fontSize: '11px', fontWeight: 600, color: '#065f46',
+                              backgroundColor: '#d1fae5',
+                            }}>Active</span>
+                          )}
+                        </td>
+                        <td>{m.last_used_at ? new Date(m.last_used_at).toLocaleString() : 'Never'}</td>
+                        <td>{new Date(m.created_at).toLocaleDateString()}</td>
+                        <td>
+                          <div style={{ display: 'flex', gap: '6px', justifyContent: 'flex-end' }}>
+                            {inactive && (
+                              <button
+                                className="btn btn-sm btn-primary"
+                                onClick={() => {
+                                  setVerifyingMethodId(verifyingMethodId === m.id ? null : m.id);
+                                  setVerifyCode('');
+                                }}
+                              >
+                                Verify
+                              </button>
+                            )}
+                            <button
+                              className="btn btn-sm btn-danger"
+                              onClick={() => handleRemoveMethod(m.id, m.label || 'Authenticator', inactive)}
+                            >
+                              Remove
+                            </button>
+                          </div>
+                          {inactive && verifyingMethodId === m.id && (
+                            <div style={{ marginTop: '8px', display: 'flex', gap: '6px', alignItems: 'center' }}>
+                              <input
+                                type="text"
+                                className="form-control"
+                                value={verifyCode}
+                                onChange={(e) => setVerifyCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                                placeholder="6-digit code"
+                                maxLength={6}
+                                inputMode="numeric"
+                                style={{ width: '120px', fontSize: '14px' }}
+                                autoFocus
+                              />
+                              <button
+                                className="btn btn-sm btn-primary"
+                                disabled={confirmingVerify || verifyCode.length !== 6}
+                                onClick={() => handleVerifyInactiveAuth(m.id)}
+                              >
+                                {confirmingVerify ? '...' : 'Confirm'}
+                              </button>
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {authenticators.length === 0 && !showAuthSetup && (
+            <p className="text-muted">No authenticators configured.</p>
+          )}
+
+          {showAuthSetup && authSetup && (
+            <div style={{ maxWidth: '400px', marginTop: '12px' }}>
+              <hr style={{ margin: '0 0 16px 0', borderColor: '#e5e7eb' }} />
+              <p style={{ marginBottom: '12px', fontWeight: 500 }}>Scan this QR code with your authenticator app:</p>
+              <div style={{ textAlign: 'center', marginBottom: '12px' }}>
+                <img src={authSetup.qrDataUrl} alt="TOTP QR Code" style={{ width: '200px', height: '200px' }} />
+              </div>
+              {authSetup.secret && (
+                <div style={{ textAlign: 'center', marginBottom: '16px' }}>
+                  <p className="text-muted text-sm" style={{ marginBottom: '4px' }}>Or enter this setup key manually:</p>
+                  <button
+                    className="btn btn-sm btn-secondary"
+                    onClick={() => {
+                      navigator.clipboard.writeText(authSetup.secret).then(() => {
+                        showToast('Setup key copied to clipboard.', 'success');
+                      }).catch(() => {
+                        showToast('Failed to copy. Key: ' + authSetup.secret);
+                      });
+                    }}
+                    style={{ fontFamily: 'monospace', letterSpacing: '2px', fontSize: '13px' }}
+                  >
+                    {authSetup.secret} &nbsp; Copy
+                  </button>
+                </div>
+              )}
+              <div className="form-group">
+                <label>Label (optional)</label>
+                <input
+                  type="text"
+                  className="form-control"
+                  value={authLabel}
+                  onChange={(e) => setAuthLabel(e.target.value)}
+                  placeholder="e.g. My Phone"
+                />
+              </div>
+              <div className="form-group">
+                <label>Verification Code</label>
+                <input
+                  type="text"
+                  className="form-control"
+                  value={authCode}
+                  onChange={(e) => setAuthCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  placeholder="6-digit code"
+                  maxLength={6}
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                />
+              </div>
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => { setShowAuthSetup(false); setAuthSetup(null); loadData(); }}
+                >
+                  Cancel
+                </button>
+                <button
+                  className="btn btn-primary"
+                  onClick={handleConfirmAuth}
+                  disabled={confirmingAuth || authCode.length !== 6}
+                >
+                  {confirmingAuth ? 'Verifying...' : 'Confirm'}
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
-        {authenticators.length > 0 && (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Label</th>
-                  <th>Status</th>
-                  <th>Last Used</th>
-                  <th>Added</th>
-                  <th style={{ width: '160px' }}></th>
-                </tr>
-              </thead>
-              <tbody>
-                {authenticators.map(m => {
-                  const inactive = !m.is_active;
-                  const isRenaming = renamingMethodId === m.id;
-                  return (
-                    <tr key={m.id} style={inactive ? { opacity: 0.75 } : undefined}>
-                      <td>
-                        {isRenaming ? (
-                          <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
-                            <input
-                              type="text"
-                              className="form-control"
-                              value={renameLabel}
-                              onChange={(e) => setRenameLabel(e.target.value.slice(0, 100))}
-                              onKeyDown={(e) => { if (e.key === 'Enter') handleRename(m.id); if (e.key === 'Escape') cancelRename(); }}
-                              style={{ width: '160px', fontSize: '13px', padding: '4px 8px' }}
-                              autoFocus
-                            />
-                            <button className="btn btn-sm btn-primary" disabled={savingRename || !renameLabel.trim()} onClick={() => handleRename(m.id)}>
-                              {savingRename ? '...' : 'Save'}
-                            </button>
-                            <button className="btn btn-sm btn-secondary" onClick={cancelRename}>Cancel</button>
-                          </div>
-                        ) : (
-                          <span style={{ cursor: 'pointer' }} title="Click to rename" onClick={() => startRename(m)}>
-                            {m.label || 'Authenticator'}
-                          </span>
-                        )}
-                      </td>
-                      <td>
-                        {inactive ? (
-                          <span style={{
-                            display: 'inline-block', padding: '2px 8px', borderRadius: '10px',
-                            fontSize: '11px', fontWeight: 600, color: '#92400e',
-                            backgroundColor: '#fef3c7',
-                          }}>Pending</span>
-                        ) : (
-                          <span style={{
-                            display: 'inline-block', padding: '2px 8px', borderRadius: '10px',
-                            fontSize: '11px', fontWeight: 600, color: '#065f46',
-                            backgroundColor: '#d1fae5',
-                          }}>Active</span>
-                        )}
-                      </td>
-                      <td>{m.last_used_at ? new Date(m.last_used_at).toLocaleString() : 'Never'}</td>
-                      <td>{new Date(m.created_at).toLocaleDateString()}</td>
-                      <td>
-                        <div style={{ display: 'flex', gap: '6px', justifyContent: 'flex-end' }}>
-                          {inactive && (
-                            <button
-                              className="btn btn-sm btn-primary"
-                              onClick={() => {
-                                setVerifyingMethodId(verifyingMethodId === m.id ? null : m.id);
-                                setVerifyCode('');
-                              }}
-                            >
-                              Verify
-                            </button>
+        {/* Passkey section */}
+        <div className="profile-mfa-section">
+          <div className="profile-mfa-section-header">
+            <div>
+              <h3 className="profile-mfa-section-title">Passkeys</h3>
+              <p className="text-muted text-sm" style={{ marginTop: '2px' }}>
+                {activePasskeys.length} of {MAX_PASSKEYS} active
+                {inactivePasskeys.length > 0 && `, ${inactivePasskeys.length} pending`}
+              </p>
+            </div>
+            <button
+              className="btn btn-sm btn-primary"
+              onClick={() => setShowPasskeyLabel(true)}
+              disabled={registeringPasskey || passkeyAtCap || showPasskeyLabel}
+            >
+              {passkeyAtCap ? 'Limit reached' : registeringPasskey ? 'Registering...' : 'Add passkey'}
+            </button>
+          </div>
+
+          {passkeys.length > 0 && (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Label</th>
+                    <th>Status</th>
+                    <th>Last Used</th>
+                    <th>Added</th>
+                    <th style={{ width: '80px' }}></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {passkeys.map(m => {
+                    const inactive = !m.is_active;
+                    const isRenaming = renamingMethodId === m.id;
+                    return (
+                      <tr key={m.id} style={inactive ? { opacity: 0.75 } : undefined}>
+                        <td>
+                          {isRenaming ? (
+                            <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                              <input
+                                type="text"
+                                className="form-control"
+                                value={renameLabel}
+                                onChange={(e) => setRenameLabel(e.target.value.slice(0, 100))}
+                                onKeyDown={(e) => { if (e.key === 'Enter') handleRename(m.id); if (e.key === 'Escape') cancelRename(); }}
+                                style={{ width: '160px', fontSize: '13px', padding: '4px 8px' }}
+                                autoFocus
+                              />
+                              <button className="btn btn-sm btn-primary" disabled={savingRename || !renameLabel.trim()} onClick={() => handleRename(m.id)}>
+                                {savingRename ? '...' : 'Save'}
+                              </button>
+                              <button className="btn btn-sm btn-secondary" onClick={cancelRename}>Cancel</button>
+                            </div>
+                          ) : (
+                            <span style={{ cursor: 'pointer' }} title="Click to rename" onClick={() => startRename(m)}>
+                              {m.label || 'Passkey'}
+                            </span>
                           )}
+                        </td>
+                        <td>
+                          {inactive ? (
+                            <span style={{
+                              display: 'inline-block', padding: '2px 8px', borderRadius: '10px',
+                              fontSize: '11px', fontWeight: 600, color: '#92400e',
+                              backgroundColor: '#fef3c7',
+                            }}>Pending</span>
+                          ) : (
+                            <span style={{
+                              display: 'inline-block', padding: '2px 8px', borderRadius: '10px',
+                              fontSize: '11px', fontWeight: 600, color: '#065f46',
+                              backgroundColor: '#d1fae5',
+                            }}>Active</span>
+                          )}
+                        </td>
+                        <td>{m.last_used_at ? new Date(m.last_used_at).toLocaleString() : 'Never'}</td>
+                        <td>{new Date(m.created_at).toLocaleDateString()}</td>
+                        <td>
                           <button
                             className="btn btn-sm btn-danger"
-                            onClick={() => handleRemoveMethod(m.id, m.label || 'Authenticator', inactive)}
+                            onClick={() => handleRemoveMethod(m.id, m.label || 'Passkey', inactive)}
                           >
                             Remove
                           </button>
-                        </div>
-                        {inactive && verifyingMethodId === m.id && (
-                          <div style={{ marginTop: '8px', display: 'flex', gap: '6px', alignItems: 'center' }}>
-                            <input
-                              type="text"
-                              className="form-control"
-                              value={verifyCode}
-                              onChange={(e) => setVerifyCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                              placeholder="6-digit code"
-                              maxLength={6}
-                              inputMode="numeric"
-                              style={{ width: '120px', fontSize: '14px' }}
-                              autoFocus
-                            />
-                            <button
-                              className="btn btn-sm btn-primary"
-                              disabled={confirmingVerify || verifyCode.length !== 6}
-                              onClick={() => handleVerifyInactiveAuth(m.id)}
-                            >
-                              {confirmingVerify ? '...' : 'Confirm'}
-                            </button>
-                          </div>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
 
-        {authenticators.length === 0 && !showAuthSetup && (
-          <p className="text-muted" style={{ padding: '0 16px 16px' }}>No authenticators configured.</p>
-        )}
-
-        {showAuthSetup && authSetup && (
-          <div style={{ padding: '0 16px 16px', maxWidth: '400px' }}>
-            <hr style={{ margin: '0 0 16px 0', borderColor: '#e5e7eb' }} />
-            <p style={{ marginBottom: '12px', fontWeight: 500 }}>Scan this QR code with your authenticator app:</p>
-            <div style={{ textAlign: 'center', marginBottom: '12px' }}>
-              <img src={authSetup.qrDataUrl} alt="TOTP QR Code" style={{ width: '200px', height: '200px' }} />
-            </div>
-            {authSetup.secret && (
-              <div style={{ textAlign: 'center', marginBottom: '16px' }}>
-                <p className="text-muted text-sm" style={{ marginBottom: '4px' }}>Or enter this setup key manually:</p>
-                <button
-                  className="btn btn-sm btn-secondary"
-                  onClick={() => {
-                    navigator.clipboard.writeText(authSetup.secret).then(() => {
-                      showToast('Setup key copied to clipboard.', 'success');
-                    }).catch(() => {
-                      showToast('Failed to copy. Key: ' + authSetup.secret);
-                    });
-                  }}
-                  style={{ fontFamily: 'monospace', letterSpacing: '2px', fontSize: '13px' }}
-                >
-                  {authSetup.secret} &nbsp; Copy
-                </button>
-              </div>
-            )}
-            <div className="form-group">
-              <label>Label (optional)</label>
-              <input
-                type="text"
-                className="form-control"
-                value={authLabel}
-                onChange={(e) => setAuthLabel(e.target.value)}
-                placeholder="e.g. My Phone"
-              />
-            </div>
-            <div className="form-group">
-              <label>Verification Code</label>
-              <input
-                type="text"
-                className="form-control"
-                value={authCode}
-                onChange={(e) => setAuthCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                placeholder="6-digit code"
-                maxLength={6}
-                inputMode="numeric"
-                autoComplete="one-time-code"
-              />
-            </div>
-            <div style={{ display: 'flex', gap: '10px' }}>
-              <button
-                className="btn btn-secondary"
-                onClick={() => { setShowAuthSetup(false); setAuthSetup(null); loadData(); }}
-              >
-                Cancel
-              </button>
-              <button
-                className="btn btn-primary"
-                onClick={handleConfirmAuth}
-                disabled={confirmingAuth || authCode.length !== 6}
-              >
-                {confirmingAuth ? 'Verifying...' : 'Confirm'}
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Passkey section */}
-      <div className="card">
-        <div className="card-header">
-          <div>
-            <h2>Passkeys</h2>
-            <p className="text-muted text-sm" style={{ marginTop: '2px' }}>
-              {activePasskeys.length} of {MAX_PASSKEYS} active
-              {inactivePasskeys.length > 0 && `, ${inactivePasskeys.length} pending`}
-            </p>
-          </div>
-          <button
-            className="btn btn-sm btn-primary"
-            onClick={() => setShowPasskeyLabel(true)}
-            disabled={registeringPasskey || passkeyAtCap || showPasskeyLabel}
-          >
-            {passkeyAtCap ? 'Limit reached' : registeringPasskey ? 'Registering...' : 'Add passkey'}
-          </button>
+          {passkeys.length === 0 && (
+            <p className="text-muted">No passkeys configured.</p>
+          )}
         </div>
-
-        {passkeys.length > 0 && (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Label</th>
-                  <th>Status</th>
-                  <th>Last Used</th>
-                  <th>Added</th>
-                  <th style={{ width: '80px' }}></th>
-                </tr>
-              </thead>
-              <tbody>
-                {passkeys.map(m => {
-                  const inactive = !m.is_active;
-                  const isRenaming = renamingMethodId === m.id;
-                  return (
-                    <tr key={m.id} style={inactive ? { opacity: 0.75 } : undefined}>
-                      <td>
-                        {isRenaming ? (
-                          <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
-                            <input
-                              type="text"
-                              className="form-control"
-                              value={renameLabel}
-                              onChange={(e) => setRenameLabel(e.target.value.slice(0, 100))}
-                              onKeyDown={(e) => { if (e.key === 'Enter') handleRename(m.id); if (e.key === 'Escape') cancelRename(); }}
-                              style={{ width: '160px', fontSize: '13px', padding: '4px 8px' }}
-                              autoFocus
-                            />
-                            <button className="btn btn-sm btn-primary" disabled={savingRename || !renameLabel.trim()} onClick={() => handleRename(m.id)}>
-                              {savingRename ? '...' : 'Save'}
-                            </button>
-                            <button className="btn btn-sm btn-secondary" onClick={cancelRename}>Cancel</button>
-                          </div>
-                        ) : (
-                          <span style={{ cursor: 'pointer' }} title="Click to rename" onClick={() => startRename(m)}>
-                            {m.label || 'Passkey'}
-                          </span>
-                        )}
-                      </td>
-                      <td>
-                        {inactive ? (
-                          <span style={{
-                            display: 'inline-block', padding: '2px 8px', borderRadius: '10px',
-                            fontSize: '11px', fontWeight: 600, color: '#92400e',
-                            backgroundColor: '#fef3c7',
-                          }}>Pending</span>
-                        ) : (
-                          <span style={{
-                            display: 'inline-block', padding: '2px 8px', borderRadius: '10px',
-                            fontSize: '11px', fontWeight: 600, color: '#065f46',
-                            backgroundColor: '#d1fae5',
-                          }}>Active</span>
-                        )}
-                      </td>
-                      <td>{m.last_used_at ? new Date(m.last_used_at).toLocaleString() : 'Never'}</td>
-                      <td>{new Date(m.created_at).toLocaleDateString()}</td>
-                      <td>
-                        <button
-                          className="btn btn-sm btn-danger"
-                          onClick={() => handleRemoveMethod(m.id, m.label || 'Passkey', inactive)}
-                        >
-                          Remove
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-
-        {passkeys.length === 0 && (
-          <p className="text-muted" style={{ padding: '0 16px 16px' }}>No passkeys configured.</p>
-        )}
       </div>
 
       {/* Passkey registration modals */}
