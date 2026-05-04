@@ -20,8 +20,11 @@ export default function AppShell() {
   const isPlaybackPage = location.pathname === '/'
     || location.pathname.startsWith('/course/')
     || isWatchPage;
+  // Truthy check, not `=== false`. /api/me ships only granted permissions
+  // (rehydrated to `{key: true}` in AuthContext), so a denied permission
+  // is `undefined`, not `false`.
   const showPlaybackBanner = !!user
-    && user.permissions?.allowPlayback === false
+    && !user.permissions?.allowPlayback
     && isPlaybackPage;
 
   // Close sidebar on route change

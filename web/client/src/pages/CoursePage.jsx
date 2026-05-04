@@ -20,7 +20,9 @@ export default function CoursePage() {
   const { siteName } = useSite();
   const { user } = useAuth();
   const { showToast } = useToast();
-  const canPlay = user?.permissions?.allowPlayback !== false;
+  // Truthy check: /api/me only ships granted permissions, so a denied
+  // permission is `undefined`, never `false`.
+  const canPlay = !!user?.permissions?.allowPlayback;
 
   // One-shot restore: read from sessionStorage on mount (returning from watch page), then clear
   const storageKey = `course:${courseId}:list`;

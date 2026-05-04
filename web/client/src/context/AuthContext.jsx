@@ -18,6 +18,11 @@ export function AuthProvider({ children }) {
         // app keeps using `user.permissions.X` truthy checks unchanged. Object
         // shape is also accepted as a fallback in case a stale server still
         // sends the full map — covers rolling-deploy windows.
+        //
+        // IMPORTANT: with this wire format a *denied* permission is
+        // `undefined`, never `false`. Always use truthy/falsy checks
+        // (`if (perms.X)`, `!perms.X`) — `=== false` / `!== false` will
+        // silently misbehave.
         if (Array.isArray(data.user.permissions)) {
           data.user.permissions = Object.fromEntries(
             data.user.permissions.map(k => [k, true])

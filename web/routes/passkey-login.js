@@ -19,6 +19,7 @@ const { createSession, getSessionMaxDays } = require('../config/session');
 const { SESSION_COOKIE, getClientIp } = require('../middleware/auth');
 const mfaService = require('../services/mfaService');
 const { verifyTurnstileToken } = require('../services/turnstileService');
+const passkeyChallengeCache = require('../services/cache/passkeyChallengeCache');
 
 // Match auth.js: returnTo must be a same-site relative path.
 function sanitizeReturnTo(returnTo) {
@@ -54,7 +55,13 @@ router.post('/api/auth/passkey/options', async (req, res) => {
         }
 
         const { challengeHandle, options } = await mfaService.generatePasskeyLoginOptions();
-        res.json({ challengeHandle, options });
+        // Hand the TTL down so the client can decide whether to reuse the
+        // handle on retry (>= half TTL remaining) vs. fetch fresh /options.
+        res.json({
+            challengeHandle,
+            options,
+            challengeTtlSeconds: passkeyChallengeCache.TTL_SECONDS,
+        });
     } catch (err) {
         console.error('Passkey login options error:', err);
         res.status(500).json({ error: 'options_failed' });

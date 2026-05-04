@@ -26,6 +26,13 @@ const USER_TTL = 30 * 60;        // 30min
 const roleKey = (id) => `role:perms:${id}`;
 const userKey = (id) => `user:perms:${id}`;
 
+// Defensive set lookup — old permission keys (e.g. allowSignIn) can linger in
+// role_permissions / user_permission_overrides after being removed from
+// ALL_PERMISSIONS. We drop them here so they don't leak through the cache,
+// the auth bundle, or /api/me. The DB rows are harmless until cleaned up
+// out-of-band; this filter guarantees the in-memory shape is canonical.
+const ALLOWED_PERMISSION_SET = new Set(ALL_PERMISSIONS);
+
 async function loadRoleFromDb(roleId) {
     const pool = getPool();
     const [permRows] = await pool.execute(
@@ -39,7 +46,10 @@ async function loadRoleFromDb(roleId) {
 
     const permissions = {};
     for (const key of ALL_PERMISSIONS) permissions[key] = false;
-    for (const row of permRows) permissions[row.permission_key] = row.granted === 1;
+    for (const row of permRows) {
+        if (!ALLOWED_PERMISSION_SET.has(row.permission_key)) continue;
+        permissions[row.permission_key] = row.granted === 1;
+    }
 
     return {
         permissions,
@@ -76,7 +86,14 @@ async function loadUserFromDb(userId) {
     };
     if (overrideRows.length > 0) {
         obj.overrides = {};
-        for (const row of overrideRows) obj.overrides[row.permission_key] = row.override_value;
+        for (const row of overrideRows) {
+            if (!ALLOWED_PERMISSION_SET.has(row.permission_key)) continue;
+            obj.overrides[row.permission_key] = row.override_value;
+        }
+        // All overrides could have been legacy keys — re-check whether any
+        // survived so the hasOverrides sentinel stays accurate.
+        obj.hasOverrides = Object.keys(obj.overrides).length > 0;
+        if (!obj.hasOverrides) delete obj.overrides;
     }
     return obj;
 }

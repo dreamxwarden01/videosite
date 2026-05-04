@@ -47,4 +47,4 @@ async function take(handle) {
     return results[0][1] || null;
 }
 
-module.exports = { create, take };
+module.exports = { create, take, TTL_SECONDS };

@@ -29,8 +29,10 @@ export default function HomePage() {
   // time; this gives the banner + greyout a chance to clear without the
   // user having to sign out and back in. We intentionally don't poll when
   // permission is already true — no upside, just extra requests.
+  // Truthy check (not `=== false`): /api/me only ships granted permissions,
+  // so a denied permission is `undefined`.
   useEffect(() => {
-    if (user && user.permissions?.allowPlayback === false) {
+    if (user && !user.permissions?.allowPlayback) {
       refresh();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps

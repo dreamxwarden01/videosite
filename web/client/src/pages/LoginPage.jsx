@@ -70,6 +70,33 @@ export default function LoginPage() {
   // could add a richer shape later (e.g. with a "remove passkey from
   // device" link) but the message itself already explains the next step.
   const [passkeyError, setPasskeyError] = useState('');
+  // Short token shown in [] under the message — purely diagnostic, helps
+  // users report what failed without reading server logs.
+  const [passkeyErrorCode, setPasskeyErrorCode] = useState('');
+
+  // Passkey challenge bookkeeping for retry UX.
+  //   { handle, options, expiresAt, ttlSeconds, attempted }
+  // - `expiresAt` is wall-clock ms (Date.now() + ttlSeconds * 1000).
+  // - `attempted` flips true the moment we POST /verify, because the
+  //   server's GET+DEL atomically consumes the Redis entry on receive.
+  // Reuse criteria (skip /options, skip Turnstile): !attempted AND
+  // remaining >= half TTL. Anything else needs a fresh /options call.
+  const [passkeyChallenge, setPasskeyChallenge] = useState(null);
+
+  // Both timing flags get flipped by setTimeout fires from the effect
+  // below — never derived inline from Date.now() at render time, so the
+  // UI updates automatically the moment a boundary crosses (no idle
+  // staleness, no reliance on incidental re-renders).
+  const [passkeyHalfTtlPassed, setPasskeyHalfTtlPassed] = useState(false);
+  const [passkeyExpired, setPasskeyExpired] = useState(false);
+
+  // Single source of truth for "can skip /options on the next attempt".
+  // Pure state, no Date.now(), so it's always correct at click time too.
+  const hasReusableChallenge = !!(
+    passkeyChallenge
+    && !passkeyChallenge.attempted
+    && !passkeyHalfTtlPassed
+  );
 
   // Enrollment email setup state
   const [enrollEmail, setEnrollEmail] = useState('');
@@ -94,6 +121,36 @@ export default function LoginPage() {
   useEffect(() => {
     if (user && !loginCompleted.current) navigate('/', { replace: true });
   }, [user, navigate]);
+
+  // Schedule the two boundary fires that drive the retry UI:
+  //   - half-TTL: flip Turnstile widget visibility on the error screen
+  //               (and force `hasReusableChallenge` → false everywhere)
+  //   - full TTL: grey out the Try Again button entirely
+  // Runs regardless of phase so both flags stay accurate even if the user
+  // bounces between credentials and passkey-error while the challenge
+  // ages out — click-time decisions then read pure state, no Date.now().
+  useEffect(() => {
+    if (!passkeyChallenge) {
+      setPasskeyHalfTtlPassed(false);
+      setPasskeyExpired(false);
+      return;
+    }
+    const now = Date.now();
+    const halfMs = passkeyChallenge.expiresAt - (passkeyChallenge.ttlSeconds * 1000) / 2;
+    const fullMs = passkeyChallenge.expiresAt;
+
+    setPasskeyHalfTtlPassed(now >= halfMs);
+    setPasskeyExpired(now >= fullMs);
+
+    const timers = [];
+    if (now < halfMs) {
+      timers.push(setTimeout(() => setPasskeyHalfTtlPassed(true), halfMs - now));
+    }
+    if (now < fullMs) {
+      timers.push(setTimeout(() => setPasskeyExpired(true), fullMs - now));
+    }
+    return () => timers.forEach(clearTimeout);
+  }, [passkeyChallenge]);
 
 
   const handleSubmit = async (e) => {
@@ -182,67 +239,115 @@ export default function LoginPage() {
 
   // ---- Passkey "quick sign in" (username-less, single round trip) ----
   //
-  // 1. POST /api/auth/passkey/options → { challengeHandle, options }
-  // 2. startAuthentication shows the OS picker; user selects + verifies
-  // 3. POST /api/auth/passkey/verify with { challengeHandle, credential }
-  // 4. On 200: session cookie is set server-side, refresh user, navigate
+  // Happy path:
+  //   1. POST /api/auth/passkey/options → { challengeHandle, options, ttl }
+  //   2. startAuthentication shows the OS picker; user selects + verifies
+  //   3. POST /api/auth/passkey/verify with { challengeHandle, credential }
+  //   4. On 200: session cookie is set server-side, refresh user, navigate
   //
-  // Errors map to the 'passkey-error' phase with a tailored message.
-  // User cancellation (NotAllowedError / AbortError) is silent — back to
-  // the credentials view, no toast, no error.
+  // Retry path (Try Again from passkey-error phase):
+  //   - If the previous challenge is still alive (not /verify-attempted AND
+  //     >= half its TTL remaining), reuse the handle + options. This skips
+  //     /options, which means no Turnstile token gets consumed and no new
+  //     challenge minted server-side.
+  //   - Otherwise we go through /options again, which needs a fresh
+  //     Turnstile token (the error-screen widget supplies it).
+  //
+  // Errors all land on 'passkey-error' (was previously silent on OS-picker
+  // cancel — now surfaces it so the user can hit Try Again from there
+  // instead of being teleported back to credentials with no explanation).
   const attemptPasskeyLogin = async () => {
     setPasskeyError('');
+    setPasskeyErrorCode('');
     setPhase('passkey');
     const rt = searchParams.get('returnTo') || '/';
 
+    let challengeHandle, options, expiresAt, ttlSeconds;
     let assertion;
+
     try {
-      // /options carries the Turnstile token. /verify doesn't need one
-      // because it's already gated by a one-shot Redis challenge handle
-      // that only /options can mint.
-      const { data: optsData, status: optsStatus, ok: optsOk } = await apiPost('/api/auth/passkey/options', {
-        turnstileToken,
-      });
+      if (hasReusableChallenge) {
+        // Skip /options entirely — same handle, same WebAuthn challenge,
+        // no Turnstile burn. The server's Redis entry is still alive.
+        challengeHandle = passkeyChallenge.handle;
+        options = passkeyChallenge.options;
+        expiresAt = passkeyChallenge.expiresAt;
+        ttlSeconds = passkeyChallenge.ttlSeconds;
+      } else {
+        // Need a fresh challenge — call /options. Turnstile token is
+        // one-shot consumed regardless of outcome; refresh the widget
+        // immediately so the next failure path has a token waiting.
+        const { data: optsData, status: optsStatus, ok: optsOk } = await apiPost('/api/auth/passkey/options', {
+          turnstileToken,
+        });
 
-      // Turnstile token is one-shot consumed by /options regardless of
-      // whether the rest of the flow succeeds. Refresh the widget RIGHT
-      // NOW so any subsequent attempt (after OS-picker cancel, after a
-      // /verify failure, or even after this same call's error branches
-      // below) has a fresh token waiting on the credentials view. The
-      // user is still looking at the passkey loading overlay during the
-      // OS prompt, so the widget refresh is invisible to them.
-      setTurnstileToken(null);
-      turnstileResetRef.current?.();
+        setTurnstileToken(null);
+        turnstileResetRef.current?.();
 
-      // 429 first — covers Cloudflare's HTML 429 (where data is null
-      // because apiFetch only parses JSON content types). Without this
-      // explicit branch, the code-based checks below would all fail and
-      // fall through to a generic passkey-error.
-      if (optsStatus === 429) {
-        showToast('Too many sign-in attempts. Please wait a moment and try again.');
-        setPhase('credentials');
-        return;
+        if (optsStatus === 429) {
+          showToast('Too many sign-in attempts. Please wait a moment and try again.');
+          setPhase('credentials');
+          return;
+        }
+
+        if (optsStatus === 422 && optsData?.errors?.turnstile) {
+          showToast(optsData.errors.turnstile);
+          if (!turnstileSiteKey) await refreshSiteSettings();
+          setPhase('credentials');
+          return;
+        }
+
+        if (!optsOk || !optsData || !optsData.options) {
+          setPasskeyError('Couldn’t start passkey sign-in. Please try again.');
+          setPasskeyErrorCode(optsData?.error || `http_${optsStatus}`);
+          setPasskeyChallenge(null);
+          setPhase('passkey-error');
+          return;
+        }
+
+        challengeHandle = optsData.challengeHandle;
+        options = optsData.options;
+        ttlSeconds = optsData.challengeTtlSeconds || 300;
+        expiresAt = Date.now() + ttlSeconds * 1000;
+        setPasskeyChallenge({ handle: challengeHandle, options, expiresAt, ttlSeconds, attempted: false });
       }
 
-      // Turnstile rejection — surface as a toast on the credentials view
-      // (so the user can see the refreshed widget) instead of dropping
-      // into the passkey-error phase.
-      if (optsStatus === 422 && optsData?.errors?.turnstile) {
-        showToast(optsData.errors.turnstile);
-        if (!turnstileSiteKey) await refreshSiteSettings();
-        setPhase('credentials');
-        return;
-      }
-
-      if (!optsOk || !optsData || !optsData.options) {
-        setPasskeyError('Couldn’t start passkey sign-in. Please try again.');
+      try {
+        assertion = await startAuthentication({ optionsJSON: options });
+      } catch (err) {
+        // OS picker cancelled / aborted / no credential. Used to silently
+        // bounce to credentials; user wants a visible error here so retry
+        // (which can reuse the still-alive challenge) is reachable.
+        const name = (err && err.name) || 'unknown';
+        if (name === 'NotAllowedError' || name === 'AbortError') {
+          setPasskeyError('Verification was cancelled or didn’t complete. You can try again.');
+        } else {
+          setPasskeyError('Couldn’t start passkey verification on this device.');
+        }
+        setPasskeyErrorCode(name);
         setPhase('passkey-error');
         return;
       }
-      assertion = await startAuthentication({ optionsJSON: optsData.options });
+
+      // Client-side TTL check — the server will reject an expired handle
+      // as `unknown_credential` but the message is misleading; pre-empt
+      // it so the user sees "challenge expired" instead. Mark attempted
+      // so the retry path doesn't try to reuse this dead handle.
+      if (Date.now() >= expiresAt) {
+        setPasskeyChallenge(prev => prev ? { ...prev, attempted: true } : prev);
+        setPasskeyError('Sign-in challenge expired. Start over from the sign-in screen.');
+        setPasskeyErrorCode('challenge_expired');
+        setPhase('passkey-error');
+        return;
+      }
+
+      // Mark before /verify because the server's GET+DEL is atomic on
+      // receive — even if the round trip blows up, the Redis entry is
+      // gone. Treating it as consumed keeps the retry policy honest.
+      setPasskeyChallenge(prev => prev ? { ...prev, attempted: true } : prev);
 
       const { data, status, ok } = await apiPost('/api/auth/passkey/verify', {
-        challengeHandle: optsData.challengeHandle,
+        challengeHandle,
         credential: assertion,
         returnTo: rt
       });
@@ -254,19 +359,12 @@ export default function LoginPage() {
         return;
       }
 
-      // 429 first — same Cloudflare-HTML reasoning as above. Widget was
-      // already refreshed when /options completed, so no extra reset
-      // needed here; we just hand control back to credentials.
       if (status === 429) {
         showToast('Too many sign-in attempts. Please wait a moment and try again.');
         setPhase('credentials');
         return;
       }
 
-      // Translate server error codes into user-facing messages + cleanup
-      // hints. The credentialId is echoed back on 404 so we can fire
-      // signalUnknownCredential without holding a reference across the
-      // round trip ourselves.
       const code = data?.error;
       if (status === 404 && code === 'unknown_credential') {
         signalUnknownCredential(data?.credentialId || assertion?.id);
@@ -276,7 +374,6 @@ export default function LoginPage() {
           'passkey from your device’s password manager.'
         );
       } else if (status === 410 && code === 'revoked') {
-        // No cleanup signal — admin may unrevoke.
         setPasskeyError('This passkey has been revoked. Please sign in with your password.');
       } else if (status === 401 && code === 'inactive_user') {
         setPasskeyError('This account is deactivated.');
@@ -285,17 +382,12 @@ export default function LoginPage() {
       } else {
         setPasskeyError('Sign-in failed. Please try again or use your password.');
       }
+      setPasskeyErrorCode(code || `http_${status}`);
       setPhase('passkey-error');
     } catch (err) {
-      // User cancelled the OS picker, or no credential available, or the
-      // browser refused the call. NotAllowedError covers cancellation +
-      // "no available credentials"; AbortError covers timeout / abort.
-      const name = err && err.name;
-      if (name === 'NotAllowedError' || name === 'AbortError') {
-        setPhase('credentials');
-        return;
-      }
+      const name = (err && err.name) || 'unknown';
       setPasskeyError('Sign-in failed. Please try again or use your password.');
+      setPasskeyErrorCode(name);
       setPhase('passkey-error');
     }
   };
@@ -564,37 +656,67 @@ export default function LoginPage() {
               </>
             )}
 
-            {phase === 'passkey-error' && (
-              <>
-                <h2 style={{ marginBottom: '8px', textAlign: 'center' }}>Sign-in failed</h2>
-                <p style={{ textAlign: 'center', color: '#555', marginBottom: '24px' }}>
-                  {passkeyError || 'Something went wrong when trying to verify with your passkey.'}
-                </p>
+            {phase === 'passkey-error' && (() => {
+              // Pre-compute the gates so the JSX stays readable.
+              //   needFreshOptions: retry has to call /options (no live
+              //     reusable challenge), which means it needs a Turnstile
+              //     token. We render the widget here so the user can earn
+              //     one without bouncing back to the credentials view.
+              //   tryAgainDisabled: greyed out on expiry (forces the user
+              //     to restart from credentials), or while we're waiting
+              //     for the Turnstile token in needFreshOptions mode.
+              const needFreshOptions = !hasReusableChallenge;
+              const showTurnstileHere = needFreshOptions && !passkeyExpired && !!turnstileSiteKey;
+              const tryAgainDisabled = passkeyExpired
+                || (needFreshOptions && !!turnstileSiteKey && !turnstileToken);
+              return (
+                <>
+                  <h2 style={{ marginBottom: '8px', textAlign: 'center' }}>Sign-in failed</h2>
+                  <p style={{ textAlign: 'center', color: '#555', marginBottom: passkeyErrorCode ? '4px' : '24px' }}>
+                    {passkeyError || 'Something went wrong when trying to verify with your passkey.'}
+                  </p>
+                  {passkeyErrorCode && (
+                    <p style={{ textAlign: 'center', color: '#9ca3af', fontSize: '12px', marginBottom: '20px', fontFamily: 'monospace' }}>
+                      [{passkeyErrorCode}]
+                    </p>
+                  )}
 
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                  <button
-                    className="btn btn-primary"
-                    style={{ width: '100%', justifyContent: 'center' }}
-                    onClick={attemptPasskeyLogin}
-                  >
-                    Try again
-                  </button>
-                  {/* White (not grey) "go back" — visually consistent with
-                      the passkey entry button on the credentials view, so
-                      the secondary action doesn't compete with the blue
-                      primary "Try again" above. Reuses .btn-passkey since
-                      it's already the project's white-outlined button
-                      style; the SVG slot is just empty. */}
-                  <button
-                    className="btn btn-passkey"
-                    style={{ width: '100%' }}
-                    onClick={() => { setPasskeyError(''); setPhase('credentials'); }}
-                  >
-                    Sign in with password
-                  </button>
-                </div>
-              </>
-            )}
+                  {showTurnstileHere && (
+                    <Turnstile
+                      onToken={setTurnstileToken}
+                      onExpire={() => setTurnstileToken(null)}
+                      onError={() => setTurnstileToken(null)}
+                      resetRef={turnstileResetRef}
+                    />
+                  )}
+
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                    <button
+                      className="btn btn-primary"
+                      style={{ width: '100%', justifyContent: 'center' }}
+                      onClick={attemptPasskeyLogin}
+                      disabled={tryAgainDisabled}
+                    >
+                      Try again
+                    </button>
+                    {/* White (not grey) "go back" — visually consistent with
+                        the passkey entry button on the credentials view, so
+                        the secondary action doesn't compete with the blue
+                        primary "Try again" above. Reuses .btn-passkey since
+                        it's already the project's white-outlined button
+                        style; the SVG slot is just empty. Always available,
+                        even after expiry. */}
+                    <button
+                      className="btn btn-passkey"
+                      style={{ width: '100%' }}
+                      onClick={() => { setPasskeyError(''); setPasskeyErrorCode(''); setPhase('credentials'); }}
+                    >
+                      Sign in with password
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
 
             {phase === 'mfa-verify' && mfaData && (
               <MfaChallengeUI
