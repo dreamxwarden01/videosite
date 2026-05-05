@@ -151,8 +151,8 @@ async function updateTaskStatus(jobId, status, progress = null, errorMessage = n
 
     // Guard: never downgrade a terminal state (completed / error) back to a
     // processing state. Stale worker status reports can race with a successful
-    // /task/complete when the same worker holds another in-flight job — the
-    // job that just completed may still be in the worker's next /task/status
+    // /tasks/complete when the same worker holds another in-flight job — the
+    // job that just completed may still be in the worker's next /tasks/status
     // batch because the job goroutine hasn't finished its defer cleanup yet.
     // Without this guard that batch would flip the row from 'completed' back
     // to 'processing', re-arm the stale timer, and 2 minutes later the stale
@@ -422,7 +422,7 @@ async function leaseTask(videoId, workerKeyId) {
     }
     await videoCache.invalidate(task.video_id);
 
-    // Seed the heartbeat cache. Subsequent /worker/task/status (running)
+    // Seed the heartbeat cache. Subsequent /worker/tasks/status (running)
     // hits HEXISTS this key as the "is the job alive" gate — no DB query.
     await transcodeCache.initOnLease(jobId, task.video_id, task.hashed_video_id, 'leased', 'worker_downloading');
 

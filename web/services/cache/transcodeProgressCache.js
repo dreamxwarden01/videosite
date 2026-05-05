@@ -2,7 +2,7 @@
 //
 // Per the user's spec, only in-progress heartbeats are coalesced; lease /
 // error / abort / complete go to DB immediately. The cache acts as both:
-//   1. The fast write path for /api/worker/task/status running heartbeats
+//   1. The fast write path for /api/worker/tasks/status running heartbeats
 //      (every ~2s per active job).
 //   2. The "is this job still alive?" gate — populated on lease, cleared on
 //      any terminal/abort/delete. The worker's status callback uses the

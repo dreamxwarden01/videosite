@@ -131,10 +131,10 @@ type Job struct {
 	duration       float64
 	phase          atomic.Value // current phase: "downloading", "probing", "transcoding", "uploading", "completing"
 
-	// Current status for the batched /task/status reporter. Read by
+	// Current status for the batched /tasks/status reporter. Read by
 	// Manager.SnapshotStatuses every 2 s; written by the job goroutine on
 	// progress. Duration is NOT mirrored here — it lives on j.duration and
-	// is sent exactly once with /task/complete.
+	// is sent exactly once with /tasks/complete.
 	reportMu       sync.Mutex
 	reportStage    string
 	reportProgress int
@@ -793,9 +793,9 @@ func (j *Job) probe() (*transcoder.ProbeResult, error) {
 	j.duration = probe.DurationSeconds
 	j.UI.Logf("[%s] probe complete: %dx%d, %.1fs, %s", j.JobID, probe.Width, probe.Height, probe.DurationSeconds, probe.Codec)
 
-	// Stage is picked up by the next /task/status tick (worker status loop
+	// Stage is picked up by the next /tasks/status tick (worker status loop
 	// reads SnapshotStatuses every 2 s). Duration is NOT pushed into the
-	// status path — it rides on /task/complete for a single DB write.
+	// status path — it rides on /tasks/complete for a single DB write.
 	j.SetStage("processing", 9)
 
 	return probe, nil
@@ -1258,7 +1258,7 @@ func (j *Job) fetchUploadURLsWithRetry(ctx context.Context, tasks []uploadTask) 
 // doUploadWithMonitoring performs the actual upload.
 //
 // The 60-second "server unreachable" safety net lives at the worker level now
-// (status loop calls slotMgr.AbortAll when /task/status has been silent that
+// (status loop calls slotMgr.AbortAll when /tasks/status has been silent that
 // long), so this function only has to worry about cancellation and 403 token
 // refresh.
 //
@@ -1508,13 +1508,13 @@ func (j *Job) reportProfileProgress(pEnd float64) {
 	j.Progress.Update(j.JobID, "transcoding", pct)
 
 	// Publish locally — worker status loop picks it up every 2 s and batches
-	// with other active jobs into a single /task/status call.
+	// with other active jobs into a single /tasks/status call.
 	j.SetStage("processing", pct)
 }
 
 // handleError classifies a job-phase error and queues a terminal status.
 //
-// The actual /task/status delivery happens in the worker status loop via
+// The actual /tasks/status delivery happens in the worker status loop via
 // Manager.SnapshotStatuses — all this method does is:
 //
 //   - Return nil for errors the server already knows about (ErrJobNotFound).

@@ -23,7 +23,7 @@ import (
 // Kept at 5 s so idle workers don't hammer /tasks/available.
 const pollInterval = 5 * time.Second
 
-// statusInterval is the cadence of the batched /task/status reporter.
+// statusInterval is the cadence of the batched /tasks/status reporter.
 const statusInterval = 2 * time.Second
 
 // statusSilenceAbort is how long the status loop tolerates consecutive failures
@@ -240,7 +240,7 @@ func (w *Worker) launchJob(r api.LeaseResult) {
 	}()
 }
 
-// statusLoop is the 2-second batched /task/status reporter.
+// statusLoop is the 2-second batched /tasks/status reporter.
 //
 // It runs for the lifetime of the worker once started (lazy via statusOnce).
 // On each tick:

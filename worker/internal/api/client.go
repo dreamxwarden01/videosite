@@ -23,7 +23,7 @@ import (
 var ErrAuthFailed = fmt.Errorf("authentication failed (401)")
 
 // ErrJobNotFound indicates a 404 response from the server.
-// Only /task/complete uses it today (job already completed / cleaned up).
+// Only /tasks/complete uses it today (job already completed / cleaned up).
 var ErrJobNotFound = fmt.Errorf("job not found (404)")
 
 // ErrCertFatal indicates the in-memory mTLS client certificate is invalid

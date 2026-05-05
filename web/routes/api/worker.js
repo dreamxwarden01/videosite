@@ -82,10 +82,10 @@ router.post('/worker/tasks/lease', requireWorkerSession, async (req, res) => {
     }
 });
 
-// POST /api/worker/task/status — batched per-job status update.
+// POST /api/worker/tasks/status — batched per-job status update.
 // Request: { jobs: [ { jobId, status, stage?, progress?, errorMessage? }, ... ] }
 // Response: { results: [ { jobId, ack }, ... ] }
-router.post('/worker/task/status', requireWorkerSession, async (req, res) => {
+router.post('/worker/tasks/status', requireWorkerSession, async (req, res) => {
     try {
         const { jobs } = req.body || {};
         if (!Array.isArray(jobs)) {
@@ -95,15 +95,15 @@ router.post('/worker/task/status', requireWorkerSession, async (req, res) => {
         const results = await reportJobStatuses(jobs);
         res.json({ results });
     } catch (err) {
-        console.error('Worker task/status error:', err);
+        console.error('Worker tasks/status error:', err);
         res.status(500).json({ error: 'Failed to update status' });
     }
 });
 
-// POST /api/worker/task/complete — single-job completion.
+// POST /api/worker/tasks/complete — single-job completion.
 // Request: { jobId, durationSeconds? }
 // Response: 204 on success, 404 if jobId unknown.
-router.post('/worker/task/complete', requireWorkerSession, async (req, res) => {
+router.post('/worker/tasks/complete', requireWorkerSession, async (req, res) => {
     try {
         const { jobId, durationSeconds } = req.body || {};
         if (!jobId) {
@@ -116,7 +116,7 @@ router.post('/worker/task/complete', requireWorkerSession, async (req, res) => {
         }
         res.status(204).end();
     } catch (err) {
-        console.error('Worker task/complete error:', err);
+        console.error('Worker tasks/complete error:', err);
         res.status(500).json({ error: 'Failed to complete task' });
     }
 });

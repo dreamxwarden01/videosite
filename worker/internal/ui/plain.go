@@ -43,7 +43,7 @@ type plainJob struct {
 
 	// completing == true once UpdateStage("completing", _) fires. The
 	// summarizer skips these rows to avoid the same stale-terminal race
-	// the server already guards against in /task/status.
+	// the server already guards against in /tasks/status.
 	completing bool
 }
 

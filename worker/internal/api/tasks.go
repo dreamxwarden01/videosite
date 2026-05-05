@@ -9,7 +9,7 @@ import (
 	"videosite-worker/internal/config"
 )
 
-// ErrCompleteRetriesExhausted is returned when /task/complete failed 5× with
+// ErrCompleteRetriesExhausted is returned when /tasks/complete failed 5× with
 // non-fatal errors. The uploaded R2 output is fine — the server's processing
 // timeout will eventually requeue on its own.
 var ErrCompleteRetriesExhausted = fmt.Errorf("complete retries exhausted")
@@ -51,11 +51,11 @@ type leaseResultsResponse struct {
 	Results []LeaseResult `json:"results"`
 }
 
-// JobStatus is one entry in the `POST /api/worker/task/status` batch.
+// JobStatus is one entry in the `POST /api/worker/tasks/status` batch.
 // Status is "running", "failed", or "aborted".
 // For "running", Stage + Progress are required.
 // For "failed", ErrorMessage is required.
-// Duration is NOT carried here — it's sent exactly once with /task/complete
+// Duration is NOT carried here — it's sent exactly once with /tasks/complete
 // so videos.duration_seconds receives a single write per job.
 type JobStatus struct {
 	JobID        string  `json:"jobId"`
@@ -65,7 +65,7 @@ type JobStatus struct {
 	ErrorMessage string  `json:"errorMessage,omitempty"`
 }
 
-// JobAck is the per-job response from /task/status.
+// JobAck is the per-job response from /tasks/status.
 // Ack:false means the server does not recognize this jobId — worker should drop it.
 type JobAck struct {
 	JobID string `json:"jobId"`
@@ -126,7 +126,7 @@ func ReportStatus(ctx context.Context, jobs []JobStatus) ([]JobAck, error) {
 		return nil, nil
 	}
 	body := map[string]interface{}{"jobs": jobs}
-	resp, err := doRequest(ctx, http.MethodPost, "/api/worker/task/status", body)
+	resp, err := doRequest(ctx, http.MethodPost, "/api/worker/tasks/status", body)
 	if err != nil {
 		return nil, err
 	}
@@ -141,11 +141,11 @@ func ReportStatus(ctx context.Context, jobs []JobStatus) ([]JobAck, error) {
 	return out.Results, nil
 }
 
-// completeRetryDelays is the fixed backoff schedule for /task/complete:
+// completeRetryDelays is the fixed backoff schedule for /tasks/complete:
 // 0s, 1s, 2s, 3s, 4s between attempts (5 attempts total, ~10s cumulative wait).
 var completeRetryDelays = []time.Duration{0, 1 * time.Second, 2 * time.Second, 3 * time.Second, 4 * time.Second}
 
-// CompletePayload is the JSON body of POST /api/worker/task/complete.
+// CompletePayload is the JSON body of POST /api/worker/tasks/complete.
 type CompletePayload struct {
 	DurationSeconds float64 `json:"durationSeconds,omitempty"`
 }
@@ -173,7 +173,7 @@ func CompleteTask(ctx context.Context, jobID string, payload CompletePayload) er
 			}
 		}
 
-		resp, err := doRequest(ctx, http.MethodPost, "/api/worker/task/complete", body)
+		resp, err := doRequest(ctx, http.MethodPost, "/api/worker/tasks/complete", body)
 		if err != nil {
 			lastErr = err
 			// Auth failures propagated from doRequest are fatal — don't retry.

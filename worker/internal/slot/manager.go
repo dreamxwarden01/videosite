@@ -169,7 +169,7 @@ func (m *Manager) RecordTerminal(status api.JobStatus) {
 	m.pendingTerminal = append(m.pendingTerminal, status)
 }
 
-// SnapshotStatuses returns the status report for the next /task/status tick:
+// SnapshotStatuses returns the status report for the next /tasks/status tick:
 //   - one "running" entry per active job (reading its atomic stage/progress)
 //   - plus every queued terminal entry (drained atomically)
 //
@@ -181,7 +181,7 @@ func (m *Manager) SnapshotStatuses() []api.JobStatus {
 
 	statuses := make([]api.JobStatus, 0, len(m.activeJobs)+len(m.pendingTerminal))
 	for jobID, j := range m.activeJobs {
-		// Skip jobs whose /task/complete call is in flight. Their last stored
+		// Skip jobs whose /tasks/complete call is in flight. Their last stored
 		// stage is still "uploading 99%" (Progress.Remove runs only after
 		// CompleteTask returns), and a concurrent status batch would race with
 		// the server's terminal write — on the server this is already blocked
