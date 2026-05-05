@@ -53,21 +53,29 @@ const apiMfaRoutes = require('./routes/api/mfa');
 const passwordResetRoutes = require('./routes/password-reset');
 const apiMaterialRoutes = require('./routes/api/materials');
 
+// Belt-and-suspenders: disabling app-level etag stops 304s, but a browser
+// that previously cached an /api response (e.g. with a stale Cache-Control
+// from before this change) could still reuse it. no-store on every /api
+// reply makes the cache miss explicit.
+//
+// MUST be mounted BEFORE every /api/* router below — Express middleware
+// runs in declaration order, and the routers below register their own
+// /api/* paths (some via app.use(routes) without a prefix, some via
+// app.use('/api', routes)). Originally this lived between the two groups,
+// which meant /api/login, /api/auth/logout, /api/register/*, /api/mfa/*,
+// /api/auth/passkey/*, /api/password-reset/*, and /api/install all
+// bypassed it. Moving it up plugs that hole.
+app.use('/api', (req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    next();
+});
+
 app.use(installRoutes);
 app.use(authRoutes);
 app.use(mfaAuthRoutes);
 app.use(passkeyLoginRoutes);
 app.use(registerRoutes);
 app.use(passwordResetRoutes);
-
-// Belt-and-suspenders: disabling app-level etag stops 304s, but a browser
-// that previously cached an /api response (e.g. with a stale Cache-Control
-// from before this change) could still reuse it. no-store on every /api
-// reply makes the cache miss explicit.
-app.use('/api', (req, res, next) => {
-    res.set('Cache-Control', 'no-store');
-    next();
-});
 
 app.use('/api', apiAppRoutes);
 app.use('/api', apiPagesRoutes);
@@ -79,22 +87,92 @@ app.use('/api', apiMfaAdminRoutes);
 app.use('/api', apiMfaRoutes);
 app.use('/api', apiMaterialRoutes);
 
-// SPA fallback — serve React app for non-API routes
-const spaIndexPath = path.join(__dirname, 'client', 'dist', 'index.html');
+// SPA route allowlist — every client path that should serve index.html must
+// appear here. Anything not in the list (and not handled by an earlier
+// router or static-file middleware) falls through to the 404 catch-all
+// below and gets a real status 404 + standalone 404.html.
+//
+// MUST stay in sync with client/src/App.jsx. We don't auto-derive — the
+// list is small enough that manual maintenance is cheaper than the build-
+// time / shared-module gymnastics, and additions are rare.
+//
+// Static asset routes (/assets/*, /favicon.ico, /install.html) are served
+// by express.static earlier in the middleware chain, so they don't need
+// listing here. The /install client path is owned by routes/install.js.
+const spaPaths = [
+    // Public — no shell
+    '/',
+    '/login',
+    '/register',
+    '/register/continue',
+    '/reset-password',
+    '/reset-password/confirm',
 
+    // Authenticated user pages
+    '/profile',
+    '/profile/security/mfa',  // legacy redirect target
+    '/course/:courseId',
+    '/watch/:videoId',
+
+    // Admin
+    '/admin/courses',
+    '/admin/courses/:courseId/edit',
+    '/admin/materials',
+    '/admin/materials/:courseId',
+    '/admin/videos',
+    '/admin/videos/:courseId',
+    '/admin/users',
+    '/admin/users/:id/edit',
+    '/admin/enrollment',
+    '/admin/roles',
+    '/admin/invitations',
+    '/admin/settings',
+    '/admin/transcoding',
+    '/admin/playback-stats',
+    '/admin/mfa-settings',
+];
+
+const spaIndexPath = path.join(__dirname, 'client', 'dist', 'index.html');
+const notFoundPath = path.join(__dirname, 'client', 'dist', '404.html');
+
+// Cache-Control values for the HTML responses Express owns. Set here
+// instead of at the nginx layer because nginx's add_header rules don't
+// preserve upstream status codes cleanly (error_page-mapped responses
+// kept rewriting 404 → 200), and routing decisions already live in this
+// file — having Express set its own cache headers keeps everything in
+// one place.
+const SPA_SHELL_CACHE = 'public, max-age=120';   // 2 min — bundle URLs are hashed, deploys propagate within window
+const NOT_FOUND_CACHE = 'public, max-age=600';   // 10 min — 404s rarely become real
+
+// Allowlisted SPA paths get the shell. GET handles HEAD too (Express).
+// Other methods (POST, PUT, etc.) fall through to the 404 — actions live
+// under /api, never on a client path.
+app.get(spaPaths, (req, res) => {
+    if (fs.existsSync(spaIndexPath)) {
+        res.set('Cache-Control', SPA_SHELL_CACHE);
+        return res.sendFile(spaIndexPath);
+    }
+    // No build yet (dev without build) — give a useful hint instead of
+    // a generic 404, since 404.html probably doesn't exist either.
+    res.status(404).json({ error: 'SPA not built. Run: cd client && npm run build' });
+});
+
+// Catch-all — anything that didn't match an earlier router, a static file,
+// or an SPA path. Returns a real 404 status code (no more 200 + SPA shell
+// for /wp-admin.php and friends).
 app.use((req, res) => {
-    // API routes: return JSON 404
     if (req.originalUrl.startsWith('/api/')) {
         return res.status(404).json({ error: 'Not found' });
     }
 
-    // Non-API routes: serve SPA index.html
-    if (fs.existsSync(spaIndexPath)) {
-        return res.sendFile(spaIndexPath);
+    if (fs.existsSync(notFoundPath)) {
+        res.set('Cache-Control', NOT_FOUND_CACHE);
+        return res.status(404).sendFile(notFoundPath);
     }
 
-    // No build yet (dev without build)
-    res.status(404).json({ error: 'SPA not built. Run: cd client && npm run build' });
+    // 404.html missing (shouldn't happen post-build) — last-resort minimal
+    // body so we still return the right status code.
+    res.status(404).type('html').send('<!DOCTYPE html><title>Page not found</title><h1>404 — Page not found</h1>');
 });
 
 // Global error handler

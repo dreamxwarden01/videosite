@@ -15,8 +15,13 @@ const { resetPool } = require('../config/database');
 const redisService = require('../services/redis');
 
 // GET /install — serve standalone install page
+//
+// no-store: response depends on installer state (pre-install only — the
+// checkInstalled middleware returns 404 once installed) so caching it at
+// the edge would let users see the install page after the site is live.
 router.get('/install', (req, res) => {
     const path = require('path');
+    res.set('Cache-Control', 'no-store');
     res.sendFile(path.join(__dirname, '..', 'client', 'dist', 'install.html'));
 });
 

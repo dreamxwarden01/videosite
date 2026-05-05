@@ -23,14 +23,23 @@ async function checkInstallStatus() {
 }
 
 function rejectInstallRoute(req, res) {
+    // Both branches set Cache-Control explicitly. checkInstalled runs at
+    // app-level before the /api no-store middleware in server.js, so a
+    // bare res.json here would otherwise go out with no cache header.
     if (req.path === '/api/install') {
+        res.set('Cache-Control', 'no-store');
         return res.status(404).json({ error: 'Not found' });
     }
-    // GET /install — serve SPA index so React router shows 404 page
-    const spaIndex = path.join(__dirname, '..', 'client', 'dist', 'index.html');
-    if (fs.existsSync(spaIndex)) {
-        return res.status(404).sendFile(spaIndex);
+    // GET /install after the site is installed: same 404 + standalone
+    // 404.html the route allowlist sends for any other unknown path.
+    // Cache header matches NOT_FOUND_CACHE in server.js so all 404
+    // responses cache identically at the edge.
+    const notFoundFile = path.join(__dirname, '..', 'client', 'dist', '404.html');
+    if (fs.existsSync(notFoundFile)) {
+        res.set('Cache-Control', 'public, max-age=600');
+        return res.status(404).sendFile(notFoundFile);
     }
+    res.set('Cache-Control', 'no-store');
     res.status(404).json({ error: 'Not found' });
 }
 
