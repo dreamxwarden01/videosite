@@ -52,18 +52,19 @@ export default function ResetPasswordPage() {
         turnstileToken
       });
 
-      if (status === 422 && data?.errors) {
-        if (data.errors.turnstile) {
-          showToast(data.errors.turnstile);
-          setTurnstileToken(null);
-          if (resetRef.current) resetRef.current();
-          // Server says Turnstile is required but we cached it as off —
-          // re-fetch so the widget mounts on the next render.
-          if (!turnstileSiteKey) await refreshSiteSettings();
-        }
-        if (data.errors.email) {
-          setEmailError(data.errors.email);
-        }
+      if (status === 403 && data?.errors?.turnstile) {
+        showToast(data.errors.turnstile);
+        setTurnstileToken(null);
+        if (resetRef.current) resetRef.current();
+        // Server says Turnstile is required but we cached it as off —
+        // re-fetch so the widget mounts on the next render.
+        if (!turnstileSiteKey) await refreshSiteSettings();
+        setSubmitting(false);
+        return;
+      }
+
+      if (status === 422 && data?.errors?.email) {
+        setEmailError(data.errors.email);
         setSubmitting(false);
         return;
       }

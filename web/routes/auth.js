@@ -43,7 +43,13 @@ router.post('/api/login', async (req, res) => {
         const ip = getClientIp(req);
         const turnstileResult = await verifyTurnstileToken(turnstileToken, ip);
         if (!turnstileResult.success) {
-            return res.status(422).json({
+            // 403 (not 422): the body looks valid, the request is just being
+            // refused — same status the future Cloudflare-Worker turnstile
+            // gate will return when it short-circuits before ever hitting
+            // the origin. Keeping the status code stable across the
+            // edge-vs-origin split means the client doesn't need to learn
+            // two shapes.
+            return res.status(403).json({
                 success: false,
                 errors: { turnstile: 'Human verification failed. Please try again.' }
             });

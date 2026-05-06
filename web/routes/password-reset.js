@@ -25,10 +25,11 @@ router.post('/api/password-reset/request', async (req, res) => {
         const { email, turnstileToken } = req.body;
         const ip = getClientIp(req);
 
-        // 1. Verify Turnstile
+        // 1. Verify Turnstile (403 — same status the future Cloudflare-Worker
+        // gate uses when it short-circuits before the origin)
         const turnstileResult = await verifyTurnstileToken(turnstileToken, ip);
         if (!turnstileResult.success) {
-            return res.status(422).json({
+            return res.status(403).json({
                 success: false,
                 errors: { turnstile: 'Human verification failed. Please try again.' }
             });

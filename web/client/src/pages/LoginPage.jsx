@@ -203,7 +203,7 @@ export default function LoginPage() {
         await refresh();
         navigate(data.returnTo || '/', { replace: true });
         return;
-      } else if (status === 422 && data?.errors?.turnstile) {
+      } else if (status === 403 && data?.errors?.turnstile) {
         showToast(data.errors.turnstile);
         gotError = true;
         // Server requires Turnstile but we cached it as off — refresh
@@ -246,7 +246,7 @@ export default function LoginPage() {
   //   3. POST /api/auth/passkey/verify with { challengeHandle, credential }
   //   4. On 200: session cookie is set server-side, refresh user, navigate
   //
-  // Retry path (Try Again from passkey-error phase):
+  // Retry path (Try Again from passkey-error phase, fresh=false):
   //   - If the previous challenge is still alive (not /verify-attempted AND
   //     >= half its TTL remaining), reuse the handle + options. This skips
   //     /options, which means no Turnstile token gets consumed and no new
@@ -254,10 +254,16 @@ export default function LoginPage() {
   //   - Otherwise we go through /options again, which needs a fresh
   //     Turnstile token (the error-screen widget supplies it).
   //
+  // Credentials-page entry (fresh=true):
+  //   - Always call /options, never reuse. The credentials view has a live
+  //     Turnstile widget the user just solved, so we always burn that token
+  //     to mint a new challenge — guarantees that every passkey-from-login
+  //     attempt is gated by a fresh human-verification proof.
+  //
   // Errors all land on 'passkey-error' (was previously silent on OS-picker
   // cancel — now surfaces it so the user can hit Try Again from there
   // instead of being teleported back to credentials with no explanation).
-  const attemptPasskeyLogin = async () => {
+  const attemptPasskeyLogin = async ({ fresh = false } = {}) => {
     setPasskeyError('');
     setPasskeyErrorCode('');
     setPhase('passkey');
@@ -267,7 +273,7 @@ export default function LoginPage() {
     let assertion;
 
     try {
-      if (hasReusableChallenge) {
+      if (!fresh && hasReusableChallenge) {
         // Skip /options entirely — same handle, same WebAuthn challenge,
         // no Turnstile burn. The server's Redis entry is still alive.
         challengeHandle = passkeyChallenge.handle;
@@ -291,7 +297,7 @@ export default function LoginPage() {
           return;
         }
 
-        if (optsStatus === 422 && optsData?.errors?.turnstile) {
+        if (optsStatus === 403 && optsData?.errors?.turnstile) {
           showToast(optsData.errors.turnstile);
           if (!turnstileSiteKey) await refreshSiteSettings();
           setPhase('credentials');
@@ -613,7 +619,7 @@ export default function LoginPage() {
                       type="button"
                       className="btn btn-passkey"
                       style={{ width: '100%' }}
-                      onClick={attemptPasskeyLogin}
+                      onClick={() => attemptPasskeyLogin({ fresh: true })}
                       disabled={submitting || turnstileGate}
                     >
                       <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
@@ -695,7 +701,7 @@ export default function LoginPage() {
                     <button
                       className="btn btn-primary"
                       style={{ width: '100%', justifyContent: 'center' }}
-                      onClick={attemptPasskeyLogin}
+                      onClick={() => attemptPasskeyLogin()}
                       disabled={tryAgainDisabled}
                     >
                       Try again

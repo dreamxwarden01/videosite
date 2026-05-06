@@ -183,17 +183,18 @@ export default function RegisterPage() {
         } else {
           showToast('Too many requests. Please wait a moment and try again.');
         }
+      } else if (status === 403 && data?.errors?.turnstile) {
+        // Turnstile failure (must be checked before the generic 403 branch
+        // below so the registration-closed message doesn't shadow it).
+        showToast(data.errors.turnstile);
+        // Server says Turnstile is required but our local state didn't
+        // know — refresh and the widget will mount on the next render.
+        if (!turnstileSiteKey) await refreshSiteSettings();
       } else if (status === 403 && data) {
         showToast(data.message || 'Registration is currently closed.');
       } else if (status === 422 && data?.errors) {
         if (data.errors.email) { setEmailError(data.errors.email); setEmailValid(false); }
         if (data.errors.invitationCode) { setCodeError(data.errors.invitationCode); setCodeValid(false); }
-        if (data.errors.turnstile) {
-          showToast(data.errors.turnstile);
-          // Server says Turnstile is required but our local state didn't
-          // know — refresh and the widget will mount on the next render.
-          if (!turnstileSiteKey) await refreshSiteSettings();
-        }
       } else if (data?.message) {
         showToast(data.message);
       } else {
@@ -250,7 +251,7 @@ export default function RegisterPage() {
         } else {
           showToast('Too many requests. Please wait a moment and try again.');
         }
-      } else if (status === 422 && data?.errors?.turnstile) {
+      } else if (status === 403 && data?.errors?.turnstile) {
         showToast(data.errors.turnstile);
         if (!turnstileSiteKey) await refreshSiteSettings();
       } else if (data?.message) {

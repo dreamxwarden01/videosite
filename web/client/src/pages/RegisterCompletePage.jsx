@@ -153,15 +153,17 @@ export default function RegisterCompletePage() {
 
       if (status === 429) {
         showToast(data?.message || 'Too many requests. Please wait a moment and try again.');
+      } else if (status === 403 && data?.errors?.turnstile) {
+        // Turnstile failure (must be checked before the generic 403 branch
+        // below so the registration-closed message doesn't shadow it).
+        showToast(data.errors.turnstile);
+        if (!turnstileSiteKey) turnstileFailedWithStaleSiteKey = true;
       } else if (status === 403) {
         showToast(data?.message || 'Registration is currently closed.');
       } else if (status === 422 && data?.errors) {
         for (const [key, msg] of Object.entries(data.errors)) {
-          if (key === '_general' || key === 'turnstile') {
+          if (key === '_general') {
             showToast(msg);
-            if (key === 'turnstile' && !turnstileSiteKey) {
-              turnstileFailedWithStaleSiteKey = true;
-            }
           } else {
             setFieldError(key, msg);
             setFieldValid(key, false);

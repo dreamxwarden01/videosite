@@ -29,10 +29,11 @@ router.post('/api/register/start', async (req, res) => {
         const { email, invitationCode, turnstileToken } = req.body;
         const ip = getClientIp(req);
 
-        // 1. Verify Turnstile
+        // 1. Verify Turnstile (403 — same status the future Cloudflare-Worker
+        // gate uses when it short-circuits before the origin)
         const turnstileResult = await verifyTurnstileToken(turnstileToken, ip);
         if (!turnstileResult.success) {
-            return res.status(422).json({
+            return res.status(403).json({
                 success: false,
                 errors: { turnstile: 'Human verification failed. Please try again.' }
             });
@@ -170,10 +171,11 @@ router.post('/api/register/complete', async (req, res) => {
         const { email, token, username, displayName, password, confirmPassword, turnstileToken } = req.body;
         const ip = getClientIp(req);
 
-        // 1. Verify Turnstile
+        // 1. Verify Turnstile (403 — same status the future Cloudflare-Worker
+        // gate uses when it short-circuits before the origin)
         const turnstileResult = await verifyTurnstileToken(turnstileToken, ip);
         if (!turnstileResult.success) {
-            return res.status(422).json({
+            return res.status(403).json({
                 success: false,
                 errors: { turnstile: 'Human verification failed. Please try again.' }
             });
