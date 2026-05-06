@@ -11,7 +11,11 @@ import LoadingSpinner from '../../components/LoadingSpinner';
 import ProfileEditModal from '../../components/ProfileEditModal';
 
 export default function SettingsPage() {
-  const { siteName } = useSite();
+  // turnstileSiteKey is pulled in to drive the disabled state of the
+  // Turnstile-at-Worker toggle: when origin Turnstile isn't configured at
+  // all (env vars missing → /api/settings/public returns null), the toggle
+  // is moot and we grey it out with an inline note.
+  const { siteName, turnstileSiteKey } = useSite();
   const { user } = useAuth();
   const { showToast } = useToast();
   const confirm = useConfirm();
@@ -48,6 +52,9 @@ export default function SettingsPage() {
   const [hmacKeyCopyLabel, setHmacKeyCopyLabel] = useState('Copy');
   const [hmacRuleCopyLabel, setHmacRuleCopyLabel] = useState('click to copy');
   const [hmacInitMode, setHmacInitMode] = useState(false);
+
+  // Turnstile-at-Worker (sister section under the same Cloudflare card)
+  const [workerTurnstileEnabled, setWorkerTurnstileEnabled] = useState(false);
 
   // Worker Keys
   const [workerKeys, setWorkerKeys] = useState([]);
@@ -99,6 +106,7 @@ export default function SettingsPage() {
         setHmacHasKey(data.hmacKeyConfigured || false);
         setHmacEnabled(s.hmac_enabled !== undefined ? s.hmac_enabled === 'true' : (data.hmacKeyConfigured || false));
         setHmacTokenValidity(s.hmac_token_validity || '600');
+        setWorkerTurnstileEnabled(s.cloudflare_turnstile_worker_gate === 'true');
         setWorkerKeys(data.workerKeys || []);
         setRoles(data.roles || []);
         originalValues.current = {
@@ -412,6 +420,34 @@ export default function SettingsPage() {
       showToast(err.message);
     } finally {
       setHmacSaving(false);
+    }
+  };
+
+  // Turnstile-at-Worker toggle. Coordination rule for both directions:
+  // never end up in (toggle off + Worker deployed) — the Worker strips the
+  // token, the origin still expects to see one, so every gated request
+  // 403s. So the safe order is:
+  //   - Enabling : toggle ON first, then deploy the Worker.
+  //   - Disabling: undeploy the Worker first, then toggle OFF.
+  // The intermediate state (toggle on + Worker not yet in front) is fine
+  // functionally — it just means Turnstile isn't actually checked during
+  // that brief window.
+  const handleToggleWorkerTurnstile = async () => {
+    const newEnabled = !workerTurnstileEnabled;
+    if (newEnabled) {
+      if (!await confirm('Order: enable this first, then deploy the cloudflare/workers/turnstile-gate Worker (with TURNSTILE_SECRET_KEY set on the Cloudflare dashboard). Origin will skip Turnstile verification on the five sign-in/registration endpoints. Continue?')) return;
+    } else {
+      if (!await confirm('Order: undeploy the cloudflare/workers/turnstile-gate Worker (or remove its routes) first, then disable this. Disabling while the Worker is still in front will break every gated request because the Worker strips the token, but origin will start expecting one again. Continue?')) return;
+    }
+    try {
+      const { ok, data } = await mfaFetch('/api/admin/settings/turnstile-gate/toggle', { method: 'PUT', body: { enabled: newEnabled } });
+      if (ok) {
+        setWorkerTurnstileEnabled(newEnabled);
+      } else {
+        showToast(data?.error || 'Failed to toggle Turnstile worker gate.');
+      }
+    } catch (err) {
+      showToast(err.message);
     }
   };
 
@@ -786,12 +822,16 @@ export default function SettingsPage() {
         }}
       />
 
-      {/* HMAC */}
+      {/* Cloudflare — HMAC playback signing + Turnstile-at-Worker gate */}
       <div className="card mt-3">
         <div className="card-header">
-          <h2>HMAC Validation</h2>
+          <h2>Cloudflare</h2>
         </div>
         <div style={{ maxWidth: '600px' }}>
+          {/* ── HMAC Validation ─────────────────────────────────────── */}
+          <h3 style={{ fontSize: '14px', textTransform: 'uppercase', letterSpacing: '0.05em', color: '#6b7280', marginTop: 0, marginBottom: '12px' }}>
+            HMAC Validation
+          </h3>
           <p className="text-muted" style={{ marginBottom: '12px' }}>
             Signs playback URLs with HMAC-SHA256 for Cloudflare WAF token authentication.
           </p>
@@ -854,6 +894,61 @@ export default function SettingsPage() {
               Must be &le; the lifetime configured in your Cloudflare WAF rule. Default: 600 seconds.
             </small>
           </div>
+
+          <hr style={{ margin: '24px 0', border: 'none', borderTop: '1px solid #e5e7eb' }} />
+
+          {/* ── Turnstile Verification at Worker ────────────────────── */}
+          <h3 style={{ fontSize: '14px', textTransform: 'uppercase', letterSpacing: '0.05em', color: '#6b7280', marginTop: 0, marginBottom: '12px' }}>
+            Turnstile Verification at Worker
+          </h3>
+          <p className="text-muted" style={{ marginBottom: '12px' }}>
+            Lets a Cloudflare Worker validate Turnstile tokens at the edge instead of the origin.
+            The five sign-in/registration endpoints will skip their own siteverify call and trust
+            that the Worker has already verified the token.
+          </p>
+
+          <div className="form-group">
+            <label style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <span style={{ fontSize: '14px', fontWeight: 500 }}>
+                {workerTurnstileEnabled ? 'Enabled' : 'Disabled'}
+              </span>
+              <div
+                role="switch"
+                aria-checked={workerTurnstileEnabled}
+                aria-disabled={!turnstileSiteKey}
+                tabIndex={turnstileSiteKey ? 0 : -1}
+                onClick={() => { if (turnstileSiteKey) handleToggleWorkerTurnstile(); }}
+                onKeyDown={e => { if (turnstileSiteKey && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); handleToggleWorkerTurnstile(); } }}
+                style={{
+                  width: '44px', height: '24px', borderRadius: '12px',
+                  backgroundColor: workerTurnstileEnabled ? '#16a34a' : '#d1d5db',
+                  position: 'relative', transition: 'background-color 0.2s',
+                  cursor: turnstileSiteKey ? 'pointer' : 'not-allowed',
+                  opacity: turnstileSiteKey ? 1 : 0.5,
+                }}
+              >
+                <div style={{
+                  width: '18px', height: '18px', borderRadius: '50%', backgroundColor: '#fff',
+                  position: 'absolute', top: '3px', left: workerTurnstileEnabled ? '23px' : '3px',
+                  transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
+                }} />
+              </div>
+            </label>
+          </div>
+
+          <small className="text-muted" style={{ display: 'block', marginTop: '8px' }}>
+            Set <code>TURNSTILE_SECRET_KEY</code> on the Cloudflare dashboard for the
+            <code> turnstile-gate</code> Worker before deploying. Coordination order: turn this
+            <strong> on</strong> <em>before</em> deploying the Worker, and <strong>off</strong>
+            <em> after</em> undeploying. (Off + Worker still in front breaks every gated request — the
+            Worker strips the token while the origin expects to see one.)
+          </small>
+          {!turnstileSiteKey && (
+            <small className="text-muted" style={{ display: 'block', marginTop: '8px', color: '#b45309' }}>
+              Configure <code>TURNSTILE_SITE_KEY</code> and <code>TURNSTILE_SECRET_KEY</code> at the
+              origin first — this toggle has no effect while site-wide Turnstile is unconfigured.
+            </small>
+          )}
         </div>
       </div>
 

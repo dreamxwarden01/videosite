@@ -1262,6 +1262,13 @@
         "responses": { "200": { "description": "Toggled." } } }
     },
 
+    "/api/admin/settings/turnstile-gate/toggle": {
+      "put": { "tags": ["admin-settings"], "operationId": "admin_settings_turnstile_gate_toggle", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "summary": "Toggle whether origin should skip Turnstile verification (delegates to the edge Worker).",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["enabled"], "additionalProperties": false, "properties": { "enabled": { "type": "boolean" } } } } } },
+        "responses": { "200": { "description": "Toggled." } } }
+    },
+
     "/api/admin/settings/worker-keys": {
       "post": { "tags": ["admin-settings"], "operationId": "admin_worker_key_create", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
         "requestBody": { "required": false, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },

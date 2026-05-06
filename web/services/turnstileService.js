@@ -23,6 +23,39 @@ function isTurnstileEnabled() {
 }
 
 /**
+ * Master "Turnstile is verified at the edge by a Cloudflare Worker, so the
+ * origin doesn't need to verify again" toggle. Read from site_settings
+ * (cached); admin flips it from the Settings page.
+ *
+ * Only takes effect when Turnstile is configured at all — see
+ * isWorkerGateActive below for the combined check.
+ *
+ * @returns {Promise<boolean>}
+ */
+async function isWorkerGateEnabled() {
+    const { getSetting } = require('./cache/settingsCache');
+    const val = await getSetting('cloudflare_turnstile_worker_gate');
+    return val === 'true';
+}
+
+/**
+ * Effective state used by verifyTurnstileToken: the gate only counts when
+ * (a) Turnstile is configured site-wide, AND (b) the admin toggle is on.
+ *
+ * If Turnstile env vars are missing, verifyTurnstileToken already
+ * short-circuits with `{ success: true, skipped: true }` regardless of the
+ * toggle, so it doesn't matter what value the toggle has — the toggle is
+ * just inert. Mirroring that here keeps the admin UI's "this setting has
+ * no effect when Turnstile isn't configured" wording truthful.
+ *
+ * @returns {Promise<boolean>}
+ */
+async function isWorkerGateActive() {
+    if (!isTurnstileEnabled()) return false;
+    return isWorkerGateEnabled();
+}
+
+/**
  * Verify a Turnstile token with Cloudflare's siteverify endpoint.
  *
  * @param {string} token          – The cf-turnstile-response from the client widget.
@@ -35,6 +68,16 @@ async function verifyTurnstileToken(token, remoteIp, idempotencyKey) {
     // skip the check entirely. This lets the same code paths work in dev
     // environments and in production with or without Turnstile enabled.
     if (!isTurnstileEnabled()) {
+        return { success: true, skipped: true };
+    }
+
+    // Edge-verification mode: a Cloudflare Worker has already validated the
+    // token before the request reached us, and stripped `turnstileToken`
+    // from the body on its way through. The five gated routes call this
+    // function with `token === undefined` in that case — we accept it as
+    // pre-verified rather than calling siteverify ourselves (which would
+    // fail with missing-input-response anyway).
+    if (await isWorkerGateEnabled()) {
         return { success: true, skipped: true };
     }
 
@@ -71,4 +114,4 @@ async function verifyTurnstileToken(token, remoteIp, idempotencyKey) {
     }
 }
 
-module.exports = { verifyTurnstileToken, isTurnstileEnabled };
+module.exports = { verifyTurnstileToken, isTurnstileEnabled, isWorkerGateEnabled, isWorkerGateActive };

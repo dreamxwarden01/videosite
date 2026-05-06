@@ -1138,6 +1138,25 @@ router.put('/admin/settings/hmac/toggle', requireAuth, checkPermission('manageSi
     }
 });
 
+// PUT /api/admin/settings/turnstile-gate/toggle — enable/disable
+// "Turnstile is verified at a Cloudflare Worker, skip origin verification."
+//
+// We accept the toggle even when origin doesn't have TURNSTILE_*_KEY set —
+// the per-request short-circuit in turnstileService.isWorkerGateActive
+// already treats the toggle as inert when Turnstile is unconfigured, so
+// flipping it has no effect until the env vars come in.
+router.put('/admin/settings/turnstile-gate/toggle', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+    try {
+        const raw = req.body.enabled;
+        const enabled = raw === true || raw === 'true';
+        await setSetting('cloudflare_turnstile_worker_gate', enabled ? 'true' : 'false');
+        res.status(204).end();
+    } catch (err) {
+        console.error('API toggle turnstile gate error:', err);
+        res.status(500).json({ error: 'Failed to toggle Turnstile worker gate' });
+    }
+});
+
 // POST /api/admin/settings/worker-keys — create worker key
 router.post('/admin/settings/worker-keys', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
     try {

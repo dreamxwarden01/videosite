@@ -665,6 +665,20 @@ async function runMigrations() {
                         CHANGE COLUMN last_activity last_seen DATETIME NOT NULL
                     `);
                 }
+            },
+            {
+                id: '030_cloudflare_turnstile_worker_gate',
+                up: async () => {
+                    // Admin toggle for "Turnstile is verified at the edge by
+                    // a Cloudflare Worker; origin should skip its own
+                    // siteverify call." Defaults to off — existing deploys
+                    // keep their current origin-side verification behavior
+                    // until an admin enables it from the Settings page.
+                    await pool.execute(`
+                        INSERT IGNORE INTO site_settings (setting_key, setting_value)
+                        VALUES ('cloudflare_turnstile_worker_gate', 'false')
+                    `);
+                }
             }
         ];
 

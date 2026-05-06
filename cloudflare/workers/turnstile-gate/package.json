@@ -1,0 +1,14 @@
+{
+    "name": "turnstile-gate",
+    "version": "1.0.0",
+    "private": true,
+    "description": "Cloudflare Worker that verifies Turnstile tokens at the edge before they reach origin.",
+    "scripts": {
+        "dev": "wrangler dev",
+        "deploy": "wrangler deploy",
+        "tail": "wrangler tail"
+    },
+    "devDependencies": {
+        "wrangler": "^3.95.0"
+    }
+}

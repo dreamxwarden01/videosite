@@ -1,0 +1,33 @@
+// Wrangler config for the turnstile-gate Worker.
+//
+// `routes` binds the Worker to the five gated POST paths on YOUR site's
+// hostname. Replace stream.dreamxwarden.ca with the public hostname (no
+// scheme, no path) before deploying — e.g. "videosite.example.com".
+//
+// TURNSTILE_SECRET_KEY is intentionally NOT declared here. Add it on the
+// Cloudflare dashboard as a Secret (Workers & Pages → turnstile-gate →
+// Settings → Variables and Secrets → Add → type `Secret`, encrypted) or
+// via `npx wrangler secret put TURNSTILE_SECRET_KEY`. Until that lands,
+// `env.TURNSTILE_SECRET_KEY` is `undefined` and the Worker's misconfig
+// guard returns 503 to every gated request — which is the loud, obvious
+// failure we want, not a silent always-403 caused by a placeholder secret.
+//
+// For local `wrangler dev`, set TURNSTILE_SECRET_KEY in `.dev.vars`
+// (gitignored). See README.
+{
+    "$schema": "node_modules/wrangler/config-schema.json",
+    "name": "turnstile-gate",
+    "main": "src/index.js",
+    "compatibility_date": "2025-04-01",
+    "workers_dev": false,
+    "routes": [
+        { "pattern": "stream.dreamxwarden.ca/api/login",                 "zone_name": "dreamxwarden.ca" },
+        { "pattern": "stream.dreamxwarden.ca/api/register/start",        "zone_name": "dreamxwarden.ca" },
+        { "pattern": "stream.dreamxwarden.ca/api/register/complete",     "zone_name": "dreamxwarden.ca" },
+        { "pattern": "stream.dreamxwarden.ca/api/password-reset/request", "zone_name": "dreamxwarden.ca" },
+        { "pattern": "stream.dreamxwarden.ca/api/auth/passkey/options",  "zone_name": "dreamxwarden.ca" }
+    ],
+    "observability": {
+        "enabled": true
+    }
+}
