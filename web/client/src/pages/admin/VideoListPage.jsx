@@ -52,6 +52,7 @@ export default function VideoListPage() {
 
   // Set page title
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Videos${courseName ? ` - ${courseName}` : ''} - ${siteName}`;
   }, [courseName, siteName]);
 

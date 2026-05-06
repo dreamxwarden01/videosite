@@ -111,6 +111,7 @@ export default function LoginPage() {
   const [enrollResending, setEnrollResending] = useState(false);
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Sign In - ${siteName}`;
   }, [siteName]);
 

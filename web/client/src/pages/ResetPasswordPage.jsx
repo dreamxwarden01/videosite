@@ -28,6 +28,7 @@ export default function ResetPasswordPage() {
   }, [user, navigate]);
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Reset Password - ${siteName}`;
   }, [siteName]);
 

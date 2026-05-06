@@ -107,6 +107,7 @@ export default function MfaSettingsPage() {
   const handlePageMfaCancel = handlePageMfaCancel_;
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `MFA Settings - ${siteName}`;
   }, [siteName]);
 

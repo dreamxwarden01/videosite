@@ -49,6 +49,7 @@ export default function CourseEditPage() {
   const [showDeleteModal, setShowDeleteModal] = useState(false);
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Edit Course - ${siteName}`;
   }, [siteName]);
 

@@ -94,7 +94,7 @@ export default function WatchPage() {
           setData(d);
           tokenRef.current = d.hmacToken || '';
           validityRef.current = d.tokenValiditySeconds || 0;
-          document.title = `${d.video.title} - ${siteName}`;
+          if (siteName) document.title = `${d.video.title} - ${siteName}`;
         } else {
           setError(d?.error || 'Failed to load video.');
           // If the server says playback was rejected for this user, the

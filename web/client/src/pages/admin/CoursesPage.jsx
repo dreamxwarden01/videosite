@@ -31,6 +31,7 @@ export default function CoursesPage() {
   const [showAddModal, setShowAddModal] = useState(false);
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Course Management - ${siteName}`;
   }, [siteName]);
 

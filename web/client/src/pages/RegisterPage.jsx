@@ -45,6 +45,7 @@ export default function RegisterPage() {
   const [step2TurnstileReady, setStep2TurnstileReady] = useState(false);
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Register - ${siteName}`;
   }, [siteName]);
 

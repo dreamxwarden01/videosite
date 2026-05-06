@@ -38,6 +38,7 @@ export default function MaterialsPage() {
   }, [fetchCourses]);
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Course Materials - ${siteName}`;
   }, [siteName]);
 

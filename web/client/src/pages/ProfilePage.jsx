@@ -108,6 +108,7 @@ export default function ProfilePage() {
   /* ============================ effects ============================ */
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Profile - ${siteName}`;
   }, [siteName]);
 

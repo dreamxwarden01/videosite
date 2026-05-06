@@ -6,7 +6,10 @@ import { useSite } from '../context/SiteContext';
 export default function NotFoundPage() {
   const { siteName } = useSite();
 
-  useEffect(() => { document.title = `Not Found - ${siteName}`; }, [siteName]);
+  useEffect(() => {
+    if (!siteName) return;
+    document.title = `Not Found - ${siteName}`;
+  }, [siteName]);
 
   return (
     <>

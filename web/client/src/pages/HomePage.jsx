@@ -14,6 +14,7 @@ export default function HomePage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = siteName;
   }, [siteName]);
 

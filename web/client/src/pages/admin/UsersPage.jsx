@@ -33,6 +33,7 @@ export default function UsersPage() {
   const [showAddModal, setShowAddModal] = useState(false);
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `User Management - ${siteName}`;
   }, [siteName]);
 

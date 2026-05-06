@@ -31,6 +31,7 @@ export default function EnrollmentPage() {
   const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Enrollment Management - ${siteName}`;
   }, [siteName]);
 

@@ -52,6 +52,7 @@ export default function MaterialListPage() {
   }, [fetchMaterials]);
 
   useEffect(() => {
+    if (!siteName) return;
     if (courseName) {
       document.title = `${courseName} - Materials - ${siteName}`;
     }

@@ -47,6 +47,7 @@ export default function PlaybackStatsPage() {
   const [data, setData] = useState(null);
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Playback Statistics - ${siteName}`;
   }, [siteName]);
 

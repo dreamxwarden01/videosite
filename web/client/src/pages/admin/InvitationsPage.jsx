@@ -45,6 +45,7 @@ export default function InvitationsPage() {
   const [copyLabel, setCopyLabel] = useState('Copy');
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Invitation Codes - ${siteName}`;
   }, [siteName]);
 

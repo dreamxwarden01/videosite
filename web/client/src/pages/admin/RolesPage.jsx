@@ -44,6 +44,7 @@ export default function RolesPage() {
   const [createSaving, setCreateSaving] = useState(false);
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Role Management - ${siteName}`;
   }, [siteName]);
 

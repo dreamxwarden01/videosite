@@ -70,6 +70,7 @@ export default function UserEditPage() {
   });
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Edit User - ${siteName}`;
   }, [siteName]);
 

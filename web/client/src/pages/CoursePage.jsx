@@ -54,7 +54,7 @@ export default function CoursePage() {
         setCourse(data.course);
         setVideos(data.videos || []);
         setPagination(data.pagination);
-        document.title = `${data.course.course_name} - ${siteName}`;
+        if (siteName) document.title = `${data.course.course_name} - ${siteName}`;
       }
     } catch {
       if (!silent) showToast('Failed to load course.');

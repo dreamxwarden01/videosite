@@ -38,6 +38,7 @@ export default function VideoManagementPage() {
   }, [fetchCourses]);
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Video Management - ${siteName}`;
   }, [siteName]);
 

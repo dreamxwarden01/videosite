@@ -77,6 +77,7 @@ export default function SettingsPage() {
   const [transcodingTouched, setTranscodingTouched] = useState({});
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Site Settings - ${siteName}`;
   }, [siteName]);
 

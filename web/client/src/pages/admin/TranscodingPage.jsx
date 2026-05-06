@@ -54,6 +54,7 @@ export default function TranscodingPage() {
   const pollRef = useRef(null);
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Transcoding Status - ${siteName}`;
   }, [siteName]);
 

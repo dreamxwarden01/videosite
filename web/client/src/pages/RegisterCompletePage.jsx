@@ -45,6 +45,7 @@ export default function RegisterCompletePage() {
   }, [user, navigate]);
 
   useEffect(() => {
+    if (!siteName) return;
     document.title = `Complete Registration - ${siteName}`;
   }, [siteName]);
 
