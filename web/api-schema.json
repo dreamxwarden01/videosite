@@ -1,0 +1,1492 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "VideoSite API",
+    "version": "1.0.0",
+    "description": "OpenAPI 3.0 schema for the VideoSite Express server. Drives Cloudflare API Shield's request validation. The list of paths must stay in sync with the routers under `web/routes/` and the SPA route allowlist in `web/server.js`."
+  },
+  "servers": [
+    { "url": "https://{your_hostname}" }
+  ],
+  "tags": [
+    { "name": "auth",            "description": "Sign in / sign out / passkey login" },
+    { "name": "auth-mfa",        "description": "MFA challenges that gate sign-in (live in /api/auth/mfa/*)" },
+    { "name": "register",        "description": "Account creation flow" },
+    { "name": "password-reset",  "description": "Forgot-password flow" },
+    { "name": "system",          "description": "Public site info + current-session info" },
+    { "name": "install",         "description": "First-run installer (rejected post-install)" },
+    { "name": "profile",         "description": "Self-service account management" },
+    { "name": "courses",         "description": "Course browsing for students" },
+    { "name": "videos",          "description": "Video metadata, playback keys, watch tracking" },
+    { "name": "upload",          "description": "Multipart upload session lifecycle" },
+    { "name": "materials",       "description": "Course attachment files" },
+    { "name": "mfa",             "description": "Self-service MFA management" },
+    { "name": "mfa-challenge",   "description": "Step-up MFA challenges for sensitive ops" },
+    { "name": "admin-courses",   "description": "Admin: course CRUD + transcoding profiles" },
+    { "name": "admin-videos",    "description": "Admin: per-course video listing" },
+    { "name": "admin-users",     "description": "Admin: user CRUD + permissions + sessions" },
+    { "name": "admin-enrollment","description": "Admin: course enrollment management" },
+    { "name": "admin-roles",     "description": "Admin: role CRUD + role-level permissions" },
+    { "name": "admin-settings",  "description": "Admin: site settings, HMAC keys, worker keys" },
+    { "name": "admin-invites",   "description": "Admin: invitation code lifecycle" },
+    { "name": "admin-stats",     "description": "Admin: playback statistics" },
+    { "name": "admin-transcode", "description": "Admin: transcoding job monitor" },
+    { "name": "admin-mfa",       "description": "Admin: site-wide MFA policy" },
+    { "name": "worker",          "description": "Transcoding worker API (mTLS + bearer token)" }
+  ],
+  "components": {
+    "securitySchemes": {
+      "sessionCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "sid",
+        "description": "Session cookie set by /api/login (or the passkey/MFA equivalents). Required for every authenticated endpoint."
+      },
+      "mfaChallenge": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-MFA-Challenge",
+        "description": "Verified MFA challenge ID used by the mfaFetch retry pattern to authorise a step-up operation. Sent on the second attempt after the initial 403+requireMFA response."
+      },
+      "bmfaCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "bmfa",
+        "description": "Browser-MFA token used as the context for bmfa-scope challenges. Set automatically when the user first hits an MFA-gated endpoint."
+      },
+      "workerBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Bearer token returned by /api/worker/auth. Required for every worker endpoint except /auth itself."
+      }
+    },
+    "schemas": {
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "error":   { "type": "string" },
+          "message": { "type": "string" }
+        }
+      },
+      "TurnstileToken": {
+        "type": "string",
+        "description": "Cloudflare Turnstile token. Optional/null when Turnstile is unconfigured site-wide.",
+        "nullable": true,
+        "maxLength": 4096
+      },
+      "Email": {
+        "type": "string",
+        "format": "email",
+        "maxLength": 254
+      },
+      "Username": {
+        "type": "string",
+        "minLength": 3,
+        "maxLength": 20,
+        "pattern": "^[A-Za-z0-9_-]+$"
+      },
+      "DisplayName": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 30,
+        "pattern": "^[A-Za-z0-9 ]+$"
+      },
+      "Password": {
+        "type": "string",
+        "minLength": 8,
+        "maxLength": 128
+      },
+      "OtpCode": {
+        "type": "string",
+        "pattern": "^[0-9]{6}$"
+      },
+      "InvitationCode": {
+        "type": "string",
+        "pattern": "^[A-Z0-9]{12}$"
+      },
+      "ChallengeId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "WebAuthnAssertion": {
+        "type": "object",
+        "description": "SimpleWebAuthn assertion payload from startAuthentication()",
+        "additionalProperties": true
+      },
+      "WebAuthnRegistration": {
+        "type": "object",
+        "description": "SimpleWebAuthn registration payload from startRegistration()",
+        "additionalProperties": true
+      },
+      "MfaMethodType": {
+        "type": "string",
+        "enum": ["email", "authenticator", "passkey"]
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "Generic error envelope.",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } }
+        }
+      },
+      "NoContent": {
+        "description": "Success, no body."
+      }
+    }
+  },
+  "paths": {
+
+    "/api/install": {
+      "post": {
+        "tags": ["install"],
+        "operationId": "install_run",
+        "summary": "Run the first-time installer (DB + Redis + R2 + admin user).",
+        "description": "Available only while the site_settings.installed flag is unset. Returns 404 once the site is installed.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                  "dbHost":              { "type": "string" },
+                  "dbPort":              { "type": "string" },
+                  "dbUser":              { "type": "string" },
+                  "dbPassword":          { "type": "string" },
+                  "dbName":              { "type": "string" },
+                  "redisHost":           { "type": "string" },
+                  "redisPort":           { "type": "string" },
+                  "redisPassword":       { "type": "string" },
+                  "redisDb":             { "type": "string" },
+                  "r2Endpoint":          { "type": "string" },
+                  "r2BucketName":        { "type": "string" },
+                  "r2AccessKeyId":       { "type": "string" },
+                  "r2SecretAccessKey":   { "type": "string" },
+                  "r2PublicDomain":      { "type": "string" },
+                  "siteName":            { "type": "string" },
+                  "siteHostname":        { "type": "string" },
+                  "siteProtocol":        { "type": "string", "enum": ["http", "https"] },
+                  "adminUsername":       { "type": "string" },
+                  "adminDisplayName":    { "type": "string" },
+                  "adminPassword":       { "type": "string" },
+                  "adminPasswordConfirm":{ "type": "string" },
+                  "smtpHost":            { "type": "string" },
+                  "smtpPort":            { "type": "string" },
+                  "smtpUser":            { "type": "string" },
+                  "smtpPass":            { "type": "string" },
+                  "smtpSecure":          { "type": "boolean" },
+                  "smtpFromName":        { "type": "string" },
+                  "smtpFromAddress":     { "type": "string" },
+                  "smtpReplyTo":         { "type": "string" },
+                  "turnstileSiteKey":    { "type": "string" },
+                  "turnstileSecretKey":  { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "$ref": "#/components/responses/NoContent" }, "default": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+
+    "/api/login": {
+      "post": {
+        "tags": ["auth"],
+        "operationId": "auth_login",
+        "summary": "Username/email + password sign-in.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["username", "password"],
+                "additionalProperties": false,
+                "properties": {
+                  "username":       { "type": "string", "maxLength": 254 },
+                  "password":       { "type": "string", "maxLength": 128 },
+                  "returnTo":       { "type": "string", "maxLength": 2048 },
+                  "turnstileToken": { "$ref": "#/components/schemas/TurnstileToken" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Success or further-action response (MFA, MFA setup)." }, "default": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+
+    "/api/auth/logout": {
+      "post": {
+        "tags": ["auth"],
+        "operationId": "auth_logout",
+        "summary": "Sign out the current session.",
+        "security": [{ "sessionCookie": [] }, {}],
+        "responses": { "200": { "$ref": "#/components/responses/NoContent" } }
+      }
+    },
+
+    "/api/auth/passkey/options": {
+      "post": {
+        "tags": ["auth"],
+        "operationId": "auth_passkey_options",
+        "summary": "Mint a one-shot username-less passkey login challenge.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "turnstileToken": { "$ref": "#/components/schemas/TurnstileToken" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "{ challengeHandle, options } for startAuthentication." }, "default": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+
+    "/api/auth/passkey/verify": {
+      "post": {
+        "tags": ["auth"],
+        "operationId": "auth_passkey_verify",
+        "summary": "Verify a passkey assertion against the one-shot Redis challenge handle.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["challengeHandle", "credential"],
+                "additionalProperties": false,
+                "properties": {
+                  "challengeHandle": { "type": "string", "minLength": 1, "maxLength": 128 },
+                  "credential":      { "$ref": "#/components/schemas/WebAuthnAssertion" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Session cookie set." }, "default": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+
+    "/api/auth/mfa/send-otp": {
+      "post": {
+        "tags": ["auth-mfa"],
+        "operationId": "auth_mfa_send_otp",
+        "summary": "Send the email OTP for an in-flight login MFA challenge.",
+        "security": [],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["challengeId"], "additionalProperties": false, "properties": { "challengeId": { "$ref": "#/components/schemas/ChallengeId" } } } } } },
+        "responses": { "200": { "description": "Sent." }, "default": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+
+    "/api/auth/mfa/verify": {
+      "post": {
+        "tags": ["auth-mfa"],
+        "operationId": "auth_mfa_verify",
+        "summary": "Verify a login MFA challenge.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["challengeId", "method"],
+                "additionalProperties": false,
+                "properties": {
+                  "challengeId": { "$ref": "#/components/schemas/ChallengeId" },
+                  "method":      { "$ref": "#/components/schemas/MfaMethodType" },
+                  "code":        { "oneOf": [ { "$ref": "#/components/schemas/OtpCode" }, { "$ref": "#/components/schemas/WebAuthnAssertion" } ] }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Session cookie set." }, "default": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+
+    "/api/auth/mfa/passkey/auth-options": {
+      "post": {
+        "tags": ["auth-mfa"],
+        "operationId": "auth_mfa_passkey_options",
+        "summary": "Get passkey assertion options for a login MFA challenge.",
+        "security": [],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["challengeId"], "additionalProperties": false, "properties": { "challengeId": { "$ref": "#/components/schemas/ChallengeId" } } } } } },
+        "responses": { "200": { "description": "PublicKeyCredentialRequestOptions." } }
+      }
+    },
+
+    "/api/auth/mfa/enrollment/start": {
+      "post": {
+        "tags": ["auth-mfa"],
+        "operationId": "auth_mfa_enroll_start",
+        "summary": "Begin first-time MFA enrollment after sign-in (when role requires MFA but user has none).",
+        "security": [],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["challengeId"], "additionalProperties": false, "properties": { "challengeId": { "$ref": "#/components/schemas/ChallengeId" } } } } } },
+        "responses": { "200": { "description": "Enrollment context." } }
+      }
+    },
+
+    "/api/auth/mfa/enrollment/send-otp": {
+      "post": {
+        "tags": ["auth-mfa"],
+        "operationId": "auth_mfa_enroll_send_otp",
+        "security": [],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["challengeId"], "additionalProperties": false, "properties": { "challengeId": { "$ref": "#/components/schemas/ChallengeId" } } } } } },
+        "responses": { "200": { "description": "Sent." } }
+      }
+    },
+
+    "/api/auth/mfa/enrollment/verify": {
+      "post": {
+        "tags": ["auth-mfa"],
+        "operationId": "auth_mfa_enroll_verify",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["challengeId", "method"],
+                "additionalProperties": false,
+                "properties": {
+                  "challengeId": { "$ref": "#/components/schemas/ChallengeId" },
+                  "method":      { "$ref": "#/components/schemas/MfaMethodType" },
+                  "code":        { "oneOf": [ { "$ref": "#/components/schemas/OtpCode" }, { "$ref": "#/components/schemas/WebAuthnAssertion" } ] }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Session cookie set, enrollment recorded." } }
+      }
+    },
+
+    "/api/auth/mfa/enrollment/passkey/auth-options": {
+      "post": {
+        "tags": ["auth-mfa"],
+        "operationId": "auth_mfa_enroll_passkey_options",
+        "security": [],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["challengeId"], "additionalProperties": false, "properties": { "challengeId": { "$ref": "#/components/schemas/ChallengeId" } } } } } },
+        "responses": { "200": { "description": "Passkey registration options." } }
+      }
+    },
+
+    "/api/auth/mfa/enrollment/email/start": {
+      "post": {
+        "tags": ["auth-mfa"],
+        "operationId": "auth_mfa_enroll_email_start",
+        "security": [],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["challengeId", "email"], "additionalProperties": false, "properties": { "challengeId": { "$ref": "#/components/schemas/ChallengeId" }, "email": { "$ref": "#/components/schemas/Email" } } } } } },
+        "responses": { "200": { "description": "OTP sent to new email." } }
+      }
+    },
+
+    "/api/auth/mfa/enrollment/email/resend": {
+      "post": {
+        "tags": ["auth-mfa"],
+        "operationId": "auth_mfa_enroll_email_resend",
+        "security": [],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["challengeId"], "additionalProperties": false, "properties": { "challengeId": { "$ref": "#/components/schemas/ChallengeId" } } } } } },
+        "responses": { "200": { "description": "Resent." } }
+      }
+    },
+
+    "/api/auth/mfa/enrollment/email/confirm": {
+      "post": {
+        "tags": ["auth-mfa"],
+        "operationId": "auth_mfa_enroll_email_confirm",
+        "security": [],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["challengeId", "code"], "additionalProperties": false, "properties": { "challengeId": { "$ref": "#/components/schemas/ChallengeId" }, "code": { "$ref": "#/components/schemas/OtpCode" } } } } } },
+        "responses": { "200": { "description": "Email enrolled." } }
+      }
+    },
+
+    "/api/register/start": {
+      "post": {
+        "tags": ["register"],
+        "operationId": "register_start",
+        "summary": "Begin registration — issue a verification email to the supplied address.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email"],
+                "additionalProperties": false,
+                "properties": {
+                  "email":          { "$ref": "#/components/schemas/Email" },
+                  "invitationCode": { "$ref": "#/components/schemas/InvitationCode" },
+                  "turnstileToken": { "$ref": "#/components/schemas/TurnstileToken" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "{ resend_backoff } — email sent." }, "default": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+
+    "/api/register/validate-token": {
+      "get": {
+        "tags": ["register"],
+        "operationId": "register_validate_token",
+        "summary": "Validate a registration verification token from the email link.",
+        "security": [],
+        "parameters": [
+          { "in": "query", "name": "email", "required": true, "schema": { "$ref": "#/components/schemas/Email" } },
+          { "in": "query", "name": "token", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 128 } }
+        ],
+        "responses": { "200": { "description": "Valid." }, "default": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+
+    "/api/register/complete": {
+      "post": {
+        "tags": ["register"],
+        "operationId": "register_complete",
+        "summary": "Finalise registration — set username, display name, password.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email", "token", "username", "displayName", "password", "confirmPassword"],
+                "additionalProperties": false,
+                "properties": {
+                  "email":           { "$ref": "#/components/schemas/Email" },
+                  "token":           { "type": "string", "minLength": 1, "maxLength": 128 },
+                  "username":        { "$ref": "#/components/schemas/Username" },
+                  "displayName":     { "$ref": "#/components/schemas/DisplayName" },
+                  "password":        { "$ref": "#/components/schemas/Password" },
+                  "confirmPassword": { "$ref": "#/components/schemas/Password" },
+                  "turnstileToken":  { "$ref": "#/components/schemas/TurnstileToken" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Account created, session cookie set." }, "default": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+
+    "/api/password-reset/request": {
+      "post": {
+        "tags": ["password-reset"],
+        "operationId": "password_reset_request",
+        "summary": "Email a password-reset link.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email"],
+                "additionalProperties": false,
+                "properties": {
+                  "email":          { "$ref": "#/components/schemas/Email" },
+                  "turnstileToken": { "$ref": "#/components/schemas/TurnstileToken" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Always 200 unless explicit validation error — prevents account enumeration." } }
+      }
+    },
+
+    "/api/password-reset/validate-token": {
+      "get": {
+        "tags": ["password-reset"],
+        "operationId": "password_reset_validate_token",
+        "security": [],
+        "parameters": [
+          { "in": "query", "name": "email", "required": true, "schema": { "$ref": "#/components/schemas/Email" } },
+          { "in": "query", "name": "token", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 128 } }
+        ],
+        "responses": { "200": { "description": "Valid + maybe MFA challenge required." } }
+      }
+    },
+
+    "/api/password-reset/confirm": {
+      "post": {
+        "tags": ["password-reset"],
+        "operationId": "password_reset_confirm",
+        "summary": "Submit the new password using the email-link token.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email", "token", "password", "confirmPassword"],
+                "additionalProperties": false,
+                "properties": {
+                  "email":            { "$ref": "#/components/schemas/Email" },
+                  "token":            { "type": "string", "minLength": 1, "maxLength": 128 },
+                  "password":         { "$ref": "#/components/schemas/Password" },
+                  "confirmPassword":  { "$ref": "#/components/schemas/Password" },
+                  "mfaChallengeId":   { "$ref": "#/components/schemas/ChallengeId" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Password updated." } }
+      }
+    },
+
+    "/api/password-reset/mfa/send-otp": {
+      "post": {
+        "tags": ["password-reset"],
+        "operationId": "password_reset_mfa_send_otp",
+        "security": [],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["challengeId"], "additionalProperties": false, "properties": { "challengeId": { "$ref": "#/components/schemas/ChallengeId" } } } } } },
+        "responses": { "200": { "description": "Sent." } }
+      }
+    },
+
+    "/api/password-reset/mfa/verify": {
+      "post": {
+        "tags": ["password-reset"],
+        "operationId": "password_reset_mfa_verify",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["challengeId", "method"],
+                "additionalProperties": false,
+                "properties": {
+                  "challengeId": { "$ref": "#/components/schemas/ChallengeId" },
+                  "method":      { "$ref": "#/components/schemas/MfaMethodType" },
+                  "code":        { "oneOf": [ { "$ref": "#/components/schemas/OtpCode" }, { "$ref": "#/components/schemas/WebAuthnAssertion" } ] }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Verified." } }
+      }
+    },
+
+    "/api/password-reset/mfa/passkey/auth-options": {
+      "post": {
+        "tags": ["password-reset"],
+        "operationId": "password_reset_mfa_passkey_options",
+        "security": [],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["challengeId"], "additionalProperties": false, "properties": { "challengeId": { "$ref": "#/components/schemas/ChallengeId" } } } } } },
+        "responses": { "200": { "description": "Passkey assertion options." } }
+      }
+    },
+
+    "/api/me": {
+      "get": {
+        "tags": ["system"],
+        "operationId": "system_me",
+        "summary": "Current user identity + granted permissions list, or { user: null } when anonymous.",
+        "security": [{ "sessionCookie": [] }, {}],
+        "responses": { "200": { "description": "Identity payload." } }
+      }
+    },
+
+    "/api/settings/public": {
+      "get": {
+        "tags": ["system"],
+        "operationId": "system_public_settings",
+        "summary": "Site name, registration flags, Turnstile site key.",
+        "security": [],
+        "responses": { "200": { "description": "Settings payload." } }
+      }
+    },
+
+    "/api/profile": {
+      "get": {
+        "tags": ["profile"],
+        "operationId": "profile_get",
+        "security": [{ "sessionCookie": [] }],
+        "responses": { "200": { "description": "Profile + sessions + canChangePassword flag." } }
+      }
+    },
+
+    "/api/profile/display-name": {
+      "put": {
+        "tags": ["profile"],
+        "operationId": "profile_display_name",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["displayName"],
+                "additionalProperties": false,
+                "properties": { "displayName": { "$ref": "#/components/schemas/DisplayName" } }
+              }
+            }
+          }
+        },
+        "responses": { "204": { "$ref": "#/components/responses/NoContent" } }
+      }
+    },
+
+    "/api/profile/password/preflight": {
+      "post": {
+        "tags": ["profile"],
+        "operationId": "profile_password_preflight",
+        "summary": "Determine whether the password change needs an MFA challenge or just current-password.",
+        "security": [{ "sessionCookie": [] }],
+        "responses": { "200": { "description": "{ needsChallenge | needsPassword | existingChallengeId, ... }" } }
+      }
+    },
+
+    "/api/profile/password": {
+      "post": {
+        "tags": ["profile"],
+        "operationId": "profile_password",
+        "summary": "Change own password (MFA challenge or current password verified).",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["newPassword", "confirmPassword"],
+                "additionalProperties": false,
+                "properties": {
+                  "newPassword":     { "$ref": "#/components/schemas/Password" },
+                  "confirmPassword": { "$ref": "#/components/schemas/Password" },
+                  "currentPassword": { "type": "string", "maxLength": 128 },
+                  "mfaChallengeId":  { "$ref": "#/components/schemas/ChallengeId" },
+                  "signOutOthers":   { "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Updated." } }
+      }
+    },
+
+    "/api/profile/sessions/terminate-all": {
+      "post": {
+        "tags": ["profile"],
+        "operationId": "profile_sessions_terminate_all",
+        "security": [{ "sessionCookie": [] }],
+        "responses": { "200": { "description": "All other sessions ended." } }
+      }
+    },
+
+    "/api/profile/security": {
+      "get": {
+        "tags": ["profile"],
+        "operationId": "profile_security",
+        "summary": "MFA enabled flag, configured methods, password-changed-at.",
+        "security": [{ "sessionCookie": [] }],
+        "responses": { "200": { "description": "Security overview." } }
+      }
+    },
+
+    "/api/profile/email/preflight": {
+      "post": {
+        "tags": ["profile"],
+        "operationId": "profile_email_preflight",
+        "security": [{ "sessionCookie": [] }],
+        "responses": { "200": { "description": "{ needsChallenge | needsPassword, ... }" } }
+      }
+    },
+
+    "/api/profile/email/start": {
+      "post": {
+        "tags": ["profile"],
+        "operationId": "profile_email_start",
+        "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email"],
+                "additionalProperties": false,
+                "properties": {
+                  "email":           { "$ref": "#/components/schemas/Email" },
+                  "currentPassword": { "type": "string", "maxLength": 128 }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "OTP sent to new email." } }
+      }
+    },
+
+    "/api/profile/email/confirm": {
+      "post": {
+        "tags": ["profile"],
+        "operationId": "profile_email_confirm",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["challengeId", "code"],
+                "additionalProperties": false,
+                "properties": {
+                  "challengeId":    { "$ref": "#/components/schemas/ChallengeId" },
+                  "code":           { "$ref": "#/components/schemas/OtpCode" },
+                  "mfaChallengeId": { "$ref": "#/components/schemas/ChallengeId" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Email updated." } }
+      }
+    },
+
+    "/api/profile/email/resend": {
+      "post": {
+        "tags": ["profile"],
+        "operationId": "profile_email_resend",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["challengeId"], "additionalProperties": false, "properties": { "challengeId": { "$ref": "#/components/schemas/ChallengeId" } } } } } },
+        "responses": { "200": { "description": "Resent." } }
+      }
+    },
+
+    "/api/courses": {
+      "get": {
+        "tags": ["courses"],
+        "operationId": "courses_list",
+        "security": [{ "sessionCookie": [] }],
+        "responses": { "200": { "description": "Course list scoped to enrollments (or all if allCourseAccess)." } }
+      }
+    },
+
+    "/api/courses/{courseId}": {
+      "parameters": [{ "in": "path", "name": "courseId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "get": {
+        "tags": ["courses"],
+        "operationId": "course_get",
+        "security": [{ "sessionCookie": [] }],
+        "parameters": [
+          { "in": "query", "name": "page",  "required": false, "schema": { "type": "integer", "minimum": 1 } },
+          { "in": "query", "name": "limit", "required": false, "schema": { "type": "integer", "enum": [10, 20, 50] } }
+        ],
+        "responses": { "200": { "description": "Course meta + paginated videos." } }
+      }
+    },
+
+    "/api/watch/{videoId}": {
+      "parameters": [{ "in": "path", "name": "videoId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "get": {
+        "tags": ["videos"],
+        "operationId": "watch_get",
+        "security": [{ "sessionCookie": [] }],
+        "responses": { "200": { "description": "Watch metadata + manifest URL build inputs." } }
+      }
+    },
+
+    "/api/updatewatch": {
+      "post": {
+        "tags": ["videos"],
+        "operationId": "updatewatch",
+        "summary": "Watch-progress beacon. Coalesced server-side; spam-safe.",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["videoId", "position"],
+                "additionalProperties": false,
+                "properties": {
+                  "videoId":  { "type": "integer", "minimum": 1 },
+                  "position": { "type": "number", "minimum": 0 },
+                  "duration": { "type": "number", "minimum": 0 },
+                  "completed":{ "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "$ref": "#/components/responses/NoContent" } }
+      }
+    },
+
+    "/api/videos/{id}": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "post": {
+        "tags": ["videos"],
+        "operationId": "video_update",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "Updated." } }
+      }
+    },
+
+    "/api/videos/{id}/delete": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "post": { "tags": ["videos"], "operationId": "video_delete", "security": [{ "sessionCookie": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/videos/{id}/clean-source": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "post": { "tags": ["videos"], "operationId": "video_clean_source", "security": [{ "sessionCookie": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/videos/{id}/retry": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "post": { "tags": ["videos"], "operationId": "video_retry", "security": [{ "sessionCookie": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/keys/{videoId}": {
+      "parameters": [{ "in": "path", "name": "videoId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "get": {
+        "tags": ["videos"],
+        "operationId": "video_keys",
+        "summary": "Per-video AES-128 HLS encryption key (if applicable).",
+        "security": [{ "sessionCookie": [] }],
+        "parameters": [
+          { "in": "query", "name": "token", "required": false, "schema": { "type": "string", "maxLength": 256 } }
+        ],
+        "responses": { "200": { "description": "Binary key material." } }
+      }
+    },
+
+    "/api/refresh-token/{videoId}": {
+      "parameters": [{ "in": "path", "name": "videoId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "get": {
+        "tags": ["videos"],
+        "operationId": "video_refresh_token",
+        "summary": "Issue a short-lived HMAC token for /api/keys/* in HLS player flow.",
+        "security": [{ "sessionCookie": [] }],
+        "responses": { "200": { "description": "{ token, expiresAt }" } }
+      }
+    },
+
+    "/api/upload/create": {
+      "post": {
+        "tags": ["upload"],
+        "operationId": "upload_create",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "{ uploadId, ... }" } }
+      }
+    },
+
+    "/api/upload/replace": {
+      "post": {
+        "tags": ["upload"],
+        "operationId": "upload_replace",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "{ uploadId, ... }" } }
+      }
+    },
+
+    "/api/upload/{uploadId}/presign": {
+      "parameters": [{ "in": "path", "name": "uploadId", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 128 } }],
+      "post": {
+        "tags": ["upload"],
+        "operationId": "upload_presign",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "Presigned PUT URLs for each part." } }
+      }
+    },
+
+    "/api/upload/{uploadId}/heartbeat": {
+      "parameters": [{ "in": "path", "name": "uploadId", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 128 } }],
+      "post": { "tags": ["upload"], "operationId": "upload_heartbeat", "security": [{ "sessionCookie": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/upload/{uploadId}/complete": {
+      "parameters": [{ "in": "path", "name": "uploadId", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 128 } }],
+      "post": {
+        "tags": ["upload"],
+        "operationId": "upload_complete",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "Multipart completed; transcoding queued." } }
+      }
+    },
+
+    "/api/upload/{uploadId}/abort": {
+      "parameters": [{ "in": "path", "name": "uploadId", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 128 } }],
+      "post": { "tags": ["upload"], "operationId": "upload_abort", "security": [{ "sessionCookie": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/materials/courses": {
+      "get": { "tags": ["materials"], "operationId": "materials_courses", "security": [{ "sessionCookie": [] }], "responses": { "200": { "description": "Courses with materials access." } } }
+    },
+
+    "/api/materials/courses/{courseId}": {
+      "parameters": [{ "in": "path", "name": "courseId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "get": { "tags": ["materials"], "operationId": "materials_list", "security": [{ "sessionCookie": [] }], "responses": { "200": { "description": "Material list for course." } } }
+    },
+
+    "/api/materials/courses/{courseId}/upload": {
+      "parameters": [{ "in": "path", "name": "courseId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "post": {
+        "tags": ["materials"],
+        "operationId": "materials_upload",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "Presigned PUT + materialId." } }
+      }
+    },
+
+    "/api/materials/{materialId}/confirm": {
+      "parameters": [{ "in": "path", "name": "materialId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "post": { "tags": ["materials"], "operationId": "materials_confirm", "security": [{ "sessionCookie": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/materials/{materialId}/download": {
+      "parameters": [{ "in": "path", "name": "materialId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "get": { "tags": ["materials"], "operationId": "materials_download", "security": [{ "sessionCookie": [] }], "responses": { "302": { "description": "Redirect to presigned R2 URL." } } }
+    },
+
+    "/api/materials/{materialId}": {
+      "parameters": [{ "in": "path", "name": "materialId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "put": {
+        "tags": ["materials"],
+        "operationId": "materials_update",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "Updated." } }
+      },
+      "delete": { "tags": ["materials"], "operationId": "materials_delete", "security": [{ "sessionCookie": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/materials/{materialId}/abort": {
+      "parameters": [{ "in": "path", "name": "materialId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "post": { "tags": ["materials"], "operationId": "materials_abort", "security": [{ "sessionCookie": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/mfa/methods": {
+      "get": { "tags": ["mfa"], "operationId": "mfa_methods_list", "security": [{ "sessionCookie": [] }], "responses": { "200": { "description": "Method list + mfaEnabled." } } }
+    },
+
+    "/api/mfa/methods/authenticator/setup": {
+      "post": { "tags": ["mfa"], "operationId": "mfa_authenticator_setup", "security": [{ "sessionCookie": [] }], "requestBody": { "required": false, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "properties": { "label": { "type": "string", "maxLength": 100 } } } } } }, "responses": { "200": { "description": "{ methodId, otpauthUri, qrDataUrl, secret }" } } }
+    },
+
+    "/api/mfa/methods/authenticator/confirm": {
+      "post": {
+        "tags": ["mfa"],
+        "operationId": "mfa_authenticator_confirm",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["methodId", "code"],
+                "additionalProperties": false,
+                "properties": {
+                  "methodId":     { "type": "integer", "minimum": 1 },
+                  "code":         { "$ref": "#/components/schemas/OtpCode" },
+                  "label":        { "type": "string", "maxLength": 100 },
+                  "challengeId":  { "$ref": "#/components/schemas/ChallengeId" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Authenticator activated." } }
+      }
+    },
+
+    "/api/mfa/methods/passkey/register-options": {
+      "post": { "tags": ["mfa"], "operationId": "mfa_passkey_register_options", "security": [{ "sessionCookie": [] }], "responses": { "200": { "description": "PublicKeyCredentialCreationOptions." } } }
+    },
+
+    "/api/mfa/methods/passkey/register": {
+      "post": {
+        "tags": ["mfa"],
+        "operationId": "mfa_passkey_register",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["credential", "regChallengeId"],
+                "additionalProperties": false,
+                "properties": {
+                  "credential":      { "$ref": "#/components/schemas/WebAuthnRegistration" },
+                  "label":           { "type": "string", "maxLength": 100 },
+                  "regChallengeId":  { "$ref": "#/components/schemas/ChallengeId" },
+                  "challengeId":     { "$ref": "#/components/schemas/ChallengeId" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Passkey registered." } }
+      }
+    },
+
+    "/api/mfa/methods/{methodId}/rename": {
+      "parameters": [{ "in": "path", "name": "methodId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "put": {
+        "tags": ["mfa"],
+        "operationId": "mfa_method_rename",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["label"], "additionalProperties": false, "properties": { "label": { "type": "string", "minLength": 1, "maxLength": 100 } } } } } },
+        "responses": { "200": { "description": "Renamed." } }
+      }
+    },
+
+    "/api/mfa/methods/{methodId}": {
+      "parameters": [{ "in": "path", "name": "methodId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "delete": { "tags": ["mfa"], "operationId": "mfa_method_delete", "security": [{ "sessionCookie": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/mfa/enable": {
+      "post": { "tags": ["mfa"], "operationId": "mfa_enable", "security": [{ "sessionCookie": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/mfa/disable": {
+      "post": { "tags": ["mfa"], "operationId": "mfa_disable", "security": [{ "sessionCookie": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/mfa/challenge/create": {
+      "post": {
+        "tags": ["mfa-challenge"],
+        "operationId": "mfa_challenge_create",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "{ challengeId, allowedMethods, ... }" } }
+      }
+    },
+
+    "/api/mfa/challenge/send-otp": {
+      "post": {
+        "tags": ["mfa-challenge"],
+        "operationId": "mfa_challenge_send_otp",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["challengeId"], "additionalProperties": false, "properties": { "challengeId": { "$ref": "#/components/schemas/ChallengeId" } } } } } },
+        "responses": { "200": { "description": "Sent." } }
+      }
+    },
+
+    "/api/mfa/challenge/verify": {
+      "post": {
+        "tags": ["mfa-challenge"],
+        "operationId": "mfa_challenge_verify",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["challengeId", "method"],
+                "additionalProperties": false,
+                "properties": {
+                  "challengeId": { "$ref": "#/components/schemas/ChallengeId" },
+                  "method":      { "$ref": "#/components/schemas/MfaMethodType" },
+                  "code":        { "oneOf": [ { "$ref": "#/components/schemas/OtpCode" }, { "$ref": "#/components/schemas/WebAuthnAssertion" } ] }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Verified." } }
+      }
+    },
+
+    "/api/mfa/challenge/passkey/auth-options": {
+      "post": {
+        "tags": ["mfa-challenge"],
+        "operationId": "mfa_challenge_passkey_options",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["challengeId"], "additionalProperties": false, "properties": { "challengeId": { "$ref": "#/components/schemas/ChallengeId" } } } } } },
+        "responses": { "200": { "description": "Passkey assertion options." } }
+      }
+    },
+
+    "/api/admin/courses": {
+      "get":  { "tags": ["admin-courses"], "operationId": "admin_courses_list",   "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "Courses." } } },
+      "post": { "tags": ["admin-courses"], "operationId": "admin_courses_create", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "Created." } } }
+    },
+
+    "/api/admin/courses/{courseId}": {
+      "parameters": [{ "in": "path", "name": "courseId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "get":    { "tags": ["admin-courses"], "operationId": "admin_course_get",    "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "Course." } } },
+      "put":    { "tags": ["admin-courses"], "operationId": "admin_course_update", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Updated." } } },
+      "delete": { "tags": ["admin-courses"], "operationId": "admin_course_delete", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/admin/courses/{courseId}/edit": {
+      "parameters": [{ "in": "path", "name": "courseId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "get": { "tags": ["admin-courses"], "operationId": "admin_course_edit", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "Edit-page bundle." } } }
+    },
+
+    "/api/admin/courses/{courseId}/transcoding-profiles": {
+      "parameters": [{ "in": "path", "name": "courseId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "put":    { "tags": ["admin-courses"], "operationId": "admin_course_tprof_set",   "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Set." } } },
+      "delete": { "tags": ["admin-courses"], "operationId": "admin_course_tprof_clear", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/admin/videos/{courseId}": {
+      "parameters": [{ "in": "path", "name": "courseId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "get": { "tags": ["admin-videos"], "operationId": "admin_videos_list", "security": [{ "sessionCookie": [] }], "responses": { "200": { "description": "Videos in course." } } }
+    },
+
+    "/api/admin/users": {
+      "get":  { "tags": ["admin-users"], "operationId": "admin_users_list",   "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "Users." } } },
+      "post": { "tags": ["admin-users"], "operationId": "admin_users_create", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Created." } } }
+    },
+
+    "/api/admin/users/new": {
+      "get": { "tags": ["admin-users"], "operationId": "admin_users_new_form", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "Form context (roles list)." } } }
+    },
+
+    "/api/admin/users/{id}": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "get":    { "tags": ["admin-users"], "operationId": "admin_user_get",    "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "User." } } },
+      "put":    { "tags": ["admin-users"], "operationId": "admin_user_update", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Updated." } } },
+      "delete": { "tags": ["admin-users"], "operationId": "admin_user_delete", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/admin/users/{id}/edit": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "get": { "tags": ["admin-users"], "operationId": "admin_user_edit_bundle", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "Bundle for edit page." } } }
+    },
+
+    "/api/admin/users/{id}/permissions": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "put": { "tags": ["admin-users"], "operationId": "admin_user_perms_update", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["permissions"], "additionalProperties": false, "properties": { "permissions": { "type": "object", "additionalProperties": { "type": "integer", "enum": [0, 1, 2] } } } } } } },
+        "responses": { "200": { "description": "Updated." } } }
+    },
+
+    "/api/admin/users/{id}/sessions": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "get": { "tags": ["admin-users"], "operationId": "admin_user_sessions", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "Sessions." } } }
+    },
+
+    "/api/admin/users/{id}/sessions/terminate-all": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "post": { "tags": ["admin-users"], "operationId": "admin_user_sessions_terminate_all", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/admin/users/{id}/reset-mfa": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "post": { "tags": ["admin-users"], "operationId": "admin_user_reset_mfa", "security": [{ "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/admin/enrollment": {
+      "get":  { "tags": ["admin-enrollment"], "operationId": "admin_enrollment_list", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "Enrollment matrix." } } },
+      "post": { "tags": ["admin-enrollment"], "operationId": "admin_enrollment_save", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Saved." } } }
+    },
+
+    "/api/admin/roles": {
+      "get":  { "tags": ["admin-roles"], "operationId": "admin_roles_list",   "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "Roles." } } },
+      "post": { "tags": ["admin-roles"], "operationId": "admin_roles_create", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Created." } } }
+    },
+
+    "/api/admin/roles/{id}": {
+      "parameters": [{ "in": "path", "name": "id", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+      "put":    { "tags": ["admin-roles"], "operationId": "admin_role_update", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Updated." } } },
+      "delete": { "tags": ["admin-roles"], "operationId": "admin_role_delete", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/admin/settings": {
+      "get": { "tags": ["admin-settings"], "operationId": "admin_settings_get", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "Settings." } } },
+      "put": { "tags": ["admin-settings"], "operationId": "admin_settings_set", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Saved." } } }
+    },
+
+    "/api/admin/settings/transcoding-profiles": {
+      "put": { "tags": ["admin-settings"], "operationId": "admin_settings_tprof_set", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Saved." } } }
+    },
+
+    "/api/admin/settings/hmac/generate": {
+      "post": { "tags": ["admin-settings"], "operationId": "admin_settings_hmac_generate", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "{ key }" } } }
+    },
+
+    "/api/admin/settings/hmac/validity": {
+      "put": { "tags": ["admin-settings"], "operationId": "admin_settings_hmac_validity", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["seconds"], "additionalProperties": false, "properties": { "seconds": { "type": "integer", "minimum": 1 } } } } } },
+        "responses": { "200": { "description": "Set." } } }
+    },
+
+    "/api/admin/settings/hmac/toggle": {
+      "put": { "tags": ["admin-settings"], "operationId": "admin_settings_hmac_toggle", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["enabled"], "additionalProperties": false, "properties": { "enabled": { "type": "boolean" } } } } } },
+        "responses": { "200": { "description": "Toggled." } } }
+    },
+
+    "/api/admin/settings/worker-keys": {
+      "post": { "tags": ["admin-settings"], "operationId": "admin_worker_key_create", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "{ keyId, keySecret }" } } }
+    },
+
+    "/api/admin/settings/worker-keys/{keyId}/revoke": {
+      "parameters": [{ "in": "path", "name": "keyId", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 64 } }],
+      "put": { "tags": ["admin-settings"], "operationId": "admin_worker_key_revoke", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/admin/settings/worker-keys/{keyId}": {
+      "parameters": [{ "in": "path", "name": "keyId", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 64 } }],
+      "delete": { "tags": ["admin-settings"], "operationId": "admin_worker_key_delete", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/admin/invitations": {
+      "get":  { "tags": ["admin-invites"], "operationId": "admin_invitations_list",   "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "Invitation codes." } } },
+      "post": { "tags": ["admin-invites"], "operationId": "admin_invitations_create", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "{ code }" } } }
+    },
+
+    "/api/admin/invitations/{code}": {
+      "parameters": [{ "in": "path", "name": "code", "required": true, "schema": { "$ref": "#/components/schemas/InvitationCode" } }],
+      "delete": { "tags": ["admin-invites"], "operationId": "admin_invitations_delete", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/admin/playback-stats": {
+      "get":    { "tags": ["admin-stats"], "operationId": "admin_playback_stats_get",   "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "parameters": [
+          { "in": "query", "name": "page",  "required": false, "schema": { "type": "integer", "minimum": 1 } },
+          { "in": "query", "name": "limit", "required": false, "schema": { "type": "integer", "enum": [10, 20, 50, 100] } },
+          { "in": "query", "name": "userId",  "required": false, "schema": { "type": "integer", "minimum": 1 } },
+          { "in": "query", "name": "videoId", "required": false, "schema": { "type": "integer", "minimum": 1 } }
+        ], "responses": { "200": { "description": "Paginated stats." } } },
+      "delete": { "tags": ["admin-stats"], "operationId": "admin_playback_stats_clear", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/admin/transcoding/jobs": {
+      "get": { "tags": ["admin-transcode"], "operationId": "admin_transcode_jobs", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "Jobs." } } }
+    },
+
+    "/api/admin/transcoding/clear-finished": {
+      "post": { "tags": ["admin-transcode"], "operationId": "admin_transcode_clear_finished", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/admin/mfa/settings": {
+      "get": { "tags": ["admin-mfa"], "operationId": "admin_mfa_settings_get", "security": [{ "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "MFA policy bundle." } } }
+    },
+
+    "/api/admin/mfa/settings/general": {
+      "put": { "tags": ["admin-mfa"], "operationId": "admin_mfa_settings_general", "security": [{ "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "Saved." } } }
+    },
+
+    "/api/admin/mfa/settings/levels": {
+      "put": { "tags": ["admin-mfa"], "operationId": "admin_mfa_settings_levels", "security": [{ "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "Saved." } } }
+    },
+
+    "/api/admin/mfa/settings/policy/{scenario}": {
+      "parameters": [{ "in": "path", "name": "scenario", "required": true, "schema": { "type": "string", "pattern": "^[a-z_]+$", "maxLength": 64 } }],
+      "put": { "tags": ["admin-mfa"], "operationId": "admin_mfa_settings_policy", "security": [{ "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "Saved." } } }
+    },
+
+    "/api/worker/auth": {
+      "post": {
+        "tags": ["worker"],
+        "operationId": "worker_auth",
+        "summary": "Exchange a worker key pair for a bearer token. mTLS-required at edge.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["keyId", "keySecret"],
+                "additionalProperties": false,
+                "properties": {
+                  "keyId":     { "type": "string", "minLength": 1, "maxLength": 64 },
+                  "keySecret": { "type": "string", "minLength": 1, "maxLength": 256 }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "{ bearerToken, expiresInSeconds }" } }
+      }
+    },
+
+    "/api/worker/tasks/available": {
+      "get": {
+        "tags": ["worker"],
+        "operationId": "worker_tasks_available",
+        "summary": "Atomically reserve up to N queued tasks.",
+        "security": [{ "workerBearer": [] }],
+        "parameters": [
+          { "in": "query", "name": "availableSlot", "required": true, "schema": { "type": "integer", "minimum": 1, "maximum": 32 } }
+        ],
+        "responses": { "200": { "description": "{ tasks: [{ videoId }] }" } }
+      }
+    },
+
+    "/api/worker/tasks/lease": {
+      "post": {
+        "tags": ["worker"],
+        "operationId": "worker_tasks_lease",
+        "summary": "Finalise reservation; return per-job specs.",
+        "security": [{ "workerBearer": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["videoIds"],
+                "additionalProperties": false,
+                "properties": {
+                  "videoIds": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 1, "maxItems": 32 }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "{ results: [{ videoId, status, ... }] }" } }
+      }
+    },
+
+    "/api/worker/tasks/status": {
+      "post": {
+        "tags": ["worker"],
+        "operationId": "worker_tasks_status",
+        "summary": "Batched status report.",
+        "security": [{ "workerBearer": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["jobs"],
+                "additionalProperties": false,
+                "properties": {
+                  "jobs": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "object",
+                      "required": ["jobId", "status"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "jobId":        { "type": "string", "minLength": 1, "maxLength": 128 },
+                        "status":       { "type": "string", "enum": ["running", "failed", "aborted"] },
+                        "stage":        { "type": "string", "maxLength": 64 },
+                        "progress":     { "type": "number", "minimum": 0, "maximum": 100 },
+                        "errorMessage": { "type": "string", "maxLength": 1024 }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "{ results: [{ jobId, ack }] }" } }
+      }
+    },
+
+    "/api/worker/tasks/complete": {
+      "post": {
+        "tags": ["worker"],
+        "operationId": "worker_tasks_complete",
+        "summary": "Single-job completion.",
+        "security": [{ "workerBearer": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["jobId"],
+                "additionalProperties": false,
+                "properties": {
+                  "jobId":           { "type": "string", "minLength": 1, "maxLength": 128 },
+                  "durationSeconds": { "type": "number", "minimum": 0 }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "204": { "$ref": "#/components/responses/NoContent" } }
+      }
+    },
+
+    "/api/worker/tasks/upload-urls": {
+      "post": {
+        "tags": ["worker"],
+        "operationId": "worker_tasks_upload_urls",
+        "summary": "Presigned PUT URLs for HLS output of one job.",
+        "security": [{ "workerBearer": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["jobId", "filenames"],
+                "additionalProperties": false,
+                "properties": {
+                  "jobId":     { "type": "string", "minLength": 1, "maxLength": 128 },
+                  "filenames": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 256 }, "minItems": 1, "maxItems": 256 }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "{ urls: [...] }" } }
+      }
+    }
+
+  }
+}
