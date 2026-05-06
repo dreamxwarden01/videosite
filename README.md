@@ -8,8 +8,8 @@ A private video course platform with hardware-accelerated distributed transcodin
 - Course and video management with role-based access control and per-user permission overrides
 - Chunked resumable uploads with presigned URLs (Cloudflare R2)
 - Adaptive bitrate streaming via Shaka Player — HLS for Apple devices (native Safari), MPEG-DASH elsewhere, both served from a single CMAF (fMP4) segment set
-- Multi-factor authentication (TOTP, OTP, WebAuthn/passkeys)
-- Invitation-based registration with Cloudflare Turnstile CAPTCHA
+- Multi-factor authentication (TOTP, OTP, WebAuthn/passkeys), including username-less passkey "quick sign in" (single round trip)
+- Invitation-based registration with Cloudflare Turnstile CAPTCHA — verification runs at the origin by default, or can be moved to the edge via the optional `turnstile-gate` Cloudflare Worker
 
 **Transcoding Worker**
 - Unified Go binary for macOS (arm64) and Windows (amd64) via build tags
@@ -23,6 +23,9 @@ A private video course platform with hardware-accelerated distributed transcodin
 
 ```
 Browser (React SPA)
+    |
+    v
+Cloudflare Edge (optional turnstile-gate Worker — gates 5 sign-in/registration POSTs)
     |
     v
 Express Server ---- MySQL/MariaDB
@@ -42,6 +45,8 @@ Go Worker(s) --- FFmpeg
 
 Redis sits between the server and DB to absorb hot reads and high-frequency writes. Sessions, permissions, settings, and video / course / user / enrollment metadata are read-cached with explicit invalidation. Watch progress (`/api/updatewatch`) and worker transcoding heartbeats land in Redis only and a background flusher drains them to DB every 15 minutes — eliminating per-tick DB writes during active playback and transcoding. An anti-cheat rate limiter on `/api/updatewatch` rejects claimed watch time exceeding wall-clock elapsed.
 
+The optional `cloudflare/workers/turnstile-gate` Worker, when deployed, sits in front of the five Turnstile-gated POST endpoints (`/api/login`, `/api/register/start`, `/api/register/complete`, `/api/password-reset/request`, `/api/auth/passkey/options`). It verifies the token via Cloudflare's siteverify, strips it from the body, and forwards to origin. The origin admin toggle ("Cloudflare → Turnstile Verification at Worker") tells the Express layer to skip its own siteverify call when the Worker is in front. Off by default — opt in from the admin Settings page.
+
 ## Tech Stack
 
 | Component | Technology |
@@ -53,6 +58,7 @@ Redis sits between the server and DB to absorb hot reads and high-frequency writ
 | Video Player | Shaka Player (HLS + DASH, CMAF) |
 | Storage | Cloudflare R2 |
 | Worker | Go 1.25, FFmpeg |
+| Edge (optional) | Cloudflare Workers (Wrangler 3+) |
 | Auth | Cookie sessions, Argon2, WebAuthn |
 | Email | Nodemailer (SMTP) |
 
@@ -137,6 +143,10 @@ On first run, the worker will:
 
 Edit `capabilities.json` to enable/disable encoders or adjust per-encoder concurrent job limits.
 
+### Cloudflare Worker (optional)
+
+Deploy `cloudflare/workers/turnstile-gate/` to verify Turnstile tokens at the edge instead of the origin. Full setup steps (route patterns, secret, coordination order with the admin toggle) live in [`cloudflare/workers/turnstile-gate/README.md`](cloudflare/workers/turnstile-gate/README.md). Skip if you don't need edge verification — origin-side verification is the default and works without any Worker.
+
 ## Environment Variables
 
 Copy `web/.env.example` to `web/.env` and fill in:
@@ -159,6 +169,7 @@ Copy `web/.env.example` to `web/.env` and fill in:
 ```
 web/
   server.js              # Express entry point + graceful shutdown
+  api-schema.json        # OpenAPI 3.0 schema (Cloudflare API Shield-compatible)
   config/                # Database, R2, session, email config
   db/                    # Schema and migrations
   middleware/            # Auth, permissions, MFA, installer
@@ -190,4 +201,11 @@ worker/
     ui/                  # Terminal UI — per-job progress bars with scroll-above log
     util/                # Helpers
     worker/              # Main loop, console commands, progress
+
+cloudflare/
+  workers/
+    turnstile-gate/      # Optional edge Turnstile verification Worker
+      src/index.js       # Fetch handler — siteverify + strip + forward
+      wrangler.jsonc     # Routes + compat date (secret set via dashboard)
+      README.md          # Deploy steps + admin-toggle coordination rules
 ```
