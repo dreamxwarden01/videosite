@@ -140,7 +140,7 @@ type dashTmplContext struct {
 // SegmentTimeline. The playlist is the authoritative source: FFmpeg
 // decides the exact segment count and durations per rendition, and the
 // HLS playlist is the only record that reflects those decisions.
-func WriteDASHManifest(outputDir string, variants []CMAFVariant, audioName string, audioBitrateKbps int, durationSec float64, hasAudio bool) error {
+func WriteDASHManifest(outputDir string, variants []Variant, audioName string, audioBitrateKbps int, durationSec float64, hasAudio bool) error {
 	reps := make([]dashVideoRep, 0, len(variants))
 	// Track the shortest per-rendition timeline so mediaPresentationDuration
 	// can be clamped down if any rendition undershoots the ffprobe duration

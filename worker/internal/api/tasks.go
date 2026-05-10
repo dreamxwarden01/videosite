@@ -24,21 +24,19 @@ type AvailableTasksResponse struct {
 // LeaseResult is one entry in the response to `POST /api/worker/tasks/lease`.
 // Status is "leased" (with full spec), "taken" (row lost the race), or "notfound".
 //
-// VideoType is "ts" (legacy MPEG-TS HLS, AES-128, encryptionKey populated) or
-// "cmaf" (fMP4 HLS + DASH, unencrypted, encryptionKey absent). A task's VideoType
-// selects the job pipeline branch — TS uses the legacy linear path, CMAF uses
-// the parallel video+audio path in runCMAF().
-//
 // AudioBitrateKbps is site-wide; it is no longer carried per-profile.
+//
+// The server may still serialize legacy fields (videoType, encryptionKey) from
+// pre-cleanup deploys; JSON unmarshal silently drops unknown fields, so this
+// struct is forward-compatible. Server-side cleanup of those fields is a
+// separate, decoupled change.
 type LeaseResult struct {
 	VideoID int    `json:"videoId"`
 	Status  string `json:"status"`
 
 	// Populated only when Status == "leased".
-	VideoType                 string                 `json:"videoType,omitempty"`
 	JobID                     string                 `json:"jobId,omitempty"`
 	DownloadURL               string                 `json:"downloadUrl,omitempty"`
-	EncryptionKey             string                 `json:"encryptionKey,omitempty"`
 	AudioBitrateKbps          int                    `json:"audioBitrateKbps,omitempty"`
 	OutputProfiles            []config.OutputProfile `json:"outputProfiles,omitempty"`
 	AudioNormalization        bool                   `json:"audioNormalization,omitempty"`

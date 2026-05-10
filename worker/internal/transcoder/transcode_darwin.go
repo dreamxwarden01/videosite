@@ -1,52 +1,13 @@
 package transcoder
 
 import (
-	"context"
 	"fmt"
-	"os"
 	"videosite-worker/internal/config"
 	"videosite-worker/internal/hardware"
 )
 
-// TranscodeToHLS transcodes a source file to HLS for a given profile.
-//
-// Hardware acceleration strategy (three tiers, tried in order):
-//
-//  1. VideoToolbox full-HW decode+encode:
-//     -hwaccel videotoolbox -hwaccel_output_format videotoolbox_vld
-//     → scale_vt (Media Engine) → optional hwdownload+pad for non-16:9
-//     → h264_videotoolbox hardware encode.
-//
-//  2. VT encode-only: CPU decode + CPU scale/pad → h264_videotoolbox.
-//
-//  3. Full software: CPU decode + CPU scale/pad → libx264.
-//
-// swDecode=true → skip VideoToolbox hardware decode (tier-2 path).
-//
-// audioBitrateKbps is the site-wide AAC bitrate injected into the single
-// ffmpeg process (TS muxes video and audio together; for CMAF, audio runs
-// in a separate ffmpeg invocation — see TranscodeAudioCMAF in cmaf.go).
-func TranscodeToHLS(ctx context.Context, sourcePath, outputDir string, profile config.OutputProfile, audioBitrateKbps int, encoder config.Encoder, duration float64, keyInfoFile string, swDecode bool, logFile string, srcW, srcH int, loudnormFilter string) (<-chan int, <-chan error) {
-	os.MkdirAll(outputDir, 0755)
-
-	ffmpegEncoder := hardware.FFmpegEncoderName[encoder.EncoderType]
-	if ffmpegEncoder == "" {
-		ffmpegEncoder = "libx264"
-	}
-
-	hwArgs, vfFilter := resolveHWArgs(encoder, swDecode, srcW, srcH, profile.Width, profile.Height)
-
-	args := buildBaseTranscodeArgs(hwArgs, sourcePath, outputDir, profile, audioBitrateKbps, ffmpegEncoder, vfFilter, loudnormFilter, keyInfoFile)
-
-	// Encoder-specific options (shared with CMAF path via applyEncoderOpts).
-	args = applyEncoderOpts(args, encoder, ffmpegEncoder, profile)
-
-	return RunFFmpegWithProgress(ctx, duration, logFile, args...)
-}
-
 // applyEncoderOpts injects encoder-specific FFmpeg flags (preset, RC mode,
-// quality tuning) immediately after the -c:v value. Shared between TS
-// (TranscodeToHLS) and CMAF (TranscodeVideoCMAF); platform-specific because
+// quality tuning) immediately after the -c:v value. Platform-specific because
 // the set of encoders differs (VT only on darwin).
 func applyEncoderOpts(args []string, encoder config.Encoder, ffmpegEncoder string, profile config.OutputProfile) []string {
 	switch encoder.EncoderType {
@@ -59,7 +20,7 @@ func applyEncoderOpts(args []string, encoder config.Encoder, ffmpegEncoder strin
 }
 
 // resolveHWArgs returns (hwArgs, vfFilter) for the chosen encoder and decode
-// tier on macOS. Shared between TS (TranscodeToHLS) and CMAF (cmaf.go).
+// tier on macOS.
 //
 // hwArgs contains FFmpeg global-input flags (-hwaccel …) injected before -i;
 // vfFilter is the value passed to -vf and handles scaling + padding as

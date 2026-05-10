@@ -399,27 +399,16 @@ async function leaseTask(videoId, workerKeyId) {
     }
 
     const task = rows[0];
-    const videoType = task.video_type || 'ts';
 
-    // Generate HLS AES-128 key only for legacy TS videos. CMAF pipelines ship
-    // unencrypted — the existing /api/keys endpoint returns 404 when the column
-    // is NULL, which is exactly what the CMAF client path expects.
-    let encryptionKey = null;
-    let encryptionKeyHex = null;
-    if (videoType === 'ts') {
-        encryptionKey = crypto.randomBytes(16);
-        encryptionKeyHex = encryptionKey.toString('hex');
-        await pool.execute(
-            "UPDATE videos SET status = 'worker_downloading', processing_job_id = ?, encryption_key = ? WHERE video_id = ?",
-            [jobId, encryptionKey, task.video_id]
-        );
-    } else {
-        // CMAF: clear any stale key from a previous lease, keep the column NULL.
-        await pool.execute(
-            "UPDATE videos SET status = 'worker_downloading', processing_job_id = ?, encryption_key = NULL WHERE video_id = ?",
-            [jobId, task.video_id]
-        );
-    }
+    // The worker only processes CMAF jobs now — legacy TS support was removed
+    // when the last in-flight TS job drained. Already-finished video_type='ts'
+    // rows still serve via /api/keys for playback, but no new TS work enters
+    // the pipeline. Clear any stale key column on every lease so the row's
+    // shape matches the unencrypted CMAF output.
+    await pool.execute(
+        "UPDATE videos SET status = 'worker_downloading', processing_job_id = ?, encryption_key = NULL WHERE video_id = ?",
+        [jobId, task.video_id]
+    );
     await videoCache.invalidate(task.video_id);
 
     // Seed the heartbeat cache. Subsequent /worker/tasks/status (running)
@@ -453,8 +442,6 @@ async function leaseTask(videoId, workerKeyId) {
     startStaleTimer(jobId);
     return {
         isLeaseSuccess: true, jobId, downloadUrl, videoId: task.video_id,
-        encryptionKey: encryptionKeyHex,
-        videoType,
         audioBitrateKbps,
         outputProfiles: profiles.map(p => ({
             name: p.name, width: p.width, height: p.height,
@@ -485,8 +472,6 @@ async function leaseTasks(videoIds, workerKeyId) {
                     status: 'leased',
                     jobId: r.jobId,
                     downloadUrl: r.downloadUrl,
-                    encryptionKey: r.encryptionKey,
-                    videoType: r.videoType,
                     audioBitrateKbps: r.audioBitrateKbps,
                     outputProfiles: r.outputProfiles,
                     audioNormalization: r.audioNormalization,
@@ -580,14 +565,14 @@ async function reportJobStatuses(jobs) {
     return results;
 }
 
-// Map file extension to the correct MIME type for R2 storage.
-// Covers both legacy TS segments and CMAF (fMP4 HLS + DASH) outputs.
+// Map file extension to the correct MIME type for R2 storage. Covers the
+// CMAF (fMP4 HLS + DASH) outputs the worker produces — .m3u8 playlists,
+// .mpd manifests, .mp4 init segments, .m4s media segments.
 //
-// MUST mirror worker/internal/api/upload.go hlsContentType byte-for-byte.
+// MUST mirror worker/internal/api/upload.go contentTypeForFile byte-for-byte.
 // R2 rejects the PUT with SignatureDoesNotMatch if the signed URL's
 // ContentType doesn't match the header the worker actually sends; the two
-// implementations live in different languages but must agree on every
-// input.
+// implementations live in different languages but must agree on every input.
 //
 // For .mp4 / .m4s we branch on whether the path sits under an `/audio/`
 // directory: the filename passed here is the job-relative path (e.g.
@@ -598,10 +583,9 @@ async function reportJobStatuses(jobs) {
 // for fMP4 init/media segments (Safari reads the box structure; Shaka
 // trusts the AdaptationSet's mimeType), but `aws s3api head-object` now
 // returns the honest type for anyone auditing the bucket.
-function hlsContentType(filename) {
+function contentTypeForFile(filename) {
     if (filename.endsWith('.m3u8')) return 'application/vnd.apple.mpegurl';
     if (filename.endsWith('.mpd'))  return 'application/dash+xml';
-    if (filename.endsWith('.ts'))   return 'video/mp2t';
     // .m4s = CMAF media segment, .mp4 = fMP4 init segment.
     //
     // Prepend a leading "/" so relative paths ("audio/aac_192k/init.mp4")
@@ -647,7 +631,7 @@ async function generateUploadUrls(jobId, filenames) {
 
     for (const filename of filenames) {
         const key = `${hashedVideoId}/${jobId}/${filename}`;
-        const contentType = hlsContentType(filename);
+        const contentType = contentTypeForFile(filename);
         const command = new PutObjectCommand({ Bucket: bucket, Key: key, ContentType: contentType, CacheControl: 'public, max-age=31536000, immutable' });
         urls[filename] = await getSignedUrl(r2, command, { expiresIn: 43200 }); // 12 hours
     }

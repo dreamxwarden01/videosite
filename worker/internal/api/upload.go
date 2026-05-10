@@ -90,14 +90,15 @@ func UploadFile(ctx context.Context, filePath, presignedURL string) error {
 	return fmt.Errorf("upload %s: failed after %d retries: %w", filepath.Base(filePath), maxUploadRetries, lastErr)
 }
 
-// hlsContentType returns the correct MIME type for HLS / CMAF / DASH output
-// files. Must match the ContentType used when generating the presigned PUT URL
-// on the server side (processingService.js hlsContentType) — R2 rejects the
-// PUT with SignatureDoesNotMatch if the signed URL's ContentType doesn't
-// match the PUT request's Content-Type header exactly.
+// contentTypeForFile returns the correct MIME type for an HLS playlist or
+// CMAF/DASH segment/manifest. Must match the ContentType used when
+// generating the presigned PUT URL on the server side
+// (processingService.js contentTypeForFile) — R2 rejects the PUT with
+// SignatureDoesNotMatch if the signed URL's ContentType doesn't match the
+// PUT request's Content-Type header exactly.
 //
-// Legacy TS uses .m3u8 + .ts; CMAF adds .mpd (DASH manifest), .mp4 (init
-// segment), and .m4s (media segments). All are served cache-immutable.
+// Outputs handled: .m3u8 (HLS playlist), .mpd (DASH manifest), .mp4 (fMP4
+// init segment), .m4s (CMAF media segment). All are served cache-immutable.
 //
 // For .mp4 / .m4s we branch on whether the path sits under an /audio/
 // directory — init.mp4 and segment_*.m4s under `audio/aac_192k/` get
@@ -112,13 +113,11 @@ func UploadFile(ctx context.Context, filePath, presignedURL string) error {
 //
 // filePath may be a relative or absolute path; we only inspect the suffix
 // and the presence of "/audio/" anywhere in it.
-func hlsContentType(filePath string) string {
+func contentTypeForFile(filePath string) string {
 	lower := strings.ToLower(filepath.ToSlash(filePath))
 	switch {
 	case strings.HasSuffix(lower, ".m3u8"):
 		return "application/vnd.apple.mpegurl"
-	case strings.HasSuffix(lower, ".ts"):
-		return "video/mp2t"
 	case strings.HasSuffix(lower, ".mpd"):
 		return "application/dash+xml"
 	case strings.HasSuffix(lower, ".mp4"), strings.HasSuffix(lower, ".m4s"):
@@ -155,11 +154,11 @@ func doUpload(ctx context.Context, filePath, presignedURL string) (int, error) {
 		return 0, fmt.Errorf("create upload request: %w", err)
 	}
 	req.ContentLength = stat.Size()
-	// Pass the full filePath (not just the basename) so hlsContentType can
-	// see the /audio/ segment in the path and return audio/mp4 for init +
-	// segments under /audio/. Stripping to basename made the path check
+	// Pass the full filePath (not just the basename) so contentTypeForFile
+	// can see the /audio/ segment in the path and return audio/mp4 for init
+	// + segments under /audio/. Stripping to basename made the path check
 	// useless — every .m4s looked identical.
-	req.Header.Set("Content-Type", hlsContentType(filePath))
+	req.Header.Set("Content-Type", contentTypeForFile(filePath))
 	req.Header.Set("Cache-Control", "public, max-age=31536000, immutable")
 
 	resp, err := httpClientPtr.Load().Do(req)

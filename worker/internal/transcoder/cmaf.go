@@ -10,7 +10,7 @@ import (
 	"videosite-worker/internal/hardware"
 )
 
-// TranscodeVideoCMAF transcodes the video-only track of sourcePath into an fMP4
+// TranscodeVideo transcodes the video-only track of sourcePath into an fMP4
 // HLS rendition at outputDir. Layout produced:
 //
 //	{outputDir}/init.mp4
@@ -20,9 +20,9 @@ import (
 //	{outputDir}/playlist.m3u8
 //
 // No audio is muxed — audio runs as a separate ffmpeg invocation
-// (TranscodeAudioCMAF) so the two can run in parallel on separate goroutines.
-// Encryption is never applied (CMAF relies on the R2 private-bucket + HMAC
-// edge validation posture, not at-rest encryption — see plan doc).
+// (TranscodeAudio) so the two can run in parallel on separate goroutines.
+// Output is never encrypted (we rely on the R2 private-bucket + HMAC edge
+// validation posture, not at-rest encryption — see plan doc).
 //
 // When srcFrameRate > profile.FpsLimit we append `-r fps_limit` to force
 // frame-rate downsampling; the flag is a global output option that works on
@@ -30,7 +30,7 @@ import (
 //
 // progressCh and errCh behave exactly like RunFFmpegWithProgress — callers
 // drain progressCh until close and then read a single error from errCh.
-func TranscodeVideoCMAF(ctx context.Context, sourcePath, outputDir string, profile config.OutputProfile, encoder config.Encoder, duration float64, swDecode bool, logFile string, srcW, srcH int, srcFrameRate float64) (<-chan int, <-chan error) {
+func TranscodeVideo(ctx context.Context, sourcePath, outputDir string, profile config.OutputProfile, encoder config.Encoder, duration float64, swDecode bool, logFile string, srcW, srcH int, srcFrameRate float64) (<-chan int, <-chan error) {
 	os.MkdirAll(outputDir, 0755)
 
 	ffmpegEncoder := hardware.FFmpegEncoderName[encoder.EncoderType]
@@ -40,9 +40,9 @@ func TranscodeVideoCMAF(ctx context.Context, sourcePath, outputDir string, profi
 
 	hwArgs, vfFilter := resolveHWArgs(encoder, swDecode, srcW, srcH, profile.Width, profile.Height)
 
-	args := buildBaseVideoCMAFArgs(hwArgs, sourcePath, outputDir, profile, ffmpegEncoder, vfFilter)
+	args := buildBaseVideoArgs(hwArgs, sourcePath, outputDir, profile, ffmpegEncoder, vfFilter)
 
-	// Encoder-specific options (same injection pattern as TranscodeToHLS).
+	// Encoder-specific options.
 	args = applyEncoderOpts(args, encoder, ffmpegEncoder, profile)
 
 	// FPS downsample: only applies when the source exceeds the profile's cap.
@@ -54,12 +54,12 @@ func TranscodeVideoCMAF(ctx context.Context, sourcePath, outputDir string, profi
 	return RunFFmpegWithProgress(ctx, duration, logFile, args...)
 }
 
-// RemuxVideoCMAF copies the source's video track into fMP4 HLS without
-// re-encoding. Audio is dropped (-an); audio is always produced separately for
-// CMAF. Remux is only chosen by the caller when FilterProfiles/ApplyBitrateCaps
+// RemuxVideo copies the source's video track into fMP4 HLS without
+// re-encoding. Audio is dropped (-an); audio is always produced separately.
+// Remux is only chosen by the caller when FilterProfiles/ApplyBitrateCaps
 // determined that resolution, codec, bitrate, and fps_limit all match —
-// otherwise TranscodeVideoCMAF is used.
-func RemuxVideoCMAF(ctx context.Context, sourcePath, outputDir string, profile config.OutputProfile, duration float64, logFile string) (<-chan int, <-chan error) {
+// otherwise TranscodeVideo is used.
+func RemuxVideo(ctx context.Context, sourcePath, outputDir string, profile config.OutputProfile, duration float64, logFile string) (<-chan int, <-chan error) {
 	os.MkdirAll(outputDir, 0755)
 
 	// ffmpeg's HLS muxer locates the fMP4 init file via strrchr(playlist_url,
@@ -88,7 +88,7 @@ func RemuxVideoCMAF(ctx context.Context, sourcePath, outputDir string, profile c
 	return RunFFmpegWithProgress(ctx, duration, logFile, args...)
 }
 
-// TranscodeAudioCMAF produces a single AAC-LC fMP4 HLS audio rendition at
+// TranscodeAudio produces a single AAC-LC fMP4 HLS audio rendition at
 // outputDir. Layout:
 //
 //	{outputDir}/init.mp4
@@ -96,10 +96,9 @@ func RemuxVideoCMAF(ctx context.Context, sourcePath, outputDir string, profile c
 //	{outputDir}/playlist.m3u8
 //
 // loudnormFilter is the filter string from a pass-1 loudnorm analysis (see
-// slot.Job.analyzeLoudnessCMAF). Pass "" to encode without normalization —
-// the caller decides whether analysis ran, so this function owns only the
-// encode pass; start/end/measurement log lines live one level up alongside
-// the TS path's equivalents.
+// slot.Job.analyzeLoudness). Pass "" to encode without normalization — the
+// caller decides whether analysis ran, so this function owns only the encode
+// pass; start/end/measurement log lines live one level up.
 //
 // progressCb reports encode 0–100 regardless of whether norm is active; the
 // caller is responsible for composing it with the analyze pass's own 0–100
@@ -108,8 +107,8 @@ func RemuxVideoCMAF(ctx context.Context, sourcePath, outputDir string, profile c
 //
 // All ffmpeg paths are forward-slash normalized so the HLS muxer's
 // dirname-by-strrchr logic writes init.mp4 into outputDir on Windows (see
-// RemuxVideoCMAF for the full backstory).
-func TranscodeAudioCMAF(
+// RemuxVideo for the full backstory).
+func TranscodeAudio(
 	ctx context.Context,
 	sourcePath, outputDir string,
 	audioBitrateKbps, segmentDurationSec int,
@@ -201,16 +200,15 @@ func TranscodeAudioCMAF(
 	return nil
 }
 
-// buildBaseVideoCMAFArgs assembles the shared ffmpeg args for a video-only
-// CMAF transcode. Parallel to buildBaseTranscodeArgs (TS path) but:
-//   - drops audio (-an) and audio-muxing flags
-//   - switches to fMP4 segments (segment_%04d.m4s + init.mp4 via -hls_fmp4_init_filename)
-//   - omits -hls_key_info_file (CMAF is never encrypted)
+// buildBaseVideoArgs assembles the shared ffmpeg args for a video-only
+// transcode. Output is fMP4 segments (segment_%04d.m4s + init.mp4 via
+// -hls_fmp4_init_filename) with no audio (-an) and no encryption. Audio is
+// always produced separately via TranscodeAudio.
 //
 // All paths passed to ffmpeg use forward slashes — ffmpeg's HLS muxer locates
 // the init file via strrchr(playlist_url, '/'), so Windows-native backslash
-// paths send the init segment to the worker's CWD. See RemuxVideoCMAF.
-func buildBaseVideoCMAFArgs(hwArgs []string, sourcePath, outputDir string, profile config.OutputProfile, ffmpegEncoder, vfFilter string) []string {
+// paths send the init segment to the worker's CWD. See RemuxVideo.
+func buildBaseVideoArgs(hwArgs []string, sourcePath, outputDir string, profile config.OutputProfile, ffmpegEncoder, vfFilter string) []string {
 	playlistPath := filepath.ToSlash(filepath.Join(outputDir, "playlist.m3u8"))
 	segmentPattern := filepath.ToSlash(filepath.Join(outputDir, "segment_%04d.m4s"))
 	initName := "init.mp4"
@@ -269,10 +267,9 @@ func buildBaseVideoCMAFArgs(hwArgs []string, sourcePath, outputDir string, profi
 // (right before the `[mix]` label in the filter_complex path, or as an
 // extra `-af` component in the simple path owned by the caller). apad
 // appends infinite silence AFTER the source audio ends, so it is ONLY
-// safe when the caller caps the output duration — either `-t <duration>`
-// at the output level (CMAF audio) or `-shortest` alongside a video
-// stream (TS muxed). Never pass true in an analysis pass with no length
-// cap; ffmpeg would then run forever pumping silence through loudnorm.
+// safe when the caller caps the output duration via `-t <duration>` at the
+// output level. Never pass true in an analysis pass with no length cap;
+// ffmpeg would then run forever pumping silence through loudnorm.
 //
 // For the loudnorm pass-1/pass-2 graph-identity invariant: apad inserts
 // constant silence after the real samples, and pass-2 loudnorm applies a
@@ -310,6 +307,20 @@ func buildAudioFilterChain(streamCount int, loudnormFilter string, padForEnd boo
 	}
 	chain += "[mix]"
 	return chain, "[mix]", true
+}
+
+// insertAfter inserts extra args after a specific argument value in the args slice.
+func insertAfter(args []string, after string, extra ...string) []string {
+	for i, a := range args {
+		if a == after {
+			result := make([]string, 0, len(args)+len(extra))
+			result = append(result, args[:i+1]...)
+			result = append(result, extra...)
+			result = append(result, args[i+1:]...)
+			return result
+		}
+	}
+	return args
 }
 
 // insertBeforeLast inserts extra args immediately before the last element of

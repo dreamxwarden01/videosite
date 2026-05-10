@@ -2,8 +2,6 @@ package slot
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -91,13 +89,11 @@ const downloadPartSize = 32 * 1024 * 1024
 
 // Job represents a single transcoding job.
 type Job struct {
-	JobID         string
-	VideoID       int
-	VideoType     string // "ts" (legacy MPEG-TS + AES-128) or "cmaf" (fMP4 HLS + DASH, unencrypted)
-	DownloadURL   string
-	EncryptionKey string // hex-encoded AES-128 key (empty = no encryption; always empty for CMAF)
-	Manager       *Manager
-	Progress      *progress.Tracker
+	JobID       string
+	VideoID     int
+	DownloadURL string
+	Manager     *Manager
+	Progress    *progress.Tracker
 
 	// LeasedAt is the wall-clock time the worker leased this job from the
 	// server. Used by the UI manager to sort the sticky progress bars
@@ -110,10 +106,8 @@ type Job struct {
 	UI ui.Manager
 
 	// Server-provided transcoding config (per-course or global defaults).
-	// AudioBitrateKbps is site-wide (moved off the per-profile struct in the
-	// CMAF migration); consumed by both TS (passed to RemuxToHLS /
-	// TranscodeToHLS) and CMAF (the single AAC rendition for all video
-	// profiles) pipelines.
+	// AudioBitrateKbps is site-wide; it drives the single AAC rendition
+	// produced for every job.
 	OutputProfiles            []config.OutputProfile
 	AudioBitrateKbps          int
 	AudioNormalization        bool
@@ -149,24 +143,17 @@ type Job struct {
 // LeasedAt is captured here (time.Now) rather than passed in by the caller so
 // every Job carries a consistent timestamp regardless of how the caller was
 // written; it only influences UI bar ordering.
-func NewJob(jobID string, videoID int, videoType, downloadURL, encryptionKey string, audioBitrateKbps int, initialEncoder config.Encoder, mgr *Manager, tracker *progress.Tracker, uiMgr ui.Manager,
+func NewJob(jobID string, videoID int, downloadURL string, audioBitrateKbps int, initialEncoder config.Encoder, mgr *Manager, tracker *progress.Tracker, uiMgr ui.Manager,
 	outputProfiles []config.OutputProfile, audioNorm bool, audioNormTarget, audioNormPeak, audioNormMaxGain float64) *Job {
 	jobCtx, cancel := context.WithCancel(context.Background())
-	// Default to the legacy TS pipeline when the server omits videoType (back-compat
-	// during the staged rollout — pre-migration servers don't set the field).
-	if videoType == "" {
-		videoType = "ts"
-	}
 	j := &Job{
-		JobID:         jobID,
-		VideoID:       videoID,
-		VideoType:     videoType,
-		DownloadURL:   downloadURL,
-		EncryptionKey: encryptionKey,
-		Manager:       mgr,
-		Progress:      tracker,
-		LeasedAt:      time.Now(),
-		UI:            uiMgr,
+		JobID:       jobID,
+		VideoID:     videoID,
+		DownloadURL: downloadURL,
+		Manager:     mgr,
+		Progress:    tracker,
+		LeasedAt:    time.Now(),
+		UI:          uiMgr,
 
 		OutputProfiles:            outputProfiles,
 		AudioBitrateKbps:          audioBitrateKbps,
@@ -294,36 +281,14 @@ func (j *Job) Run() error {
 		return j.handleError("probe", err)
 	}
 
-	// 3-6. PROCESSING — branches on VideoType.
-	//
-	// TS path (legacy):
-	//   analyze audio → transcode per-profile (serial) → write master.m3u8
-	//   One ffmpeg per profile muxes video + audio together; encryption
-	//   applied via -hls_key_info_file.
-	//
-	// CMAF path (new):
-	//   video goroutine (serial per-profile fMP4 HLS, no audio, no encryption) ||
+	// 3-6. PROCESSING:
+	//   video goroutine (serial per-profile fMP4 HLS, no audio) ||
 	//   audio goroutine (single AAC fMP4 rendition with optional two-pass norm)
 	//   → rewrite playlists for HMAC → probe init.mp4 for codecs →
-	//     write master.m3u8 (CMAF form) + manifest.mpd (DASH).
-	if j.VideoType == "cmaf" {
-		j.phase.Store("transcoding")
-		if err := j.runCMAF(probe); err != nil {
-			return j.handleError("processing", err)
-		}
-	} else {
-		loudnormFilter, err := j.analyzeLoudness(probe)
-		if err != nil {
-			return j.handleError("audio analysis", err)
-		}
-		j.phase.Store("transcoding")
-		profiles, err := j.transcode(probe, loudnormFilter)
-		if err != nil {
-			return j.handleError("transcode", err)
-		}
-		if err := j.generateMasterPlaylist(profiles); err != nil {
-			return j.handleError("master playlist", err)
-		}
+	//     write master.m3u8 + manifest.mpd (DASH).
+	j.phase.Store("transcoding")
+	if err := j.runTranscode(probe); err != nil {
+		return j.handleError("processing", err)
 	}
 
 	// 7. UPLOAD
@@ -801,118 +766,14 @@ func (j *Job) probe() (*transcoder.ProbeResult, error) {
 	return probe, nil
 }
 
-// prepareEncryption writes the AES-128 key file and FFmpeg key_info file
-// to the temp directory. Returns the path to the key_info file, or "" if
-// no encryption key is set.
-func (j *Job) prepareEncryption() (string, error) {
-	if j.EncryptionKey == "" {
-		return "", nil
-	}
-
-	keyBytes, err := hex.DecodeString(j.EncryptionKey)
-	if err != nil {
-		return "", fmt.Errorf("decode encryption key: %w", err)
-	}
-
-	// Write raw 16-byte key file
-	keyFilePath := filepath.Join(j.tempDir, "encryption.key")
-	if err := os.WriteFile(keyFilePath, keyBytes, 0600); err != nil {
-		return "", fmt.Errorf("write encryption key file: %w", err)
-	}
-
-	// Build key URI: same scheme://host logic as the API client
-	keyURI := api.BuildURL(fmt.Sprintf("/api/keys/%d", j.VideoID))
-
-	// Generate a random 16-byte IV for this video.
-	// FFmpeg key_info line 3: 32-char hex string, no 0x prefix.
-	ivBytes := make([]byte, 16)
-	if _, err := rand.Read(ivBytes); err != nil {
-		return "", fmt.Errorf("generate IV: %w", err)
-	}
-	ivHex := hex.EncodeToString(ivBytes)
-
-	// Write key_info file (3 lines: key URI, key file path, IV hex)
-	keyInfoPath := filepath.Join(j.tempDir, "key_info.txt")
-	keyInfoContent := keyURI + "\n" + keyFilePath + "\n" + ivHex
-	if err := os.WriteFile(keyInfoPath, []byte(keyInfoContent), 0600); err != nil {
-		return "", fmt.Errorf("write key info file: %w", err)
-	}
-
-	j.UI.Logf("[%s] encryption prepared", j.JobID)
-	return keyInfoPath, nil
-}
-
-// analyzeLoudness runs a loudnorm pass-1 analysis if audio normalization is
-// enabled in config. Returns the loudnorm filter string for pass 2, or "" if
-// normalization is disabled or the source has no audio stream.
-//
-// Progress wiring: when norm is on, analyze is step 0 of the weighted 10–90
-// processing plan. The bar shows 0–100 local pct; the server-facing global
-// pct advances through the analyze span instead of staying pinned at 10
-// until the first profile starts.
-func (j *Job) analyzeLoudness(probe *transcoder.ProbeResult) (string, error) {
-	if !j.AudioNormalization {
-		return "", nil
-	}
-	if probe.AudioCodec == "" {
-		j.UI.Logf("[%s] audio normalization: no audio stream, skipping", j.JobID)
-		return "", nil
-	}
-
-	// Step 0 of the processing plan when normOn = true.
-	plan := processingPlan(len(j.OutputProfiles), true)
-	aStart, aEnd := stepRange(plan, 0)
-
-	j.Progress.Update(j.JobID, "analyzing audio", int(aStart))
-	j.SetStage("processing", int(aStart))
-	j.UI.UpdateStage(j.JobID, "analyzing audio", int(aStart))
-	j.UI.Logf("[%s] analyzing audio loudness (EBU R128)...", j.JobID)
-
-	sourcePath := filepath.Join(j.tempDir, "source.mp4")
-	// TS path is single-audio-track by design — multi-track fixture handling
-	// lives only in the CMAF runCMAF path. Pass 1 here so AnalyzeLoudness
-	// stays on the original `-af loudnorm=...` form, byte-for-byte identical
-	// to pre-change behaviour for every legacy video that still runs TS.
-	stats, err := transcoder.AnalyzeLoudness(j.ctx, sourcePath, 1, j.duration, func(pct int) {
-		j.UI.UpdateStageProgress(j.JobID, pct)
-		globalPct := scaleLocal(aStart, aEnd, pct)
-		j.Progress.Update(j.JobID, "analyzing audio", globalPct)
-		j.SetStage("processing", globalPct)
-	})
-	if err != nil {
-		if j.ctx.Err() != nil {
-			return "", fmt.Errorf("aborted: %w", j.ctx.Err())
-		}
-		// Non-fatal: if analysis fails, proceed without normalization.
-		j.UI.Logf("[%s] WARN: audio loudness analysis failed, skipping normalization: %v", j.JobID, err)
-		return "", nil
-	}
-	if stats == nil {
-		j.UI.Logf("[%s] audio normalization: no audio detected by loudnorm, skipping", j.JobID)
-		return "", nil
-	}
-
-	gainRequired := j.AudioNormalizationTarget - stats.InputI
-	j.UI.Logf("[%s] audio: measured %.1f LUFS, target %.1f LUFS, gain required %.1f dB (max %.1f dB)",
-		j.JobID, stats.InputI, j.AudioNormalizationTarget, gainRequired, j.AudioNormalizationMaxGain)
-
-	filter := transcoder.BuildLoudnormFilter(stats,
-		j.AudioNormalizationTarget,
-		j.AudioNormalizationPeak,
-		j.AudioNormalizationMaxGain,
-	)
-	return filter, nil
-}
-
-// analyzeLoudnessCMAF runs loudnorm pass-1 for the CMAF pipeline. It emits
-// the same start/result/skip log lines as analyzeLoudness (TS path) so the
-// console trace is consistent between pipelines; progress reporting is
-// delegated via progressCb because CMAF feeds it into the V+A bar rather than
-// the TS weighted processingPlan.
+// analyzeLoudness runs loudnorm pass-1 if audio normalization is enabled.
+// Emits a start/result/skip log line for the audit trail; progress is
+// delegated via progressCb because runTranscode composes it into the V+A
+// bar rather than reporting it directly.
 //
 // Returns the loudnorm filter string for pass 2, or "" if normalization is
 // disabled, the source has no audio, analysis failed, or loudnorm saw no audio.
-func (j *Job) analyzeLoudnessCMAF(probe *transcoder.ProbeResult, progressCb func(pct int)) (string, error) {
+func (j *Job) analyzeLoudness(probe *transcoder.ProbeResult, progressCb func(pct int)) (string, error) {
 	if !j.AudioNormalization {
 		return "", nil
 	}
@@ -955,243 +816,11 @@ func (j *Job) analyzeLoudnessCMAF(probe *transcoder.ProbeResult, progressCb func
 	return filter, nil
 }
 
-func (j *Job) transcode(probe *transcoder.ProbeResult, loudnormFilter string) ([]transcoder.FilteredProfile, error) {
-	profiles := transcoder.FilterProfiles(probe, j.OutputProfiles)
-	profiles = transcoder.ApplyBitrateCaps(j.JobID, profiles, probe.Height, probe.VideoBitrateKbps)
-
-	if len(profiles) == 0 {
-		return nil, fmt.Errorf("no suitable output profiles for source %dx%d", probe.Width, probe.Height)
-	}
-
-	// Prepare HLS AES-128 encryption (writes key file + key_info file)
-	keyInfoFile, err := j.prepareEncryption()
-	if err != nil {
-		return nil, fmt.Errorf("prepare encryption: %w", err)
-	}
-
-	sourcePath := filepath.Join(j.tempDir, "source.mp4")
-	totalProfiles := len(profiles)
-
-	// Build the weighted progress plan once so every profile's global-pct
-	// span is computed consistently with the analyze pass (if any).
-	normOn := loudnormFilter != ""
-	plan := processingPlan(totalProfiles, normOn)
-
-	for i, profile := range profiles {
-		if err := j.ctx.Err(); err != nil {
-			return nil, fmt.Errorf("aborted: %w", err)
-		}
-
-		// Step index in the plan: 0 is analyze when normOn, so profiles
-		// start at 1; otherwise they start at 0.
-		stepIdx := i
-		if normOn {
-			stepIdx++
-		}
-		pStart, pEnd := stepRange(plan, stepIdx)
-		// Stage label kept short ("remuxing 1080p") — the profile name,
-		// step index, and codec details already appear in the surrounding
-		// Logf lines (the lease line lists the full profile set; the
-		// per-encoder messages name the codec). Putting all of that into
-		// the bar label too just chewed bar width and duplicated info
-		// that's two lines up in the scroll log.
-		stageLabel := fmt.Sprintf("%dp", profile.Height)
-
-		profileDir := filepath.Join(j.outputDir, profile.Name)
-
-		// Try remux first if eligible.
-		// With normalization active, remux copies video but re-encodes audio.
-		if profile.CanRemux {
-			remuxTier := "remux"
-			if loudnormFilter != "" {
-				remuxTier = "remux+norm"
-			}
-			j.UI.UpdateStage(j.JobID, "remuxing "+stageLabel, int(pStart))
-			remuxLog := ffmpegLogPath(j.JobID, profile.Name, remuxTier)
-			err := j.remuxProfile(sourcePath, profileDir, profile, keyInfoFile, remuxLog, pStart, pEnd, loudnormFilter)
-			if err == nil {
-				j.UI.Logf("[%s] remux successful: %s", j.JobID, profile.Name)
-				j.reportProfileProgress(pEnd)
-				continue
-			}
-			if j.ctx.Err() != nil {
-				return nil, fmt.Errorf("aborted: %w", j.ctx.Err())
-			}
-			if errors.Is(err, transcoder.ErrFFmpegMissing) {
-				return nil, err // Fatal — propagate without falling back to transcode
-			}
-			j.UI.Logf("[%s] WARN: remux failed for %s, falling back to transcode: %v", j.JobID, profile.Name, err)
-			os.RemoveAll(profileDir) // Clean up failed remux
-		}
-
-		// Transcode with encoder fallback. The stage label and bar reset
-		// happen once here (not per-encoder-retry inside transcodeProfile) so
-		// hw→sw decode fallbacks don't spam the log.
-		j.UI.UpdateStage(j.JobID, "transcoding "+stageLabel, int(pStart))
-		if err := j.transcodeProfile(sourcePath, profileDir, profile, probe.DurationSeconds, pStart, pEnd, keyInfoFile, probe.Width, probe.Height, loudnormFilter); err != nil {
-			return nil, err
-		}
-
-		j.reportProfileProgress(pEnd)
-	}
-
-	return profiles, nil
-}
-
-// remuxProfile runs a remux for one profile and reports progress. pStart/pEnd
-// define this profile's slice of the weighted 10–90% global-pct band (see
-// processingPlan / stepRange in weights.go). The UI bar is driven with local
-// 0–100 pct; the per-1% console print was removed in favor of the bar.
-// loudnormFilter is passed through to RemuxToHLS: when non-empty, video is
-// stream-copied and audio is re-encoded with normalization applied.
-// Returns nil on success, a non-nil error on failure or FFmpeg missing.
-// The caller must check j.ctx.Err() after a non-nil return to distinguish
-// an abort from a genuine remux failure (which should fall back to transcode).
-func (j *Job) remuxProfile(sourcePath, profileDir string, profile transcoder.FilteredProfile, keyInfoFile, logFile string, pStart, pEnd float64, loudnormFilter string) error {
-	progressCh, errCh := transcoder.RemuxToHLS(
-		j.ctx, sourcePath, profileDir, profile.OutputProfile, j.AudioBitrateKbps, keyInfoFile, logFile, j.duration, loudnormFilter,
-	)
-
-	for pct := range progressCh {
-		j.UI.UpdateStageProgress(j.JobID, pct)
-		j.Progress.Update(j.JobID, fmt.Sprintf("remuxing %s", profile.Name), pct)
-
-		// Update local report state; worker status loop picks it up every 2 s.
-		globalPct := scaleLocal(pStart, pEnd, pct)
-		j.SetStage("processing", globalPct)
-	}
-	// Drain any remaining items so the FFmpeg goroutine can close the channel.
-	for range progressCh {
-	}
-
-	return <-errCh
-}
-
-// transcodeProfile encodes one profile with encoder-tier fallback.
-// pStart/pEnd are this profile's slice of the weighted 10–90% global-pct
-// band; local progress (0–100) is scaled into that slice for the server
-// report and drives the UI bar directly. The stage label and bar reset are
-// handled by the caller, so encoder-tier retries inside this function don't
-// spam the bar with repeated transitions.
-func (j *Job) transcodeProfile(sourcePath, profileDir string, profile transcoder.FilteredProfile, duration float64, pStart, pEnd float64, keyInfoFile string, srcW, srcH int, loudnormFilter string) error {
-	// Start with the encoder assigned when this job acquired its slot.
-	// If that type has already failed (from a previous profile), ask the
-	// manager for the next available fallback — no new slot is acquired.
-	encoder := j.initialEncoder
-	if j.failedTypes[encoder.EncoderType] {
-		var err error
-		encoder, err = j.Manager.NextEncoder(j.failedTypes)
-		if err != nil {
-			return fmt.Errorf("no encoder available for profile %s: %w", profile.Name, err)
-		}
-	}
-
-	for {
-		if err := j.ctx.Err(); err != nil {
-			return fmt.Errorf("aborted: %w", err)
-		}
-
-		// Two-tier decode selection per encoder type:
-		//   Tier 1 (full GPU):  hw decode + hw encode  — tried first if available
-		//   Tier 2 (half-half): sw decode + hw encode  — tried after tier-1 failure
-		// Once both tiers of an encoder type are exhausted, move to the next type.
-		// hwDecodeFailed tracks whether tier-1 has already been tried for each type.
-		swDecode := !hwDecodeAvailable(encoder.EncoderType) || j.hwDecodeFailed[encoder.EncoderType]
-
-		var tierLabel string
-		switch {
-		case encoder.EncoderType == hardware.EncoderSW:
-			tierLabel = "software"
-			j.UI.Logf("[%s] transcoding %s with software (libx264)", j.JobID, profile.Name)
-		case swDecode:
-			tierLabel = "vt-swdec"
-			j.UI.Logf("[%s] transcoding %s with %s (sw decode + hw encode)", j.JobID, profile.Name, encoder.EncoderType)
-		default:
-			tierLabel = "vt-hwdec"
-			j.UI.Logf("[%s] transcoding %s with %s (hw decode + hw encode)", j.JobID, profile.Name, encoder.EncoderType)
-		}
-
-		// Re-reset the bar on tier retry so the user sees the new attempt
-		// start from 0 instead of continuing from wherever the failed attempt
-		// left off.
-		j.UI.UpdateStageProgress(j.JobID, 0)
-
-		logFile := ffmpegLogPath(j.JobID, profile.Name, tierLabel)
-		progressCh, errCh := transcoder.TranscodeToHLS(j.ctx, sourcePath, profileDir, profile.OutputProfile, j.AudioBitrateKbps, encoder, duration, keyInfoFile, swDecode, logFile, srcW, srcH, loudnormFilter)
-
-		// Drain progress updates into the bar + server-report state.
-		// The per-1% Printf that used to live here was removed in favor of
-		// the bar.
-		for pct := range progressCh {
-			j.UI.UpdateStageProgress(j.JobID, pct)
-			j.Progress.Update(j.JobID, fmt.Sprintf("transcoding %s", profile.Name), pct)
-
-			globalPct := scaleLocal(pStart, pEnd, pct)
-			j.SetStage("processing", globalPct)
-		}
-		// Drain any remaining items so the FFmpeg goroutine can close the channel.
-		for range progressCh {
-		}
-
-		err := <-errCh
-		if err == nil {
-			return nil // Success
-		}
-
-		// Check if aborted
-		if j.ctx.Err() != nil {
-			return fmt.Errorf("aborted during transcode: %w", j.ctx.Err())
-		}
-
-		// FFmpeg binary missing — fatal, propagate directly for worker shutdown
-		if errors.Is(err, transcoder.ErrFFmpegMissing) {
-			return err
-		}
-
-		// Tier-1 (full GPU) failed — retry same encoder with sw decode (tier-2).
-		// Per-job tracking: other concurrent jobs on the same machine still try
-		// full-GPU first for their own videos.
-		if !swDecode {
-			j.UI.Logf("[%s] WARN: %s full-GPU failed for %s, retrying with sw decode: %v", j.JobID, encoder.EncoderType, profile.Name, err)
-			j.hwDecodeFailed[encoder.EncoderType] = true
-			os.RemoveAll(profileDir)
-			continue // same encoder type, sw decode next iteration
-		}
-
-		// Tier-2 also failed (or hw decode never available) — this encoder type is done.
-		j.UI.Logf("[%s] WARN: %s exhausted for %s, trying next encoder: %v", j.JobID, encoder.EncoderType, profile.Name, err)
-		j.failedTypes[encoder.EncoderType] = true
-		os.RemoveAll(profileDir)
-
-		encoder, err = j.Manager.NextEncoder(j.failedTypes)
-		if err != nil {
-			return fmt.Errorf("all encoders failed for profile %s: %w", profile.Name, err)
-		}
-	}
-}
-
 // hwDecodeAvailable is defined in job_darwin.go / job_windows.go.
 // Returns whether the full-GPU (hardware decode) path should be attempted
 // for the given encoder type.
 
-func (j *Job) generateMasterPlaylist(profiles []transcoder.FilteredProfile) error {
-	// Write master playlist (always includes HMAC query params)
-	if err := transcoder.WriteMasterPlaylist(j.outputDir, profiles, j.AudioBitrateKbps); err != nil {
-		return fmt.Errorf("write master playlist: %w", err)
-	}
-
-	// Rewrite per-profile playlists with HMAC token variables
-	for _, p := range profiles {
-		playlistPath := filepath.Join(j.outputDir, p.Name, "playlist.m3u8")
-		if err := transcoder.RewritePlaylistHMAC(playlistPath); err != nil {
-			return fmt.Errorf("rewrite HMAC playlist for %s: %w", p.Name, err)
-		}
-	}
-
-	return nil
-}
-
-// upload collects all HLS output files and uploads them concurrently to R2.
+// upload collects all output files and uploads them concurrently to R2.
 //
 // Upload logic:
 //  1. Fetch presigned PUT URLs for all files (batched, with RetryWithBackoff).
@@ -1500,18 +1129,6 @@ func (j *Job) fetchUploadURLsBatch(ctx context.Context, tasks []uploadTask) (map
 	return allURLs, nil
 }
 
-// reportProfileProgress snaps the server-reported progress to the end of the
-// just-finished profile step. pEnd comes from stepRange and already accounts
-// for the weighted plan (analyze + profiles).
-func (j *Job) reportProfileProgress(pEnd float64) {
-	pct := int(pEnd)
-	j.Progress.Update(j.JobID, "transcoding", pct)
-
-	// Publish locally — worker status loop picks it up every 2 s and batches
-	// with other active jobs into a single /tasks/status call.
-	j.SetStage("processing", pct)
-}
-
 // handleError classifies a job-phase error and queues a terminal status.
 //
 // The actual /tasks/status delivery happens in the worker status loop via
@@ -1567,13 +1184,13 @@ func (j *Job) handleError(phase string, err error) error {
 	return fmt.Errorf("job %s failed at %s: %w", j.JobID, phase, err)
 }
 
-// runCMAF drives the CMAF (fMP4 HLS + DASH) processing branch.
+// runTranscode drives the fMP4 HLS + DASH processing pass.
 //
 // Video and audio run in parallel — two ffmpeg processes, one per track —
 // because each uses its own encoder/codec and there's no muxing benefit to
-// serialising them the way the TS pipeline does. Profiles within the video
-// track are still serial to avoid oversubscribing the GPU (a single encoder
-// slot from Manager backs this whole job).
+// serialising them. Profiles within the video track are still serial to
+// avoid oversubscribing the GPU (a single encoder slot from Manager backs
+// this whole job).
 //
 // Progress reporting: video reports `(done*100 + pct) / N` local %, audio
 // reports 0–50 during loudnorm analyze + 50–100 during encode (or 0–100 if
@@ -1584,7 +1201,7 @@ func (j *Job) handleError(phase string, err error) error {
 //
 // On success, produces master.m3u8 + manifest.mpd + per-track playlists,
 // init segments, and .m4s segments — ready for upload by the caller.
-func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
+func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 	profiles := transcoder.FilterProfiles(probe, j.OutputProfiles)
 	profiles = transcoder.ApplyBitrateCaps(j.JobID, profiles, probe.Height, probe.VideoBitrateKbps)
 	if len(profiles) == 0 {
@@ -1739,7 +1356,7 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 				updateV(overall)
 			}
 
-			if err := j.cmafVideoProfile(egCtx, &encoder, sourcePath, profileVideoDir, p, probe, onLocalProgress); err != nil {
+			if err := j.transcodeVideoProfile(egCtx, &encoder, sourcePath, profileVideoDir, p, probe, onLocalProgress); err != nil {
 				recordErr(fmt.Errorf("video profile %s: %w", p.Name, err))
 				return
 			}
@@ -1750,7 +1367,7 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 
 	// --- Audio goroutine ---
 	// Skipped entirely when the source has no audio track — no analyze, no
-	// encode, no TranscodeAudioCMAF call, no /audio/ directory created or
+	// encode, no TranscodeAudio call, no /audio/ directory created or
 	// uploaded. audioPct is pinned at 100 in the shared state (see above)
 	// so the video goroutine's progress drives the server-reported pct by
 	// itself.
@@ -1795,7 +1412,7 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 				}
 			}
 
-			loudnormFilter, err := j.analyzeLoudnessCMAF(probe, analyzeProgress)
+			loudnormFilter, err := j.analyzeLoudness(probe, analyzeProgress)
 			if err != nil {
 				recordErr(fmt.Errorf("audio analyze: %w", err))
 				return
@@ -1803,7 +1420,7 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 
 			// Encode band is decided by whichever of norm/merge actually
 			// happened. Re-check against the returned filter string rather
-			// than normWillRun alone — analyzeLoudnessCMAF can return ""
+			// than normWillRun alone — analyzeLoudness can return ""
 			// when loudnorm bailed mid-analysis (rare) even though
 			// j.AudioNormalization was true.
 			normActuallyRan := loudnormFilter != ""
@@ -1828,9 +1445,9 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 				}
 			}
 
-			logFile := ffmpegLogPath(j.JobID, "audio", "cmaf-audio")
+			logFile := ffmpegLogPath(j.JobID, "audio", "audio")
 			segDur := profiles[0].SegmentDuration
-			err = transcoder.TranscodeAudioCMAF(
+			err = transcoder.TranscodeAudio(
 				egCtx, sourcePath, audioDir,
 				j.AudioBitrateKbps, segDur, loudnormFilter,
 				probe.AudioStreamCount,
@@ -1846,7 +1463,7 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 			// path contained backslashes — catching that here surfaces the
 			// failure at the ffmpeg boundary rather than much later at
 			// ProbeCodecString / playback.
-			if vErr := verifyCMAFInit(audioDir, logFile); vErr != nil {
+			if vErr := verifyInit(audioDir, logFile); vErr != nil {
 				recordErr(fmt.Errorf("audio: %w", vErr))
 			}
 		}()
@@ -1874,9 +1491,9 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 	}
 
 	// Build variants by probing each init.mp4 for its RFC 6381 codec string.
-	// A missing string is non-fatal — WriteMasterPlaylistCMAF / WriteDASHManifest
+	// A missing string is non-fatal — WriteMasterPlaylist / WriteDASHManifest
 	// fall back to a conservative default so the manifests still validate.
-	variants := make([]transcoder.CMAFVariant, 0, len(profiles))
+	variants := make([]transcoder.Variant, 0, len(profiles))
 	for _, p := range profiles {
 		initPath := filepath.Join(j.outputDir, "video", p.Name, "init.mp4")
 		codecStr, err := transcoder.ProbeCodecString(initPath)
@@ -1891,7 +1508,7 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 		if p.FpsLimit > 0 && outFps > p.FpsLimit {
 			outFps = p.FpsLimit
 		}
-		variants = append(variants, transcoder.CMAFVariant{
+		variants = append(variants, transcoder.Variant{
 			Name:             p.Name,
 			Width:            p.Width,
 			Height:           p.Height,
@@ -1901,8 +1518,8 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 		})
 	}
 
-	if err := transcoder.WriteMasterPlaylistCMAF(j.outputDir, variants, audioName, j.AudioBitrateKbps, hasAudio); err != nil {
-		return fmt.Errorf("write CMAF master playlist: %w", err)
+	if err := transcoder.WriteMasterPlaylist(j.outputDir, variants, audioName, j.AudioBitrateKbps, hasAudio); err != nil {
+		return fmt.Errorf("write master playlist: %w", err)
 	}
 	if err := transcoder.WriteDASHManifest(j.outputDir, variants, audioName, j.AudioBitrateKbps, probe.DurationSeconds, hasAudio); err != nil {
 		return fmt.Errorf("write DASH manifest: %w", err)
@@ -1911,8 +1528,7 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 	return nil
 }
 
-// cmafVideoProfile encodes one CMAF video profile with the same encoder-tier
-// fallback strategy used by transcodeProfile (TS path):
+// transcodeVideoProfile encodes one video profile with encoder-tier fallback:
 //
 //	tier 1: hw decode + hw encode (full GPU)  [if supported]
 //	tier 2: sw decode + hw encode
@@ -1922,29 +1538,29 @@ func (j *Job) runCMAF(probe *transcoder.ProbeResult) error {
 // profiles (once a type has failed on this job we stop trying it). Remux
 // takes a disjoint path: it's either applicable (copy + mux only, no encoder
 // involved) or we transcode.
-func (j *Job) cmafVideoProfile(ctx context.Context, encoder *config.Encoder, sourcePath, profileDir string, profile transcoder.FilteredProfile, probe *transcoder.ProbeResult, onProgress func(int)) error {
-	// Remux first if eligible. CMAF remux is the simplest case — video copy,
-	// no audio, no encryption — so no encoder fallback applies; a failure
-	// just drops us into the transcode path below.
+func (j *Job) transcodeVideoProfile(ctx context.Context, encoder *config.Encoder, sourcePath, profileDir string, profile transcoder.FilteredProfile, probe *transcoder.ProbeResult, onProgress func(int)) error {
+	// Remux first if eligible. Remux is the simplest case — video copy, no
+	// audio, no encryption — so no encoder fallback applies; a failure just
+	// drops us into the transcode path below.
 	if profile.CanRemux {
-		j.UI.Logf("[%s] remuxing %s (cmaf)...", j.JobID, profile.Name)
-		remuxLog := ffmpegLogPath(j.JobID, profile.Name, "cmaf-remux")
-		progressCh, errCh := transcoder.RemuxVideoCMAF(ctx, sourcePath, profileDir, profile.OutputProfile, probe.DurationSeconds, remuxLog)
+		j.UI.Logf("[%s] remuxing %s...", j.JobID, profile.Name)
+		remuxLog := ffmpegLogPath(j.JobID, profile.Name, "remux")
+		progressCh, errCh := transcoder.RemuxVideo(ctx, sourcePath, profileDir, profile.OutputProfile, probe.DurationSeconds, remuxLog)
 		for pct := range progressCh {
 			onProgress(pct)
 		}
 		err := <-errCh
 		if err == nil {
 			// Gate remux success on the init segment actually landing in
-			// profileDir (see verifyCMAFInit for the Windows hls muxer
+			// profileDir (see verifyInit for the Windows hls muxer
 			// backstory). If it's missing, fall back to transcode instead
 			// of declaring a silent failure.
-			if vErr := verifyCMAFInit(profileDir, remuxLog); vErr != nil {
-				j.UI.Logf("[%s] WARN: cmaf remux for %s produced no init.mp4, falling back to transcode: %v", j.JobID, profile.Name, vErr)
+			if vErr := verifyInit(profileDir, remuxLog); vErr != nil {
+				j.UI.Logf("[%s] WARN: remux for %s produced no init.mp4, falling back to transcode: %v", j.JobID, profile.Name, vErr)
 				os.RemoveAll(profileDir)
 				os.MkdirAll(profileDir, 0755)
 			} else {
-				j.UI.Logf("[%s] remux successful: %s (cmaf)", j.JobID, profile.Name)
+				j.UI.Logf("[%s] remux successful: %s", j.JobID, profile.Name)
 				return nil
 			}
 		} else {
@@ -1954,7 +1570,7 @@ func (j *Job) cmafVideoProfile(ctx context.Context, encoder *config.Encoder, sou
 			if errors.Is(err, transcoder.ErrFFmpegMissing) {
 				return err
 			}
-			j.UI.Logf("[%s] WARN: cmaf remux failed for %s, falling back to transcode: %v", j.JobID, profile.Name, err)
+			j.UI.Logf("[%s] WARN: remux failed for %s, falling back to transcode: %v", j.JobID, profile.Name, err)
 			os.RemoveAll(profileDir)
 			os.MkdirAll(profileDir, 0755)
 		}
@@ -1970,20 +1586,20 @@ func (j *Job) cmafVideoProfile(ctx context.Context, encoder *config.Encoder, sou
 		var tierLabel string
 		switch {
 		case encoder.EncoderType == hardware.EncoderSW:
-			tierLabel = "cmaf-sw"
-			j.UI.Logf("[%s] cmaf transcoding %s with software (libx264)", j.JobID, profile.Name)
+			tierLabel = "sw"
+			j.UI.Logf("[%s] transcoding %s with software (libx264)", j.JobID, profile.Name)
 		case swDecode:
-			tierLabel = "cmaf-vt-swdec"
-			j.UI.Logf("[%s] cmaf transcoding %s with %s (sw decode + hw encode)", j.JobID, profile.Name, encoder.EncoderType)
+			tierLabel = "vt-swdec"
+			j.UI.Logf("[%s] transcoding %s with %s (sw decode + hw encode)", j.JobID, profile.Name, encoder.EncoderType)
 		default:
-			tierLabel = "cmaf-vt-hwdec"
-			j.UI.Logf("[%s] cmaf transcoding %s with %s (hw decode + hw encode)", j.JobID, profile.Name, encoder.EncoderType)
+			tierLabel = "vt-hwdec"
+			j.UI.Logf("[%s] transcoding %s with %s (hw decode + hw encode)", j.JobID, profile.Name, encoder.EncoderType)
 		}
 
 		onProgress(0)
 
 		logFile := ffmpegLogPath(j.JobID, profile.Name, tierLabel)
-		progressCh, errCh := transcoder.TranscodeVideoCMAF(ctx, sourcePath, profileDir, profile.OutputProfile, *encoder, probe.DurationSeconds, swDecode, logFile, probe.Width, probe.Height, probe.FrameRate)
+		progressCh, errCh := transcoder.TranscodeVideo(ctx, sourcePath, profileDir, profile.OutputProfile, *encoder, probe.DurationSeconds, swDecode, logFile, probe.Width, probe.Height, probe.FrameRate)
 
 		for pct := range progressCh {
 			onProgress(pct)
@@ -1992,11 +1608,11 @@ func (j *Job) cmafVideoProfile(ctx context.Context, encoder *config.Encoder, sou
 		err := <-errCh
 		if err == nil {
 			// Same defensive init.mp4 check as the remux path.
-			if vErr := verifyCMAFInit(profileDir, logFile); vErr != nil {
-				j.UI.Logf("[%s] WARN: cmaf transcode for %s produced no init.mp4: %v", j.JobID, profile.Name, vErr)
+			if vErr := verifyInit(profileDir, logFile); vErr != nil {
+				j.UI.Logf("[%s] WARN: transcode for %s produced no init.mp4: %v", j.JobID, profile.Name, vErr)
 				return vErr
 			}
-			j.UI.Logf("[%s] transcoded %s successfully (cmaf)", j.JobID, profile.Name)
+			j.UI.Logf("[%s] transcoded %s successfully", j.JobID, profile.Name)
 			return nil
 		}
 
@@ -2008,14 +1624,14 @@ func (j *Job) cmafVideoProfile(ctx context.Context, encoder *config.Encoder, sou
 		}
 
 		if !swDecode {
-			j.UI.Logf("[%s] WARN: %s full-GPU failed for %s (cmaf), retrying with sw decode: %v", j.JobID, encoder.EncoderType, profile.Name, err)
+			j.UI.Logf("[%s] WARN: %s full-GPU failed for %s, retrying with sw decode: %v", j.JobID, encoder.EncoderType, profile.Name, err)
 			j.hwDecodeFailed[encoder.EncoderType] = true
 			os.RemoveAll(profileDir)
 			os.MkdirAll(profileDir, 0755)
 			continue
 		}
 
-		j.UI.Logf("[%s] WARN: %s exhausted for %s (cmaf), trying next encoder: %v", j.JobID, encoder.EncoderType, profile.Name, err)
+		j.UI.Logf("[%s] WARN: %s exhausted for %s, trying next encoder: %v", j.JobID, encoder.EncoderType, profile.Name, err)
 		j.failedTypes[encoder.EncoderType] = true
 		os.RemoveAll(profileDir)
 		os.MkdirAll(profileDir, 0755)
@@ -2034,17 +1650,17 @@ func (j *Job) cleanup() {
 	}
 }
 
-// verifyCMAFInit confirms that {dir}/init.mp4 was produced (non-empty) after
-// a CMAF ffmpeg run completes. ffmpeg's HLS muxer locates fmp4_init_filename
-// by running strrchr('/') over the playlist URL string; on Windows the native
-// backslash paths used to send init.mp4 to the worker's CWD while ffmpeg still
-// returned exit 0. The main fix lives in transcoder/cmaf.go (all paths are
-// ToSlash'd before being handed to ffmpeg), but this check is the belt: if a
-// future build of ffmpeg, a third encoder option, or some other quirk puts
-// the init segment somewhere unexpected, we catch it here with a directory
-// listing and the ffmpeg log path so diagnosis is trivial — instead of
-// showing up hours later as a 404 in the browser.
-func verifyCMAFInit(dir, logFile string) error {
+// verifyInit confirms that {dir}/init.mp4 was produced (non-empty) after a
+// transcode run completes. ffmpeg's HLS muxer locates fmp4_init_filename by
+// running strrchr('/') over the playlist URL string; on Windows the native
+// backslash paths used to send init.mp4 to the worker's CWD while ffmpeg
+// still returned exit 0. The main fix lives in transcoder/cmaf.go (all
+// paths are ToSlash'd before being handed to ffmpeg), but this check is the
+// belt: if a future build of ffmpeg, a third encoder option, or some other
+// quirk puts the init segment somewhere unexpected, we catch it here with a
+// directory listing and the ffmpeg log path so diagnosis is trivial —
+// instead of showing up hours later as a 404 in the browser.
+func verifyInit(dir, logFile string) error {
 	initPath := filepath.Join(dir, "init.mp4")
 	if st, err := os.Stat(initPath); err == nil && st.Size() > 0 {
 		return nil

@@ -206,7 +206,7 @@ func (w *Worker) launchJob(r api.LeaseResult) {
 	slog.Info("Launching job", "job", r.JobID, "video", r.VideoID,
 		"encoder", encoder.EncoderType, "device", encoder.DeviceIndex)
 
-	job := slot.NewJob(r.JobID, r.VideoID, r.VideoType, r.DownloadURL, r.EncryptionKey, r.AudioBitrateKbps, encoder, w.manager, w.tracker, w.ui,
+	job := slot.NewJob(r.JobID, r.VideoID, r.DownloadURL, r.AudioBitrateKbps, encoder, w.manager, w.tracker, w.ui,
 		r.OutputProfiles, r.AudioNormalization, r.AudioNormalizationTarget, r.AudioNormalizationPeak, r.AudioNormalizationMaxGain)
 	w.manager.RegisterJob(r.JobID, job)
 
