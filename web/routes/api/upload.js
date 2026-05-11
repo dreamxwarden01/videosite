@@ -4,7 +4,8 @@ const path = require('path');
 const { requireAuth } = require('../../middleware/auth');
 const { checkPermission } = require('../../middleware/permissions');
 const { getPool } = require('../../config/database');
-const { createVideo, cleanR2Prefix } = require('../../services/videoService');
+const { createVideo } = require('../../services/videoService');
+const deletionService = require('../../services/deletionService');
 const { getCourseById } = require('../../services/courseService');
 const { createTask } = require('../../services/processingService');
 const {
@@ -281,26 +282,33 @@ router.post('/upload/:uploadId/complete', requireAuth, checkPermission('uploadVi
             // Replacement — reset video for reprocessing
             videoId = session.video_id;
 
-            // Get current video info for cleanup
+            // Get current video info for cleanup. Replacement keeps the same
+            // hashed_video_id, so we scope the OLD-output cleanup to the
+            // previous job's subdirectory (`{hash}/{old_job_id}/`) rather
+            // than the whole hash — the new transcode will write under a
+            // fresh job_id and the reaper must not race it. Earlier-retry
+            // orphan tails (if any) sit until video-delete, per design.
             const [videoRows] = await pool.execute(
-                'SELECT hashed_video_id, r2_source_key FROM videos WHERE video_id = ?',
+                'SELECT hashed_video_id, r2_source_key, processing_job_id FROM videos WHERE video_id = ?',
                 [videoId]
             );
 
             if (videoRows.length > 0) {
-                // Clean old R2 source
-                const oldSourceKey = videoRows[0].r2_source_key;
-                if (oldSourceKey) {
-                    const oldSourceDir = oldSourceKey.substring(0, oldSourceKey.lastIndexOf('/') + 1);
-                    cleanR2Prefix(oldSourceDir).catch(err => {
-                        console.error(`R2 source cleanup failed for replaced video ${videoId}:`, err.message);
-                    });
+                const { hashed_video_id, r2_source_key, processing_job_id } = videoRows[0];
+
+                // Old source: enqueue immediate prefix delete.
+                if (r2_source_key) {
+                    const oldSourceDir = r2_source_key.substring(0, r2_source_key.lastIndexOf('/') + 1);
+                    await deletionService.enqueuePrefix(oldSourceDir, { source: 'video_replace' });
                 }
 
-                // Clean old HLS segments (fire-and-forget)
-                cleanR2Prefix(`${videoRows[0].hashed_video_id}/`).catch(err => {
-                    console.error(`R2 HLS cleanup failed for replaced video ${videoId}:`, err.message);
-                });
+                // Old output: only enqueue if we know the previous job_id.
+                if (processing_job_id) {
+                    await deletionService.enqueuePrefix(
+                        `${hashed_video_id}/${processing_job_id}/`,
+                        { source: 'video_replace' }
+                    );
+                }
             }
 
             // Delete old processing_queue row

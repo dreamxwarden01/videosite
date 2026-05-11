@@ -333,6 +333,21 @@ CREATE TABLE IF NOT EXISTS course_materials (
     INDEX idx_course_materials_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS pending_deletes (
+    id                BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    mode              ENUM('key','prefix') NOT NULL,
+    target            VARCHAR(512) NOT NULL,
+    hashed_video_id   VARCHAR(64) DEFAULT NULL,
+    execute_at        DATETIME NOT NULL,
+    attempts          INT UNSIGNED NOT NULL DEFAULT 0,
+    last_attempt_at   DATETIME DEFAULT NULL,
+    last_error        TEXT DEFAULT NULL,
+    source            VARCHAR(32) DEFAULT NULL,
+    created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_pending_deletes_execute_at (execute_at),
+    INDEX idx_pending_deletes_hashed_video_id (hashed_video_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS schema_migrations (
     migration_id   VARCHAR(100) PRIMARY KEY,
     applied_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP

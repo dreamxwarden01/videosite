@@ -247,20 +247,27 @@ const server = app.listen(PORT, async () => {
         cleanupExpiredResetRateLimits();
     }, 60 * 60 * 1000);
 
-    // Clean stale material uploads every hour
-    const { cleanupStaleMaterials, deleteR2Object } = require('./services/materialService');
+    // Clean stale material uploads every hour. The DB rows are deleted
+    // inline; the R2 objects are enqueued for deletion via the deletion
+    // reaper so transient R2 failures retry instead of orphaning silently.
+    const { cleanupStaleMaterials } = require('./services/materialService');
+    const deletionService = require('./services/deletionService');
     setInterval(async () => {
         try {
             const staleKeys = await cleanupStaleMaterials();
             for (const key of staleKeys) {
-                deleteR2Object(key).catch(err => {
-                    console.error(`R2 material cleanup failed for ${key}:`, err.message);
-                });
+                await deletionService.enqueueKey(key, { source: 'stale_material' });
             }
         } catch (err) {
             console.error('Material cleanup error:', err.message);
         }
     }, 60 * 60 * 1000);
+
+    // Periodic R2 deletion reaper. Drains pending_deletes rows whose
+    // execute_at has passed. Boot drain runs immediately so rows queued
+    // during downtime get picked up; subsequent ticks every 60s (env-
+    // configurable via DELETION_REAPER_INTERVAL_MS).
+    deletionService.startReaper();
 
     // Clean expired worker sessions every hour
     const { cleanupExpiredWorkerSessions } = require('./services/workerAuthService');

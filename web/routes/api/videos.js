@@ -2,7 +2,8 @@ const express = require('express');
 const router = express.Router();
 const { requireAuth } = require('../../middleware/auth');
 const { getPool } = require('../../config/database');
-const { getVideoById, updateVideo, deleteVideo, cleanR2Prefix } = require('../../services/videoService');
+const { getVideoById, updateVideo, deleteVideo } = require('../../services/videoService');
+const deletionService = require('../../services/deletionService');
 const { generateToken, getTokenValiditySeconds } = require('../../services/tokenService');
 const { retryFailedVideo } = require('../../services/processingService');
 const { checkPermission } = require('../../middleware/permissions');
@@ -206,7 +207,7 @@ router.post('/videos/:id/clean-source', requireAuth, checkPermission('changeVide
 
         // Derive directory from r2_source_key (e.g. "source/{upload_id}/source.mp4" → "source/{upload_id}/")
         const sourceDir = video.r2_source_key.substring(0, video.r2_source_key.lastIndexOf('/') + 1);
-        await cleanR2Prefix(sourceDir);
+        await deletionService.enqueuePrefix(sourceDir, { source: 'manual_source_clean' });
         await pool.execute('UPDATE videos SET r2_source_key = NULL WHERE video_id = ?', [videoId]);
 
         res.status(204).end();

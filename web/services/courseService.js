@@ -43,28 +43,36 @@ async function updateCourse(courseId, updates) {
 }
 
 /**
- * Delete a course with 404-based worker abort + R2 cleanup for all its videos.
+ * Delete a course with 404-based worker abort + queued R2 cleanup for all
+ * its videos and attachments.
  *
  * Flow:
- * 1. Pre-fetch course info, all video info (hashed IDs + status), active jobs
- * 2. Clear stale timers for all active jobs
- * 3. DELETE course (FK cascade removes videos, processing_queue → workers get 404)
- * 4. For each video:
- *    - Source file: always cleaned immediately
- *    - HLS output: delayed 2 min if video was processing, immediate otherwise
+ * 1. Pre-fetch video info (hashed IDs + status + r2_source_key)
+ * 2. Pre-fetch active processing jobs (for stale-timer clearance) and
+ *    in-flight upload sessions (for multipart abort)
+ * 3. Abort in-flight multipart uploads (fire-and-forget; R2's 24h
+ *    lifecycle catches stragglers)
+ * 4. Clear stale timers + heartbeat cache so workers detect the abort
+ * 5. DELETE course (FK cascade removes videos, processing_queue,
+ *    upload_sessions, course_materials → workers get 404)
+ * 6. Enqueue R2 cleanup rows in pending_deletes:
+ *    - Source prefix per video — immediate
+ *    - Output prefix per video — 2-min delay if mid-processing, else immediate
+ *    - Attachments prefix for the course — immediate
  */
 async function deleteCourse(courseId) {
     const pool = getPool();
-    const { cleanR2Prefix } = require('./videoService');
     const { clearStaleTimer } = require('./processingService');
+    const { abortMultipartUpload } = require('./uploadService');
+    const deletionService = require('./deletionService');
 
-    // 1. Get all videos with hashed IDs, source key, and status (need for R2 cleanup)
+    // 1. Get all videos (need hashed IDs, source key, and status for R2 cleanup planning)
     const [videos] = await pool.execute(
         'SELECT video_id, hashed_video_id, r2_source_key, status FROM videos WHERE course_id = ?',
         [courseId]
     );
 
-    // 3. Get active jobs for stale timer clearance
+    // 2a. Get active jobs for stale-timer clearance
     const [activeJobs] = await pool.execute(
         `SELECT pq.job_id FROM processing_queue pq
          JOIN videos v ON pq.video_id = v.video_id
@@ -72,60 +80,66 @@ async function deleteCourse(courseId) {
         [courseId]
     );
 
-    // 4. Clear stale timers for all active jobs
+    // 2b. Get in-flight upload sessions for this course's videos
+    const [inflightSessions] = await pool.execute(
+        `SELECT object_key, r2_upload_id FROM upload_sessions
+         WHERE course_id = ? AND status IN ('active', 'completing')`,
+        [courseId]
+    );
+
+    // 3. Abort in-flight multipart uploads (fire-and-forget). R2's bucket
+    //    lifecycle covers anything that fails here within 24 hours.
+    for (const session of inflightSessions) {
+        abortMultipartUpload(session.object_key, session.r2_upload_id).catch(err => {
+            console.error(`R2 multipart abort failed for upload ${session.r2_upload_id}:`, err.message);
+        });
+    }
+
+    // 4. Clear stale timers + heartbeat cache so workers' next status ping
+    //    detects the abort cleanly (avoids the 2-minute stale-timeout wait).
     for (const job of activeJobs) {
         clearStaleTimer(job.job_id);
     }
-    // Drop heartbeat cache so workers' next status ping detects the abort.
     await require('./cache/transcodeProgressCache').clearJobs(activeJobs.map(j => j.job_id));
 
     // 5. Delete course record — FK cascade deletes videos, processing_queue,
-    //    watch_progress, enrollments → workers get 404
+    //    upload_sessions, course_materials, watch_progress, enrollments,
+    //    transcoding_profiles → workers get 404 on next API call
     await pool.execute('DELETE FROM courses WHERE course_id = ?', [courseId]);
 
-    // Invalidate cached video meta for every cascade-deleted video, plus the course itself.
+    // Invalidate caches for every cascade-deleted video + the course itself.
     const videoIds = videos.map(v => v.video_id);
     await videoCache.invalidateMany(videoIds);
     await courseCache.invalidate(courseId);
-    // Also drop watch-progress cache for the cascade-deleted videos so resume
-    // doesn't point to a vanished row.
     await require('./cache/watchProgressCache').clearForVideos(videoIds);
 
-    // 6. R2 cleanup for all video prefixes (fire-and-forget)
+    // 6. Enqueue R2 cleanup. All durable — reaper retries on transient
+    //    R2 failures, survives server restarts.
     const processingStatuses = ['worker_downloading', 'processing', 'worker_uploading'];
-    for (const video of videos) {
-        const isProcessing = processingStatuses.includes(video.status);
+    const now = new Date();
+    const delayedAt = new Date(Date.now() + 2 * 60 * 1000); // +2 min for in-flight workers
 
-        // Source file: always clean immediately (extract directory from r2_source_key)
+    for (const video of videos) {
+        // Source: always immediate (worker has already downloaded what it needs).
         if (video.r2_source_key) {
             const sourceDir = video.r2_source_key.substring(0, video.r2_source_key.lastIndexOf('/') + 1);
-            cleanR2Prefix(sourceDir).catch(err => {
-                console.error(`R2 source cleanup failed for video ${video.video_id}:`, err.message);
-            });
+            await deletionService.enqueuePrefix(sourceDir, { source: 'course_delete' });
         }
 
-        if (isProcessing) {
-            // HLS output: delay 2 minutes for worker to stop uploading
-            const vid = video; // capture for closure
-            const timer = setTimeout(() => {
-                cleanR2Prefix(`${vid.hashed_video_id}/`).catch(err => {
-                    console.error(`R2 HLS cleanup failed for video ${vid.video_id}:`, err.message);
-                });
-            }, 2 * 60 * 1000);
-            if (timer.unref) timer.unref();
-        } else {
-            // Not processing: clean HLS output immediately
-            cleanR2Prefix(`${video.hashed_video_id}/`).catch(err => {
-                console.error(`R2 HLS cleanup failed for video ${video.video_id}:`, err.message);
-            });
-        }
+        // Output: 2-min delay if mid-processing (let worker finish its upload),
+        // immediate otherwise. Hash collision check at video creation time
+        // closes the race with new uploads picking the same hash.
+        const isProcessing = processingStatuses.includes(video.status);
+        await deletionService.enqueuePrefix(`${video.hashed_video_id}/`, {
+            hashed_video_id: video.hashed_video_id,
+            execute_at: isProcessing ? delayedAt : now,
+            source: 'course_delete',
+        });
     }
 
-    // 7. Clean all course material files from R2 (fire-and-forget)
-    // DB records already removed by FK CASCADE on course_materials.course_id
-    cleanR2Prefix(`attachments/${courseId}/`).catch(err => {
-        console.error(`R2 materials cleanup failed for course ${courseId}:`, err.message);
-    });
+    // Attachments: one prefix for all course materials.
+    // DB rows are gone via FK CASCADE on course_materials.course_id.
+    await deletionService.enqueuePrefix(`attachments/${courseId}/`, { source: 'course_delete' });
 }
 
 async function listCourses(page = 1, limit = 10) {

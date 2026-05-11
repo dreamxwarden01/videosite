@@ -7,7 +7,6 @@ const {
     generateMaterialId,
     getPresignedUploadUrl,
     getPresignedDownloadUrl,
-    deleteR2Object,
     createMaterialRecord,
     confirmUpload,
     getMaterialsByCourse,
@@ -17,6 +16,7 @@ const {
     abortMaterial,
     getCoursesWithMaterialCount,
 } = require('../../services/materialService');
+const deletionService = require('../../services/deletionService');
 
 const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB
 const BLOCKED_EXTENSIONS = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.ts', '.m3u8'];
@@ -211,10 +211,8 @@ router.delete('/materials/:materialId', requireAuth, checkPermission('deleteAtta
             return res.status(404).json({ error: 'Material not found.' });
         }
 
-        // Fire-and-forget R2 cleanup
-        deleteR2Object(objectKey).catch(err => {
-            console.error(`R2 delete failed for material ${materialId}:`, err.message);
-        });
+        // R2 cleanup is queued for retry-capable async deletion.
+        await deletionService.enqueueKey(objectKey, { source: 'material_delete' });
 
         res.status(204).end();
     } catch (err) {
@@ -234,10 +232,9 @@ router.post('/materials/:materialId/abort', requireAuth, checkPermission('upload
             return res.status(404).json({ error: 'Material not found or not in uploading state.' });
         }
 
-        // Fire-and-forget R2 cleanup
-        deleteR2Object(objectKey).catch(err => {
-            console.error(`R2 delete failed for aborted material ${materialId}:`, err.message);
-        });
+        // R2 cleanup is queued. If the upload never completed on R2, the
+        // delete is a no-op (treated as success by the reaper).
+        await deletionService.enqueueKey(objectKey, { source: 'material_abort' });
 
         res.status(204).end();
     } catch (err) {

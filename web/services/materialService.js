@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { PutObjectCommand, GetObjectCommand, DeleteObjectCommand, CopyObjectCommand } = require('@aws-sdk/client-s3');
+const { PutObjectCommand, GetObjectCommand, CopyObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { getR2Client, getR2BucketName } = require('../config/r2');
 const { getPool } = require('../config/database');
@@ -47,16 +47,6 @@ async function getPresignedDownloadUrl(objectKey, filename, { inline = false } =
         ResponseContentDisposition: disposition,
     });
     return getSignedUrl(r2, command, { expiresIn: 3600 });
-}
-
-async function deleteR2Object(objectKey) {
-    const r2 = getR2Client();
-    const bucket = getR2BucketName();
-    const command = new DeleteObjectCommand({
-        Bucket: bucket,
-        Key: objectKey,
-    });
-    await r2.send(command);
 }
 
 // --- DB operations ---
@@ -214,7 +204,6 @@ module.exports = {
     generateMaterialId,
     getPresignedUploadUrl,
     getPresignedDownloadUrl,
-    deleteR2Object,
     createMaterialRecord,
     confirmUpload,
     getMaterialsByCourse,

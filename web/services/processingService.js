@@ -63,10 +63,13 @@ function clearStaleTimer(jobId) {
     }
 }
 
-// Timer-triggered: reset a single stale job with R2 cleanup.
+// Timer-triggered: reset a single stale job. Partial R2 segments under
+// `{hashed_video_id}/{job_id}/` are left in place — they'll be swept up at
+// video-delete time via the `{hashed_video_id}/` prefix in pending_deletes.
+// New attempts get a fresh job_id, so the orphaned subdirectory doesn't
+// interfere with playback.
 async function resetSingleStaleTask(jobId) {
     const pool = getPool();
-    const { cleanR2Prefix } = require('./videoService');
 
     // Double-check staleness via Redis (the source of truth for live workers).
     // The in-process timer fires after STALE_TIMEOUT_MS of no in-process
@@ -77,11 +80,10 @@ async function resetSingleStaleTask(jobId) {
         return; // Heartbeat is fresh — not stale.
     }
 
-    // Get task details (need hashed paths for R2 cleanup)
+    // Get task details
     const [rows] = await pool.execute(
-        `SELECT pq.video_id, pq.job_id, v.hashed_video_id
+        `SELECT pq.video_id, pq.job_id
          FROM processing_queue pq
-         JOIN videos v ON pq.video_id = v.video_id
          WHERE pq.job_id = ? AND pq.status IN ('leased', 'processing')`,
         [jobId]
     );
@@ -102,13 +104,6 @@ async function resetSingleStaleTask(jobId) {
     if (result.affectedRows === 0) return; // Job state changed concurrently.
 
     console.log(`Stale timer: reset job ${jobId} (video ${task.video_id})`);
-
-    // Clean up partial R2 output
-    try {
-        await cleanR2Prefix(`${task.hashed_video_id}/${task.job_id}/`);
-    } catch (err) {
-        console.error(`R2 cleanup failed for stale job ${jobId}:`, err.message);
-    }
 
     // Reset video status and clear encryption key
     await pool.execute(
@@ -262,10 +257,12 @@ async function completeTask(jobId, durationSeconds = null) {
     return true;
 }
 
-// Delete the original source file from R2 after transcoding completes.
+// Enqueue the original source file's prefix for deletion after transcoding
+// completes. The DB pointer is cleared inline; the actual R2 sweep happens
+// in the deletion reaper (retry-capable, survives server restarts).
 async function cleanupSourceFile(videoId) {
     const pool = getPool();
-    const { cleanR2Prefix } = require('./videoService');
+    const deletionService = require('./deletionService');
 
     const [rows] = await pool.execute(
         `SELECT r2_source_key FROM videos WHERE video_id = ?`,
@@ -279,7 +276,7 @@ async function cleanupSourceFile(videoId) {
     // Derive directory from r2_source_key (e.g. "source/{upload_id}/source.mp4" → "source/{upload_id}/")
     const sourceKey = rows[0].r2_source_key;
     const sourceDir = sourceKey.substring(0, sourceKey.lastIndexOf('/') + 1);
-    await cleanR2Prefix(sourceDir);
+    await deletionService.enqueuePrefix(sourceDir, { source: 'transcode_completed' });
 
     await pool.execute(
         'UPDATE videos SET r2_source_key = NULL WHERE video_id = ?',
@@ -640,11 +637,12 @@ async function generateUploadUrls(jobId, filenames) {
 }
 
 // Re-queue a failed video for transcoding.
-// Cleans up any partial HLS output from the previous failed job,
-// resets the processing_queue row back to queued, and resets the video status.
+// Partial output from the previous failed job stays under
+// `{hashed_video_id}/{old_job_id}/` — the retry gets a new job_id and writes
+// to its own subdirectory. Orphans get swept at video-delete time via the
+// hash-prefix entry in pending_deletes.
 async function retryFailedVideo(videoId) {
     const pool = getPool();
-    const { cleanR2Prefix } = require('./videoService');
 
     // Get video info — must be in error status to retry
     const [videoRows] = await pool.execute(
@@ -658,17 +656,7 @@ async function retryFailedVideo(videoId) {
         return false; // Not found or not in error state
     }
 
-    const { processing_job_id: oldJobId, hashed_video_id } = videoRows[0];
-
-    // Clean up any partial HLS output from the failed job
-    if (oldJobId) {
-        try {
-            await cleanR2Prefix(`${hashed_video_id}/${oldJobId}/`);
-        } catch (err) {
-            console.error(`R2 cleanup failed for retry of video ${videoId}:`, err.message);
-            // Continue with retry even if R2 cleanup fails
-        }
-    }
+    const { processing_job_id: oldJobId } = videoRows[0];
 
     // Reset the processing_queue row back to queued (brings it to the back of the queue)
     const [result] = await pool.execute(
@@ -714,15 +702,18 @@ async function retryFailedVideo(videoId) {
 // Backstop for the in-process timer (which is lost on server restart). Reads
 // last_heartbeat from Redis (source of truth for live workers); the DB
 // last_heartbeat lags by one flush cycle and isn't reliable here.
+//
+// Partial R2 segments from the dead worker are left in place — they'll be
+// swept at video-delete time via the `{hashed_video_id}/` prefix entry in
+// pending_deletes. The retry attempt gets a fresh job_id, writing to a new
+// subdirectory.
 async function resetStaleTasks() {
     const pool = getPool();
-    const { cleanR2Prefix } = require('./videoService');
 
     // Pull every in-flight task from DB; we'll filter by Redis next.
     const [inFlight] = await pool.execute(
-        `SELECT pq.job_id, pq.video_id, v.hashed_video_id
+        `SELECT pq.job_id, pq.video_id
          FROM processing_queue pq
-         JOIN videos v ON pq.video_id = v.video_id
          WHERE pq.status IN ('leased', 'processing') AND pq.job_id IS NOT NULL`
     );
 
@@ -758,13 +749,6 @@ async function resetStaleTasks() {
         clearStaleTimer(task.job_id);
         console.log(`Stale poll: reset job ${task.job_id} (video ${task.video_id})`);
 
-        // Clean up partial R2 output (fire-and-forget — don't block the poll response)
-        if (task.job_id) {
-            cleanR2Prefix(`${task.hashed_video_id}/${task.job_id}/`).catch(err => {
-                console.error(`R2 cleanup failed for stale job ${task.job_id}:`, err.message);
-            });
-        }
-
         // Reset video status and clear encryption key
         await pool.execute(
             `UPDATE videos
@@ -794,16 +778,17 @@ async function getTaskByJobId(jobId) {
 }
 
 // Abort a job and requeue it (called when worker gracefully shuts down).
-// Cleans up any partial R2 output, then resets the task back to queued.
+// Partial R2 output from the aborted job stays under
+// `{hashed_video_id}/{job_id}/` — the requeue picks up a new job_id on next
+// lease and writes to a fresh subdirectory. Orphans get swept at
+// video-delete time via the hash-prefix entry in pending_deletes.
 async function abortAndRequeue(jobId) {
     clearStaleTimer(jobId);
     const pool = getPool();
-    const { cleanR2Prefix } = require('./videoService');
 
     const [taskRows] = await pool.execute(
-        `SELECT pq.video_id, v.hashed_video_id, pq.job_id
+        `SELECT pq.video_id, pq.job_id
          FROM processing_queue pq
-         JOIN videos v ON pq.video_id = v.video_id
          WHERE pq.job_id = ?`,
         [jobId]
     );
@@ -812,16 +797,7 @@ async function abortAndRequeue(jobId) {
         return false;
     }
 
-    const { video_id, hashed_video_id, job_id } = taskRows[0];
-
-    // Clean up any partial HLS output from the aborted job
-    if (job_id) {
-        try {
-            await cleanR2Prefix(`${hashed_video_id}/${job_id}/`);
-        } catch (err) {
-            console.error(`R2 cleanup failed for aborted job ${jobId}:`, err.message);
-        }
-    }
+    const { video_id, job_id } = taskRows[0];
 
     // Reset processing_queue row back to queued
     await pool.execute(

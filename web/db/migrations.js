@@ -679,6 +679,40 @@ async function runMigrations() {
                         VALUES ('cloudflare_turnstile_worker_gate', 'false')
                     `);
                 }
+            },
+            {
+                id: '031_pending_deletes',
+                up: async () => {
+                    // Durable queue for R2 object deletions. Replaces the
+                    // fire-and-forget `cleanR2Prefix.catch(log)` pattern
+                    // scattered across course/video/material/processing
+                    // services with a single retry-capable mechanism.
+                    //
+                    // mode='key' — DeleteObject(target). 'prefix' —
+                    // ListObjectsV2 + batched DeleteObjects until empty.
+                    // hashed_video_id is denormalized off `target` for the
+                    // hash-collision check at video creation time; null
+                    // for source / attachment / material rows. Reaper
+                    // hard-deletes the row on success — failed-and-stuck
+                    // rows accumulate `attempts` + `last_error` and stay
+                    // in the table for ops visibility.
+                    await pool.execute(`
+                        CREATE TABLE IF NOT EXISTS pending_deletes (
+                            id                BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                            mode              ENUM('key','prefix') NOT NULL,
+                            target            VARCHAR(512) NOT NULL,
+                            hashed_video_id   VARCHAR(64) DEFAULT NULL,
+                            execute_at        DATETIME NOT NULL,
+                            attempts          INT UNSIGNED NOT NULL DEFAULT 0,
+                            last_attempt_at   DATETIME DEFAULT NULL,
+                            last_error        TEXT DEFAULT NULL,
+                            source            VARCHAR(32) DEFAULT NULL,
+                            created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            INDEX idx_pending_deletes_execute_at (execute_at),
+                            INDEX idx_pending_deletes_hashed_video_id (hashed_video_id)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    `);
+                }
             }
         ];
 
