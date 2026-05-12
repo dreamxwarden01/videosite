@@ -755,6 +755,62 @@ async function runMigrations() {
                         ALTER TABLE course_materials DROP COLUMN status
                     `);
                 }
+            },
+            {
+                id: '033_enhanced_transcoding_profiles',
+                up: async () => {
+                    // Split global transcoding_profiles into two sets — the
+                    // existing "default" set and a new "enhanced" set
+                    // (1440p/1080p/720p, higher bitrates) — discriminated by
+                    // is_enhanced_profile. is_system_profile flags the seeded
+                    // rows so the admin UI hides the Delete button and the
+                    // PUT handler rejects payloads that drop them.
+                    //
+                    // course_id IS NOT NULL (course-specific overrides) keep
+                    // is_system_profile=0 and is_enhanced_profile=NULL — the
+                    // enhanced concept is meaningless for those rows.
+                    await pool.execute(`
+                        ALTER TABLE transcoding_profiles
+                          ADD COLUMN is_system_profile   TINYINT(1) NOT NULL DEFAULT 0 AFTER course_id,
+                          ADD COLUMN is_enhanced_profile TINYINT(1)          DEFAULT NULL AFTER is_system_profile
+                    `);
+                    await pool.execute(`
+                        UPDATE transcoding_profiles
+                           SET is_system_profile = 1, is_enhanced_profile = 0
+                         WHERE course_id IS NULL
+                    `);
+
+                    // gop_size (frames) -> gop_seconds. The worker computes
+                    // keyint = round(gop_seconds * effective_fps) at FFmpeg
+                    // arg time so GOP stays at 2s regardless of source fps.
+                    // DECIMAL(4,2) allows fractional values (e.g. 1.5s).
+                    await pool.execute(`
+                        ALTER TABLE transcoding_profiles
+                          ADD COLUMN gop_seconds DECIMAL(4,2) UNSIGNED NOT NULL DEFAULT 2.00 AFTER segment_duration
+                    `);
+                    await pool.execute(`
+                        ALTER TABLE transcoding_profiles DROP COLUMN gop_size
+                    `);
+
+                    // Seed the enhanced set.
+                    await pool.execute(`
+                        INSERT INTO transcoding_profiles
+                          (course_id, is_system_profile, is_enhanced_profile, name,
+                           width, height, video_bitrate_kbps, fps_limit,
+                           codec, profile, preset, segment_duration, gop_seconds, sort_order)
+                        VALUES
+                          (NULL, 1, 1, '1440p', 2560, 1440, 18000, 60, 'h264', 'high', 'medium', 6, 2.00, 0),
+                          (NULL, 1, 1, '1080p', 1920, 1080, 10000, 60, 'h264', 'high', 'medium', 6, 2.00, 1),
+                          (NULL, 1, 1, '720p',  1280,  720,  6000, 60, 'h264', 'main', 'medium', 6, 2.00, 2)
+                    `);
+
+                    // Per-course toggle: when use_custom_profiles=0, this
+                    // picks between the default and enhanced global sets.
+                    await pool.execute(`
+                        ALTER TABLE courses
+                          ADD COLUMN use_enhanced_profiles TINYINT(1) NOT NULL DEFAULT 0 AFTER use_custom_profiles
+                    `);
+                }
             }
         ];
 

@@ -37,8 +37,10 @@ export default function CourseEditPage() {
 
   // Transcoding config
   const [useCustomProfiles, setUseCustomProfiles] = useState(false);
+  const [useEnhancedProfiles, setUseEnhancedProfiles] = useState(false);
   const [audioNormalization, setAudioNormalization] = useState(true);
-  const [globalProfiles, setGlobalProfiles] = useState([]);
+  const [defaultGlobalProfiles, setDefaultGlobalProfiles] = useState([]);
+  const [enhancedGlobalProfiles, setEnhancedGlobalProfiles] = useState([]);
   const [courseProfiles, setCourseProfiles] = useState([]);
   const [savingTranscoding, setSavingTranscoding] = useState(false);
   const [editingProfile, setEditingProfile] = useState(null);
@@ -62,8 +64,10 @@ export default function CourseEditPage() {
         setDescription(data.course.description || '');
         setIsActive(data.course.is_active ? '1' : '0');
         setUseCustomProfiles(!!data.course.use_custom_profiles);
+        setUseEnhancedProfiles(!!data.course.use_enhanced_profiles);
         setAudioNormalization(!!data.course.audio_normalization);
-        setGlobalProfiles(data.globalProfiles || []);
+        setDefaultGlobalProfiles(data.defaultGlobalProfiles || []);
+        setEnhancedGlobalProfiles(data.enhancedGlobalProfiles || []);
         setCourseProfiles(data.courseProfiles || []);
         originalDetails.current = {
           course_name: data.course.course_name,
@@ -72,6 +76,7 @@ export default function CourseEditPage() {
         };
         originalTranscoding.current = {
           use_custom_profiles: !!data.course.use_custom_profiles,
+          use_enhanced_profiles: !!data.course.use_enhanced_profiles,
           audio_normalization: !!data.course.audio_normalization,
           profiles: JSON.stringify(data.courseProfiles || [])
         };
@@ -97,6 +102,7 @@ export default function CourseEditPage() {
     || isActive !== originalDetails.current.is_active;
 
   const transcodingDirty = useCustomProfiles !== originalTranscoding.current.use_custom_profiles
+    || useEnhancedProfiles !== originalTranscoding.current.use_enhanced_profiles
     || audioNormalization !== originalTranscoding.current.audio_normalization
     || JSON.stringify(courseProfiles) !== originalTranscoding.current.profiles;
 
@@ -133,18 +139,25 @@ export default function CourseEditPage() {
         }
       } catch (err) { showToast(err.message); }
     } else if (newValue && !useCustomProfiles) {
-      // Switching to custom — copy global profiles as starting point
+      // Switching to custom — copy the currently-effective global set as
+      // a starting point (whichever the enhanced toggle currently lands on).
+      const seedFrom = useEnhancedProfiles ? enhancedGlobalProfiles : defaultGlobalProfiles;
       setUseCustomProfiles(true);
-      setCourseProfiles(globalProfiles.map(p => ({ ...p, profile_id: undefined })));
+      setCourseProfiles(seedFrom.map(p => ({ ...p, profile_id: undefined, is_system_profile: 0, is_enhanced_profile: null })));
     }
   };
 
   const handleSaveTranscoding = async () => {
     setSavingTranscoding(true);
     try {
-      // Save audio normalization + custom profiles flag
+      // Save audio normalization + custom-profiles flag + enhanced-profiles flag.
       const { ok: metaOk, data: metaData } = await mfaFetch(`/api/admin/courses/${courseId}`, {
-        method: 'PUT', body: { courseName: courseInfo.course_name, use_custom_profiles: useCustomProfiles, audio_normalization: audioNormalization }
+        method: 'PUT', body: {
+          courseName: courseInfo.course_name,
+          use_custom_profiles: useCustomProfiles,
+          use_enhanced_profiles: useEnhancedProfiles,
+          audio_normalization: audioNormalization
+        }
       });
       if (!metaOk) { showToast(metaData?.error || 'Failed to save.'); return; }
 
@@ -159,6 +172,7 @@ export default function CourseEditPage() {
       showToast('Transcoding config saved.', 'success');
       originalTranscoding.current = {
         use_custom_profiles: useCustomProfiles,
+        use_enhanced_profiles: useEnhancedProfiles,
         audio_normalization: audioNormalization,
         profiles: JSON.stringify(courseProfiles)
       };
@@ -183,7 +197,9 @@ export default function CourseEditPage() {
     setCourseProfiles(courseProfiles.filter((_, i) => i !== idx));
   };
 
-  const displayProfiles = useCustomProfiles ? courseProfiles : globalProfiles;
+  const displayProfiles = useCustomProfiles
+    ? courseProfiles
+    : (useEnhancedProfiles ? enhancedGlobalProfiles : defaultGlobalProfiles);
 
   const sidebarItems = [
     { key: 'details', label: 'Course Details' },
@@ -319,6 +335,25 @@ export default function CourseEditPage() {
                       <span className="toggle-slider"></span>
                     </label>
                   </div>
+
+                  {/* Enhanced Quality toggle — only meaningful when on globals */}
+                  {!useCustomProfiles && (
+                    <div className="flex-between" style={{ marginBottom: '20px' }}>
+                      <div>
+                        <strong>Use Enhanced Quality Profiles</strong>
+                        <p className="text-muted text-sm" style={{ margin: '4px 0 0' }}>
+                          {useEnhancedProfiles
+                            ? 'Encoding at 1440p / 1080p / 720p with higher bitrate ceilings'
+                            : 'Encoding at default quality (1080p / 720p)'}
+                        </p>
+                      </div>
+                      <label className="toggle-switch">
+                        <input type="checkbox" checked={useEnhancedProfiles}
+                          onChange={e => setUseEnhancedProfiles(e.target.checked)} />
+                        <span className="toggle-slider"></span>
+                      </label>
+                    </div>
+                  )}
 
                   {/* Profile list */}
                   <div className={`table-wrap${!useCustomProfiles ? ' data-loading' : ''}`} style={{ marginBottom: '16px' }}>

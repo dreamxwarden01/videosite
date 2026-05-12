@@ -3,6 +3,7 @@ package transcoder
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,7 +41,15 @@ func TranscodeVideo(ctx context.Context, sourcePath, outputDir string, profile c
 
 	hwArgs, vfFilter := resolveHWArgs(encoder, swDecode, srcW, srcH, profile.Width, profile.Height)
 
-	args := buildBaseVideoArgs(hwArgs, sourcePath, outputDir, profile, ffmpegEncoder, vfFilter)
+	// Effective output fps drives the keyint (-g) computation in
+	// buildBaseVideoArgs. Sources slower than the cap pass through at source
+	// rate; faster ones get capped via -r below.
+	effectiveFps := srcFrameRate
+	if profile.FpsLimit > 0 && srcFrameRate > float64(profile.FpsLimit)+0.01 {
+		effectiveFps = float64(profile.FpsLimit)
+	}
+
+	args := buildBaseVideoArgs(hwArgs, sourcePath, outputDir, profile, ffmpegEncoder, vfFilter, effectiveFps)
 
 	// Encoder-specific options.
 	args = applyEncoderOpts(args, encoder, ffmpegEncoder, profile)
@@ -208,10 +217,19 @@ func TranscodeAudio(
 // All paths passed to ffmpeg use forward slashes — ffmpeg's HLS muxer locates
 // the init file via strrchr(playlist_url, '/'), so Windows-native backslash
 // paths send the init segment to the worker's CWD. See RemuxVideo.
-func buildBaseVideoArgs(hwArgs []string, sourcePath, outputDir string, profile config.OutputProfile, ffmpegEncoder, vfFilter string) []string {
+//
+// effectiveFps is the output frame rate (capped by profile.FpsLimit). It feeds
+// the keyint calculation so GOP stays at profile.GOPSeconds regardless of
+// source fps.
+func buildBaseVideoArgs(hwArgs []string, sourcePath, outputDir string, profile config.OutputProfile, ffmpegEncoder, vfFilter string, effectiveFps float64) []string {
 	playlistPath := filepath.ToSlash(filepath.Join(outputDir, "playlist.m3u8"))
 	segmentPattern := filepath.ToSlash(filepath.Join(outputDir, "segment_%04d.m4s"))
 	initName := "init.mp4"
+
+	keyint := int(math.Round(profile.GOPSeconds * effectiveFps))
+	if keyint < 1 {
+		keyint = 1
+	}
 
 	args := make([]string, 0, 30+len(hwArgs))
 	args = append(args, hwArgs...)
@@ -225,7 +243,7 @@ func buildBaseVideoArgs(hwArgs []string, sourcePath, outputDir string, profile c
 		"-vf", vfFilter,
 		"-profile:v", profile.Profile,
 		"-an",
-		"-g", fmt.Sprintf("%d", profile.GOPSize),
+		"-g", fmt.Sprintf("%d", keyint),
 		"-sc_threshold", "0",
 		"-hls_time", fmt.Sprintf("%d", profile.SegmentDuration),
 		"-hls_playlist_type", "vod",

@@ -19,17 +19,21 @@ import (
 // Audio bitrate is site-wide (api.LeaseResult.AudioBitrateKbps), not per-profile.
 // FpsLimit caps the output frame rate for this profile; sources below the limit
 // are passed through unchanged (no upsampling).
+//
+// GOPSeconds is the keyframe interval in seconds — the FFmpeg keyint flag is
+// computed as round(GOPSeconds * effective_fps) at arg-build time so GOP
+// stays a constant 2s regardless of source frame rate.
 type OutputProfile struct {
-	Name             string `json:"name"`
-	Width            int    `json:"width"`
-	Height           int    `json:"height"`
-	VideoBitrateKbps int    `json:"video_bitrate_kbps"`
-	FpsLimit         int    `json:"fps_limit"`
-	Codec            string `json:"codec"`
-	Profile          string `json:"profile"`
-	Preset           string `json:"preset"`
-	SegmentDuration  int    `json:"segment_duration"`
-	GOPSize          int    `json:"gop_size"`
+	Name             string  `json:"name"`
+	Width            int     `json:"width"`
+	Height           int     `json:"height"`
+	VideoBitrateKbps int     `json:"video_bitrate_kbps"`
+	FpsLimit         int     `json:"fps_limit"`
+	Codec            string  `json:"codec"`
+	Profile          string  `json:"profile"`
+	Preset           string  `json:"preset"`
+	SegmentDuration  int     `json:"segment_duration"`
+	GOPSeconds       float64 `json:"gop_seconds"`
 }
 
 // Config holds the worker configuration loaded from config.json.

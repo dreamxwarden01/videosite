@@ -1252,8 +1252,13 @@
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Saved." } } }
     },
 
-    "/api/admin/settings/transcoding-profiles": {
-      "put": { "tags": ["admin-settings"], "operationId": "admin_settings_tprof_set", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+    "/api/admin/settings/transcoding-profiles/default": {
+      "put": { "tags": ["admin-settings"], "operationId": "admin_settings_tprof_default_set", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Saved." } } }
+    },
+
+    "/api/admin/settings/transcoding-profiles/enhanced": {
+      "put": { "tags": ["admin-settings"], "operationId": "admin_settings_tprof_enhanced_set", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Saved." } } }
     },
 

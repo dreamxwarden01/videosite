@@ -1,11 +1,28 @@
 const { getPool } = require('../config/database');
 
-const PROFILE_COLUMNS = 'profile_id, course_id, name, width, height, video_bitrate_kbps, fps_limit, codec, profile, preset, segment_duration, gop_size, sort_order';
+const PROFILE_COLUMNS = 'profile_id, course_id, is_system_profile, is_enhanced_profile, name, width, height, video_bitrate_kbps, fps_limit, codec, profile, preset, segment_duration, gop_seconds, sort_order';
 
-async function getGlobalProfiles() {
+// Global default-quality set (1080p/720p, lower bitrates). Returned by
+// getEffectiveProfiles when the course uses globals and use_enhanced_profiles=0.
+async function getDefaultGlobalProfiles() {
     const pool = getPool();
     const [rows] = await pool.execute(
-        `SELECT ${PROFILE_COLUMNS} FROM transcoding_profiles WHERE course_id IS NULL ORDER BY sort_order ASC`
+        `SELECT ${PROFILE_COLUMNS} FROM transcoding_profiles
+          WHERE course_id IS NULL AND is_enhanced_profile = 0
+          ORDER BY sort_order ASC`
+    );
+    return rows;
+}
+
+// Global enhanced-quality set (1440p/1080p/720p, higher bitrates). Returned
+// by getEffectiveProfiles when the course uses globals and
+// use_enhanced_profiles=1.
+async function getEnhancedGlobalProfiles() {
+    const pool = getPool();
+    const [rows] = await pool.execute(
+        `SELECT ${PROFILE_COLUMNS} FROM transcoding_profiles
+          WHERE course_id IS NULL AND is_enhanced_profile = 1
+          ORDER BY sort_order ASC`
     );
     return rows;
 }
@@ -19,32 +36,61 @@ async function getCourseProfiles(courseId) {
     return rows;
 }
 
+// Pick the profile set the worker should encode against:
+//   - use_custom_profiles=1 → course-specific rows (fall back to default
+//     globals when the course toggled custom but never saved any rows).
+//   - use_custom_profiles=0 + use_enhanced_profiles=1 → enhanced set.
+//   - use_custom_profiles=0 + use_enhanced_profiles=0 → default set.
 async function getEffectiveProfiles(courseId) {
     const pool = getPool();
-    const [course] = await pool.execute(
-        'SELECT use_custom_profiles FROM courses WHERE course_id = ?',
+    const [rows] = await pool.execute(
+        'SELECT use_custom_profiles, use_enhanced_profiles FROM courses WHERE course_id = ?',
         [courseId]
     );
-    if (course.length === 0) return [];
-    if (course[0].use_custom_profiles) {
-        const profiles = await getCourseProfiles(courseId);
-        return profiles.length > 0 ? profiles : await getGlobalProfiles();
+    if (rows.length === 0) return [];
+    const c = rows[0];
+    if (c.use_custom_profiles) {
+        const cp = await getCourseProfiles(courseId);
+        if (cp.length > 0) return cp;
     }
-    return getGlobalProfiles();
+    return c.use_enhanced_profiles ? getEnhancedGlobalProfiles() : getDefaultGlobalProfiles();
 }
 
-async function saveGlobalProfiles(profiles) {
+// Replace one global set (default or enhanced) in a single transaction.
+// is_system_profile is taken from the input row (UI passes it through
+// unchanged for system rows; the route handler is responsible for
+// preventing tamper). is_enhanced_profile is stamped from `enhanced`.
+async function saveGlobalProfileSet(profiles, enhanced) {
     const pool = getPool();
     const conn = await pool.getConnection();
+    const enhancedFlag = enhanced ? 1 : 0;
     try {
         await conn.beginTransaction();
-        await conn.execute('DELETE FROM transcoding_profiles WHERE course_id IS NULL');
+        await conn.execute(
+            'DELETE FROM transcoding_profiles WHERE course_id IS NULL AND is_enhanced_profile = ?',
+            [enhancedFlag]
+        );
         for (let i = 0; i < profiles.length; i++) {
             const p = profiles[i];
             await conn.execute(
-                `INSERT INTO transcoding_profiles (course_id, name, width, height, video_bitrate_kbps, fps_limit, codec, profile, preset, segment_duration, gop_size, sort_order)
-                 VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [p.name, p.width, p.height, p.video_bitrate_kbps, p.fps_limit || 60, p.codec || 'h264', p.profile || 'high', p.preset || 'medium', p.segment_duration || 6, p.gop_size || 48, i]
+                `INSERT INTO transcoding_profiles
+                   (course_id, is_system_profile, is_enhanced_profile, name, width, height,
+                    video_bitrate_kbps, fps_limit, codec, profile, preset,
+                    segment_duration, gop_seconds, sort_order)
+                 VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    p.is_system_profile ? 1 : 0,
+                    enhancedFlag,
+                    p.name, p.width, p.height,
+                    p.video_bitrate_kbps,
+                    p.fps_limit || 60,
+                    p.codec || 'h264',
+                    p.profile || 'high',
+                    p.preset || 'medium',
+                    p.segment_duration || 6,
+                    p.gop_seconds != null ? p.gop_seconds : 2.00,
+                    i
+                ]
             );
         }
         await conn.commit();
@@ -56,6 +102,14 @@ async function saveGlobalProfiles(profiles) {
     }
 }
 
+async function saveDefaultGlobalProfiles(profiles) {
+    return saveGlobalProfileSet(profiles, false);
+}
+
+async function saveEnhancedGlobalProfiles(profiles) {
+    return saveGlobalProfileSet(profiles, true);
+}
+
 async function saveCourseProfiles(courseId, profiles) {
     const pool = getPool();
     const conn = await pool.getConnection();
@@ -65,9 +119,23 @@ async function saveCourseProfiles(courseId, profiles) {
         for (let i = 0; i < profiles.length; i++) {
             const p = profiles[i];
             await conn.execute(
-                `INSERT INTO transcoding_profiles (course_id, name, width, height, video_bitrate_kbps, fps_limit, codec, profile, preset, segment_duration, gop_size, sort_order)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [courseId, p.name, p.width, p.height, p.video_bitrate_kbps, p.fps_limit || 60, p.codec || 'h264', p.profile || 'high', p.preset || 'medium', p.segment_duration || 6, p.gop_size || 48, i]
+                `INSERT INTO transcoding_profiles
+                   (course_id, is_system_profile, is_enhanced_profile, name, width, height,
+                    video_bitrate_kbps, fps_limit, codec, profile, preset,
+                    segment_duration, gop_seconds, sort_order)
+                 VALUES (?, 0, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    courseId,
+                    p.name, p.width, p.height,
+                    p.video_bitrate_kbps,
+                    p.fps_limit || 60,
+                    p.codec || 'h264',
+                    p.profile || 'high',
+                    p.preset || 'medium',
+                    p.segment_duration || 6,
+                    p.gop_seconds != null ? p.gop_seconds : 2.00,
+                    i
+                ]
             );
         }
         await conn.commit();
@@ -83,6 +151,33 @@ async function deleteCourseProfiles(courseId) {
     const pool = getPool();
     await pool.execute('DELETE FROM transcoding_profiles WHERE course_id = ?', [courseId]);
     await pool.execute('UPDATE courses SET use_custom_profiles = 0 WHERE course_id = ?', [courseId]);
+}
+
+// Count system rows in a global set — used by the PUT handler to reject
+// payloads that drop a system profile.
+async function countSystemRows(enhanced) {
+    const pool = getPool();
+    const [rows] = await pool.execute(
+        'SELECT COUNT(*) AS n FROM transcoding_profiles WHERE course_id IS NULL AND is_enhanced_profile = ? AND is_system_profile = 1',
+        [enhanced ? 1 : 0]
+    );
+    return rows[0].n;
+}
+
+// For each {profile_id} in the payload that came from an existing row,
+// re-fetch is_system_profile from the DB. Returns Map<profile_id, flag>.
+// Lets the PUT handler stamp the canonical flag onto the payload and
+// prevent client tamper.
+async function getSystemFlagsByIds(profileIds) {
+    if (!profileIds.length) return new Map();
+    const pool = getPool();
+    const placeholders = profileIds.map(() => '?').join(',');
+    const [rows] = await pool.execute(
+        `SELECT profile_id, is_system_profile FROM transcoding_profiles
+          WHERE profile_id IN (${placeholders})`,
+        profileIds
+    );
+    return new Map(rows.map(r => [r.profile_id, r.is_system_profile]));
 }
 
 async function getAudioNormalizationSettings() {
@@ -155,19 +250,26 @@ function validateProfile(p) {
     if (!Number.isInteger(p.video_bitrate_kbps) || p.video_bitrate_kbps <= 0) errors.push('Video bitrate must be a positive integer');
     if (p.fps_limit !== undefined && (!Number.isInteger(p.fps_limit) || p.fps_limit < 1 || p.fps_limit > 120)) errors.push('FPS limit must be an integer between 1 and 120');
     if (p.segment_duration !== undefined && (!Number.isInteger(p.segment_duration) || p.segment_duration < 1 || p.segment_duration > 30)) errors.push('Segment duration must be 1-30');
-    if (p.gop_size !== undefined && (!Number.isInteger(p.gop_size) || p.gop_size < 1 || p.gop_size > 250)) errors.push('GOP size must be 1-250');
+    if (p.gop_seconds !== undefined) {
+        const g = Number(p.gop_seconds);
+        if (!Number.isFinite(g) || g < 0.1 || g > 10) errors.push('GOP seconds must be between 0.1 and 10');
+    }
     // audio_bitrate_kbps is no longer a per-profile field — reject if the client still sends it.
     if (p.audio_bitrate_kbps !== undefined) errors.push('audio_bitrate_kbps is no longer a per-profile field; use the site-wide audio bitrate setting');
     return errors;
 }
 
 module.exports = {
-    getGlobalProfiles,
+    getDefaultGlobalProfiles,
+    getEnhancedGlobalProfiles,
     getCourseProfiles,
     getEffectiveProfiles,
-    saveGlobalProfiles,
+    saveDefaultGlobalProfiles,
+    saveEnhancedGlobalProfiles,
     saveCourseProfiles,
     deleteCourseProfiles,
+    countSystemRows,
+    getSystemFlagsByIds,
     getAudioNormalizationSettings,
     saveAudioNormalizationSettings,
     getAudioBitrateDefault,

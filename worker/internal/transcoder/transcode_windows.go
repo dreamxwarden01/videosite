@@ -43,10 +43,20 @@ func resolveHWArgs(encoder config.Encoder, swDecode bool, srcW, srcH, tgtW, tgtH
 	case hardware.EncoderNVENC:
 		if hardware.CUDAHWDecodeSupported() && !swDecode {
 			// Full GPU: NVDEC decode → scale_cuda → h264_nvenc, frames never leave GPU.
+			//
+			// -threads 1 caps NVDEC's decode-surface pool. FFmpeg's nvdec wrapper
+			// allocates roughly threads*2 + DPB-depth surfaces; on a 16-thread
+			// host that exceeds NVDEC's 32-surface limit and cuvidCreateDecoder
+			// returns CUDA_ERROR_INVALID_VALUE, falling back to SW decode while
+			// the filter graph still expects cuda-format frames. -threads 1
+			// keeps surfaces ~6 (well under 32). Decode work happens on
+			// hardware anyway — the thread count only affects FFmpeg-side
+			// frame-parallel bookkeeping.
 			hwArgs = []string{
 				"-hwaccel", "cuda",
 				"-hwaccel_device", strconv.Itoa(encoder.DeviceIndex),
 				"-hwaccel_output_format", "cuda",
+				"-threads", "1",
 			}
 			vfFilter = fmt.Sprintf("scale_cuda=%d:%d", tgtW, tgtH)
 			return

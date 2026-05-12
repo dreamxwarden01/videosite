@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 
+// `type: 'decimal'` accepts fractional values via parseFloat (used for
+// gop_seconds, e.g., 1.5 or 2.0). All other numerics stay integer-only.
 const FIELDS = [
   { key: 'name', label: 'Profile Name', type: 'text' },
   { key: 'width', label: 'Width (px)', type: 'numeric', min: 1, max: 7680 },
@@ -10,12 +12,12 @@ const FIELDS = [
   { key: 'profile', label: 'H.264 Profile', type: 'select', options: ['baseline', 'main', 'high'] },
   { key: 'preset', label: 'Encoding Preset', type: 'select', options: ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'] },
   { key: 'segment_duration', label: 'Segment Duration (s)', type: 'numeric', min: 1, max: 30 },
-  { key: 'gop_size', label: 'GOP Size (frames)', type: 'numeric', min: 1, max: 250 },
+  { key: 'gop_seconds', label: 'GOP Length (s)', type: 'decimal', min: 0.1, max: 10, step: 0.1 },
 ];
 
 const DEFAULT_PROFILE = {
   name: '', width: '', height: '', video_bitrate_kbps: '', fps_limit: '60',
-  codec: 'h264', profile: 'high', preset: 'medium', segment_duration: '6', gop_size: '48'
+  codec: 'h264', profile: 'high', preset: 'medium', segment_duration: '6', gop_seconds: '2'
 };
 
 export default function ProfileEditModal({ isOpen, profile, onClose, onSave }) {
@@ -47,16 +49,30 @@ export default function ProfileEditModal({ isOpen, profile, onClose, onSave }) {
     if (!/^\d+$/.test(pasted)) e.preventDefault();
   };
 
+  // Decimal inputs accept digits + at most one dot.
+  const handleDecimalKey = (e) => {
+    if (e.key.length !== 1) return;
+    if (e.key === '.' && !e.currentTarget.value.includes('.')) return;
+    if (!/\d/.test(e.key)) e.preventDefault();
+  };
+
+  const handleDecimalPaste = (e) => {
+    const pasted = e.clipboardData.getData('text');
+    if (!/^\d+(\.\d+)?$/.test(pasted)) e.preventDefault();
+  };
+
   const validate = (values) => {
     const errs = {};
     if (!values.name.trim()) errs.name = 'Required';
     for (const f of FIELDS) {
-      if (f.type !== 'numeric') continue;
-      const v = parseInt(values[f.key], 10);
-      if (!values[f.key] || isNaN(v)) {
-        errs[f.key] = 'Required';
-      } else if (v < f.min || v > f.max) {
-        errs[f.key] = `Must be ${f.min}–${f.max}`;
+      if (f.type === 'numeric') {
+        const v = parseInt(values[f.key], 10);
+        if (!values[f.key] || isNaN(v)) errs[f.key] = 'Required';
+        else if (v < f.min || v > f.max) errs[f.key] = `Must be ${f.min}–${f.max}`;
+      } else if (f.type === 'decimal') {
+        const v = parseFloat(values[f.key]);
+        if (values[f.key] === '' || isNaN(v)) errs[f.key] = 'Required';
+        else if (v < f.min || v > f.max) errs[f.key] = `Must be ${f.min}–${f.max}`;
       }
     }
     return errs;
@@ -90,6 +106,15 @@ export default function ProfileEditModal({ isOpen, profile, onClose, onSave }) {
     const parsed = { ...form };
     for (const f of FIELDS) {
       if (f.type === 'numeric') parsed[f.key] = parseInt(form[f.key], 10);
+      else if (f.type === 'decimal') parsed[f.key] = parseFloat(form[f.key]);
+    }
+    // Preserve is_system_profile / profile_id / is_enhanced_profile that came
+    // in from the source row — the modal doesn't expose them but the parent
+    // needs them passed through on save.
+    if (profile) {
+      if (profile.profile_id !== undefined) parsed.profile_id = profile.profile_id;
+      if (profile.is_system_profile !== undefined) parsed.is_system_profile = profile.is_system_profile;
+      if (profile.is_enhanced_profile !== undefined) parsed.is_enhanced_profile = profile.is_enhanced_profile;
     }
     onSave(parsed);
   };
@@ -118,12 +143,12 @@ export default function ProfileEditModal({ isOpen, profile, onClose, onSave }) {
                     id={`pf-${f.key}`}
                     className={`form-control${touched[f.key] && errors[f.key] ? ' input-error' : ''}`}
                     type="text"
-                    inputMode={f.type === 'numeric' ? 'numeric' : undefined}
+                    inputMode={f.type === 'numeric' ? 'numeric' : f.type === 'decimal' ? 'decimal' : undefined}
                     value={form[f.key]}
                     onChange={e => handleChange(f.key, e.target.value)}
                     onBlur={() => handleBlur(f.key)}
-                    onKeyDown={f.type === 'numeric' ? handleDigitOnly : undefined}
-                    onPaste={f.type === 'numeric' ? handleDigitPaste : undefined}
+                    onKeyDown={f.type === 'numeric' ? handleDigitOnly : f.type === 'decimal' ? handleDecimalKey : undefined}
+                    onPaste={f.type === 'numeric' ? handleDigitPaste : f.type === 'decimal' ? handleDecimalPaste : undefined}
                     autoFocus={f.key === 'name'}
                   />
                 )}

@@ -29,7 +29,7 @@ const { generateWorkerKeyPair, revokeWorkerKey, deleteWorkerKey, listWorkerKeys 
 const { generateSecretKey, isHmacConfigured, setSetting } = require('../../services/tokenService');
 
 // Services - Transcoding Profiles
-const { getGlobalProfiles, getCourseProfiles, saveGlobalProfiles, saveCourseProfiles, deleteCourseProfiles, getAudioNormalizationSettings, saveAudioNormalizationSettings, getAudioBitrateDefault, saveAudioBitrateDefault, validateAudioBitrate, validateProfile } = require('../../services/transcodingProfileService');
+const { getDefaultGlobalProfiles, getEnhancedGlobalProfiles, getCourseProfiles, saveDefaultGlobalProfiles, saveEnhancedGlobalProfiles, saveCourseProfiles, deleteCourseProfiles, countSystemRows, getSystemFlagsByIds, getAudioNormalizationSettings, saveAudioNormalizationSettings, getAudioBitrateDefault, saveAudioBitrateDefault, validateAudioBitrate, validateProfile } = require('../../services/transcodingProfileService');
 
 // Services - Invitations
 const { generateInvitationCode, listInvitationCodes, removeInvitationCode } = require('../../services/registrationService');
@@ -150,11 +150,14 @@ router.get('/admin/courses/:courseId/edit', requireAuth, checkPermission('change
         }
         const videoResult = await listCourseVideos(req.params.courseId, 1, 100);
         await require('../../services/cache/transcodeProgressCache').applyLiveOverlayToVideos(videoResult.videos);
-        const globalProfiles = await getGlobalProfiles();
+        // Send both global sets so the course edit page can preview whichever
+        // one the toggle currently lands on without a second round-trip.
+        const defaultGlobalProfiles = await getDefaultGlobalProfiles();
+        const enhancedGlobalProfiles = await getEnhancedGlobalProfiles();
         const courseProfiles = course.use_custom_profiles ? await getCourseProfiles(req.params.courseId) : [];
         const audioNormalization = await getAudioNormalizationSettings();
         const audioBitrateKbps = await getAudioBitrateDefault();
-        res.json({ course, videos: videoResult.videos.map(sanitizeAdminVideo), globalProfiles, courseProfiles, audioNormalization, audioBitrateKbps });
+        res.json({ course, videos: videoResult.videos.map(sanitizeAdminVideo), defaultGlobalProfiles, enhancedGlobalProfiles, courseProfiles, audioNormalization, audioBitrateKbps });
     } catch (err) {
         console.error('API get course edit error:', err);
         res.status(500).json({ error: 'Failed to load course.' });
@@ -164,13 +167,15 @@ router.get('/admin/courses/:courseId/edit', requireAuth, checkPermission('change
 // PUT /api/admin/courses/:courseId — update
 router.put('/admin/courses/:courseId', requireAuth, checkPermission('changeCourse'), requireMfaForScenario('course'), requireCourseAccess, async (req, res) => {
     try {
-        const { courseName, description, is_active, use_custom_profiles, audio_normalization } = req.body;
-        const updates = {
-            course_name: courseName,
-            description,
-            is_active: is_active === '1' || is_active === true || is_active === 1 ? 1 : 0
-        };
+        const { courseName, description, is_active, use_custom_profiles, use_enhanced_profiles, audio_normalization } = req.body;
+        const updates = {};
+        if (courseName !== undefined) updates.course_name = courseName;
+        if (description !== undefined) updates.description = description;
+        if (is_active !== undefined) {
+            updates.is_active = is_active === '1' || is_active === true || is_active === 1 ? 1 : 0;
+        }
         if (use_custom_profiles !== undefined) updates.use_custom_profiles = use_custom_profiles ? 1 : 0;
+        if (use_enhanced_profiles !== undefined) updates.use_enhanced_profiles = use_enhanced_profiles ? 1 : 0;
         if (audio_normalization !== undefined) updates.audio_normalization = audio_normalization ? 1 : 0;
         await updateCourse(req.params.courseId, updates);
         res.status(204).end();
@@ -211,7 +216,7 @@ router.put('/admin/courses/:courseId/transcoding-profiles', requireAuth, checkPe
                 video_bitrate_kbps: parseInt(p.video_bitrate_kbps, 10),
                 fps_limit: p.fps_limit !== undefined ? parseInt(p.fps_limit, 10) : 60,
                 segment_duration: p.segment_duration !== undefined ? parseInt(p.segment_duration, 10) : 6,
-                gop_size: p.gop_size !== undefined ? parseInt(p.gop_size, 10) : 48
+                gop_seconds: p.gop_seconds !== undefined ? parseFloat(p.gop_seconds) : 2.00
             };
             const errors = validateProfile(parsed);
             if (errors.length > 0) {
@@ -890,11 +895,12 @@ router.get('/admin/settings', requireAuth, checkPermission('manageSite'), requir
             return rest;
         });
 
-        const transcodingProfiles = await getGlobalProfiles();
+        const defaultProfiles = await getDefaultGlobalProfiles();
+        const enhancedProfiles = await getEnhancedGlobalProfiles();
         const audioNormalization = await getAudioNormalizationSettings();
         const audioBitrateKbps = await getAudioBitrateDefault();
 
-        res.json({ settings: settingsMap, workerKeys: sanitizedWorkerKeys, roles, hmacKeyConfigured, r2PublicDomain: process.env.R2_PUBLIC_DOMAIN || '', transcodingProfiles, audioNormalization, audioBitrateKbps });
+        res.json({ settings: settingsMap, workerKeys: sanitizedWorkerKeys, roles, hmacKeyConfigured, r2PublicDomain: process.env.R2_PUBLIC_DOMAIN || '', defaultProfiles, enhancedProfiles, audioNormalization, audioBitrateKbps });
     } catch (err) {
         console.error('API settings error:', err);
         res.status(500).json({ error: 'Failed to load settings.' });
@@ -1036,32 +1042,63 @@ router.put('/admin/settings', requireAuth, checkPermission('manageSite'), requir
     }
 });
 
-// PUT /api/admin/settings/transcoding-profiles — save global profiles + audio normalization + site-wide audio bitrate
-router.put('/admin/settings/transcoding-profiles', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+// Shared validator for a global-profile PUT payload. Returns either { error }
+// or a normalized profiles array. The system-row guard prevents the client
+// from sneaking a system row out by dropping it from the payload or flipping
+// is_system_profile to 0 on the wire.
+async function parseAndGuardGlobalProfiles(profiles, enhanced) {
+    if (!Array.isArray(profiles) || profiles.length === 0) {
+        return { error: 'At least one profile is required' };
+    }
+    const out = [];
+    const dbFlagsByIdPromise = getSystemFlagsByIds(
+        profiles.map(p => p.profile_id).filter(id => Number.isInteger(id))
+    );
+    for (let i = 0; i < profiles.length; i++) {
+        const p = profiles[i];
+        const parsed = {
+            name: (p.name || '').trim(),
+            width: parseInt(p.width, 10),
+            height: parseInt(p.height, 10),
+            video_bitrate_kbps: parseInt(p.video_bitrate_kbps, 10),
+            fps_limit: p.fps_limit !== undefined ? parseInt(p.fps_limit, 10) : 60,
+            segment_duration: p.segment_duration !== undefined ? parseInt(p.segment_duration, 10) : 6,
+            gop_seconds: p.gop_seconds !== undefined ? parseFloat(p.gop_seconds) : 2.00,
+        };
+        const errors = validateProfile(parsed);
+        if (errors.length > 0) {
+            return { error: `Profile ${i + 1}: ${errors.join(', ')}` };
+        }
+        out.push({ ...p, ...parsed });
+    }
+    const dbFlagsById = await dbFlagsByIdPromise;
+    // Re-stamp is_system_profile from the DB for any row that carried a
+    // profile_id (i.e., it's an existing row). New rows default to 0.
+    for (const row of out) {
+        if (Number.isInteger(row.profile_id) && dbFlagsById.has(row.profile_id)) {
+            row.is_system_profile = dbFlagsById.get(row.profile_id);
+        } else {
+            row.is_system_profile = 0;
+        }
+    }
+    // Reject payloads that dropped a system row.
+    const incomingSystemCount = out.filter(r => r.is_system_profile === 1).length;
+    const dbSystemCount = await countSystemRows(enhanced);
+    if (incomingSystemCount < dbSystemCount) {
+        return { error: 'system_profile_missing: cannot drop a system profile from this set' };
+    }
+    return { profiles: out };
+}
+
+// PUT /api/admin/settings/transcoding-profiles/default — save default-quality
+// global set + (optionally) audio normalization + site-wide audio bitrate.
+// Audio settings ride on the default endpoint for back-compat; the enhanced
+// endpoint handles only its profile array.
+router.put('/admin/settings/transcoding-profiles/default', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
     try {
         const { profiles, audioNormalization, audioBitrateKbps } = req.body;
-
-        // Validate profiles
-        if (!Array.isArray(profiles) || profiles.length === 0) {
-            return res.status(400).json({ error: 'At least one profile is required' });
-        }
-        for (let i = 0; i < profiles.length; i++) {
-            const p = profiles[i];
-            const parsed = {
-                name: (p.name || '').trim(),
-                width: parseInt(p.width, 10),
-                height: parseInt(p.height, 10),
-                video_bitrate_kbps: parseInt(p.video_bitrate_kbps, 10),
-                fps_limit: p.fps_limit !== undefined ? parseInt(p.fps_limit, 10) : 60,
-                segment_duration: p.segment_duration !== undefined ? parseInt(p.segment_duration, 10) : 6,
-                gop_size: p.gop_size !== undefined ? parseInt(p.gop_size, 10) : 48
-            };
-            const errors = validateProfile(parsed);
-            if (errors.length > 0) {
-                return res.status(400).json({ error: `Profile ${i + 1}: ${errors.join(', ')}` });
-            }
-            profiles[i] = { ...p, ...parsed };
-        }
+        const result = await parseAndGuardGlobalProfiles(profiles, false);
+        if (result.error) return res.status(400).json({ error: result.error });
 
         // Validate the site-wide audio bitrate before we touch the DB.
         let audioBitrateParsed = null;
@@ -1073,9 +1110,8 @@ router.put('/admin/settings/transcoding-profiles', requireAuth, checkPermission(
             }
         }
 
-        await saveGlobalProfiles(profiles);
+        await saveDefaultGlobalProfiles(result.profiles);
 
-        // Save audio normalization settings if provided
         if (audioNormalization) {
             const target = parseFloat(audioNormalization.target);
             const peak = parseFloat(audioNormalization.peak);
@@ -1092,8 +1128,23 @@ router.put('/admin/settings/transcoding-profiles', requireAuth, checkPermission(
 
         res.status(204).end();
     } catch (err) {
-        console.error('API save transcoding profiles error:', err);
-        res.status(500).json({ error: 'Failed to save transcoding profiles' });
+        console.error('API save default transcoding profiles error:', err);
+        res.status(500).json({ error: 'Failed to save default transcoding profiles' });
+    }
+});
+
+// PUT /api/admin/settings/transcoding-profiles/enhanced — save enhanced-quality
+// global set. Profile array only; audio settings live on the /default endpoint.
+router.put('/admin/settings/transcoding-profiles/enhanced', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+    try {
+        const { profiles } = req.body;
+        const result = await parseAndGuardGlobalProfiles(profiles, true);
+        if (result.error) return res.status(400).json({ error: result.error });
+        await saveEnhancedGlobalProfiles(result.profiles);
+        res.status(204).end();
+    } catch (err) {
+        console.error('API save enhanced transcoding profiles error:', err);
+        res.status(500).json({ error: 'Failed to save enhanced transcoding profiles' });
     }
 });
 

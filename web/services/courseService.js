@@ -5,6 +5,8 @@ const courseCache = require('./cache/courseCache');
 async function createCourse(courseName, description, createdBy) {
     const pool = getPool();
 
+    // use_enhanced_profiles defaults to 0 (default-quality global set). New
+    // courses opt into enhanced via the toggle on the edit page.
     const [result] = await pool.execute(
         `INSERT INTO courses (course_name, description, created_by) VALUES (?, ?, ?)`,
         [courseName, description || null, createdBy]
@@ -30,6 +32,9 @@ async function updateCourse(courseId, updates) {
     if (updates.course_name !== undefined) { fields.push('course_name = ?'); values.push(updates.course_name); }
     if (updates.description !== undefined) { fields.push('description = ?'); values.push(updates.description); }
     if (updates.is_active !== undefined) { fields.push('is_active = ?'); values.push(updates.is_active); }
+    if (updates.use_custom_profiles !== undefined) { fields.push('use_custom_profiles = ?'); values.push(updates.use_custom_profiles); }
+    if (updates.use_enhanced_profiles !== undefined) { fields.push('use_enhanced_profiles = ?'); values.push(updates.use_enhanced_profiles); }
+    if (updates.audio_normalization !== undefined) { fields.push('audio_normalization = ?'); values.push(updates.audio_normalization); }
 
     if (fields.length === 0) return;
     values.push(courseId);

@@ -445,7 +445,8 @@ async function leaseTask(videoId, workerKeyId) {
             video_bitrate_kbps: p.video_bitrate_kbps,
             fps_limit: p.fps_limit,
             codec: p.codec, profile: p.profile, preset: p.preset,
-            segment_duration: p.segment_duration, gop_size: p.gop_size
+            segment_duration: p.segment_duration,
+            gop_seconds: parseFloat(p.gop_seconds)
         })),
         audioNormalization: courseAudioNorm,
         audioNormalizationTarget: parseFloat(normSettings.target),

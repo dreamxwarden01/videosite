@@ -70,15 +70,18 @@ export default function SettingsPage() {
   const [wkKeyIdCopyLabel, setWkKeyIdCopyLabel] = useState('Copy');
   const [wkSecretCopyLabel, setWkSecretCopyLabel] = useState('Copy');
 
-  // Transcoding profiles
-  const [transcodingProfiles, setTranscodingProfiles] = useState([]);
+  // Transcoding profiles — two global sets, default and enhanced.
+  const [defaultProfiles, setDefaultProfiles] = useState([]);
+  const [enhancedProfiles, setEnhancedProfiles] = useState([]);
   const [audioBitrateKbps, setAudioBitrateKbps] = useState('192');
   const [audioNormTarget, setAudioNormTarget] = useState('-20');
   const [audioNormPeak, setAudioNormPeak] = useState('-2');
   const [audioNormMaxGain, setAudioNormMaxGain] = useState('20');
-  const [savingTranscoding, setSavingTranscoding] = useState(false);
+  const [savingDefault, setSavingDefault] = useState(false);
+  const [savingEnhanced, setSavingEnhanced] = useState(false);
   const [showProfileModal, setShowProfileModal] = useState(false);
-  const [editingProfileIdx, setEditingProfileIdx] = useState(null);
+  // editingProfileTarget = { set: 'default' | 'enhanced', idx } or null
+  const [editingProfileTarget, setEditingProfileTarget] = useState(null);
   const originalTranscoding = useRef({});
   const [transcodingErrors, setTranscodingErrors] = useState({});
   const [transcodingTouched, setTranscodingTouched] = useState({});
@@ -122,8 +125,9 @@ export default function SettingsPage() {
         };
         setErrors({});
 
-        // Transcoding profiles
-        setTranscodingProfiles(data.transcodingProfiles || []);
+        // Transcoding profiles — load both global sets
+        setDefaultProfiles(data.defaultProfiles || []);
+        setEnhancedProfiles(data.enhancedProfiles || []);
         const an = data.audioNormalization || {};
         setAudioNormTarget(an.target || '-20');
         setAudioNormPeak(an.peak || '-2');
@@ -131,7 +135,8 @@ export default function SettingsPage() {
         const abk = String(data.audioBitrateKbps ?? '192');
         setAudioBitrateKbps(abk);
         originalTranscoding.current = {
-          profiles: JSON.stringify(data.transcodingProfiles || []),
+          defaultProfiles: JSON.stringify(data.defaultProfiles || []),
+          enhancedProfiles: JSON.stringify(data.enhancedProfiles || []),
           target: an.target || '-20',
           peak: an.peak || '-2',
           maxGain: an.maxGain || '20',
@@ -626,10 +631,12 @@ export default function SettingsPage() {
         </div>
         <div>
           <p className="text-muted" style={{ marginBottom: '16px' }}>
-            Default encoding profiles for all courses. Individual courses can override these.
+            Default site-wide encoding profiles. Courses choose between the default and enhanced sets via a per-course toggle, or can override entirely with custom profiles.
           </p>
 
-          <div className="table-wrap" style={{ marginBottom: '16px' }}>
+          {/* Default Quality */}
+          <h3 style={{ marginBottom: '8px' }}>Default Quality Profiles</h3>
+          <div className="table-wrap" style={{ marginBottom: '12px' }}>
             <table>
               <thead>
                 <tr>
@@ -637,36 +644,132 @@ export default function SettingsPage() {
                   <th>Resolution</th>
                   <th>Video Bitrate</th>
                   <th>Max FPS</th>
+                  <th>GOP (s)</th>
                   <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {transcodingProfiles.map((p, idx) => (
-                  <tr key={p.profile_id || idx}>
+                {defaultProfiles.map((p, idx) => (
+                  <tr key={p.profile_id || `d-${idx}`}>
                     <td>{p.name}</td>
                     <td>{p.width}x{p.height}</td>
                     <td>{p.video_bitrate_kbps} kbps</td>
                     <td>{p.fps_limit} fps</td>
+                    <td>{p.gop_seconds}</td>
                     <td>
-                      <button className="btn btn-secondary btn-sm" onClick={() => { setEditingProfileIdx(idx); setShowProfileModal(true); }}>Edit</button>
-                      <button className="btn btn-danger btn-sm" style={{ marginLeft: '4px' }} onClick={async () => {
-                        if (!await confirm('Delete this profile?')) return;
-                        setTranscodingProfiles(prev => prev.filter((_, i) => i !== idx));
-                      }}>Delete</button>
+                      <button className="btn btn-secondary btn-sm" onClick={() => { setEditingProfileTarget({ set: 'default', idx }); setShowProfileModal(true); }}>Edit</button>
+                      {!p.is_system_profile && (
+                        <button className="btn btn-danger btn-sm" style={{ marginLeft: '4px' }} onClick={async () => {
+                          if (!await confirm('Delete this profile?')) return;
+                          setDefaultProfiles(prev => prev.filter((_, i) => i !== idx));
+                        }}>Delete</button>
+                      )}
                     </td>
                   </tr>
                 ))}
-                {transcodingProfiles.length === 0 && (
-                  <tr><td colSpan="5" className="text-muted" style={{ textAlign: 'center', padding: '16px' }}>No profiles configured</td></tr>
+                {defaultProfiles.length === 0 && (
+                  <tr><td colSpan="6" className="text-muted" style={{ textAlign: 'center', padding: '16px' }}>No profiles configured</td></tr>
                 )}
               </tbody>
             </table>
           </div>
 
-          <button className="btn btn-secondary" style={{ marginBottom: '20px' }}
-            onClick={() => { setEditingProfileIdx(null); setShowProfileModal(true); }}>
-            Add Profile
+          <button className="btn btn-secondary btn-sm" style={{ marginBottom: '20px' }}
+            onClick={() => { setEditingProfileTarget({ set: 'default', idx: null }); setShowProfileModal(true); }}>
+            Add Default Profile
           </button>
+
+          <button className="btn btn-primary btn-sm" style={{ marginLeft: '8px', marginBottom: '20px' }}
+            disabled={savingDefault || JSON.stringify(defaultProfiles) === originalTranscoding.current.defaultProfiles}
+            onClick={async () => {
+              if (defaultProfiles.length === 0) { showToast('At least one profile is required.'); return; }
+              setSavingDefault(true);
+              try {
+                const { ok, data } = await mfaFetch('/api/admin/settings/transcoding-profiles/default', {
+                  method: 'PUT', body: { profiles: defaultProfiles }
+                });
+                if (ok) {
+                  showToast('Default profiles saved.', 'success');
+                  originalTranscoding.current = { ...originalTranscoding.current, defaultProfiles: JSON.stringify(defaultProfiles) };
+                } else {
+                  showToast(data?.error || 'Failed to save default profiles.');
+                }
+              } catch (err) { showToast(err.message); }
+              finally { setSavingDefault(false); }
+            }}>
+            {savingDefault ? 'Saving...' : 'Save Default Profiles'}
+          </button>
+
+          {/* Enhanced Quality */}
+          <h3 style={{ marginBottom: '8px' }}>Enhanced Quality Profiles</h3>
+          <p className="text-muted text-sm" style={{ marginBottom: '8px' }}>
+            Higher-bitrate set (1440p / 1080p / 720p). Courses opt in via the per-course toggle.
+          </p>
+          <div className="table-wrap" style={{ marginBottom: '12px' }}>
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Resolution</th>
+                  <th>Video Bitrate</th>
+                  <th>Max FPS</th>
+                  <th>GOP (s)</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {enhancedProfiles.map((p, idx) => (
+                  <tr key={p.profile_id || `e-${idx}`}>
+                    <td>{p.name}</td>
+                    <td>{p.width}x{p.height}</td>
+                    <td>{p.video_bitrate_kbps} kbps</td>
+                    <td>{p.fps_limit} fps</td>
+                    <td>{p.gop_seconds}</td>
+                    <td>
+                      <button className="btn btn-secondary btn-sm" onClick={() => { setEditingProfileTarget({ set: 'enhanced', idx }); setShowProfileModal(true); }}>Edit</button>
+                      {!p.is_system_profile && (
+                        <button className="btn btn-danger btn-sm" style={{ marginLeft: '4px' }} onClick={async () => {
+                          if (!await confirm('Delete this profile?')) return;
+                          setEnhancedProfiles(prev => prev.filter((_, i) => i !== idx));
+                        }}>Delete</button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+                {enhancedProfiles.length === 0 && (
+                  <tr><td colSpan="6" className="text-muted" style={{ textAlign: 'center', padding: '16px' }}>No profiles configured</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <button className="btn btn-secondary btn-sm" style={{ marginBottom: '20px' }}
+            onClick={() => { setEditingProfileTarget({ set: 'enhanced', idx: null }); setShowProfileModal(true); }}>
+            Add Enhanced Profile
+          </button>
+
+          <button className="btn btn-primary btn-sm" style={{ marginLeft: '8px', marginBottom: '20px' }}
+            disabled={savingEnhanced || JSON.stringify(enhancedProfiles) === originalTranscoding.current.enhancedProfiles}
+            onClick={async () => {
+              if (enhancedProfiles.length === 0) { showToast('At least one profile is required.'); return; }
+              setSavingEnhanced(true);
+              try {
+                const { ok, data } = await mfaFetch('/api/admin/settings/transcoding-profiles/enhanced', {
+                  method: 'PUT', body: { profiles: enhancedProfiles }
+                });
+                if (ok) {
+                  showToast('Enhanced profiles saved.', 'success');
+                  originalTranscoding.current = { ...originalTranscoding.current, enhancedProfiles: JSON.stringify(enhancedProfiles) };
+                } else {
+                  showToast(data?.error || 'Failed to save enhanced profiles.');
+                }
+              } catch (err) { showToast(err.message); }
+              finally { setSavingEnhanced(false); }
+            }}>
+            {savingEnhanced ? 'Saving...' : 'Save Enhanced Profiles'}
+          </button>
+
+          <h3 style={{ marginTop: '24px', marginBottom: '12px' }}>Audio Settings</h3>
 
           <div className="form-group" style={{ maxWidth: '400px' }}>
             <label htmlFor="audioBitrateKbps">Audio Bitrate (kbps)</label>
@@ -699,7 +802,7 @@ export default function SettingsPage() {
             </small>
           </div>
 
-          <h3 style={{ marginBottom: '12px' }}>Audio Normalization Defaults</h3>
+          <h4 style={{ marginBottom: '12px' }}>Audio Normalization Defaults</h4>
           <p className="text-muted text-sm" style={{ marginBottom: '12px' }}>
             Audio normalization is enabled by default for new courses. Individual courses can disable it.
           </p>
@@ -762,15 +865,13 @@ export default function SettingsPage() {
           </div>
 
           <button className="btn btn-primary" style={{ marginTop: '8px' }}
-            disabled={savingTranscoding || Object.keys(transcodingErrors).length > 0 || (
-              JSON.stringify(transcodingProfiles) === originalTranscoding.current.profiles
-              && audioNormTarget === originalTranscoding.current.target
+            disabled={savingDefault || Object.keys(transcodingErrors).length > 0 || (
+              audioNormTarget === originalTranscoding.current.target
               && audioNormPeak === originalTranscoding.current.peak
               && audioNormMaxGain === originalTranscoding.current.maxGain
               && audioBitrateKbps === originalTranscoding.current.audioBitrateKbps
             )}
             onClick={async () => {
-              if (transcodingProfiles.length === 0) { showToast('At least one profile is required.'); return; }
               const abkInt = parseInt(audioBitrateKbps, 10);
               if (!Number.isInteger(abkInt) || abkInt < 128 || abkInt > 320) {
                 setTranscodingTouched(t => ({ ...t, audioBitrateKbps: true }));
@@ -778,20 +879,24 @@ export default function SettingsPage() {
                 showToast('Please fix the errors below.');
                 return;
               }
-              setSavingTranscoding(true);
+              setSavingDefault(true);
               try {
-                const { ok, data } = await mfaFetch('/api/admin/settings/transcoding-profiles', {
+                // Audio settings ride on the default-profiles PUT — we send
+                // only the audio fields here, leaving the default profile
+                // array intact server-side.
+                const { ok, data } = await mfaFetch('/api/admin/settings/transcoding-profiles/default', {
                   method: 'PUT',
                   body: {
-                    profiles: transcodingProfiles,
+                    profiles: defaultProfiles,
                     audioNormalization: { target: audioNormTarget, peak: audioNormPeak, maxGain: audioNormMaxGain },
                     audioBitrateKbps: abkInt
                   }
                 });
                 if (ok) {
-                  showToast('Transcoding settings saved.', 'success');
+                  showToast('Audio settings saved.', 'success');
                   originalTranscoding.current = {
-                    profiles: JSON.stringify(transcodingProfiles),
+                    ...originalTranscoding.current,
+                    defaultProfiles: JSON.stringify(defaultProfiles),
                     target: audioNormTarget, peak: audioNormPeak, maxGain: audioNormMaxGain,
                     audioBitrateKbps: audioBitrateKbps
                   };
@@ -799,26 +904,38 @@ export default function SettingsPage() {
                   showToast(data?.error || 'Failed to save.');
                 }
               } catch (err) { showToast(err.message); }
-              finally { setSavingTranscoding(false); }
+              finally { setSavingDefault(false); }
             }}
           >
-            {savingTranscoding ? 'Saving...' : 'Save Transcoding Settings'}
+            {savingDefault ? 'Saving...' : 'Save Audio Settings'}
           </button>
         </div>
       </div>
 
       <ProfileEditModal
         isOpen={showProfileModal}
-        profile={editingProfileIdx !== null ? transcodingProfiles[editingProfileIdx] : null}
-        onClose={() => { setShowProfileModal(false); setEditingProfileIdx(null); }}
+        profile={(() => {
+          if (!editingProfileTarget || editingProfileTarget.idx === null) return null;
+          const src = editingProfileTarget.set === 'enhanced' ? enhancedProfiles : defaultProfiles;
+          return src[editingProfileTarget.idx];
+        })()}
+        onClose={() => { setShowProfileModal(false); setEditingProfileTarget(null); }}
         onSave={(profile) => {
-          if (editingProfileIdx !== null) {
-            setTranscodingProfiles(prev => prev.map((p, i) => i === editingProfileIdx ? profile : p));
+          if (!editingProfileTarget) return;
+          const setter = editingProfileTarget.set === 'enhanced' ? setEnhancedProfiles : setDefaultProfiles;
+          // Stamp is_enhanced_profile for new rows so the server save lands
+          // them in the right set even before the user hits Save.
+          const stamped = {
+            ...profile,
+            is_enhanced_profile: editingProfileTarget.set === 'enhanced' ? 1 : 0
+          };
+          if (editingProfileTarget.idx !== null) {
+            setter(prev => prev.map((p, i) => i === editingProfileTarget.idx ? stamped : p));
           } else {
-            setTranscodingProfiles(prev => [...prev, profile]);
+            setter(prev => [...prev, stamped]);
           }
           setShowProfileModal(false);
-          setEditingProfileIdx(null);
+          setEditingProfileTarget(null);
         }}
       />
 
