@@ -11,7 +11,7 @@ const videoCache = require('../../services/cache/videoCache');
 const enrollmentCache = require('../../services/cache/enrollmentCache');
 const watchProgressCache = require('../../services/cache/watchProgressCache');
 
-// POST /api/updatewatch
+// POST /api/watch-progress
 //
 // Body: { video_id: uint32, position: number, delta: number }
 //
@@ -40,7 +40,7 @@ const watchProgressCache = require('../../services/cache/watchProgressCache');
 // bursts fit (a single ~30s network blip on retry), abusive claims don't. No
 // comparison against last_watch_at: two devices viewing the same video
 // concurrently is a real use case that would false-positive.
-router.post('/updatewatch', requireAuth, async (req, res) => {
+router.post('/watch-progress', requireAuth, async (req, res) => {
     try {
         const user = res.locals.user;
         const { video_id, position, delta } = req.body;

@@ -1,4 +1,5 @@
 import { apiPost } from '../api';
+import { startUploadHeartbeat } from './uploadHeartbeat';
 
 // Mirror of the server-side allowlist in routes/api/upload.js. The check
 // on the client is UX (fail fast, no wasted multipart init); the server
@@ -124,20 +125,32 @@ export async function multipartUpload({ file, createUrl, createBody, onProgress,
 
   const { uploadId, totalParts, partSize } = createRes.data;
 
-  // 2. Start heartbeat interval
+  // 2. Start heartbeat ticker (5s interval, retries on transient errors,
+  //    self-aborts on 60s of no successful heartbeat — see
+  //    uploadHeartbeat.js for full semantics).
   const abortedRef = { current: false };
   const activeXhrs = new Set();
-  const heartbeatInterval = setInterval(() => {
-    if (!abortedRef.current) {
-      apiPost(`/api/upload/${uploadId}/heartbeat`).catch(() => {});
+
+  function abortLocallyAndStopXhrs() {
+    abortedRef.current = true;
+    for (const xhrRef of activeXhrs) {
+      if (xhrRef.current) xhrRef.current.abort();
     }
-  }, 10000);
+  }
+
+  const heartbeat = startUploadHeartbeat(`/api/upload/${uploadId}/heartbeat`, {
+    onTimeout: () => {
+      // Server-side stale timer will fire in parallel; we just stop
+      // pushing parts so the user sees a fast failure.
+      abortLocallyAndStopXhrs();
+    },
+  });
 
   // 3. Set up abort handler — stops XHRs first, then reports abort
   if (onAbortRef) {
     onAbortRef.current = async () => {
       abortedRef.current = true;
-      clearInterval(heartbeatInterval);
+      heartbeat.stop();
       // Abort all in-flight XHRs immediately
       for (const xhrRef of activeXhrs) {
         if (xhrRef.current) xhrRef.current.abort();
@@ -248,10 +261,10 @@ export async function multipartUpload({ file, createUrl, createBody, onProgress,
     });
     if (!completeRes.ok) throw new Error(completeRes.data?.error || 'Failed to finalize upload');
 
-    clearInterval(heartbeatInterval);
+    heartbeat.stop();
     return { uploadId };
   } catch (err) {
-    clearInterval(heartbeatInterval);
+    heartbeat.stop();
     // If not already aborted, abort the session on error (best-effort)
     if (!abortedRef.current && !(err instanceof UploadAbortedError)) {
       apiPostRetry(`/api/upload/${uploadId}/abort`).catch(() => {});

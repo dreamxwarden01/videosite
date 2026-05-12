@@ -49,8 +49,31 @@ async function getPresignedDownloadUrl(objectKey, filename, { inline = false } =
     return getSignedUrl(r2, command, { expiresIn: 3600 });
 }
 
+/**
+ * Re-stamp the uploaded object's Content-Type + Cache-Control headers
+ * via CopyObject-to-self. Called at /complete time so the headers
+ * reflect the client-declared type rather than whatever R2 inferred
+ * during the presigned PUT.
+ */
+async function applyHeaders(objectKey, contentType) {
+    const r2 = getR2Client();
+    const bucket = getR2BucketName();
+    await r2.send(new CopyObjectCommand({
+        Bucket: bucket,
+        Key: objectKey,
+        CopySource: `${bucket}/${objectKey}`,
+        ContentType: contentType || 'application/octet-stream',
+        CacheControl: 'public, max-age=31536000, immutable',
+        MetadataDirective: 'REPLACE',
+    }));
+}
+
 // --- DB operations ---
 
+/**
+ * Insert a row for a confirmed attachment. Called from the /complete
+ * handler after the PUT has landed and headers have been re-stamped.
+ */
 async function createMaterialRecord(courseId, objectKey, filename, fileSize, contentType, week, uploadedBy) {
     const pool = getPool();
     const [result] = await pool.execute(
@@ -61,40 +84,11 @@ async function createMaterialRecord(courseId, objectKey, filename, fileSize, con
     return result.insertId;
 }
 
-async function confirmUpload(materialId, userId) {
-    const pool = getPool();
-    const [rows] = await pool.execute(
-        `SELECT object_key, content_type FROM course_materials WHERE material_id = ? AND status = 'uploading' AND uploaded_by = ?`,
-        [materialId, userId]
-    );
-    if (!rows.length) return false;
-
-    const [result] = await pool.execute(
-        `UPDATE course_materials SET status = 'active' WHERE material_id = ?`,
-        [materialId]
-    );
-    if (result.affectedRows === 0) return false;
-
-    // Set Cache-Control metadata server-side via copy-to-self
-    const r2 = getR2Client();
-    const bucket = getR2BucketName();
-    await r2.send(new CopyObjectCommand({
-        Bucket: bucket,
-        Key: rows[0].object_key,
-        CopySource: `${bucket}/${rows[0].object_key}`,
-        ContentType: rows[0].content_type,
-        CacheControl: 'public, max-age=31536000, immutable',
-        MetadataDirective: 'REPLACE',
-    }));
-
-    return true;
-}
-
 async function getMaterialsByCourse(courseId) {
     const pool = getPool();
     const [rows] = await pool.execute(
         `SELECT material_id, course_id, filename, file_size, content_type, week, uploaded_by, created_at, updated_at
-         FROM course_materials WHERE course_id = ? AND status = 'active'
+         FROM course_materials WHERE course_id = ?
          ORDER BY CAST(week AS UNSIGNED) DESC, created_at DESC, filename ASC`,
         [courseId]
     );
@@ -140,47 +134,14 @@ async function deleteMaterial(materialId) {
     return rows[0].object_key;
 }
 
-async function abortMaterial(materialId, userId) {
-    const pool = getPool();
-    const [rows] = await pool.execute(
-        `SELECT object_key FROM course_materials WHERE material_id = ? AND status = 'uploading' AND uploaded_by = ?`,
-        [materialId, userId]
-    );
-    if (rows.length === 0) return null;
-
-    await pool.execute(
-        `UPDATE course_materials SET status = 'aborted' WHERE material_id = ?`,
-        [materialId]
-    );
-    return rows[0].object_key;
-}
-
-async function cleanupStaleMaterials() {
-    const pool = getPool();
-    const [rows] = await pool.execute(
-        `SELECT material_id, object_key FROM course_materials
-         WHERE status = 'uploading' AND created_at < DATE_SUB(NOW(), INTERVAL 65 MINUTE)`
-    );
-
-    if (rows.length === 0) return [];
-
-    const ids = rows.map(r => r.material_id);
-    await pool.execute(
-        `DELETE FROM course_materials WHERE material_id IN (${ids.map(() => '?').join(',')})`,
-        ids
-    );
-
-    return rows.map(r => r.object_key);
-}
-
 async function getCoursesWithMaterialCount(userId, hasAllCourseAccess) {
     const pool = getPool();
 
     if (hasAllCourseAccess) {
         const [rows] = await pool.execute(
             `SELECT c.course_id, c.course_name,
-                (SELECT COUNT(*) FROM course_materials m WHERE m.course_id = c.course_id AND m.status = 'active') as material_count,
-                (SELECT MAX(m.created_at) FROM course_materials m WHERE m.course_id = c.course_id AND m.status = 'active') as last_material_at
+                (SELECT COUNT(*) FROM course_materials m WHERE m.course_id = c.course_id) as material_count,
+                (SELECT MAX(m.created_at) FROM course_materials m WHERE m.course_id = c.course_id) as last_material_at
              FROM courses c WHERE c.is_active = 1
              ORDER BY c.course_name ASC`
         );
@@ -189,8 +150,8 @@ async function getCoursesWithMaterialCount(userId, hasAllCourseAccess) {
 
     const [rows] = await pool.execute(
         `SELECT c.course_id, c.course_name,
-            (SELECT COUNT(*) FROM course_materials m WHERE m.course_id = c.course_id AND m.status = 'active') as material_count,
-            (SELECT MAX(m.created_at) FROM course_materials m WHERE m.course_id = c.course_id AND m.status = 'active') as last_material_at
+            (SELECT COUNT(*) FROM course_materials m WHERE m.course_id = c.course_id) as material_count,
+            (SELECT MAX(m.created_at) FROM course_materials m WHERE m.course_id = c.course_id) as last_material_at
          FROM courses c
          JOIN enrollments e ON c.course_id = e.course_id
          WHERE e.user_id = ? AND c.is_active = 1
@@ -204,13 +165,11 @@ module.exports = {
     generateMaterialId,
     getPresignedUploadUrl,
     getPresignedDownloadUrl,
+    applyHeaders,
     createMaterialRecord,
-    confirmUpload,
     getMaterialsByCourse,
     getMaterialById,
     updateMaterial,
     deleteMaterial,
-    abortMaterial,
-    cleanupStaleMaterials,
     getCoursesWithMaterialCount,
 };

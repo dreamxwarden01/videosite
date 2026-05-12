@@ -1,7 +1,7 @@
 // Watch progress write-coalescing cache.
 //
 // The cache stores a delta accumulator + the latest position per (user, video).
-// /api/updatewatch HINCRBYFLOATs the delta and HSETs the position; the periodic
+// /api/watch-progress HINCRBYFLOATs the delta and HSETs the position; the periodic
 // flusher (services/flusher.js) drains dirty:watch every 15 min, applies the
 // accumulated delta to watch_progress.watch_seconds, and overwrites
 // last_position + last_watch_at.
@@ -11,7 +11,7 @@
 //   dirty:watch                          set member = "{user_id}:{video_id}"
 //
 // We accumulate `delta` (not the absolute watch_seconds) so we never have to
-// know the current DB value to serve a /updatewatch — the flusher's UPSERT
+// know the current DB value to serve a /watch-progress — the flusher's UPSERT
 // adds the delta to the existing row's watch_seconds in a single SQL.
 //
 // Resume reads (playback start, watch page) check this cache first for the
@@ -69,7 +69,7 @@ async function applyRateLimit(userId, videoId, credit) {
     return credit;
 }
 
-// Record one /updatewatch tick. credit may be 0 (position-only refresh).
+// Record one /watch-progress tick. credit may be 0 (position-only refresh).
 async function recordProgress(userId, videoId, position, credit) {
     const redis = getClient();
     const k = key(userId, videoId);

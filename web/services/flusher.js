@@ -15,6 +15,7 @@ const { getClient } = require('./redis');
 const { getPool } = require('../config/database');
 const watchCache = require('./cache/watchProgressCache');
 const transcodeCache = require('./cache/transcodeProgressCache');
+const uploadHeartbeatCache = require('./cache/uploadHeartbeatCache');
 
 const FLUSH_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const BATCH_SIZE = 500;
@@ -99,7 +100,7 @@ async function flushDirtyWorkerSessions() {
 // Drain dirty:watch into watch_progress. The cached `delta` is added to the
 // existing watch_seconds in a single UPSERT; last_position + last_watch_at
 // are overwritten with the cache values. After a successful UPSERT we DEL
-// the hash so the next /updatewatch starts a fresh delta accumulator.
+// the hash so the next /watch-progress starts a fresh delta accumulator.
 async function flushDirtyWatch() {
     const redis = getClient();
     const members = await watchCache.getDirtyMembers();
@@ -138,7 +139,7 @@ async function flushDirtyWatch() {
                     [uid, vid, data.delta, data.last_position, lastWatchAt]
                 );
 
-                // Clear the hash + dirty marker. Subsequent /updatewatch starts
+                // Clear the hash + dirty marker. Subsequent /watch-progress starts
                 // a fresh delta accumulator from 0.
                 await watchCache.deleteEntry(uid, vid);
                 flushed++;
@@ -198,6 +199,49 @@ async function flushDirtyTranscode() {
     return flushed;
 }
 
+// Drain dirty:upload_heartbeat into upload_sessions.last_heartbeat.
+// Upload heartbeats fire every 5 s per active upload; coalescing into
+// Redis avoids hammering upload_sessions with per-tick UPDATEs. The
+// stale-detection logic reads from Redis (the live source of truth), so
+// the DB column only needs to be near-current for the cold-start sweep
+// (resetStaleUploads) after a server restart.
+//
+// The Redis hash stays after flush (cache is still valid until terminal
+// state); only the dirty marker is removed. Caller-driven `clearHeartbeat`
+// on abort/complete is what evicts the hash.
+async function flushDirtyUploadHeartbeats() {
+    const ids = await uploadHeartbeatCache.getDirtyMembers();
+    if (ids.length === 0) return 0;
+
+    const pool = getPool();
+    let flushed = 0;
+
+    for (let i = 0; i < ids.length; i += BATCH_SIZE) {
+        const batch = ids.slice(i, i + BATCH_SIZE);
+        for (const uploadId of batch) {
+            try {
+                const data = await uploadHeartbeatCache.readForFlush(uploadId);
+                if (!data) {
+                    await uploadHeartbeatCache.removeDirty(uploadId);
+                    continue;
+                }
+                const lastHeartbeat = new Date(data.last_heartbeat);
+                await pool.execute(
+                    `UPDATE upload_sessions SET last_heartbeat = ?
+                     WHERE upload_id = ? AND status = 'active'`,
+                    [lastHeartbeat, uploadId]
+                );
+                await uploadHeartbeatCache.removeDirty(uploadId);
+                flushed++;
+            } catch (err) {
+                console.error(`Upload heartbeat flusher: failed for ${uploadId}: ${err.message}`);
+                // Leave in dirty set for next cycle.
+            }
+        }
+    }
+    return flushed;
+}
+
 let intervalHandle = null;
 
 function start() {
@@ -208,8 +252,9 @@ function start() {
             const workerSessionsN = await flushDirtyWorkerSessions();
             const watchN = await flushDirtyWatch();
             const transcodeN = await flushDirtyTranscode();
-            if (sessionsN > 0 || workerSessionsN > 0 || watchN > 0 || transcodeN > 0) {
-                console.log(`Flusher: drained ${sessionsN} user sessions, ${workerSessionsN} worker sessions, ${watchN} watch, ${transcodeN} transcode to DB`);
+            const uploadHbN = await flushDirtyUploadHeartbeats();
+            if (sessionsN > 0 || workerSessionsN > 0 || watchN > 0 || transcodeN > 0 || uploadHbN > 0) {
+                console.log(`Flusher: drained ${sessionsN} user sessions, ${workerSessionsN} worker sessions, ${watchN} watch, ${transcodeN} transcode, ${uploadHbN} upload-hb to DB`);
             }
         } catch (err) {
             console.error('Flusher tick error:', err.message);
@@ -234,10 +279,16 @@ async function flushAll() {
         const ws = await flushDirtyWorkerSessions();
         const w = await flushDirtyWatch();
         const t = await flushDirtyTranscode();
-        total += s + ws + w + t;
-        if (s === 0 && ws === 0 && w === 0 && t === 0) break;
+        const u = await flushDirtyUploadHeartbeats();
+        total += s + ws + w + t + u;
+        if (s === 0 && ws === 0 && w === 0 && t === 0 && u === 0) break;
     }
     return total;
 }
 
-module.exports = { start, stop, flushAll, flushDirtyUserSessions, flushDirtyWorkerSessions, flushDirtyWatch, flushDirtyTranscode };
+module.exports = {
+    start, stop, flushAll,
+    flushDirtyUserSessions, flushDirtyWorkerSessions,
+    flushDirtyWatch, flushDirtyTranscode,
+    flushDirtyUploadHeartbeats,
+};

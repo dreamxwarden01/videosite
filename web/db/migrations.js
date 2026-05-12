@@ -713,6 +713,48 @@ async function runMigrations() {
                         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                     `);
                 }
+            },
+            {
+                id: '032_stateful_attachment_uploads',
+                up: async () => {
+                    // upload_sessions now backs both video (multipart) and
+                    // attachment (single-PUT) flows. type tells the two
+                    // apart; r2_upload_id + total_parts are multipart-only;
+                    // content_type is set by attachments (used at
+                    // /complete to set R2 Cache-Control and to seed the
+                    // course_materials row).
+                    await pool.execute(`
+                        ALTER TABLE upload_sessions
+                          ADD COLUMN type ENUM('video','attachment')
+                            NOT NULL DEFAULT 'video' AFTER created_by
+                    `);
+                    await pool.execute(`
+                        ALTER TABLE upload_sessions
+                          ADD COLUMN content_type VARCHAR(100)
+                            DEFAULT NULL AFTER object_key
+                    `);
+                    await pool.execute(`
+                        ALTER TABLE upload_sessions
+                          MODIFY COLUMN r2_upload_id VARCHAR(1024) DEFAULT NULL
+                    `);
+                    await pool.execute(`
+                        ALTER TABLE upload_sessions
+                          MODIFY COLUMN total_parts INT UNSIGNED DEFAULT NULL
+                    `);
+
+                    // course_materials.status was used to distinguish
+                    // 'uploading' placeholders from confirmed 'active'
+                    // rows. With the new flow the placeholder lives in
+                    // upload_sessions and course_materials only gets a
+                    // row at /complete — so the column is dead. User
+                    // verified no in-flight rows in prod before deploy.
+                    await pool.execute(`
+                        ALTER TABLE course_materials DROP INDEX idx_course_materials_status
+                    `);
+                    await pool.execute(`
+                        ALTER TABLE course_materials DROP COLUMN status
+                    `);
+                }
             }
         ];
 

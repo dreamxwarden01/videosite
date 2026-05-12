@@ -321,7 +321,7 @@ export default function WatchPage() {
             t.accumulated = 0;
             const pos = videoEl.currentTime;
 
-            fetch('/api/updatewatch', {
+            fetch('/api/watch-progress', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -375,7 +375,7 @@ export default function WatchPage() {
             });
             try {
               const blob = new Blob([body], { type: 'application/json' });
-              if (navigator.sendBeacon && navigator.sendBeacon('/api/updatewatch', blob)) {
+              if (navigator.sendBeacon && navigator.sendBeacon('/api/watch-progress', blob)) {
                 return;
               }
             } catch {}
@@ -383,7 +383,7 @@ export default function WatchPage() {
             // too large) — fall back to keepalive fetch so the request still
             // outlives the page. Errors swallowed: nothing useful to do here.
             try {
-              fetch('/api/updatewatch', {
+              fetch('/api/watch-progress', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body,

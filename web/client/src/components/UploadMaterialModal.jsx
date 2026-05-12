@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { useToast } from '../context/ToastContext';
 import { useConfirm } from './ConfirmModal';
 import { apiPost } from '../api';
+import { startUploadHeartbeat } from '../services/uploadHeartbeat';
 
 const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB
 const BLOCKED_EXTENSIONS = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.ts', '.m3u8'];
@@ -147,9 +148,10 @@ export default function UploadMaterialModal({ isOpen, onClose, courses, preselec
     setUploadProgress(0);
     setUploadText('Starting upload...');
 
-    let materialId = null;
+    let uploadId = null;
+    let heartbeat = null;
     try {
-      // 1. Create material record + get presigned URL
+      // 1. Create attachment upload session + get presigned PUT URL
       const { data, ok } = await apiPost(`/api/materials/courses/${courseId}/upload`, {
         filename: filename.trim(),
         fileSize: file.size,
@@ -161,9 +163,19 @@ export default function UploadMaterialModal({ isOpen, onClose, courses, preselec
         throw new Error(data?.error || 'Failed to initiate upload.');
       }
 
-      materialId = data.materialId;
+      uploadId = data.uploadId;
 
-      // 2. Upload file to presigned URL with progress
+      // 2. Start heartbeat ticker (5s / 5 retries with backoff / single
+      //    in-flight / self-abort at 60s of no successful heartbeat).
+      heartbeat = startUploadHeartbeat(`/api/materials/${uploadId}/heartbeat`, {
+        onTimeout: () => {
+          // Server-side stale timer will fire in parallel — just abort
+          // the local XHR so the user sees a fast failure.
+          if (xhrRef.current) xhrRef.current.abort();
+        },
+      });
+
+      // 3. PUT file to presigned URL with progress reporting
       await new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhrRef.current = xhr;
@@ -192,21 +204,38 @@ export default function UploadMaterialModal({ isOpen, onClose, courses, preselec
         xhr.send(file);
       });
 
-      // 3. Confirm upload
-      const confirmResult = await apiPost(`/api/materials/${materialId}/confirm`);
-      if (!confirmResult.ok) {
-        throw new Error('Failed to confirm upload.');
+      // 4. Report completion — server re-stamps headers, creates the
+      //    course_materials row, returns the materialId.
+      const completeResult = await apiPost(`/api/materials/${uploadId}/complete`, {
+        week: week.trim(),
+      });
+      if (completeResult.status === 410) {
+        throw new Error('Course was deleted; upload discarded.');
+      }
+      if (!completeResult.ok) {
+        throw new Error(completeResult.data?.error || 'Failed to complete upload.');
       }
 
+      heartbeat.stop();
+      heartbeat = null;
       setUploading(false);
       setSuccessTitle(filename.trim());
     } catch (err) {
+      if (heartbeat) {
+        heartbeat.stop();
+        heartbeat = null;
+      }
       if (err.message === '__aborted__') {
+        // User cancelled (or heartbeat self-aborted). Notify server so
+        // the R2 object is enqueued for deletion.
+        if (uploadId) {
+          apiPost(`/api/materials/${uploadId}/abort`).catch(() => {});
+        }
         showToast('Upload cancelled.', 'info');
       } else {
-        // Abort on server if we have a materialId
-        if (materialId) {
-          apiPost(`/api/materials/${materialId}/abort`).catch(() => {});
+        // Other failure — also tell server to drop the session.
+        if (uploadId) {
+          apiPost(`/api/materials/${uploadId}/abort`).catch(() => {});
         }
         showToast(err.message || 'Upload failed', 'error');
       }

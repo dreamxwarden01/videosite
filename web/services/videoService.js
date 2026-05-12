@@ -143,19 +143,24 @@ async function deleteVideo(videoId) {
         [videoId]
     );
 
-    // 2b. Get in-flight upload session (if any) so we can abort the multipart
+    // 2b. Get in-flight upload session (if any) so we can abort the multipart.
+    // Video sessions only here — attachment sessions don't reference video_id.
     const [inflightSessions] = await pool.execute(
-        `SELECT object_key, r2_upload_id FROM upload_sessions
-         WHERE video_id = ? AND status IN ('active', 'completing')`,
+        `SELECT upload_id, object_key, r2_upload_id FROM upload_sessions
+         WHERE video_id = ? AND status IN ('active', 'completing')
+           AND type = 'video'`,
         [videoId]
     );
 
     // 3. Abort in-flight multipart upload (fire-and-forget — R2's lifecycle
-    //    cleans up parts within 24h if this fails).
+    //    cleans up parts within 24h if this fails). Also drop the Redis
+    //    heartbeat cache so the next client tick gets a 404.
+    const uploadHeartbeatCache = require('./cache/uploadHeartbeatCache');
     for (const session of inflightSessions) {
         abortMultipartUpload(session.object_key, session.r2_upload_id).catch(err => {
             console.error(`R2 multipart abort failed for upload ${session.r2_upload_id}:`, err.message);
         });
+        await uploadHeartbeatCache.clearHeartbeat(session.upload_id);
     }
 
     // 4. Clear stale timer for active job

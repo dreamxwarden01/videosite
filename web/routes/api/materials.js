@@ -7,16 +7,25 @@ const {
     generateMaterialId,
     getPresignedUploadUrl,
     getPresignedDownloadUrl,
+    applyHeaders,
     createMaterialRecord,
-    confirmUpload,
     getMaterialsByCourse,
     getMaterialById,
     updateMaterial,
     deleteMaterial,
-    abortMaterial,
     getCoursesWithMaterialCount,
 } = require('../../services/materialService');
+const {
+    generateUploadId,
+    createSession,
+    getSession,
+    heartbeat,
+    markCompleting,
+    markCompleted,
+    abortAttachmentSession,
+} = require('../../services/uploadSessionService');
 const deletionService = require('../../services/deletionService');
+const courseCache = require('../../services/cache/courseCache');
 
 const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB
 const BLOCKED_EXTENSIONS = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.ts', '.m3u8'];
@@ -59,7 +68,6 @@ router.get('/materials/courses/:courseId', requireAuth, checkPermission('accessA
             return res.status(403).json({ error: 'You are not enrolled in this course.' });
         }
 
-        const courseCache = require('../../services/cache/courseCache');
         const course = await courseCache.getCourseMeta(courseId);
         if (!course || course.is_active !== 1) return res.status(404).json({ error: 'Course not found.' });
 
@@ -83,6 +91,11 @@ router.get('/materials/courses/:courseId', requireAuth, checkPermission('accessA
 });
 
 // ── 3. POST /materials/courses/:courseId/upload — initiate upload ──
+//
+// Creates an `upload_sessions` row of type='attachment' and returns the
+// uploadId + presigned PUT URL. The `course_materials` row is NOT
+// created until `/complete` — keeps the materials table free of
+// uploading placeholders.
 router.post('/materials/courses/:courseId/upload', requireAuth, checkPermission('uploadAttachments'), async (req, res) => {
     try {
         const user = res.locals.user;
@@ -108,52 +121,140 @@ router.post('/materials/courses/:courseId/upload', requireAuth, checkPermission(
             return res.status(400).json({ error: 'File must have an extension.' });
         }
 
-        // Generate object key
+        // Generate IDs + R2 key
+        const uploadId = generateUploadId();
         const materialFileId = generateMaterialId();
         const objectKey = `attachments/${courseId}/${materialFileId}${ext}`;
+        const finalContentType = contentType || 'application/octet-stream';
 
-        // Create DB record (status = 'uploading')
-        const materialId = await createMaterialRecord(
-            courseId, objectKey, filename, fileSize,
-            contentType || 'application/octet-stream', week, user.user_id
-        );
+        // Open the session (heartbeat tracking starts now)
+        await createSession({
+            type: 'attachment',
+            uploadId,
+            courseId,
+            objectKey,
+            contentType: finalContentType,
+            originalFilename: filename,
+            fileSizeBytes: fileSize,
+            createdBy: user.user_id,
+        });
 
-        // Generate presigned PUT URL
-        const uploadUrl = await getPresignedUploadUrl(objectKey, contentType);
+        // Presigned PUT URL — the client uploads directly to R2.
+        const uploadUrl = await getPresignedUploadUrl(objectKey, finalContentType);
 
-        res.status(201).json({ materialId, uploadUrl });
+        res.status(201).json({ uploadId, uploadUrl });
     } catch (err) {
         console.error('Material upload initiate error:', err);
         res.status(500).json({ error: 'Failed to initiate upload.' });
     }
 });
 
-// ── 4. POST /materials/:materialId/confirm — confirm upload complete ──
-router.post('/materials/:materialId/confirm', requireAuth, checkPermission('uploadAttachments'), async (req, res) => {
+// ── 4. POST /materials/:uploadId/heartbeat — keep session alive ──
+//
+// Goes through Redis (no DB write per tick). Returns 204 on accepted,
+// 404 if session is missing/terminal/owned-by-different-user. Client
+// stops heartbeating on a 404.
+router.post('/materials/:uploadId/heartbeat', requireAuth, checkPermission('uploadAttachments'), async (req, res) => {
     try {
-        const materialId = parseInt(req.params.materialId);
-        const userId = res.locals.user.user_id;
-
-        const success = await confirmUpload(materialId, userId);
-        if (!success) {
-            return res.status(404).json({ error: 'Material not found or already confirmed.' });
-        }
-
+        const accepted = await heartbeat(req.params.uploadId, res.locals.user.user_id);
+        if (!accepted) return res.status(404).json({ error: 'Session not found.' });
         res.status(204).end();
     } catch (err) {
-        console.error('Material confirm error:', err);
-        res.status(500).json({ error: 'Failed to confirm upload.' });
+        console.error('Material heartbeat error:', err);
+        res.status(500).json({ error: 'Failed to heartbeat.' });
     }
 });
 
-// ── 5. GET /materials/:materialId/download — presigned download URL ──
+// ── 5. POST /materials/:uploadId/complete — finalize upload ──
+//
+// Re-stamps the R2 object's Content-Type / Cache-Control via
+// CopyObject, verifies the course still exists (410 if not, with R2
+// cleanup enqueued), and inserts the `course_materials` row. Returns
+// `{ materialId }` on success.
+router.post('/materials/:uploadId/complete', requireAuth, checkPermission('uploadAttachments'), async (req, res) => {
+    try {
+        const userId = res.locals.user.user_id;
+        const uploadId = req.params.uploadId;
+
+        const session = await getSession(uploadId);
+        if (!session || session.type !== 'attachment'
+            || session.created_by !== userId
+            || !['active', 'completing'].includes(session.status)) {
+            return res.status(404).json({ error: 'Session not found.' });
+        }
+
+        // Hold the session across the work below so a concurrent stale
+        // timer doesn't fire on us.
+        await markCompleting(uploadId);
+
+        // Course-existence safety net: if the course was deleted while
+        // the upload was in flight, drop the R2 object and tell the
+        // client.
+        const course = await courseCache.getCourseMeta(session.course_id);
+        if (!course || course.is_active !== 1) {
+            await deletionService.enqueueKey(session.object_key, {
+                source: 'orphaned_attachment',
+            });
+            // Mark completed (terminal) just so the row doesn't linger
+            // as 'completing' for the resetStaleUploads sweep.
+            await markCompleted(uploadId, null);
+            return res.status(410).json({ error: 'Course deleted.' });
+        }
+
+        // Re-stamp the object's headers from the cached content_type.
+        await applyHeaders(session.object_key, session.content_type);
+
+        // Insert the real `course_materials` row.
+        const week = req.body && typeof req.body.week === 'string' ? req.body.week : null;
+        const materialId = await createMaterialRecord(
+            session.course_id,
+            session.object_key,
+            session.original_filename,
+            session.file_size_bytes,
+            session.content_type,
+            week,
+            userId
+        );
+
+        await markCompleted(uploadId, null);
+
+        res.status(200).json({ materialId });
+    } catch (err) {
+        console.error('Material complete error:', err);
+        res.status(500).json({ error: 'Failed to complete upload.' });
+    }
+});
+
+// ── 6. POST /materials/:uploadId/abort — cancel an in-flight upload ──
+//
+// Marks the session aborted and enqueues the R2 object for deletion
+// with a 60 s buffer (in case the client's PUT lands after the abort).
+router.post('/materials/:uploadId/abort', requireAuth, checkPermission('uploadAttachments'), async (req, res) => {
+    try {
+        const userId = res.locals.user.user_id;
+        const uploadId = req.params.uploadId;
+
+        const session = await getSession(uploadId);
+        if (!session || session.type !== 'attachment' || session.created_by !== userId) {
+            return res.status(404).json({ error: 'Session not found.' });
+        }
+
+        await abortAttachmentSession(uploadId);
+        res.status(204).end();
+    } catch (err) {
+        console.error('Material abort error:', err);
+        res.status(500).json({ error: 'Failed to abort upload.' });
+    }
+});
+
+// ── 7. GET /materials/:materialId/download — presigned download URL ──
 router.get('/materials/:materialId/download', requireAuth, checkPermission('accessAttachments'), async (req, res) => {
     try {
         const user = res.locals.user;
         const materialId = parseInt(req.params.materialId);
 
         const material = await getMaterialById(materialId);
-        if (!material || material.status !== 'active') {
+        if (!material) {
             return res.status(404).json({ error: 'Material not found.' });
         }
 
@@ -170,14 +271,14 @@ router.get('/materials/:materialId/download', requireAuth, checkPermission('acce
     }
 });
 
-// ── 6. PUT /materials/:materialId — edit filename/week ──
+// ── 8. PUT /materials/:materialId — edit filename/week ──
 router.put('/materials/:materialId', requireAuth, checkPermission('uploadAttachments'), async (req, res) => {
     try {
         const materialId = parseInt(req.params.materialId);
         const { filename, week } = req.body;
 
         const material = await getMaterialById(materialId);
-        if (!material || material.status !== 'active') {
+        if (!material) {
             return res.status(404).json({ error: 'Material not found.' });
         }
 
@@ -201,7 +302,7 @@ router.put('/materials/:materialId', requireAuth, checkPermission('uploadAttachm
     }
 });
 
-// ── 7. DELETE /materials/:materialId — delete material + R2 object ──
+// ── 9. DELETE /materials/:materialId — delete material + R2 object ──
 router.delete('/materials/:materialId', requireAuth, checkPermission('deleteAttachments'), async (req, res) => {
     try {
         const materialId = parseInt(req.params.materialId);
@@ -211,35 +312,11 @@ router.delete('/materials/:materialId', requireAuth, checkPermission('deleteAtta
             return res.status(404).json({ error: 'Material not found.' });
         }
 
-        // R2 cleanup is queued for retry-capable async deletion.
         await deletionService.enqueueKey(objectKey, { source: 'material_delete' });
-
         res.status(204).end();
     } catch (err) {
         console.error('Material delete error:', err);
         res.status(500).json({ error: 'Failed to delete material.' });
-    }
-});
-
-// ── 8. POST /materials/:materialId/abort — abort stuck upload ──
-router.post('/materials/:materialId/abort', requireAuth, checkPermission('uploadAttachments'), async (req, res) => {
-    try {
-        const materialId = parseInt(req.params.materialId);
-        const userId = res.locals.user.user_id;
-
-        const objectKey = await abortMaterial(materialId, userId);
-        if (!objectKey) {
-            return res.status(404).json({ error: 'Material not found or not in uploading state.' });
-        }
-
-        // R2 cleanup is queued. If the upload never completed on R2, the
-        // delete is a no-op (treated as success by the reaper).
-        await deletionService.enqueueKey(objectKey, { source: 'material_abort' });
-
-        res.status(204).end();
-    } catch (err) {
-        console.error('Material abort error:', err);
-        res.status(500).json({ error: 'Failed to abort upload.' });
     }
 });
 

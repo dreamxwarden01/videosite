@@ -148,16 +148,18 @@ CREATE TABLE IF NOT EXISTS upload_sessions (
     week              VARCHAR(20)  DEFAULT NULL,
     lecture_date      DATE         DEFAULT NULL,
     description       TEXT         DEFAULT NULL,
-    r2_upload_id      VARCHAR(1024) NOT NULL,
+    r2_upload_id      VARCHAR(1024) DEFAULT NULL,
     object_key        VARCHAR(500) NOT NULL,
+    content_type      VARCHAR(100) DEFAULT NULL,
     original_filename VARCHAR(255) NOT NULL,
     file_size_bytes   BIGINT UNSIGNED NOT NULL,
-    total_parts       INT UNSIGNED NOT NULL,
+    total_parts       INT UNSIGNED DEFAULT NULL,
     status            ENUM('active','completing','completed','aborted') NOT NULL DEFAULT 'active',
     last_heartbeat    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at      DATETIME     DEFAULT NULL,
     created_by        INT UNSIGNED NOT NULL,
+    type              ENUM('video','attachment') NOT NULL DEFAULT 'video',
     INDEX idx_video_active (video_id, status),
     INDEX idx_heartbeat (status, last_heartbeat),
     FOREIGN KEY (course_id) REFERENCES courses(course_id) ON DELETE CASCADE,
@@ -323,14 +325,12 @@ CREATE TABLE IF NOT EXISTS course_materials (
     file_size         BIGINT UNSIGNED NOT NULL DEFAULT 0,
     content_type      VARCHAR(100) NOT NULL DEFAULT 'application/octet-stream',
     week              VARCHAR(20) DEFAULT NULL,
-    status            ENUM('uploading','active','aborted') NOT NULL DEFAULT 'uploading',
     uploaded_by       INT UNSIGNED NOT NULL,
     created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (course_id) REFERENCES courses(course_id) ON DELETE CASCADE,
     FOREIGN KEY (uploaded_by) REFERENCES users(user_id) ON DELETE CASCADE,
-    INDEX idx_course_materials_course (course_id),
-    INDEX idx_course_materials_status (status)
+    INDEX idx_course_materials_course (course_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS pending_deletes (

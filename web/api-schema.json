@@ -815,10 +815,10 @@
       }
     },
 
-    "/api/updatewatch": {
+    "/api/watch-progress": {
       "post": {
         "tags": ["videos"],
-        "operationId": "updatewatch",
+        "operationId": "watch_progress",
         "summary": "Watch-progress beacon. Coalesced server-side; spam-safe.",
         "security": [{ "sessionCookie": [] }],
         "requestBody": {
@@ -962,13 +962,29 @@
         "operationId": "materials_upload",
         "security": [{ "sessionCookie": [] }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
-        "responses": { "200": { "description": "Presigned PUT + materialId." } }
+        "responses": { "200": { "description": "Presigned PUT + uploadId." } }
       }
     },
 
-    "/api/materials/{materialId}/confirm": {
-      "parameters": [{ "in": "path", "name": "materialId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
-      "post": { "tags": ["materials"], "operationId": "materials_confirm", "security": [{ "sessionCookie": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    "/api/materials/{uploadId}/heartbeat": {
+      "parameters": [{ "in": "path", "name": "uploadId", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 128 } }],
+      "post": { "tags": ["materials"], "operationId": "materials_heartbeat", "security": [{ "sessionCookie": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/materials/{uploadId}/complete": {
+      "parameters": [{ "in": "path", "name": "uploadId", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 128 } }],
+      "post": {
+        "tags": ["materials"],
+        "operationId": "materials_complete",
+        "security": [{ "sessionCookie": [] }],
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "Created materialId or 410 Gone if course was deleted." } }
+      }
+    },
+
+    "/api/materials/{uploadId}/abort": {
+      "parameters": [{ "in": "path", "name": "uploadId", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 128 } }],
+      "post": { "tags": ["materials"], "operationId": "materials_abort", "security": [{ "sessionCookie": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
     },
 
     "/api/materials/{materialId}/download": {
@@ -986,11 +1002,6 @@
         "responses": { "200": { "description": "Updated." } }
       },
       "delete": { "tags": ["materials"], "operationId": "materials_delete", "security": [{ "sessionCookie": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
-    },
-
-    "/api/materials/{materialId}/abort": {
-      "parameters": [{ "in": "path", "name": "materialId", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
-      "post": { "tags": ["materials"], "operationId": "materials_abort", "security": [{ "sessionCookie": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
     },
 
     "/api/mfa/methods": {

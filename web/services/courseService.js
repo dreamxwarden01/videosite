@@ -65,6 +65,7 @@ async function deleteCourse(courseId) {
     const { clearStaleTimer } = require('./processingService');
     const { abortMultipartUpload } = require('./uploadService');
     const deletionService = require('./deletionService');
+    const uploadHeartbeatCache = require('./cache/uploadHeartbeatCache');
 
     // 1. Get all videos (need hashed IDs, source key, and status for R2 cleanup planning)
     const [videos] = await pool.execute(
@@ -80,19 +81,35 @@ async function deleteCourse(courseId) {
         [courseId]
     );
 
-    // 2b. Get in-flight upload sessions for this course's videos
+    // 2b. Get in-flight upload sessions (both videos and attachments)
     const [inflightSessions] = await pool.execute(
-        `SELECT object_key, r2_upload_id FROM upload_sessions
+        `SELECT upload_id, type, object_key, r2_upload_id FROM upload_sessions
          WHERE course_id = ? AND status IN ('active', 'completing')`,
         [courseId]
     );
 
-    // 3. Abort in-flight multipart uploads (fire-and-forget). R2's bucket
-    //    lifecycle covers anything that fails here within 24 hours.
+    // 3. Cancel each in-flight session. Videos use S3 AbortMultipartUpload
+    //    (fire-and-forget; R2's 24h lifecycle covers stragglers).
+    //    Attachments are single-PUT — enqueue an R2 key delete with a
+    //    60s buffer (same "wait for in-flight PUT to settle" idea as
+    //    the stale-detection path). The FK cascade below will delete
+    //    the upload_sessions rows themselves.
+    const ATTACHMENT_BUFFER_MS = 60 * 1000;
     for (const session of inflightSessions) {
-        abortMultipartUpload(session.object_key, session.r2_upload_id).catch(err => {
-            console.error(`R2 multipart abort failed for upload ${session.r2_upload_id}:`, err.message);
-        });
+        if (session.type === 'video') {
+            abortMultipartUpload(session.object_key, session.r2_upload_id).catch(err => {
+                console.error(`R2 multipart abort failed for upload ${session.r2_upload_id}:`, err.message);
+            });
+        } else {
+            await deletionService.enqueueKey(session.object_key, {
+                source: 'course_delete',
+                execute_at: new Date(Date.now() + ATTACHMENT_BUFFER_MS),
+            });
+        }
+        // Drop Redis cache for the upload so a stale heartbeat from the
+        // client gets a 404 immediately (the 24h TTL is a safety net,
+        // not the primary cleanup path).
+        await uploadHeartbeatCache.clearHeartbeat(session.upload_id);
     }
 
     // 4. Clear stale timers + heartbeat cache so workers' next status ping

@@ -110,6 +110,7 @@ router.post('/upload/create', requireAuth, checkPermission('uploadVideo'), async
 
         // Create session record
         await createSession({
+            type: 'video',
             uploadId,
             videoId: null,
             courseId,
@@ -175,6 +176,7 @@ router.post('/upload/replace', requireAuth, checkPermission('uploadVideo'), asyn
 
         // Create session record (store old source key so abort can skip cleanup)
         await createSession({
+            type: 'video',
             uploadId,
             videoId,
             courseId: video.course_id,
