@@ -17,7 +17,7 @@ import {
 
 const links = [
   { to: '/profile', label: 'Profile', Icon: ProfileIcon, permission: null },
-  { to: '/admin/materials', label: 'Materials', Icon: MaterialsIcon, permission: 'accessAttachments' },
+  { to: '/materials', label: 'Materials', Icon: MaterialsIcon, permission: 'accessAttachments' },
   { to: '/admin/videos', label: 'Videos', Icon: VideosIcon, permissionAny: ['uploadVideo', 'changeVideo'] },
   { to: '/admin/courses', label: 'Courses', Icon: CoursesIcon, permission: 'manageCourse' },
   { to: '/admin/enrollment', label: 'Enrollment', Icon: EnrollmentIcon, permission: 'manageEnrolment' },

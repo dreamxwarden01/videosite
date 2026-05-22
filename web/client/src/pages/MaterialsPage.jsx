@@ -76,7 +76,7 @@ export default function MaterialsPage() {
                 <tr
                   key={c.course_id}
                   className="clickable-row"
-                  onClick={() => navigate(`/admin/materials/${c.course_id}`)}
+                  onClick={() => navigate(`/materials/${c.course_id}`)}
                 >
                   <td>{c.course_name}</td>
                   <td>{c.material_count || 0}</td>

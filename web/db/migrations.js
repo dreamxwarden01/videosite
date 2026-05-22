@@ -811,6 +811,25 @@ async function runMigrations() {
                           ADD COLUMN use_enhanced_profiles TINYINT(1) NOT NULL DEFAULT 0 AFTER use_custom_profiles
                     `);
                 }
+            },
+            {
+                id: '034_toggle_own_mfa',
+                up: async () => {
+                    // toggleOwnMfa gates the per-account MFA enable/disable
+                    // toggle on the profile page. Granted to every existing
+                    // role so current behavior (anyone can toggle their own
+                    // MFA) is preserved; deny it per-user (or per-role) to
+                    // lock the toggle, e.g. on shared demo accounts.
+                    //
+                    // Independent of requireMFA — see routes/api/mfa.js: the
+                    // enable endpoint accepts toggleOwnMfa OR requireMFA so a
+                    // require-MFA user can still complete forced enrollment
+                    // even without the toggle permission.
+                    await pool.execute(`
+                        INSERT IGNORE INTO role_permissions (role_id, permission_key, granted)
+                        SELECT role_id, 'toggleOwnMfa', 1 FROM roles
+                    `);
+                }
             }
         ];
 

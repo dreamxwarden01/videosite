@@ -11,7 +11,9 @@ export default function AppShell() {
   const location = useLocation();
   const { user } = useAuth();
 
-  const hasSidebar = location.pathname.startsWith('/admin') || location.pathname === '/profile';
+  const hasSidebar = location.pathname.startsWith('/admin')
+    || location.pathname.startsWith('/materials')
+    || location.pathname === '/profile';
   const isWatchPage = location.pathname.startsWith('/watch/');
 
   // Banner only on the pages where the playback restriction is user-facing:

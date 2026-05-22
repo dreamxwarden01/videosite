@@ -503,6 +503,7 @@ router.get('/profile/security', requireAuth, async (req, res) => {
                 created_at: m.created_at,
             })),
             requireMFA: !!user.permissions.requireMFA,
+            toggleOwnMfa: !!user.permissions.toggleOwnMfa,
             hasEmail,
             maskedEmail: hasEmail ? maskEmail(userRow.email) : null,
             passwordChangedAt: userRow ? userRow.password_changed_at : null,

@@ -60,11 +60,13 @@ export default function App() {
                       Navigate so existing bookmarks land on the right tab. */}
                   <Route path="/profile/security/mfa" element={<Navigate to="/profile?tab=mfa" replace />} />
 
+                  {/* Course materials — gated by accessAttachments, not admin-only */}
+                  <Route path="/materials" element={<MaterialsPage />} />
+                  <Route path="/materials/:courseId" element={<MaterialListPage />} />
+
                   {/* Admin */}
                   <Route path="/admin/courses" element={<CoursesPage />} />
                   <Route path="/admin/courses/:courseId/edit" element={<CourseEditPage />} />
-                  <Route path="/admin/materials" element={<MaterialsPage />} />
-                  <Route path="/admin/materials/:courseId" element={<MaterialListPage />} />
                   <Route path="/admin/videos" element={<VideoManagementPage />} />
                   <Route path="/admin/videos/:courseId" element={<VideoListPage />} />
                   <Route path="/admin/users" element={<UsersPage />} />

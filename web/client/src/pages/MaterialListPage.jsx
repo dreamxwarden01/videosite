@@ -108,7 +108,7 @@ export default function MaterialListPage() {
       <div className="card" style={{ padding: '12px 16px', marginBottom: '16px' }}>
         <div className="flex-between">
           <div className="flex gap-2" style={{ alignItems: 'center' }}>
-            <Link to="/admin/materials" className="btn btn-secondary btn-sm">Back</Link>
+            <Link to="/materials" className="btn btn-secondary btn-sm">Back</Link>
             <h2 style={{ margin: 0 }}>{courseName}</h2>
           </div>
           {perms.uploadAttachments && (

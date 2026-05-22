@@ -114,6 +114,22 @@ async function invalidateRole(roleId) {
     await getClient().del(roleKey(roleId));
 }
 
+// Drop every cached role:perms:* entry. Called once at boot — a deploy that
+// adds a key to ALL_PERMISSIONS leaves pre-deploy role caches without that
+// key (it would read as undefined → false for up to the 24h TTL). Flushing
+// at startup forces a clean rebuild from DB on the next request. User caches
+// (user:perms:*) store only the role pointer + overrides, not resolved
+// permissions, so they don't need flushing here.
+async function invalidateAllRoles() {
+    const redis = getClient();
+    let cursor = '0';
+    do {
+        const [next, batch] = await redis.scan(cursor, 'MATCH', 'role:perms:*', 'COUNT', 100);
+        cursor = next;
+        if (batch.length > 0) await redis.del(...batch);
+    } while (cursor !== '0');
+}
+
 async function invalidateUser(userId) {
     await getClient().del(userKey(userId));
 }
@@ -129,6 +145,7 @@ module.exports = {
     getRolePerms,
     getUserPerms,
     invalidateRole,
+    invalidateAllRoles,
     invalidateUser,
     invalidateUsers,
 };

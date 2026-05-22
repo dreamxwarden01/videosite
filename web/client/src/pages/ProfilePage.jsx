@@ -456,9 +456,12 @@ export default function ProfilePage() {
   if (loading) return <LoadingSpinner />;
   if (!profile) return <p className="text-muted">Failed to load profile.</p>;
 
+  // The "Your Password" tab is always shown — when the account lacks
+  // changeOwnPassword the fields render disabled with an explanatory notice,
+  // rather than the tab vanishing (which reads as a broken/incomplete UI).
   const sidebarItems = [
     { key: 'account', label: 'Account' },
-    ...(canChangePassword ? [{ key: 'security', label: 'Your Password' }] : []),
+    { key: 'security', label: 'Your Password' },
     { key: 'mfa', label: 'Multi-Factor Authentication' },
     { key: 'sessions', label: 'Active Sessions' },
   ];
@@ -580,11 +583,25 @@ export default function ProfilePage() {
             )}
 
             {/* ===== SIGN IN & SECURITY ===== */}
-            {activeTab === 'security' && canChangePassword && (
+            {activeTab === 'security' && (
               <div className="course-edit-content-scroll">
                 <div style={{ maxWidth: '600px' }}>
                   <h3 style={{ marginTop: 0, marginBottom: '4px' }}>Your Password</h3>
                   <p className="text-muted text-sm" style={{ marginBottom: '20px' }}>{formatPasswordDate()}</p>
+
+                  {!canChangePassword && (
+                    <div style={{
+                      padding: '10px 12px',
+                      marginBottom: '20px',
+                      borderRadius: '6px',
+                      backgroundColor: '#fef3c7',
+                      border: '1px solid #fcd34d',
+                      color: '#92400e',
+                      fontSize: '13px',
+                    }}>
+                      Password changes are disabled on this account.
+                    </div>
+                  )}
 
                   {/* Hidden username for password managers — helps autofill
                       associate the suggested new password with this account
@@ -608,6 +625,7 @@ export default function ProfilePage() {
                       autoComplete="new-password"
                       className={`form-control${pwTouched.newPw && newPwError ? ' input-error' : ''}`}
                       value={newPassword}
+                      disabled={!canChangePassword}
                       onChange={(e) => { const v = e.target.value.replace(/\s/g, ''); setNewPassword(v); }}
                       onBlur={() => setPwTouched(prev => ({ ...prev, newPw: true }))}
                     />
@@ -622,6 +640,7 @@ export default function ProfilePage() {
                       autoComplete="new-password"
                       className={`form-control${pwTouched.confirm && pwConfirmError ? ' input-error' : ''}`}
                       value={confirmPassword}
+                      disabled={!canChangePassword}
                       onChange={(e) => setConfirmPassword(e.target.value.replace(/\s/g, ''))}
                       onBlur={() => setPwTouched(prev => ({ ...prev, confirm: true }))}
                     />
@@ -629,10 +648,11 @@ export default function ProfilePage() {
                   </div>
 
                   <div className="form-group" style={{ marginBottom: '20px' }}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontWeight: 400 }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: canChangePassword ? 'pointer' : 'not-allowed', fontWeight: 400 }}>
                       <input
                         type="checkbox"
                         checked={signOutOthers}
+                        disabled={!canChangePassword}
                         onChange={(e) => setSignOutOthers(e.target.checked)}
                         style={{ margin: 0 }}
                       />
@@ -646,7 +666,7 @@ export default function ProfilePage() {
                   <button
                     type="button"
                     className="btn btn-primary"
-                    disabled={!pwInlineValid || changingPw}
+                    disabled={!canChangePassword || !pwInlineValid || changingPw}
                     onClick={openPwModal}
                   >
                     {changingPw ? 'Changing...' : 'Change Password'}

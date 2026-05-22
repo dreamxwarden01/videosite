@@ -113,12 +113,12 @@ const spaPaths = [
     '/profile/security/mfa',  // legacy redirect target
     '/course/:courseId',
     '/watch/:videoId',
+    '/materials',             // course materials — gated by accessAttachments, not admin-only
+    '/materials/:courseId',
 
     // Admin
     '/admin/courses',
     '/admin/courses/:courseId/edit',
-    '/admin/materials',
-    '/admin/materials/:courseId',
     '/admin/videos',
     '/admin/videos/:courseId',
     '/admin/users',
@@ -212,6 +212,16 @@ const server = app.listen(PORT, async () => {
         try {
             const redisService = require('./services/redis');
             await redisService.connect();
+
+            // Flush cached role permissions once. A deploy that adds a key to
+            // ALL_PERMISSIONS leaves pre-deploy role:perms:* entries missing
+            // that key (reads as false) until their 24h TTL expires; flushing
+            // here forces a clean rebuild from DB.
+            try {
+                await require('./services/cache/permissionCache').invalidateAllRoles();
+            } catch (err) {
+                console.error('Role permission cache flush failed:', err.message);
+            }
 
             // Start the periodic write-coalescing flusher (drains dirty:session:user
             // every 15 min into DB). Phase 5 will plug watch + transcode into the

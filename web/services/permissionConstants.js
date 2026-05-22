@@ -5,6 +5,7 @@
 const ALL_PERMISSIONS = [
     'allowPlayback',
     'changeOwnPassword',
+    'toggleOwnMfa',
     'allCourseAccess',
     'manageCourse',
     'addCourse',

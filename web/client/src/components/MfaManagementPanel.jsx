@@ -28,6 +28,10 @@ export default function MfaManagementPanel({ onChange }) {
   const [hasEmail, setHasEmail] = useState(false);
   const [maskedEmail, setMaskedEmail] = useState('');
   const [requireMFA, setRequireMFA] = useState(false);
+  // toggleOwnMfa: whether this account may operate the enable/disable toggle.
+  // Defaults false so a failed /profile/security fetch leaves the toggle
+  // locked rather than wrongly operable.
+  const [toggleOwnMfa, setToggleOwnMfa] = useState(false);
   const [toggling, setToggling] = useState(false);
 
   // Authenticator setup
@@ -71,6 +75,7 @@ export default function MfaManagementPanel({ onChange }) {
       if (securityRes.ok && securityRes.data) {
         setHasEmail(securityRes.data.hasEmail);
         setRequireMFA(securityRes.data.requireMFA);
+        setToggleOwnMfa(!!securityRes.data.toggleOwnMfa);
         if (securityRes.data.maskedEmail) {
           setMaskedEmail(securityRes.data.maskedEmail);
         }
@@ -404,6 +409,12 @@ export default function MfaManagementPanel({ onChange }) {
 
   const canToggle = mfaEnabled || hasEmail;
   const forceEnabled = requireMFA && mfaEnabled;
+  // The toggle is operable when the account may toggle MFA (toggleOwnMfa),
+  // or when a requireMFA user still needs to enable it (forced enrollment) —
+  // mirrors the server gate on /api/mfa/enable. forceEnabled still wins for
+  // the disable direction. canToggle covers the "needs an email first" case.
+  const mfaToggleAllowed = canToggle && !forceEnabled
+    && (toggleOwnMfa || (requireMFA && !mfaEnabled));
 
   return (
     <>
@@ -419,8 +430,20 @@ export default function MfaManagementPanel({ onChange }) {
               {!hasEmail && !mfaEnabled && (
                 <span className="text-muted text-sm">Set an email address on the Account tab before enabling MFA.</span>
               )}
+              {!toggleOwnMfa && !requireMFA && (
+                <span style={{
+                  display: 'inline-block',
+                  marginTop: '4px',
+                  padding: '3px 10px',
+                  borderRadius: '10px',
+                  fontSize: '12px',
+                  fontWeight: 600,
+                  color: '#92400e',
+                  backgroundColor: '#fef3c7',
+                }}>MFA toggle disabled on this account</span>
+              )}
             </div>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '10px', flexShrink: 0, cursor: canToggle && !forceEnabled ? 'pointer' : 'not-allowed' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '10px', flexShrink: 0, cursor: mfaToggleAllowed ? 'pointer' : 'not-allowed' }}>
               <span style={{ fontSize: '14px', fontWeight: 500 }}>
                 {mfaEnabled ? 'Enabled' : 'Disabled'}
               </span>
@@ -428,9 +451,9 @@ export default function MfaManagementPanel({ onChange }) {
                 role="switch"
                 aria-checked={mfaEnabled}
                 tabIndex={0}
-                onClick={canToggle && !forceEnabled && !toggling ? handleToggleMfa : undefined}
+                onClick={mfaToggleAllowed && !toggling ? handleToggleMfa : undefined}
                 onKeyDown={(e) => {
-                  if ((e.key === 'Enter' || e.key === ' ') && canToggle && !forceEnabled && !toggling) {
+                  if ((e.key === 'Enter' || e.key === ' ') && mfaToggleAllowed && !toggling) {
                     e.preventDefault();
                     handleToggleMfa();
                   }
@@ -442,7 +465,7 @@ export default function MfaManagementPanel({ onChange }) {
                   backgroundColor: mfaEnabled ? '#16a34a' : '#d1d5db',
                   position: 'relative',
                   transition: 'background-color 0.2s',
-                  opacity: (canToggle && !forceEnabled) ? 1 : 0.5,
+                  opacity: mfaToggleAllowed ? 1 : 0.5,
                 }}
               >
                 <div style={{

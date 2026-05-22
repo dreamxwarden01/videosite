@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { requireAuth } = require('../../middleware/auth');
+const { checkPermission, checkAnyPermission } = require('../../middleware/permissions');
 const { getPool } = require('../../config/database');
 const mfaService = require('../../services/mfaService');
 
@@ -373,8 +374,13 @@ router.delete('/mfa/methods/:methodId', async (req, res) => {
     }
 });
 
-// POST /api/mfa/enable — enable MFA for the user
-router.post('/mfa/enable', async (req, res) => {
+// POST /api/mfa/enable — enable MFA for the user.
+//
+// Gated on toggleOwnMfa OR requireMFA: toggleOwnMfa is the discretionary
+// "user controls their own MFA" permission, but a requireMFA user must also
+// be able to reach this endpoint to complete forced enrollment even if they
+// lack toggleOwnMfa — so requireMFA alone is sufficient here.
+router.post('/mfa/enable', checkAnyPermission('toggleOwnMfa', 'requireMFA'), async (req, res) => {
     try {
         const user = res.locals.user;
         const pool = getPool();
@@ -435,8 +441,12 @@ router.post('/mfa/enable', async (req, res) => {
     }
 });
 
-// POST /api/mfa/disable — disable MFA for the user
-router.post('/mfa/disable', async (req, res) => {
+// POST /api/mfa/disable — disable MFA for the user.
+//
+// Gated on toggleOwnMfa. requireMFA users would be refused by
+// disableUserMfa() regardless; the permission gate just makes the UI's
+// greyed toggle authoritative server-side for accounts without it.
+router.post('/mfa/disable', checkPermission('toggleOwnMfa'), async (req, res) => {
     try {
         const user = res.locals.user;
         const pool = getPool();
