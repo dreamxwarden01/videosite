@@ -135,64 +135,6 @@
             <div class="field-err" data-for="siteHostname" style="display: none; color: #dc3545; font-size: 13px; margin-top: 4px;"></div>
           </div>
 
-          <h2 style="margin: 24px 0 12px; font-size: 16px;">Email (SMTP) <span style="color: #9ca3af; font-weight: 400; font-size: 13px;">— optional, configure later</span></h2>
-          <p style="color: #9ca3af; font-size: 13px; margin-bottom: 12px;">Required for email MFA, password reset, and invitation emails.</p>
-          <div style="display: flex; gap: 8px;">
-            <div style="flex: 3;">
-              <label for="smtpHost" style="display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500;">SMTP Host</label>
-              <input type="text" id="smtpHost" name="smtpHost" placeholder="smtp.server.com" data-nospace
-                style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; box-sizing: border-box;">
-              <div class="field-err" data-for="smtpHost" style="display: none; color: #dc3545; font-size: 13px; margin-top: 4px;"></div>
-            </div>
-            <div style="flex: 1;">
-              <label for="smtpPort" style="display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500;">Port</label>
-              <input type="text" id="smtpPort" name="smtpPort" value="465" data-nospace
-                style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; box-sizing: border-box;">
-              <div class="field-err" data-for="smtpPort" style="display: none; color: #dc3545; font-size: 13px; margin-top: 4px;"></div>
-            </div>
-          </div>
-          <div style="display: flex; gap: 8px; margin-top: 12px;">
-            <div style="flex: 1;">
-              <label for="smtpUser" style="display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500;">Username</label>
-              <input type="text" id="smtpUser" name="smtpUser" data-nospace
-                style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; box-sizing: border-box;">
-              <div class="field-err" data-for="smtpUser" style="display: none; color: #dc3545; font-size: 13px; margin-top: 4px;"></div>
-            </div>
-            <div style="flex: 1;">
-              <label for="smtpPass" style="display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500;">Password</label>
-              <input type="password" id="smtpPass" name="smtpPass" data-nospace
-                style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; box-sizing: border-box;">
-              <div class="field-err" data-for="smtpPass" style="display: none; color: #dc3545; font-size: 13px; margin-top: 4px;"></div>
-            </div>
-          </div>
-          <div style="margin-top: 12px;">
-            <label for="smtpSecure" style="display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500;">Use SSL/TLS</label>
-            <select id="smtpSecure" name="smtpSecure"
-              style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; box-sizing: border-box; background: #fff;">
-              <option value="true">Yes (port 465)</option>
-              <option value="false">No (port 587 / STARTTLS)</option>
-            </select>
-          </div>
-          <div style="margin-top: 12px;">
-            <label for="smtpFromName" style="display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500;">From Name</label>
-            <input type="text" id="smtpFromName" name="smtpFromName" placeholder="My App"
-              style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; box-sizing: border-box;">
-          </div>
-          <div style="display: flex; gap: 8px; margin-top: 12px;">
-            <div style="flex: 1;">
-              <label for="smtpFromAddress" style="display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500;">From Address</label>
-              <input type="text" id="smtpFromAddress" name="smtpFromAddress" placeholder="noreply@yourdomain.com" data-nospace
-                style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; box-sizing: border-box;">
-              <div class="field-err" data-for="smtpFromAddress" style="display: none; color: #dc3545; font-size: 13px; margin-top: 4px;"></div>
-            </div>
-            <div style="flex: 1;">
-              <label for="smtpReplyTo" style="display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500;">Reply-To Address</label>
-              <input type="text" id="smtpReplyTo" name="smtpReplyTo" placeholder="support@yourdomain.com" data-nospace
-                style="width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; box-sizing: border-box;">
-              <div class="field-err" data-for="smtpReplyTo" style="display: none; color: #dc3545; font-size: 13px; margin-top: 4px;"></div>
-            </div>
-          </div>
-
           <h2 style="margin: 24px 0 12px; font-size: 16px;">Cloudflare Turnstile <span style="color: #9ca3af; font-weight: 400; font-size: 13px;">— optional, configure later</span></h2>
           <p style="color: #9ca3af; font-size: 13px; margin-bottom: 12px;">Bot protection for login and registration pages.</p>
           <div style="margin-top: 12px;">
@@ -259,7 +201,6 @@
     });
   }
   stripToHostname(document.getElementById('siteHostname'));
-  stripToHostname(document.getElementById('smtpHost'));
   stripToHostname(document.getElementById('r2PublicDomain'));
 
   // Auto-extract bucket name from endpoint URL on blur

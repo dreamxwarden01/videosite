@@ -18,7 +18,7 @@
     "$schema": "node_modules/wrangler/config-schema.json",
     "name": "turnstile-gate",
     "main": "src/index.js",
-    "compatibility_date": "2025-04-01",
+    "compatibility_date": "2026-05-14",
     "workers_dev": false,
     "routes": [
         { "pattern": "stream.dreamxwarden.ca/api/login",                 "zone_name": "dreamxwarden.ca" },

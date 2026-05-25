@@ -57,8 +57,9 @@ async function setSetting(key, value) {
  * @returns {string} 64-char hex secret key
  */
 async function generateSecretKey() {
+    const { setSecretSetting } = require('./settingsEncryption');
     const secret = crypto.randomBytes(32).toString('hex');
-    await setSetting('hmac_secret_key', secret);
+    await setSecretSetting('hmac_secret_key', secret);
     return secret;
 }
 
@@ -77,7 +78,7 @@ async function generateSecretKey() {
  * @returns {boolean}
  */
 async function isHmacEnabled() {
-    const val = await getSetting('hmac_enabled');
+    const val = await getSetting('video_hmac_enabled');
     if (val === null) {
         // Legacy: setting doesn't exist yet — fall back to key existence
         return !!(await getSetting('hmac_secret_key'));
@@ -89,7 +90,10 @@ async function generateToken(path) {
     const enabled = await isHmacEnabled();
     if (!enabled) return null;
 
-    const secret = await getSetting('hmac_secret_key');
+    // Decrypts transparently if the row was encrypted by migration 035.
+    // Untagged plaintext rows still work (back-compat for first-deploy).
+    const { getSecretSetting } = require('./settingsEncryption');
+    const secret = await getSecretSetting('hmac_secret_key');
     if (!secret) return null;
 
     const issuedAt = Math.floor(Date.now() / 1000);
@@ -115,7 +119,7 @@ async function isHmacConfigured() {
  * @returns {number}
  */
 async function getTokenValiditySeconds() {
-    const val = await getSetting('hmac_token_validity');
+    const val = await getSetting('video_hmac_token_validity');
     const parsed = parseInt(val, 10);
     return parsed > 0 ? parsed : DEFAULT_TOKEN_VALIDITY_SECONDS;
 }

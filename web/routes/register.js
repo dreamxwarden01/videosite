@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { verifyTurnstileToken } = require('../services/turnstileService');
+const { mapEmailErrorHttp } = require('../services/emailService');
 const {
     checkRegistrationEnabled,
     checkInvitationRequired,
@@ -109,6 +110,10 @@ router.post('/api/register/start', async (req, res) => {
         );
 
         if (!result.success) {
+            const httpErr = mapEmailErrorHttp(result);
+            if (httpErr) {
+                return res.status(httpErr.status).json({ success: false, message: httpErr.body.error });
+            }
             return res.status(503).json({
                 success: false,
                 message: result.message || 'Failed to send verification email. Please try again later.'

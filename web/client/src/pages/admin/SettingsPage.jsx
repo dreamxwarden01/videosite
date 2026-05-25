@@ -41,7 +41,6 @@ export default function SettingsPage() {
   const [roles, setRoles] = useState([]);
 
   // R2 public domain (read-only, from env, used by HMAC WAF rule)
-  const [r2PublicDomain, setR2PublicDomain] = useState('');
 
   // HMAC
   const [hmacEnabled, setHmacEnabled] = useState(false);
@@ -52,6 +51,26 @@ export default function SettingsPage() {
   const [hmacKeyCopyLabel, setHmacKeyCopyLabel] = useState('Copy');
   const [hmacRuleCopyLabel, setHmacRuleCopyLabel] = useState('click to copy');
   const [hmacInitMode, setHmacInitMode] = useState(false);
+
+  // Email Sending (sister section under the same Cloudflare card). The
+  // email-sender Worker holds the matching secret in EMAIL_HMAC_SECRET.
+  const [emailHmacSecretConfigured, setEmailHmacSecretConfigured] = useState(false);
+  const [generatedEmailKey, setGeneratedEmailKey] = useState(null);
+  const [emailKeyCopyLabel, setEmailKeyCopyLabel] = useState('Copy');
+
+  // CF Access service credentials for email-sender. The toggle attaches
+  // Cf-Access-Client-Id / -Client-Secret headers to outbound sends so the
+  // worker route bypasses Super Bot Fight Mode via cf.access.authenticated.
+  const [emailServiceCredentialsEnabled, setEmailServiceCredentialsEnabled] = useState(false);
+  const [emailServiceClientId, setEmailServiceClientId] = useState(null);
+  const [emailAccessSecretConfigured, setEmailAccessSecretConfigured] = useState(false);
+  // null | 'initial' (first enable, asks for id+secret) | 'rotate'.
+  // Both modals use content-overlay (z-index 900) so a mid-submit MFA
+  // challenge (mfa-challenge-overlay z-index 1100) stacks on top.
+  const [emailServiceModal, setEmailServiceModal] = useState(null);
+  const [emailServiceClientIdInput, setEmailServiceClientIdInput] = useState('');
+  const [emailServiceSecretInput, setEmailServiceSecretInput] = useState('');
+  const [emailServiceSaving, setEmailServiceSaving] = useState(false);
 
   // Turnstile-at-Worker (sister section under the same Cloudflare card)
   const [workerTurnstileEnabled, setWorkerTurnstileEnabled] = useState(false);
@@ -105,11 +124,18 @@ export default function SettingsPage() {
         setRequireInvitationCode(s.require_invitation_code !== 'false');
         setRegistrationTokenValidity(s.emailed_link_validity_minutes || '30');
         setRegistrationDefaultRole(s.registration_default_role || '2');
-        setR2PublicDomain(data.r2PublicDomain || '');
-        setHmacHasKey(data.hmacKeyConfigured || false);
-        setHmacEnabled(s.hmac_enabled !== undefined ? s.hmac_enabled === 'true' : (data.hmacKeyConfigured || false));
-        setHmacTokenValidity(s.hmac_token_validity || '600');
-        setWorkerTurnstileEnabled(s.cloudflare_turnstile_worker_gate === 'true');
+        // Everything Cloudflare-related now lives under data.cloudflare —
+        // the server parses booleans + strips raw row keys before sending,
+        // so the client reads them directly without `=== 'true'` checks.
+        const cf = data.cloudflare || {};
+        setHmacHasKey(cf.video_hmac_secret_configured || false);
+        setEmailHmacSecretConfigured(cf.email_hmac_secret_configured || false);
+        setEmailAccessSecretConfigured(cf.email_access_secret_configured || false);
+        setEmailServiceCredentialsEnabled(!!cf.email_with_service_credentials);
+        setEmailServiceClientId(cf.email_access_client_id || null);
+        setHmacEnabled(!!cf.video_hmac_enabled);
+        setHmacTokenValidity(cf.video_hmac_token_validity || '600');
+        setWorkerTurnstileEnabled(!!cf.turnstile_worker_gate);
         setWorkerKeys(data.workerKeys || []);
         setRoles(data.roles || []);
         originalValues.current = {
@@ -338,7 +364,7 @@ export default function SettingsPage() {
       if (!await confirm('You must disable the related HMAC validation rule from your Cloudflare WAF rules before turning this off, otherwise all videos will be inaccessible. Continue?')) return;
     }
     try {
-      const { ok, data } = await mfaFetch('/api/admin/settings/hmac/toggle', { method: 'PUT', body: { hmac_enabled: newEnabled } });
+      const { ok, data } = await mfaFetch('/api/admin/settings/video-hmac/toggle', { method: 'PUT', body: { video_hmac_enabled: newEnabled } });
       if (ok) {
         setHmacEnabled(newEnabled);
       } else {
@@ -355,7 +381,7 @@ export default function SettingsPage() {
       if (!await confirm('Generate a new HMAC secret key? This will invalidate all existing playback tokens.')) return;
     }
     try {
-      const { ok, data } = await mfaFetch('/api/admin/settings/hmac/generate', { method: 'POST' });
+      const { ok, data } = await mfaFetch('/api/admin/settings/video-hmac/generate', { method: 'POST' });
       if (ok && data?.secret) {
         setGeneratedHmacKey(data.secret);
         setHmacKeyCopyLabel('Copy');
@@ -376,7 +402,7 @@ export default function SettingsPage() {
     if (hmacInitMode) {
       // Auto-enable after first initialization
       try {
-        const { ok, data } = await mfaFetch('/api/admin/settings/hmac/toggle', { method: 'PUT', body: { hmac_enabled: true } });
+        const { ok, data } = await mfaFetch('/api/admin/settings/video-hmac/toggle', { method: 'PUT', body: { video_hmac_enabled: true } });
         if (ok) {
           setHmacEnabled(true);
         } else {
@@ -398,8 +424,136 @@ export default function SettingsPage() {
     }).catch(() => {});
   };
 
+  // Email-sender secret generate. Mirrors the HMAC flow but simpler — no
+  // auto-enable step (presence of the secret is the only enable signal)
+  // and no WAF rule to display.
+  const doGenerateEmail = async () => {
+    if (emailHmacSecretConfigured) {
+      if (!await confirm('Generate a new email-sender secret? The email-sender Worker must be updated with the new secret (wrangler secret put EMAIL_HMAC_SECRET) before outbound email will work again.')) return;
+    }
+    try {
+      const { ok, data } = await mfaFetch('/api/admin/settings/email/generate', { method: 'POST' });
+      if (ok && data?.secret) {
+        setGeneratedEmailKey(data.secret);
+        setEmailKeyCopyLabel('Copy');
+        setEmailKeyConfigured(true);
+      } else {
+        showToast(data?.error || 'Failed to generate email secret.');
+      }
+    } catch (err) {
+      showToast(err.message);
+    }
+  };
+
+  const handleCloseEmailModal = () => {
+    setGeneratedEmailKey(null);
+  };
+
+  const handleCopyEmailKey = () => {
+    if (!generatedEmailKey) return;
+    navigator.clipboard.writeText(generatedEmailKey).then(() => {
+      setEmailKeyCopyLabel('Copied!');
+      setTimeout(() => setEmailKeyCopyLabel('Copy'), 1500);
+    }).catch(() => {});
+  };
+
+  // Strip a leading `CF-Access-Client-Id:` / `CF-Access-Client-Secret:` header
+  // prefix (case-insensitive, any whitespace around the colon) and trim
+  // surrounding whitespace. Cloudflare's dashboard displays the values as
+  // header lines and "copy" puts the whole line on the clipboard, so a paste
+  // of `CF-Access-Client-Secret: abc...` should become `abc...`. Server
+  // applies the same sanitizer as the authoritative gate.
+  const sanitizeCfAccessValue = (raw) =>
+    (typeof raw === 'string' ? raw : '')
+      .replace(/^\s*cf-access-client-(?:id|secret)\s*:\s*/i, '')
+      .trim();
+
+  // Service-credentials handlers. Toggle flow:
+  //  - Off → On with no clientId stored → open 'initial' prompt (id + secret).
+  //  - Off → On with clientId stored     → toggle endpoint, no prompt.
+  //  - On → Off                          → confirm dialog, then toggle endpoint.
+  // Rotate is independent of the toggle — opens 'rotate' modal with clientId
+  // pre-filled, secret blank, and rotates without touching the toggle state.
+  const handleToggleEmailService = async (newValue) => {
+    if (emailServiceSaving) return;
+    if (newValue && !emailServiceClientId) {
+      // First-time enable — collect credentials.
+      setEmailServiceClientIdInput('');
+      setEmailServiceSecretInput('');
+      setEmailServiceModal('initial');
+      return;
+    }
+    if (!newValue) {
+      const ok = await confirm('Disable Cloudflare Access service credentials? Outbound email will no longer attach the Cf-Access-Client-* headers, and the worker route may start failing if it requires Access authentication.');
+      if (!ok) return;
+    }
+    setEmailServiceSaving(true);
+    try {
+      const { ok, data } = await mfaFetch('/api/admin/settings/email/service-credentials/toggle', {
+        method: 'PUT', body: { enabled: newValue },
+      });
+      if (ok) {
+        setEmailServiceCredentialsEnabled(newValue);
+      } else {
+        showToast(data?.error || 'Failed to update service credentials toggle.');
+      }
+    } catch (err) {
+      showToast(err.message);
+    } finally {
+      setEmailServiceSaving(false);
+    }
+  };
+
+  const openRotateServiceCredentials = () => {
+    setEmailServiceClientIdInput(emailServiceClientId || '');
+    setEmailServiceSecretInput('');
+    setEmailServiceModal('rotate');
+  };
+
+  const closeEmailServiceModal = () => {
+    if (emailServiceSaving) return; // don't close while a request is in flight
+    setEmailServiceModal(null);
+    setEmailServiceClientIdInput('');
+    setEmailServiceSecretInput('');
+  };
+
+  const submitEmailServiceCredentials = async () => {
+    if (emailServiceSaving) return;
+    const clientId = emailServiceClientIdInput.trim();
+    const secret = emailServiceSecretInput.trim();
+    if (!clientId) { showToast('Client ID is required.'); return; }
+    if (!secret) { showToast('Client Secret is required.'); return; }
+
+    setEmailServiceSaving(true);
+    try {
+      const isInitial = emailServiceModal === 'initial';
+      const body = isInitial
+        ? { clientId, secret, enable: true }
+        : { clientId, secret };
+      const { ok, data } = await mfaFetch('/api/admin/settings/email/service-credentials', {
+        method: 'PUT', body,
+      });
+      if (ok) {
+        setEmailServiceClientId(clientId);
+        if (isInitial) setEmailServiceCredentialsEnabled(true);
+        showToast(isInitial ? 'Service credentials saved and enabled.' : 'Service credentials rotated.', 'success');
+        setEmailServiceModal(null);
+        setEmailServiceClientIdInput('');
+        setEmailServiceSecretInput('');
+      } else {
+        showToast(data?.error || 'Failed to save service credentials.');
+      }
+    } catch (err) {
+      showToast(err.message);
+    } finally {
+      setEmailServiceSaving(false);
+    }
+  };
+
   const buildWafRule = (secret) => {
-    const host = r2PublicDomain || 'your-cdn-domain.com';
+    // R2 public domain no longer ships in the settings response — admin
+    // edits the placeholder before pasting into Cloudflare.
+    const host = 'your-cdn-domain.com';
     const validity = hmacTokenValidity || '600';
     return `(http.host eq "${host}") and not (\n    starts_with(http.request.uri.query, "verify=") and\n    is_timed_hmac_valid_v0(\n        "${secret}",\n        concat(\n            substring(http.request.uri.path, 0, 79),\n            "?",\n            substring(http.request.uri.query, 7, 200)\n        ),\n        ${validity},\n        http.request.timestamp.sec,\n        1\n    )\n)`;
   };
@@ -415,7 +569,7 @@ export default function SettingsPage() {
   const handleSaveHmacValidity = async () => {
     setHmacSaving(true);
     try {
-      const { ok, data } = await mfaFetch('/api/admin/settings/hmac/validity', { method: 'PUT', body: { hmac_token_validity: hmacTokenValidity } });
+      const { ok, data } = await mfaFetch('/api/admin/settings/video-hmac/validity', { method: 'PUT', body: { video_hmac_token_validity: hmacTokenValidity } });
       if (ok) {
         showToast('Token validity updated.', 'success');
       } else {
@@ -1066,6 +1220,76 @@ export default function SettingsPage() {
               origin first — this toggle has no effect while site-wide Turnstile is unconfigured.
             </small>
           )}
+
+          <hr style={{ margin: '24px 0', border: 'none', borderTop: '1px solid #e5e7eb' }} />
+
+          {/* ── Email Sending ───────────────────────────────────────── */}
+          <h3 style={{ fontSize: '14px', textTransform: 'uppercase', letterSpacing: '0.05em', color: '#6b7280', marginTop: 0, marginBottom: '12px' }}>
+            Email Sending
+          </h3>
+          <p className="text-muted" style={{ marginBottom: '12px', fontSize: '13px' }}>
+            Transactional email is sent via the <code>email-sender</code> Worker. Configure the
+            sender address on the worker (<code>EMAIL_FROM_ADDRESS</code> in <code>wrangler.jsonc</code>).
+            The display name is pulled from the site name above.
+          </p>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '12px' }}>
+            <span style={{ fontSize: '13px', color: '#6b7280' }}>Status:</span>
+            {emailHmacSecretConfigured ? (
+              <span style={{
+                display: 'inline-block', padding: '3px 10px', borderRadius: '10px',
+                fontSize: '12px', fontWeight: 600, color: '#065f46', backgroundColor: '#d1fae5',
+              }}>Configured</span>
+            ) : (
+              <span style={{
+                display: 'inline-block', padding: '3px 10px', borderRadius: '10px',
+                fontSize: '12px', fontWeight: 600, color: '#92400e', backgroundColor: '#fef3c7',
+              }}>Not configured</span>
+            )}
+          </div>
+
+          <button type="button" className="btn btn-primary btn-sm" onClick={doGenerateEmail}>
+            {emailHmacSecretConfigured ? 'Generate New Key' : 'Initialize Key'}
+          </button>
+
+          <div style={{ marginTop: '20px', paddingTop: '16px', borderTop: '1px solid #e5e7eb' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px' }}>
+              <span style={{ fontSize: '14px', fontWeight: 500 }}>
+                Send email with service credentials
+              </span>
+              <div
+                role="switch"
+                aria-checked={emailServiceCredentialsEnabled}
+                tabIndex={0}
+                onClick={() => handleToggleEmailService(!emailServiceCredentialsEnabled)}
+                onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleToggleEmailService(!emailServiceCredentialsEnabled); } }}
+                style={{
+                  width: '44px', height: '24px', borderRadius: '12px',
+                  backgroundColor: emailServiceCredentialsEnabled ? '#16a34a' : '#d1d5db',
+                  position: 'relative', transition: 'background-color 0.2s',
+                  cursor: emailServiceSaving ? 'not-allowed' : 'pointer',
+                  opacity: emailServiceSaving ? 0.5 : 1,
+                }}
+              >
+                <div style={{
+                  width: '18px', height: '18px', borderRadius: '50%', backgroundColor: '#fff',
+                  position: 'absolute', top: '3px', left: emailServiceCredentialsEnabled ? '23px' : '3px',
+                  transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
+                }} />
+              </div>
+            </label>
+            <p className="text-muted text-sm" style={{ marginBottom: '12px' }}>
+              Attach <code>Cf-Access-Client-Id</code> / <code>Cf-Access-Client-Secret</code> headers
+              to outbound sends. Configure a Cloudflare Access service token and a policy on
+              <code> stream.dreamxwarden.ca/email-sending</code>, then a WAF rule on
+              <code> cf.access.authenticated</code> to bypass Super Bot Fight Mode.
+            </p>
+            {emailServiceClientId && (
+              <button type="button" className="btn btn-secondary btn-sm" onClick={openRotateServiceCredentials} disabled={emailServiceSaving}>
+                Rotate Service Credentials
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
@@ -1129,6 +1353,93 @@ export default function SettingsPage() {
           </table>
         </div>
       </div>
+
+      {/* Service Credentials Modal — initial setup + enable, or rotate.
+          Uses content-overlay (z-index 900) so a mid-submit MFA challenge
+          (mfa-challenge-overlay z-index 1100) stacks on top. */}
+      {emailServiceModal && (
+        <div className="content-overlay active" onClick={closeEmailServiceModal}>
+          <div className="wk-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '520px' }}>
+            <div className="wk-modal-header">
+              <h3>{emailServiceModal === 'initial' ? 'Configure Service Credentials' : 'Rotate Service Credentials'}</h3>
+            </div>
+            <div className="wk-modal-body">
+              <p className="text-muted text-sm" style={{ marginTop: 0, marginBottom: '16px' }}>
+                Paste the Client ID and Client Secret from your Cloudflare Access service token
+                (Zero Trust → Access → Service Tokens).
+                {emailServiceModal === 'rotate' && ' The current Client ID is pre-filled; you can change it if the token was rotated.'}
+              </p>
+              <div className="form-group">
+                <label htmlFor="cfAccessClientIdInput">Client ID</label>
+                <input id="cfAccessClientIdInput" type="text" className="form-control"
+                  value={emailServiceClientIdInput}
+                  onChange={e => setEmailServiceClientIdInput(sanitizeCfAccessValue(e.target.value))}
+                  placeholder="abc123...access"
+                  autoComplete="off"
+                  disabled={emailServiceSaving}
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="cfAccessClientSecretInput">Client Secret</label>
+                <input id="cfAccessClientSecretInput" type="password" className="form-control"
+                  value={emailServiceSecretInput}
+                  onChange={e => setEmailServiceSecretInput(sanitizeCfAccessValue(e.target.value))}
+                  placeholder={emailServiceModal === 'rotate' ? 'Enter the new secret' : 'Paste the secret'}
+                  autoComplete="off"
+                  autoFocus={emailServiceModal === 'rotate'}
+                  disabled={emailServiceSaving}
+                />
+                {emailServiceModal === 'rotate' && (
+                  <small className="text-muted" style={{ display: 'block', marginTop: '4px' }}>
+                    The previously stored secret is not shown — paste the new one to rotate.
+                  </small>
+                )}
+              </div>
+            </div>
+            <div className="wk-modal-footer" style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+              <button type="button" className="btn btn-secondary btn-sm" onClick={closeEmailServiceModal} disabled={emailServiceSaving}>
+                Cancel
+              </button>
+              <button type="button" className="btn btn-primary btn-sm" onClick={submitEmailServiceCredentials}
+                disabled={emailServiceSaving || !emailServiceClientIdInput.trim() || !emailServiceSecretInput.trim()}>
+                {emailServiceSaving ? 'Saving…' : (emailServiceModal === 'initial' ? 'Save & Enable' : 'Rotate')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Email Sender Secret Generated Modal */}
+      {generatedEmailKey && (
+        <div className="content-overlay active" onClick={handleCloseEmailModal}>
+          <div className="wk-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '620px' }}>
+            <div className="wk-modal-header"><h3>Email Worker Secret Generated</h3></div>
+            <div className="wk-modal-body">
+              <div className="wk-field">
+                <label>Email Worker Secret</label>
+                <div className="wk-field-row">
+                  <input type="text" readOnly value={generatedEmailKey}
+                    onClick={e => e.target.select()} style={{ cursor: 'text' }} />
+                  <button type="button" className="btn btn-sm" onClick={handleCopyEmailKey}>{emailKeyCopyLabel}</button>
+                </div>
+              </div>
+              <p className="wk-warning">Save this key now — it won't be shown again.</p>
+              <p className="text-muted" style={{ fontSize: '13px', marginTop: '8px' }}>
+                Add this secret to the <code>email-sender</code> Worker:
+                <br />
+                <code>npx wrangler secret put EMAIL_HMAC_SECRET</code>
+                <br />
+                …or via the Cloudflare dashboard (Workers &amp; Pages → email-sender →
+                Settings → Variables and Secrets). Email sending will fail until the
+                Worker's secret matches this value.
+              </p>
+            </div>
+            <div className="wk-modal-footer">
+              <button type="button" className="btn btn-primary btn-sm" onClick={handleCloseEmailModal}>OK</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* HMAC Key Generated Modal */}
       {generatedHmacKey && (

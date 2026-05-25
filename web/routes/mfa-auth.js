@@ -4,6 +4,7 @@ const { createSession, getSessionMaxDays } = require('../config/session');
 const { SESSION_COOKIE, getClientIp } = require('../middleware/auth');
 const { getPool } = require('../config/database');
 const mfaService = require('../services/mfaService');
+const { mapEmailErrorHttp } = require('../services/emailService');
 
 // Validate returnTo: must be a same-site relative path
 function sanitizeReturnTo(returnTo) {
@@ -61,6 +62,8 @@ router.post('/api/auth/mfa/send-otp', async (req, res) => {
         const result = await mfaService.sendOtpEmail(ctx.challenge.id, ctx.challenge.user_id);
 
         if (!result.success) {
+            const httpErr = mapEmailErrorHttp(result);
+            if (httpErr) return res.status(httpErr.status).json(httpErr.body);
             if (result.retryAfter || result.message === 'Daily limit reached') {
                 return res.status(429).json({
                     error: result.message,
@@ -357,6 +360,8 @@ router.post('/api/auth/mfa/enrollment/email/start', async (req, res) => {
         // Send OTP to the new email
         const result = await mfaService.sendOtpToEmail(challenge.id, userId, normalizedEmail);
         if (!result.success) {
+            const httpErr = mapEmailErrorHttp(result);
+            if (httpErr) return res.status(httpErr.status).json(httpErr.body);
             return res.status(503).json({ error: result.message || 'Failed to send verification code' });
         }
 
@@ -385,6 +390,8 @@ router.post('/api/auth/mfa/enrollment/email/resend', async (req, res) => {
 
         const result = await mfaService.sendOtpToEmail(challenge.id, challenge.user_id, challenge.message_operation);
         if (!result.success) {
+            const httpErr = mapEmailErrorHttp(result);
+            if (httpErr) return res.status(httpErr.status).json(httpErr.body);
             if (result.retryAfter || result.message === 'Daily limit reached') {
                 return res.status(429).json({ error: result.message, retryAfter: result.retryAfter || null });
             }

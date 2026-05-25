@@ -196,8 +196,10 @@ async function startRegistration(email, invitationCode) {
     const emailResult = await sendRegistrationEmail(email, token, siteName, validityMinutes, protocol, hostname);
 
     if (!emailResult.success) {
-        // If we just reset the rate limit counter, leave total_sent at 0
-        return { success: false, message: emailResult.message };
+        // Pass through the structured error class so the route can map
+        // not_configured / rejected / unavailable to the right HTTP status.
+        // Rate limit counter is NOT updated on failure (preserved behaviour).
+        return { success: false, error: emailResult.error, message: emailResult.message };
     }
 
     // Update rate limit record on successful send

@@ -34,7 +34,6 @@ router.post('/api/install', async (req, res) => {
             r2Endpoint, r2BucketName, r2AccessKeyId, r2SecretAccessKey, r2PublicDomain,
             siteName, siteHostname, siteProtocol,
             adminUsername, adminDisplayName, adminPassword, adminPasswordConfirm,
-            smtpHost, smtpPort, smtpUser, smtpPass, smtpSecure, smtpFromName, smtpFromAddress, smtpReplyTo,
             turnstileSiteKey, turnstileSecretKey
         } = req.body;
 
@@ -126,7 +125,6 @@ router.post('/api/install', async (req, res) => {
             r2PublicDomain: (r2PublicDomain || '').trim().replace(/^https?:\/\//, '').split('/')[0],
             sessionSecret,
             mfaEncryptionKey,
-            smtpHost, smtpPort, smtpUser, smtpPass, smtpSecure, smtpFromName, smtpFromAddress, smtpReplyTo,
             turnstileSiteKey, turnstileSecretKey,
             port: 3000
         });

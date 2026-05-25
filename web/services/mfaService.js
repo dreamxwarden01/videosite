@@ -375,7 +375,9 @@ async function sendOtpEmail(challengeId, userId) {
     });
 
     if (!emailResult.success) {
-        return { success: false, message: 'Failed to send email' };
+        // Pass through the structured error class so the route can map
+        // not_configured / rejected / unavailable to the right HTTP status.
+        return { success: false, error: emailResult.error, message: emailResult.message || 'Failed to send email' };
     }
 
     // Update rate limit record
@@ -1148,7 +1150,7 @@ async function sendOtpToEmail(challengeId, userId, targetEmail) {
     });
 
     if (!emailResult.success) {
-        return { success: false, message: 'Failed to send email' };
+        return { success: false, error: emailResult.error, message: emailResult.message || 'Failed to send email' };
     }
 
     // Update rate limit record

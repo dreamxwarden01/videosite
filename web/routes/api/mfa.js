@@ -4,6 +4,7 @@ const { requireAuth } = require('../../middleware/auth');
 const { checkPermission, checkAnyPermission } = require('../../middleware/permissions');
 const { getPool } = require('../../config/database');
 const mfaService = require('../../services/mfaService');
+const { mapEmailErrorHttp } = require('../../services/emailService');
 
 // All routes require authentication
 router.use('/mfa', requireAuth);
@@ -565,6 +566,8 @@ router.post('/mfa/challenge/send-otp', async (req, res) => {
 
         const result = await mfaService.sendOtpEmail(challengeId, user.user_id);
         if (!result.success) {
+            const httpErr = mapEmailErrorHttp(result);
+            if (httpErr) return res.status(httpErr.status).json(httpErr.body);
             if (result.retryAfter || result.message === 'Daily limit reached') {
                 return res.status(429).json({
                     error: result.message,

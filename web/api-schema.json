@@ -1262,19 +1262,35 @@
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Saved." } } }
     },
 
-    "/api/admin/settings/hmac/generate": {
-      "post": { "tags": ["admin-settings"], "operationId": "admin_settings_hmac_generate", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "{ key }" } } }
+    "/api/admin/settings/video-hmac/generate": {
+      "post": { "tags": ["admin-settings"], "operationId": "admin_settings_video_hmac_generate", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "{ key }" } } }
     },
 
-    "/api/admin/settings/hmac/validity": {
-      "put": { "tags": ["admin-settings"], "operationId": "admin_settings_hmac_validity", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["seconds"], "additionalProperties": false, "properties": { "seconds": { "type": "integer", "minimum": 1 } } } } } },
+    "/api/admin/settings/email/generate": {
+      "post": { "tags": ["admin-settings"], "operationId": "admin_settings_email_generate", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "description": "{ secret }" } } }
+    },
+
+    "/api/admin/settings/email/service-credentials": {
+      "put": { "tags": ["admin-settings"], "operationId": "admin_settings_email_service_creds_set", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["clientId", "secret"], "additionalProperties": false, "properties": { "clientId": { "type": "string", "minLength": 1 }, "secret": { "type": "string", "minLength": 1 }, "enable": { "type": "boolean" } } } } } },
+        "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/admin/settings/email/service-credentials/toggle": {
+      "put": { "tags": ["admin-settings"], "operationId": "admin_settings_email_service_creds_toggle", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["enabled"], "additionalProperties": false, "properties": { "enabled": { "type": "boolean" } } } } } },
+        "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/admin/settings/video-hmac/validity": {
+      "put": { "tags": ["admin-settings"], "operationId": "admin_settings_video_hmac_validity", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["video_hmac_token_validity"], "additionalProperties": false, "properties": { "video_hmac_token_validity": { "type": "integer", "minimum": 600 } } } } } },
         "responses": { "200": { "description": "Set." } } }
     },
 
-    "/api/admin/settings/hmac/toggle": {
-      "put": { "tags": ["admin-settings"], "operationId": "admin_settings_hmac_toggle", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["enabled"], "additionalProperties": false, "properties": { "enabled": { "type": "boolean" } } } } } },
+    "/api/admin/settings/video-hmac/toggle": {
+      "put": { "tags": ["admin-settings"], "operationId": "admin_settings_video_hmac_toggle", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["video_hmac_enabled"], "additionalProperties": false, "properties": { "video_hmac_enabled": { "type": "boolean" } } } } } },
         "responses": { "200": { "description": "Toggled." } } }
     },
 

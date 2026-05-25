@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 
 // Middleware
@@ -876,11 +877,33 @@ router.get('/admin/settings', requireAuth, checkPermission('manageSite'), requir
         for (const s of settings) {
             settingsMap[s.setting_key] = s.setting_value;
         }
-        // Expose key existence before stripping secrets
-        const hmacKeyConfigured = !!settingsMap.hmac_secret_key;
+        // Build the Cloudflare sub-object — everything CF-related lives
+        // under data.cloudflare so the settings blob stays focused on
+        // identity/site/session/registration concerns. The shape mixes
+        // existence flags (booleans), toggle states (parsed booleans), and
+        // configurable values (strings) — the client reads them directly,
+        // no `=== 'true'` dance required.
+        const cloudflare = {
+            video_hmac_enabled: settingsMap.video_hmac_enabled === 'true',
+            video_hmac_secret_configured: !!settingsMap.hmac_secret_key,
+            video_hmac_token_validity: settingsMap.video_hmac_token_validity || '600',
+            email_hmac_secret_configured: !!settingsMap.email_secret_key,
+            email_with_service_credentials: settingsMap.email_with_service_credentials === 'true',
+            email_access_secret_configured: !!settingsMap.cf_access_client_secret,
+            email_access_client_id: settingsMap.cf_access_client_id || null,
+            turnstile_worker_gate: settingsMap.cloudflare_turnstile_worker_gate === 'true',
+        };
 
-        // Never send secrets to client
+        // Strip everything that's now in `cloudflare` (or that was always a
+        // secret) out of the settings blob.
         delete settingsMap.hmac_secret_key;
+        delete settingsMap.video_hmac_enabled;
+        delete settingsMap.video_hmac_token_validity;
+        delete settingsMap.email_secret_key;
+        delete settingsMap.email_with_service_credentials;
+        delete settingsMap.cf_access_client_id;
+        delete settingsMap.cf_access_client_secret;
+        delete settingsMap.cloudflare_turnstile_worker_gate;
 
         // Strip keys managed by other pages / returned separately
         for (const key of Object.keys(settingsMap)) {
@@ -900,7 +923,7 @@ router.get('/admin/settings', requireAuth, checkPermission('manageSite'), requir
         const audioNormalization = await getAudioNormalizationSettings();
         const audioBitrateKbps = await getAudioBitrateDefault();
 
-        res.json({ settings: settingsMap, workerKeys: sanitizedWorkerKeys, roles, hmacKeyConfigured, r2PublicDomain: process.env.R2_PUBLIC_DOMAIN || '', defaultProfiles, enhancedProfiles, audioNormalization, audioBitrateKbps });
+        res.json({ settings: settingsMap, cloudflare, workerKeys: sanitizedWorkerKeys, roles, defaultProfiles, enhancedProfiles, audioNormalization, audioBitrateKbps });
     } catch (err) {
         console.error('API settings error:', err);
         res.status(500).json({ error: 'Failed to load settings.' });
@@ -1148,8 +1171,8 @@ router.put('/admin/settings/transcoding-profiles/enhanced', requireAuth, checkPe
     }
 });
 
-// POST /api/admin/settings/hmac/generate — generate new HMAC secret key
-router.post('/admin/settings/hmac/generate', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+// POST /api/admin/settings/video-hmac/generate — generate new HMAC secret key
+router.post('/admin/settings/video-hmac/generate', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
     try {
         const secret = await generateSecretKey();
         res.json({ success: true, secret });
@@ -1159,14 +1182,103 @@ router.post('/admin/settings/hmac/generate', requireAuth, checkPermission('manag
     }
 });
 
-// PUT /api/admin/settings/hmac/validity — update token validity hint
-router.put('/admin/settings/hmac/validity', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+// POST /api/admin/settings/email/generate — generate new email-sender secret.
+//
+// 64-char hex; stored encrypted (enc:v1:) in site_settings as
+// `email_secret_key` via setSecretSetting and surfaced once in the admin UI
+// for the admin to paste into the email-sender Worker via
+// `wrangler secret put EMAIL_HMAC_SECRET`. setSecretSetting purges the
+// site:settings cache so the next sendEmail call uses the new value.
+router.post('/admin/settings/email/generate', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
     try {
-        const val = parseInt(req.body.hmac_token_validity, 10);
+        const { setSecretSetting } = require('../../services/settingsEncryption');
+        const secret = crypto.randomBytes(32).toString('hex');
+        await setSecretSetting('email_secret_key', secret);
+        res.json({ success: true, secret });
+    } catch (err) {
+        console.error('API generate email secret error:', err);
+        res.status(500).json({ error: 'Failed to generate email secret key' });
+    }
+});
+
+// Strip a leading `CF-Access-Client-Id:` / `CF-Access-Client-Secret:` header
+// prefix (case-insensitive, whitespace around the colon allowed) and trim
+// surrounding whitespace. The Cloudflare dashboard ships the values copied
+// directly from a header-style display, so a paste like
+// `CF-Access-Client-Secret: abc123` should resolve to `abc123`. Client and
+// server both sanitize — client for the visible input, server as the
+// authoritative gate.
+function sanitizeCfAccessValue(raw) {
+    if (typeof raw !== 'string') return '';
+    return raw.replace(/^\s*cf-access-client-(?:id|secret)\s*:\s*/i, '').trim();
+}
+
+// PUT /api/admin/settings/email/service-credentials — set or rotate the
+// Cloudflare Access service-token credentials used to call the email-sender
+// Worker. Body: { clientId, secret, enable? }.
+//
+// - clientId is stored plaintext (it's an identifier, not a secret).
+// - secret is stored encrypted via setSecretSetting (enc:v1:).
+// - If `enable` is true/false, the email_with_service_credentials toggle is
+//   updated atomically. Omit `enable` to rotate without touching the toggle.
+//
+// Both fields are sanitized via sanitizeCfAccessValue() — strips any pasted
+// `CF-Access-Client-*:` header prefix + surrounding whitespace.
+//
+// MFA-gated so a stolen session can't rotate credentials silently.
+router.put('/admin/settings/email/service-credentials', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+    try {
+        const clientId = sanitizeCfAccessValue(req.body && req.body.clientId);
+        const secret = sanitizeCfAccessValue(req.body && req.body.secret);
+        const enable = req.body && req.body.enable;
+        if (!clientId) {
+            return res.status(422).json({ error: 'clientId is required' });
+        }
+        if (!secret) {
+            return res.status(422).json({ error: 'secret is required' });
+        }
+        const { setSecretSetting } = require('../../services/settingsEncryption');
+        await setSetting('cf_access_client_id', clientId);
+        await setSecretSetting('cf_access_client_secret', secret);
+        if (enable === true || enable === false) {
+            await setSetting('email_with_service_credentials', enable ? 'true' : 'false');
+        }
+        res.status(204).end();
+    } catch (err) {
+        console.error('API set service credentials error:', err);
+        res.status(500).json({ error: 'Failed to save service credentials' });
+    }
+});
+
+// PUT /api/admin/settings/email/service-credentials/toggle — flip the
+// email_with_service_credentials switch without touching the stored
+// credentials. Refuses to enable if credentials aren't yet configured.
+router.put('/admin/settings/email/service-credentials/toggle', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+    try {
+        const enabled = req.body && (req.body.enabled === true || req.body.enabled === 'true');
+        if (enabled) {
+            const { getSetting } = require('../../services/cache/settingsCache');
+            const clientId = await getSetting('cf_access_client_id');
+            if (!clientId) {
+                return res.status(422).json({ error: 'Configure service credentials before enabling' });
+            }
+        }
+        await setSetting('email_with_service_credentials', enabled ? 'true' : 'false');
+        res.status(204).end();
+    } catch (err) {
+        console.error('API toggle service credentials error:', err);
+        res.status(500).json({ error: 'Failed to toggle service credentials' });
+    }
+});
+
+// PUT /api/admin/settings/video-hmac/validity — update video-HMAC token validity hint
+router.put('/admin/settings/video-hmac/validity', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+    try {
+        const val = parseInt(req.body.video_hmac_token_validity, 10);
         if (!val || val < 600) {
             return res.status(400).json({ error: 'Token validity must be at least 600 seconds' });
         }
-        await setSetting('hmac_token_validity', String(val));
+        await setSetting('video_hmac_token_validity', String(val));
         res.status(204).end();
     } catch (err) {
         console.error('API save HMAC validity error:', err);
@@ -1174,14 +1286,14 @@ router.put('/admin/settings/hmac/validity', requireAuth, checkPermission('manage
     }
 });
 
-// PUT /api/admin/settings/hmac/toggle — enable/disable HMAC validation
-router.put('/admin/settings/hmac/toggle', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+// PUT /api/admin/settings/video-hmac/toggle — enable/disable video-playback HMAC.
+router.put('/admin/settings/video-hmac/toggle', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
     try {
-        const enabled = req.body.hmac_enabled === 'true' || req.body.hmac_enabled === true;
+        const enabled = req.body.video_hmac_enabled === 'true' || req.body.video_hmac_enabled === true;
         if (enabled && !(await isHmacConfigured())) {
             return res.status(400).json({ error: 'Cannot enable HMAC validation without a secret key. Generate a key first.' });
         }
-        await setSetting('hmac_enabled', enabled ? 'true' : 'false');
+        await setSetting('video_hmac_enabled', enabled ? 'true' : 'false');
         res.status(204).end();
     } catch (err) {
         console.error('API toggle HMAC error:', err);

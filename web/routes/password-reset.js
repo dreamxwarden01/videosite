@@ -7,6 +7,7 @@ const { validatePassword } = require('../services/registrationService');
 const { updateUser, getUserById } = require('../services/userService');
 const { requestPasswordReset, validateResetToken, consumeResetToken } = require('../services/passwordResetService');
 const mfaService = require('../services/mfaService');
+const { mapEmailErrorHttp } = require('../services/emailService');
 
 // Simple email format check
 function isValidEmail(email) {
@@ -50,12 +51,23 @@ router.post('/api/password-reset/request', async (req, res) => {
 
         const normalizedEmail = email.trim().toLowerCase();
 
-        // 3. Fire-and-forget: look up user + send reset email in background
-        //    Response returns immediately to avoid leaking timing differences
-        //    between existing and non-existing emails.
-        requestPasswordReset(normalizedEmail).catch(err => {
-            console.error('Password reset background error:', err);
-        });
+        // Now synchronous: we still hide whether the email matched a user
+        // (returning 204 for no_user / rate_limited / rejected — all the
+        // outcomes a non-admin could enumerate). But true service-level
+        // failures (worker not configured / unavailable) are surfaced so
+        // the admin sees them in the client, not just buried in server
+        // logs. Per-recipient `rejected` is silenced to keep anti-
+        // enumeration.
+        const result = await requestPasswordReset(normalizedEmail);
+        if (result.sent === false && result.reason === 'email_failed') {
+            if (result.error === 'not_configured') {
+                return res.status(503).json({ error: 'Email sending is not configured' });
+            }
+            if (result.error === 'unavailable') {
+                return res.status(503).json({ error: 'Email sending unavailable' });
+            }
+            // 'rejected' (or missing error class) → silent 204; logged inside emailService.
+        }
 
         res.status(204).end();
     } catch (err) {
@@ -263,6 +275,8 @@ router.post('/api/password-reset/mfa/send-otp', async (req, res) => {
         const result = await mfaService.sendOtpEmail(ctx.challenge.id, ctx.challenge.user_id);
 
         if (!result.success) {
+            const httpErr = mapEmailErrorHttp(result);
+            if (httpErr) return res.status(httpErr.status).json(httpErr.body);
             if (result.retryAfter || result.message === 'Daily limit reached') {
                 return res.status(429).json({ error: result.message, retryAfter: result.retryAfter || null });
             }

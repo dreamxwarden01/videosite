@@ -71,15 +71,8 @@ PORT=${config.port || 3000}
 # MFA
 MFA_ENCRYPTION_KEY=${config.mfaEncryptionKey}
 
-# Email (SMTP)
-SMTP_HOST=${config.smtpHost || ''}
-SMTP_PORT=${config.smtpPort || '465'}
-SMTP_USER=${config.smtpUser || ''}
-SMTP_PASS=${config.smtpPass || ''}
-SMTP_SECURE=${config.smtpSecure || 'true'}
-SMTP_FROM_NAME="${config.smtpFromName || ''}"
-SMTP_FROM_ADDRESS=${config.smtpFromAddress || ''}
-SMTP_REPLY_TO=${config.smtpReplyTo || ''}
+# Email is sent via the email-sender Cloudflare Worker — configure the
+# email_secret_key in admin Settings (Cloudflare → Email Sending) after install.
 
 # Cloudflare Turnstile
 TURNSTILE_SITE_KEY=${config.turnstileSiteKey || ''}

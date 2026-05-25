@@ -223,6 +223,18 @@ const server = app.listen(PORT, async () => {
                 console.error('Role permission cache flush failed:', err.message);
             }
 
+            // Flush the site:settings Redis blob too. After migration 035 the
+            // hmac_secret_key / email_secret_key rows are stored encrypted;
+            // a stale pre-deploy site:settings blob still holds the plaintext
+            // forms. The new readers tolerate either via the enc:v1: prefix
+            // check, but invalidating once ensures the encrypted form lands
+            // immediately rather than after the 30 min TTL.
+            try {
+                await require('./services/cache/settingsCache').invalidate();
+            } catch (err) {
+                console.error('Settings cache flush failed:', err.message);
+            }
+
             // Start the periodic write-coalescing flusher (drains dirty:session:user
             // every 15 min into DB). Phase 5 will plug watch + transcode into the
             // same module.

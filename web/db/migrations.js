@@ -830,6 +830,79 @@ async function runMigrations() {
                         SELECT role_id, 'toggleOwnMfa', 1 FROM roles
                     `);
                 }
+            },
+            {
+                id: '035_encrypt_settings_secrets',
+                up: async () => {
+                    // Encrypt-at-rest for sensitive site_settings rows
+                    // (HMAC playback secret, email-sender HMAC secret).
+                    // Future writes via setSecretSetting() encrypt
+                    // transparently; this migration covers the rows that
+                    // already exist on existing deployments.
+                    //
+                    // Failures here fail-loud (throw) so the operator
+                    // can't end up with encrypted DB rows + no key to
+                    // decrypt them. Idempotent via the enc:v1: prefix.
+                    if (!process.env.SETTINGS_SECRET_ENCRYPTION_KEY) {
+                        throw new Error(
+                            'Migration 035 requires SETTINGS_SECRET_ENCRYPTION_KEY in .env. ' +
+                            'Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))" ' +
+                            'then add SETTINGS_SECRET_ENCRYPTION_KEY=... to .env and restart.'
+                        );
+                    }
+                    const { encryptSettingValue, isEncrypted } = require('../services/settingsEncryption');
+                    const SECRET_KEYS = ['hmac_secret_key', 'email_secret_key'];
+                    for (const key of SECRET_KEYS) {
+                        const [[row]] = await pool.execute(
+                            'SELECT setting_value FROM site_settings WHERE setting_key = ?',
+                            [key]
+                        );
+                        if (!row) continue;                          // never configured — nothing to encrypt
+                        if (isEncrypted(row.setting_value)) continue; // already encrypted on a prior run
+                        const encrypted = encryptSettingValue(row.setting_value);
+                        await pool.execute(
+                            'UPDATE site_settings SET setting_value = ? WHERE setting_key = ?',
+                            [encrypted, key]
+                        );
+                    }
+                }
+            },
+            {
+                id: '036_rename_hmac_enabled',
+                up: async () => {
+                    // Disambiguate the two HMAC concepts in site_settings:
+                    //   - hmac_secret_key       — video playback URL signing
+                    //   - hmac_enabled          — video HMAC toggle  (renamed here)
+                    //   - email_secret_key      — email-sender worker HMAC
+                    //   - cf_access_client_*    — service token for email worker
+                    //
+                    // Renames hmac_enabled → video_hmac_enabled. INSERT-SELECT
+                    // copies the value (no-op if the old row is absent),
+                    // ON DUPLICATE KEY UPDATE makes it safe to re-run after a
+                    // partial run, and the DELETE drops the old row.
+                    await pool.execute(`
+                        INSERT INTO site_settings (setting_key, setting_value)
+                        SELECT 'video_hmac_enabled', setting_value
+                          FROM site_settings WHERE setting_key = 'hmac_enabled'
+                        ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)
+                    `);
+                    await pool.execute(`DELETE FROM site_settings WHERE setting_key = 'hmac_enabled'`);
+                }
+            },
+            {
+                id: '037_rename_hmac_token_validity',
+                up: async () => {
+                    // Same rename mechanic as 036 — moves the validity hint to
+                    // the video_-prefixed namespace so the Cloudflare card's
+                    // keys all line up (video_hmac_*, email_hmac_*, etc.).
+                    await pool.execute(`
+                        INSERT INTO site_settings (setting_key, setting_value)
+                        SELECT 'video_hmac_token_validity', setting_value
+                          FROM site_settings WHERE setting_key = 'hmac_token_validity'
+                        ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)
+                    `);
+                    await pool.execute(`DELETE FROM site_settings WHERE setting_key = 'hmac_token_validity'`);
+                }
             }
         ];
 

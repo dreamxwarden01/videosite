@@ -220,7 +220,11 @@ async function requestPasswordReset(email) {
     const emailResult = await sendPasswordResetEmail(email, token, siteName, validityMinutes, protocol, hostname);
 
     if (!emailResult.success) {
-        return { sent: false, reason: 'email_failed' };
+        // Pass through the structured error class so the route can decide
+        // whether to surface the failure to the client (e.g. 'not_configured'
+        // / 'unavailable' are surfaced; 'rejected' is silently swallowed to
+        // preserve anti-enumeration).
+        return { sent: false, reason: 'email_failed', error: emailResult.error };
     }
 
     // Update rate limit on successful send

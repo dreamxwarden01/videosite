@@ -6,6 +6,7 @@ const { getUserById, verifyPassword, updateUser } = require('../../services/user
 const { getUserSessions, deleteUserSessions } = require('../../config/session');
 const { generateToken, getTokenValiditySeconds } = require('../../services/tokenService');
 const mfaService = require('../../services/mfaService');
+const { mapEmailErrorHttp } = require('../../services/emailService');
 const { getUserMfaMethods, isUserMfaEnabled, maskEmail, validateChallenge, consumeChallenge } = mfaService;
 const UAParser = require('ua-parser-js');
 
@@ -682,6 +683,8 @@ router.post('/profile/email/start', requireAuth, async (req, res) => {
         // Send OTP to the NEW email
         const sendResult = await mfaService.sendOtpToEmail(challenge.id, user.user_id, normalizedEmail);
         if (!sendResult.success) {
+            const httpErr = mapEmailErrorHttp(sendResult);
+            if (httpErr) return res.status(httpErr.status).json(httpErr.body);
             if (sendResult.retryAfter || sendResult.message === 'Daily limit reached') {
                 return res.status(429).json({ error: sendResult.message, retryAfter: sendResult.retryAfter || null });
             }
@@ -791,6 +794,8 @@ router.post('/profile/email/resend', requireAuth, async (req, res) => {
 
         const result = await mfaService.sendOtpToEmail(challengeId, user.user_id, challenge.message_operation);
         if (!result.success) {
+            const httpErr = mapEmailErrorHttp(result);
+            if (httpErr) return res.status(httpErr.status).json(httpErr.body);
             if (result.retryAfter || result.message === 'Daily limit reached') {
                 return res.status(429).json({
                     error: result.message,

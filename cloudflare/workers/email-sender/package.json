@@ -1,0 +1,14 @@
+{
+    "name": "email-sender",
+    "version": "1.0.0",
+    "private": true,
+    "description": "Cloudflare Worker that sends transactional email via the native send_email binding on behalf of the videosite origin.",
+    "scripts": {
+        "dev": "wrangler dev",
+        "deploy": "wrangler deploy",
+        "tail": "wrangler tail"
+    },
+    "devDependencies": {
+        "wrangler": "^3.95.0"
+    }
+}
