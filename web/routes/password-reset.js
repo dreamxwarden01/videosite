@@ -8,6 +8,7 @@ const { updateUser, getUserById } = require('../services/userService');
 const { requestPasswordReset, validateResetToken, consumeResetToken } = require('../services/passwordResetService');
 const mfaService = require('../services/mfaService');
 const { mapEmailErrorHttp } = require('../services/emailService');
+const { getSetting } = require('../services/cache/settingsCache');
 
 // Simple email format check
 function isValidEmail(email) {
@@ -51,22 +52,22 @@ router.post('/api/password-reset/request', async (req, res) => {
 
         const normalizedEmail = email.trim().toLowerCase();
 
-        // Now synchronous: we still hide whether the email matched a user
-        // (returning 204 for no_user / rate_limited / rejected — all the
-        // outcomes a non-admin could enumerate). But true service-level
-        // failures (worker not configured / unavailable) are surfaced so
-        // the admin sees them in the client, not just buried in server
-        // logs. Per-recipient `rejected` is silenced to keep anti-
-        // enumeration.
+        // Upfront not-configured probe — same response for every caller
+        // (constant, doesn't depend on whether the address exists), so
+        // surfacing it doesn't leak per-user info. Without this, an
+        // unconfigured email service would silently 204 for both
+        // existing and non-existing addresses, hiding the misconfig.
+        const emailKey = await getSetting('email_secret_key');
+        if (!emailKey) {
+            return res.status(503).json({ error: 'Email sending is not configured' });
+        }
+
+        // The rest: 204 for no_user / rate_limited / rejected (the cases a
+        // probe could distinguish per-user); only `unavailable` is surfaced
+        // since it'd hit any caller equally.
         const result = await requestPasswordReset(normalizedEmail);
-        if (result.sent === false && result.reason === 'email_failed') {
-            if (result.error === 'not_configured') {
-                return res.status(503).json({ error: 'Email sending is not configured' });
-            }
-            if (result.error === 'unavailable') {
-                return res.status(503).json({ error: 'Email sending unavailable' });
-            }
-            // 'rejected' (or missing error class) → silent 204; logged inside emailService.
+        if (result.sent === false && result.reason === 'email_failed' && result.error === 'unavailable') {
+            return res.status(503).json({ error: 'Email sending unavailable' });
         }
 
         res.status(204).end();

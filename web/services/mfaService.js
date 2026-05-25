@@ -308,8 +308,9 @@ async function checkOtpRateLimit(userId) {
         return { allowed: true };
     }
 
-    // Daily limit
-    if (row.total_sent >= 10) {
+    // Daily limit — 20 sends per user per 24h. Well under the Cloudflare
+    // Email Sending 1000/day cap even if every active user maxes out.
+    if (row.total_sent >= 20) {
         return { allowed: false, message: 'Daily limit reached' };
     }
 
