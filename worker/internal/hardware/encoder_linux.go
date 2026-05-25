@@ -1,8 +1,8 @@
-//go:build windows
+//go:build linux
 
 package hardware
 
-// EncoderType constants for Windows hardware encoder types.
+// EncoderType constants for Linux hardware encoder types.
 const (
 	EncoderNVENC = "NVENC"
 	EncoderQSV   = "QSV"
@@ -30,9 +30,14 @@ func SetCUDAHWDecodeSupported(v bool) { cudaHWDecodeSupported = v }
 func CUDAHWDecodeSupported() bool { return cudaHWDecodeSupported }
 
 // DetectedGPU holds info about a detected GPU for encoding.
+//
+// On Linux, DeviceIndex for QSV is the integer suffix of the
+// /dev/dri/renderD<N> path (e.g. 128, 129) so the transcoder can
+// reconstruct the device path for FFmpeg's -init_hw_device flag.
+// For NVENC, DeviceIndex is the CUDA index from nvidia-smi.
 type DetectedGPU struct {
 	HardwareID  string
 	Name        string
 	EncoderType string
-	DeviceIndex int // FFmpeg device index: CUDA index for NVENC, adapter index for QSV
+	DeviceIndex int
 }

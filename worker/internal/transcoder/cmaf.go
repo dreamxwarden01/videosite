@@ -27,7 +27,7 @@ import (
 //
 // When srcFrameRate > profile.FpsLimit we append `-r fps_limit` to force
 // frame-rate downsampling; the flag is a global output option that works on
-// every HW path (NVENC/AMF/QSV/VT) and software.
+// every HW path (NVENC/QSV/VT) and software.
 //
 // progressCh and errCh behave exactly like RunFFmpegWithProgress — callers
 // drain progressCh until close and then read a single error from errCh.

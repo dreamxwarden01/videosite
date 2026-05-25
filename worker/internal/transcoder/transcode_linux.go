@@ -1,4 +1,4 @@
-//go:build windows
+//go:build linux
 
 package transcoder
 
@@ -11,7 +11,7 @@ import (
 
 // applyEncoderOpts injects encoder-specific FFmpeg flags (preset, RC mode,
 // quality tuning) immediately after the -c:v value. Platform-specific because
-// the set of encoders differs (NVENC/QSV on windows).
+// the set of encoders differs (NVENC/QSV on linux).
 func applyEncoderOpts(args []string, encoder config.Encoder, ffmpegEncoder string, profile config.OutputProfile) []string {
 	switch encoder.EncoderType {
 	case hardware.EncoderNVENC:
@@ -24,7 +24,7 @@ func applyEncoderOpts(args []string, encoder config.Encoder, ffmpegEncoder strin
 }
 
 // resolveHWArgs returns (hwArgs, vfFilter) for the chosen encoder and decode
-// tier on Windows.
+// tier on Linux.
 //
 // hwArgs contains FFmpeg global-input flags (-hwaccel … -init_hw_device …)
 // injected before -i; vfFilter is the value passed to -vf and handles scaling
@@ -62,15 +62,15 @@ func resolveHWArgs(encoder config.Encoder, swDecode bool, srcW, srcH, tgtW, tgtH
 		// Tier 2: CPU decode+scale, GPU encode via h264_nvenc.
 		vfFilter = cpuVF
 	case hardware.EncoderQSV:
-		// Check if padding is needed (source aspect ratio differs from output).
 		// vpp_qsv cannot pad, so fall back to CPU scale/pad when needed.
 		needsPad := srcW > 0 && srcH > 0 &&
 			srcW*tgtH != srcH*tgtW
 
 		if !swDecode && !needsPad {
-			// Full GPU: QSV decode → vpp_qsv scale → h264_qsv encode.
+			// Full GPU via OneVPL: QSV decode → vpp_qsv scale → h264_qsv encode.
+			// DeviceIndex stores the integer suffix of /dev/dri/renderD<N>.
 			hwArgs = []string{
-				"-init_hw_device", fmt.Sprintf("qsv=hw:%d", encoder.DeviceIndex),
+				"-init_hw_device", fmt.Sprintf("qsv=hw,child_device=/dev/dri/renderD%d", encoder.DeviceIndex),
 				"-hwaccel", "qsv",
 				"-hwaccel_device", "hw",
 				"-hwaccel_output_format", "qsv",

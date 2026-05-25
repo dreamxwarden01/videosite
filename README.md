@@ -13,9 +13,9 @@ A private video course platform with hardware-accelerated distributed transcodin
 - Transactional email via a dedicated `email-sender` Cloudflare Worker (Cloudflare Email Sending) — HMAC-signed origin→worker requests, optional Cloudflare Access service-token layer for Super-Bot-Fight-Mode bypass, at-rest encryption of stored secrets
 
 **Transcoding Worker**
-- Unified Go binary for macOS (arm64) and Windows (amd64) via build tags
-- Hardware-accelerated encoding: VideoToolbox (macOS), NVENC / AMF / QSV (Windows)
-- Multi-GPU support on Windows with per-encoder concurrent job scheduling
+- Unified Go binary for macOS (arm64), Windows (amd64), and Linux (amd64) via build tags
+- Hardware-accelerated encoding: VideoToolbox (macOS), NVENC / QSV (Windows + Linux)
+- Multi-GPU support on Windows / Linux with per-encoder concurrent job scheduling
 - Automatic encoder detection and load-balanced job distribution
 - EBU R128 two-pass audio loudness normalization
 - Smart profile filtering: skips upscaling, remuxes when re-encoding is unnecessary
@@ -131,13 +131,18 @@ The worker uses an interactive first-run setup to configure server connection, A
 ```bash
 cd worker
 
-# macOS (native)
-go build -o videosite-worker .
-./videosite-worker
+# macOS (native arm64)
+go build -o videosite-worker-darwin-arm64 .
+./videosite-worker-darwin-arm64
 
 # Windows (cross-compile from macOS)
-GOOS=windows GOARCH=amd64 go build -o videosite-worker.exe .
+GOOS=windows GOARCH=amd64 go build -o videosite-worker-windows-amd64.exe .
+
+# Linux (cross-compile from macOS)
+GOOS=linux GOARCH=amd64 go build -o videosite-worker-linux-amd64 .
 ```
+
+On Linux the FFmpeg build must include `--enable-libmfx` / OneVPL for QSV and `--enable-nvenc --enable-cuda-llvm` for NVENC. The `jellyfin/ffmpeg` packages and `BtbN/FFmpeg-Builds` static binaries both ship with the required codecs. (Dockerizing the Linux worker is a separate follow-up — pick a base image that already bundles a hardware-accelerated FFmpeg, mount `config.json` / `capabilities.json` as volumes, pass `--gpus all` for NVENC and `--device /dev/dri` for QSV.)
 
 On first run, the worker will:
 1. Prompt for the server hostname and API key credentials
@@ -197,6 +202,7 @@ worker/
   main.go                # Entry point (shared)
   main_darwin.go         # macOS startup banner
   main_windows.go        # Windows startup banner
+  main_linux.go          # Linux startup banner
   internal/
     api/                 # Server communication, uploads, retries
     auth/                # Bearer session handling with the server

@@ -6,8 +6,7 @@ web/client/node_modules/
 web/client/dist/
 
 # Compiled binaries
-worker/videosite-worker
-worker/videosite-worker.exe
+worker/videosite-worker-*
 
 # Runtime config (contains secrets)
 worker/config.json
