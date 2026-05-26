@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -124,6 +125,24 @@ type Job struct {
 	outputDir      string
 	duration       float64
 	phase          atomic.Value // current phase: "downloading", "probing", "transcoding", "uploading", "completing"
+
+	// Per-job GOP / segment decisions, populated in probe().
+	//
+	// useSourceGOP=true means the source has a constant GOP ≤ maxRemuxGOPSec
+	// (see runTranscode) — every rendition adopts source cadence (then
+	// re-snaps per profile to its own effective output fps in runTranscode).
+	// =false means we fall back to defaultGOPSec / targetSegSec for the
+	// whole job.
+	//
+	// targetSegSec is the desired segment duration in seconds (from the
+	// first profile's SegmentDuration, defaulting to defaultTargetSeg). It's
+	// stashed here so runTranscode can re-derive per-profile chosenSegSec
+	// when fps caps cause renditions to land on different frame grids.
+	sourceGOPSec float64
+	chosenGOPSec float64
+	chosenSegSec float64
+	targetSegSec float64
+	useSourceGOP bool
 
 	// Current status for the batched /tasks/status reporter. Read by
 	// Manager.SnapshotStatuses every 2 s; written by the job goroutine on
@@ -758,12 +777,87 @@ func (j *Job) probe() (*transcoder.ProbeResult, error) {
 	j.duration = probe.DurationSeconds
 	j.UI.Logf("[%s] probe complete: %dx%d, %.1fs, %s", j.JobID, probe.Width, probe.Height, probe.DurationSeconds, probe.Codec)
 
+	// GOP probe — sample first 60s of packets to decide whether to adopt the
+	// source's cadence for the whole job. Failure here is non-fatal: we just
+	// fall back to the default 2s GOP / 6s segments.
+	j.computeGOPDecision(sourcePath, probe)
+
 	// Stage is picked up by the next /tasks/status tick (worker status loop
 	// reads SnapshotStatuses every 2 s). Duration is NOT pushed into the
 	// status path — it rides on /tasks/complete for a single DB write.
 	j.SetStage("processing", 9)
 
 	return probe, nil
+}
+
+// GOP decision constants. All in seconds.
+const (
+	gopToleranceSec   = 0.1 // ±100ms inter-IDR variance is still "constant"
+	maxRemuxGOPSec    = 2.0 // source GOPs > this force re-encode at defaultGOPSec
+	defaultGOPSec     = 2.0 // when not adopting source cadence
+	defaultTargetSeg  = 6.0 // fallback target if profiles don't supply one
+)
+
+// computeGOPDecision probes the source's GOP cadence and picks the per-job
+// (chosenGOPSec, chosenSegSec, useSourceGOP) tuple every rendition will use.
+// Logs the decision so operators can see which path each job took.
+//
+// When useSourceGOP is true AND probe.FrameRate is known, chosenGOPSec is
+// snapped to the source's frame grid: round(probed_mean × fps) / fps. This
+// matters because ffprobe quantizes packet PTS to ms-precision, which makes
+// the raw probe mean drift a few μs above the true rational source GOP.
+// That tiny overshoot is enough to make the encoder skip a frame when
+// evaluating `-force_key_frames "expr:gte(t, n_forced*X)"` — the natural
+// frame's PTS lands just *under* the threshold and the encoder fires at
+// frame N+1 instead, producing 118-frame GOPs from a 117-frame source.
+// Snapping aligns transcoded renditions to the same time grid the remuxed
+// renditions inherit from the source, so cross-rendition segment boundaries
+// stay coherent.
+func (j *Job) computeGOPDecision(sourcePath string, probe *transcoder.ProbeResult) {
+	targetSeg := defaultTargetSeg
+	if len(j.OutputProfiles) > 0 && j.OutputProfiles[0].SegmentDuration > 0 {
+		targetSeg = j.OutputProfiles[0].SegmentDuration
+	}
+	j.targetSegSec = targetSeg
+
+	gop, variance, idrCount, err := transcoder.ProbeGOP(sourcePath)
+	if err != nil {
+		j.UI.Logf("[%s] gop probe failed: %v — falling back to default %.1fs GOP", j.JobID, err, defaultGOPSec)
+	}
+
+	if err == nil && idrCount >= 3 && variance <= gopToleranceSec && gop > 0 && gop <= maxRemuxGOPSec {
+		snapped := gop
+		if probe != nil && probe.FrameRate > 0 {
+			framesPerGOP := math.Round(gop * probe.FrameRate)
+			if framesPerGOP > 0 {
+				snapped = framesPerGOP / probe.FrameRate
+			}
+		}
+		j.sourceGOPSec = snapped
+		j.chosenGOPSec = snapped
+		j.useSourceGOP = true
+	} else {
+		j.chosenGOPSec = defaultGOPSec
+		j.useSourceGOP = false
+	}
+	j.chosenSegSec = math.Ceil(targetSeg/j.chosenGOPSec) * j.chosenGOPSec
+
+	if j.useSourceGOP {
+		j.UI.Logf("[%s] gop: source cadence %.3fs (var %.3fs, %d IDRs/60s) — adopted, seg=%.3fs",
+			j.JobID, gop, variance, idrCount, j.chosenSegSec)
+	} else {
+		reason := "variable"
+		if err != nil {
+			reason = "probe failed"
+		} else if idrCount < 3 {
+			reason = fmt.Sprintf("only %d IDRs in 60s", idrCount)
+		} else if variance > gopToleranceSec {
+			reason = fmt.Sprintf("variance %.3fs > %.3fs", variance, gopToleranceSec)
+		} else if gop > maxRemuxGOPSec {
+			reason = fmt.Sprintf("gop %.3fs > %.1fs ceiling", gop, maxRemuxGOPSec)
+		}
+		j.UI.Logf("[%s] gop: %s — default %.1fs GOP, seg=%.3fs", j.JobID, reason, j.chosenGOPSec, j.chosenSegSec)
+	}
 }
 
 // analyzeLoudness runs loudnorm pass-1 if audio normalization is enabled.
@@ -1208,6 +1302,44 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 		return fmt.Errorf("no suitable output profiles for source %dx%d", probe.Width, probe.Height)
 	}
 
+	// Apply the per-job GOP / segment decision to every rendition, re-snapping
+	// per-profile when fps caps cause different renditions to land on
+	// different output frame grids.
+	//
+	// Why per-profile: a 60fps source with fps_limit=30 on a downscaled
+	// rendition emits frames at 30fps. The source-fps-snapped chosenGOPSec
+	// (e.g. 1.95195s = 117 source frames) doesn't land on a 30fps frame
+	// boundary — frame 58 at 30fps is 1.9333s (below), frame 59 is 1.9666s
+	// (above). The encoder fires at frame 59, giving 1.9666s GOPs at the
+	// downsampled output. Without re-snapping, that drifts vs the source-fps
+	// renditions cross-rendition. With per-profile re-snap, each rendition
+	// honors its own frame grid; manifest carries per-Representation
+	// durations (DASH allows it).
+	//
+	// If the source GOP wasn't adopted (variable or > maxRemuxGOPSec), force
+	// re-encode for every profile: remux would import the source's variable
+	// IDR positions, breaking the constant-duration invariant.
+	for i := range profiles {
+		p := &profiles[i]
+		if j.useSourceGOP && probe.FrameRate > 0 {
+			// Effective output fps for this profile (capped if set below source).
+			outFps := probe.FrameRate
+			if p.FpsLimit > 0 && float64(p.FpsLimit) < outFps {
+				outFps = float64(p.FpsLimit)
+			}
+			framesPerGOP := math.Round(j.chosenGOPSec * outFps)
+			if framesPerGOP < 1 {
+				framesPerGOP = 1
+			}
+			p.GOPSeconds = framesPerGOP / outFps
+			p.SegmentDuration = math.Ceil(j.targetSegSec/p.GOPSeconds) * p.GOPSeconds
+		} else {
+			p.GOPSeconds = j.chosenGOPSec
+			p.SegmentDuration = j.chosenSegSec
+			p.CanRemux = false
+		}
+	}
+
 	sourcePath := filepath.Join(j.tempDir, "source.mp4")
 	audioName := fmt.Sprintf("aac_%dk", j.AudioBitrateKbps)
 	audioDir := filepath.Join(j.outputDir, "audio", audioName)
@@ -1521,6 +1653,8 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 	if err := transcoder.WriteMasterPlaylist(j.outputDir, variants, audioName, j.AudioBitrateKbps, hasAudio); err != nil {
 		return fmt.Errorf("write master playlist: %w", err)
 	}
+	// WriteDASHManifest now decides per-Representation uniformity from the
+	// modal value of each rendition's playlist — no global hint needed.
 	if err := transcoder.WriteDASHManifest(j.outputDir, variants, audioName, j.AudioBitrateKbps, probe.DurationSeconds, hasAudio); err != nil {
 		return fmt.Errorf("write DASH manifest: %w", err)
 	}

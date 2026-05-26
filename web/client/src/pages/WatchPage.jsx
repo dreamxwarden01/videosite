@@ -48,6 +48,17 @@ function pickManifestUrl(data) {
   return `${base}?verify=${encodeURIComponent(data.hmacToken)}`;
 }
 
+// isManifestOrInitUrl matches the URLs whose disappearance means the whole
+// video is gone (manifests + init segments), as opposed to .m4s media
+// segments which Shaka retries and where a permanent loss should stall
+// playback at that point rather than tear the player down. Used to gate
+// destroyAndShowError on 404 — see handleShakaError below.
+function isManifestOrInitUrl(url) {
+  if (!url) return false;
+  const path = url.split('?')[0].toLowerCase();
+  return path.endsWith('.m3u8') || path.endsWith('.mpd') || path.endsWith('.mp4');
+}
+
 export default function WatchPage() {
   const { videoId } = useParams();
   const { siteName } = useSite();
@@ -267,12 +278,25 @@ export default function WatchPage() {
       }
 
       // Error handling
+      //
+      // Shaka error code 1001 = BAD_HTTP_STATUS; data layout is
+      // [url, status, responseText, headers, method]. We only tear the
+      // player down when the missing resource is a manifest (.m3u8/.mpd)
+      // or init segment (.mp4) — those mean the whole video is gone. A
+      // 404 on an individual .m4s media segment is treated as a transient
+      // network condition: Shaka's networking engine will retry per its
+      // streaming.retryParameters, and a permanent loss stalls playback
+      // at that point rather than killing the session entirely.
       function handleShakaError(err) {
         if (err && err.code === 1001 && err.data && err.data[1] === 404) {
-          destroyAndShowError('Video Unavailable', 'This video is no longer available.');
-        } else {
-          console.error('Player error:', err);
+          if (isManifestOrInitUrl(err.data[0])) {
+            destroyAndShowError('Video Unavailable', 'This video is no longer available.');
+          } else {
+            console.warn('Media segment 404, deferring to Shaka retry:', err.data[0]);
+          }
+          return;
         }
+        console.error('Player error:', err);
       }
 
       player.addEventListener('error', (event) => handleShakaError(event.detail));

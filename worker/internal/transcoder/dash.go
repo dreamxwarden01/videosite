@@ -12,9 +12,38 @@ import (
 )
 
 // dashMPDTemplate is a MPEG-DASH static VOD manifest using the isoff-live
-// profile with per-Representation SegmentTimeline addressing. The file
-// layout it references matches the CMAF folder layout produced by
-// TranscodeVideoCMAF / TranscodeAudioCMAF:
+// profile. Both video and audio AdaptationSets use a single per-job
+// timescale ({{.Timescale}} = 1000000, so durations are in microseconds);
+// each Representation independently chooses between
+// SegmentTemplate-with-duration (compact, when its segments are uniform)
+// and SegmentTemplate-with-SegmentTimeline (per-segment durations, when
+// not). Per ISO/IEC 23009-1 §5.3, AdaptationSets and Representations may
+// each carry their own SegmentTemplate addressing.
+//
+// Why μs timescale: timescale=1000 (ms) loses sub-ms precision per
+// segment. For a source like 60000/1001 fps with chosen_seg = 4 × 117/59.94
+// = 7.8078078...s, the ms-form rounds to 7808 and accumulates ~0.2ms/seg
+// of declared-vs-actual drift; on multi-hour content that's visible as
+// scrub-bar jitter. timescale=1000000 reduces the per-segment drift to
+// <1 μs, eliminating accumulation under any realistic content length.
+//
+// Why per-Representation duration: fps-cap downsampling makes the encoder
+// snap forced IDRs to the output's frame grid, which differs from the
+// source's frame grid. A 60000/1001 source with a 30fps-capped rendition
+// produces ~59-frame GOPs (1.9667s) on the cap, vs 117-frame GOPs
+// (1.95195s) on the source-fps renditions. Each rendition therefore needs
+// its own SegmentTemplate@duration value. The video AdaptationSet omits
+// segmentAlignment="true" since renditions may differ at the segment
+// boundary level (per-segment switching still works, just not at the
+// frame-aligned guarantee).
+//
+// Why mixed uniform / SegmentTimeline coexists: ffmpeg's native AAC
+// encoder + apad combination drifts ~66ms/segment and inserts a ~2s
+// "correction" segment every ~30, regardless of the -hls_time target —
+// so even uniform-video jobs typically need SegmentTimeline on audio.
+// Each rendition decides for itself.
+//
+// File layout referenced:
 //
 //	{outputDir}/manifest.mpd
 //	{outputDir}/video/{rep.Name}/init.mp4
@@ -22,28 +51,11 @@ import (
 //	{outputDir}/audio/{AudioName}/init.mp4
 //	{outputDir}/audio/{AudioName}/segment_0000.m4s, ...
 //
-// Why SegmentTimeline and not the shorter SegmentTemplate duration="..."
-// form: FFmpeg's HLS muxer decides when to cut a segment based on the
-// *encoded* keyframe stream for each rendition. Two renditions with the
-// same -hls_time target can legitimately end up one segment apart — a
-// different GOP cadence, fps cap, or keyframe landing at a slightly
-// different presentation time is enough. A single "duration=N" attribute
-// then misleads the DASH player into computing segment count as
-// ceil(mediaPresentationDuration / N), which 404s on whichever rendition
-// came up short and tears down the player. SegmentTimeline declares the
-// exact segment count and per-segment duration for each Representation,
-// so players stop requesting where reality stops. The HLS side has
-// always agreed with reality (each playlist.m3u8 lists the segments
-// FFmpeg actually wrote); this brings DASH to the same footing.
-//
 // Shaka Player appends ?verify=... to every segment request via the
 // existing registerRequestFilter — DASH does NOT use the HLS
 // EXT-X-DEFINE mechanism — so this template is deliberately free of any
-// HMAC substitution. The audio AdaptationSet is gated by
-// {{- if .HasAudio}} so no-audio sources emit a video-only MPD. Shaka
-// accepts an MPD with zero audio sets and plays the <video> element
-// silently; declaring an audio set whose segments never resolve would
-// leave Shaka stuck in the buffering state forever.
+// HMAC substitution. The audio AdaptationSet is gated by {{if .HasAudio}}
+// so no-audio sources emit a video-only MPD.
 const dashMPDTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
      type="static"
@@ -51,16 +63,20 @@ const dashMPDTemplate = `<?xml version="1.0" encoding="UTF-8"?>
      minBufferTime="PT2S"
      profiles="urn:mpeg:dash:profile:isoff-live:2011">
   <Period>
-    <AdaptationSet contentType="video" mimeType="video/mp4" segmentAlignment="true" startWithSAP="1">
+    <AdaptationSet contentType="video" mimeType="video/mp4" startWithSAP="1">
 {{- range .VideoReps}}
       <Representation id="{{.Name}}" codecs="{{.Codecs}}" bandwidth="{{.Bandwidth}}" width="{{.Width}}" height="{{.Height}}" frameRate="{{.FrameRate}}">
-        <SegmentTemplate media="video/{{.Name}}/segment_$Number%04d$.m4s" initialization="video/{{.Name}}/init.mp4" timescale="1000" startNumber="0">
+{{- if .Uniform}}
+        <SegmentTemplate media="video/{{.Name}}/segment_$Number%04d$.m4s" initialization="video/{{.Name}}/init.mp4" timescale="{{$.Timescale}}" startNumber="0" duration="{{.SegmentDurationTicks}}"/>
+{{- else}}
+        <SegmentTemplate media="video/{{.Name}}/segment_$Number%04d$.m4s" initialization="video/{{.Name}}/init.mp4" timescale="{{$.Timescale}}" startNumber="0">
           <SegmentTimeline>
 {{- range .Timeline}}
             <S d="{{.Duration}}"{{if gt .Repeat 0}} r="{{.Repeat}}"{{end}}/>
 {{- end}}
           </SegmentTimeline>
         </SegmentTemplate>
+{{- end}}
       </Representation>
 {{- end}}
     </AdaptationSet>
@@ -68,13 +84,17 @@ const dashMPDTemplate = `<?xml version="1.0" encoding="UTF-8"?>
     <AdaptationSet contentType="audio" mimeType="audio/mp4" lang="und">
       <Representation id="{{.AudioName}}" codecs="mp4a.40.2" bandwidth="{{.AudioBandwidth}}" audioSamplingRate="48000">
         <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2"/>
-        <SegmentTemplate media="audio/{{.AudioName}}/segment_$Number%04d$.m4s" initialization="audio/{{.AudioName}}/init.mp4" timescale="1000" startNumber="0">
+{{- if .AudioUniform}}
+        <SegmentTemplate media="audio/{{.AudioName}}/segment_$Number%04d$.m4s" initialization="audio/{{.AudioName}}/init.mp4" timescale="{{$.Timescale}}" startNumber="0" duration="{{.AudioSegmentDurationTicks}}"/>
+{{- else}}
+        <SegmentTemplate media="audio/{{.AudioName}}/segment_$Number%04d$.m4s" initialization="audio/{{.AudioName}}/init.mp4" timescale="{{$.Timescale}}" startNumber="0">
           <SegmentTimeline>
 {{- range .AudioTimeline}}
             <S d="{{.Duration}}"{{if gt .Repeat 0}} r="{{.Repeat}}"{{end}}/>
 {{- end}}
           </SegmentTimeline>
         </SegmentTemplate>
+{{- end}}
       </Representation>
     </AdaptationSet>
 {{- end}}
@@ -82,8 +102,12 @@ const dashMPDTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 </MPD>
 `
 
+// dashTimescale is the shared per-job MPD timescale: microseconds. See
+// dashMPDTemplate docstring for why μs over ms.
+const dashTimescale = 1000000
+
 // dashSegmentRun is a run-length-encoded entry in a SegmentTimeline.
-// Duration is in milliseconds (matches SegmentTemplate timescale="1000").
+// Duration is in dashTimescale ticks (μs).
 // Repeat follows the DASH @r semantics — "repeat this many additional
 // times" — so Repeat=0 is one segment, Repeat=2 is three segments. We
 // only emit @r when > 0 to keep the MPD compact for single-segment tails.
@@ -92,29 +116,38 @@ type dashSegmentRun struct {
 	Repeat   int
 }
 
-// dashVideoRep is the template view of one video Representation.
+// dashVideoRep is the template view of one video Representation. Carries
+// both addressing forms; Uniform picks between them at render time. When
+// Uniform is true, SegmentDurationTicks is used (in dashTimescale ticks)
+// and Timeline is ignored. When false, Timeline is used.
 type dashVideoRep struct {
-	Name      string
-	Codecs    string
-	Bandwidth int // bits/sec
-	Width     int
-	Height    int
-	FrameRate int
-	Timeline  []dashSegmentRun
+	Name                 string
+	Codecs               string
+	Bandwidth            int // bits/sec
+	Width                int
+	Height               int
+	FrameRate            int
+	Uniform              bool
+	SegmentDurationTicks int
+	Timeline             []dashSegmentRun
 }
 
-// dashTmplContext is the full view passed to the MPD template.
+// dashTmplContext is the full view passed to dashMPDTemplate.
 //
-// HasAudio gates the audio AdaptationSet in the template (see
-// dashMPDTemplate above). When false, AudioName, AudioBandwidth, and
-// AudioTimeline are unused — keep them zero-valued.
+// HasAudio gates the entire audio AdaptationSet. When false, every audio*
+// field is unused.
 type dashTmplContext struct {
-	DurationISO    string
-	VideoReps      []dashVideoRep
-	AudioName      string
-	AudioBandwidth int
-	AudioTimeline  []dashSegmentRun
-	HasAudio       bool
+	DurationISO string
+	Timescale   int // shared timescale for both AdaptationSets
+
+	VideoReps []dashVideoRep
+
+	HasAudio                  bool
+	AudioName                 string
+	AudioBandwidth            int
+	AudioUniform              bool
+	AudioSegmentDurationTicks int              // when AudioUniform
+	AudioTimeline             []dashSegmentRun // when !AudioUniform
 }
 
 // WriteDASHManifest renders an MPD into outputDir/manifest.mpd.
@@ -142,11 +175,12 @@ type dashTmplContext struct {
 // HLS playlist is the only record that reflects those decisions.
 func WriteDASHManifest(outputDir string, variants []Variant, audioName string, audioBitrateKbps int, durationSec float64, hasAudio bool) error {
 	reps := make([]dashVideoRep, 0, len(variants))
-	// Track the shortest per-rendition timeline so mediaPresentationDuration
-	// can be clamped down if any rendition undershoots the ffprobe duration
-	// — a player that sees a longer mediaPresentationDuration than the
-	// timeline allows may try to present a seek bar past the last segment.
-	shortestMs := -1
+	// Track the shortest per-rendition timeline (in ticks) so
+	// mediaPresentationDuration can be clamped down if any rendition
+	// undershoots the ffprobe duration — a player that sees a longer
+	// mediaPresentationDuration than the timeline allows may try to
+	// present a seek bar past the last segment.
+	shortestTicks := -1
 	for _, v := range variants {
 		codecs := v.Codecs
 		if codecs == "" {
@@ -161,50 +195,62 @@ func WriteDASHManifest(outputDir string, variants []Variant, audioName string, a
 		}
 
 		playlistPath := filepath.Join(outputDir, "video", v.Name, "playlist.m3u8")
-		durs, err := readPlaylistSegmentDurationsMs(playlistPath)
+		durs, err := readPlaylistSegmentDurationsTicks(playlistPath)
 		if err != nil {
 			return fmt.Errorf("read %s playlist for DASH timeline: %w", v.Name, err)
 		}
 		if len(durs) == 0 {
 			return fmt.Errorf("no #EXTINF segments found in %s playlist", v.Name)
 		}
-		sumMs := 0
+		sumTicks := 0
 		for _, d := range durs {
-			sumMs += d
+			sumTicks += d
 		}
-		if shortestMs < 0 || sumMs < shortestMs {
-			shortestMs = sumMs
+		if shortestTicks < 0 || sumTicks < shortestTicks {
+			shortestTicks = sumTicks
 		}
 
-		reps = append(reps, dashVideoRep{
+		modalTicks, uniform := segmentDurationIfUniform(durs)
+		rep := dashVideoRep{
 			Name:      v.Name,
 			Codecs:    codecs,
 			Bandwidth: v.VideoBitrateKbps * 1000,
 			Width:     v.Width,
 			Height:    v.Height,
 			FrameRate: frameRate,
-			Timeline:  compressToSegmentRuns(durs),
-		})
+			Uniform:   uniform,
+		}
+		if uniform {
+			rep.SegmentDurationTicks = modalTicks
+		} else {
+			rep.Timeline = compressToSegmentRuns(durs)
+		}
+		reps = append(reps, rep)
 	}
 
 	var audioRuns []dashSegmentRun
+	audioUniform := false
+	audioSegTicks := 0
 	if hasAudio {
 		audioPlaylist := filepath.Join(outputDir, "audio", audioName, "playlist.m3u8")
-		durs, err := readPlaylistSegmentDurationsMs(audioPlaylist)
+		durs, err := readPlaylistSegmentDurationsTicks(audioPlaylist)
 		if err != nil {
 			return fmt.Errorf("read audio playlist for DASH timeline: %w", err)
 		}
 		if len(durs) == 0 {
 			return fmt.Errorf("no #EXTINF segments found in audio playlist")
 		}
-		sumMs := 0
+		sumTicks := 0
 		for _, d := range durs {
-			sumMs += d
+			sumTicks += d
 		}
-		if shortestMs < 0 || sumMs < shortestMs {
-			shortestMs = sumMs
+		if shortestTicks < 0 || sumTicks < shortestTicks {
+			shortestTicks = sumTicks
 		}
-		audioRuns = compressToSegmentRuns(durs)
+		audioSegTicks, audioUniform = segmentDurationIfUniform(durs)
+		if !audioUniform {
+			audioRuns = compressToSegmentRuns(durs)
+		}
 	}
 
 	// mediaPresentationDuration should not exceed what every rendition can
@@ -213,20 +259,23 @@ func WriteDASHManifest(outputDir string, variants []Variant, audioName string, a
 	// frame the muxer drops); using the shortest timeline here keeps the
 	// header honest.
 	effectiveDurationSec := durationSec
-	if shortestMs > 0 {
-		timelineSec := float64(shortestMs) / 1000.0
+	if shortestTicks > 0 {
+		timelineSec := float64(shortestTicks) / float64(dashTimescale)
 		if timelineSec < effectiveDurationSec {
 			effectiveDurationSec = timelineSec
 		}
 	}
 
 	ctx := dashTmplContext{
-		DurationISO:    formatISODuration(effectiveDurationSec),
-		VideoReps:      reps,
-		AudioName:      audioName,
-		AudioBandwidth: audioBitrateKbps * 1000,
-		AudioTimeline:  audioRuns,
-		HasAudio:       hasAudio,
+		DurationISO:               formatISODuration(effectiveDurationSec),
+		Timescale:                 dashTimescale,
+		VideoReps:                 reps,
+		HasAudio:                  hasAudio,
+		AudioName:                 audioName,
+		AudioBandwidth:            audioBitrateKbps * 1000,
+		AudioUniform:              audioUniform,
+		AudioSegmentDurationTicks: audioSegTicks,
+		AudioTimeline:             audioRuns,
 	}
 
 	tmpl, err := template.New("mpd").Parse(dashMPDTemplate)
@@ -243,17 +292,63 @@ func WriteDASHManifest(outputDir string, variants []Variant, audioName string, a
 	return os.WriteFile(mpdPath, []byte(sb.String()), 0644)
 }
 
-// readPlaylistSegmentDurationsMs parses an HLS playlist and returns each
-// segment's duration in milliseconds, in playlist order. Only #EXTINF
-// lines are considered; comments and segment URIs are ignored. The
+// dashUniformToleranceTicks is the per-segment deviation budget for
+// declaring a Representation "uniform-duration", in dashTimescale ticks
+// (μs). 100ms = 100000 μs covers fractional-fps drift (23.976fps + 2s GOP →
+// real 2.002s) and ffmpeg muxer rounding while staying well under typical
+// ABR switching granularity. Matches gopToleranceSec in slot/job.go.
+const dashUniformToleranceTicks = 100 * 1000 // 100ms in μs
+
+// segmentDurationIfUniform returns (modalTicks, true) when the given
+// segment-duration sequence (excluding the trailing partial) is uniform
+// within ±dashUniformToleranceTicks of its modal value, else (0, false).
+// Used for both video and audio renditions — each gets its own uniformity
+// verdict so fps-cap and AAC quirks can be handled independently.
+func segmentDurationIfUniform(durs []int) (int, bool) {
+	// Need at least 2 segments to make sense of "ignore the last" — for
+	// very short videos with a single segment, skip uniformity and take
+	// the SegmentTimeline path so the manifest is honest about what the
+	// muxer emitted.
+	if len(durs) < 2 {
+		return 0, false
+	}
+	// Modal value over all-but-last. AAC quantization typically produces
+	// one of two adjacent durations; fps-cap renditions produce a single
+	// value with ±1 frame jitter. Either way, mode + tolerance handles it.
+	counts := make(map[int]int)
+	for i := 0; i < len(durs)-1; i++ {
+		counts[durs[i]]++
+	}
+	var modal, modalCount int
+	for d, c := range counts {
+		if c > modalCount {
+			modal = d
+			modalCount = c
+		}
+	}
+	for i := 0; i < len(durs)-1; i++ {
+		dev := durs[i] - modal
+		if dev < 0 {
+			dev = -dev
+		}
+		if dev > dashUniformToleranceTicks {
+			return 0, false
+		}
+	}
+	return modal, true
+}
+
+// readPlaylistSegmentDurationsTicks parses an HLS playlist and returns each
+// segment's duration in dashTimescale ticks (μs), in playlist order. Only
+// #EXTINF lines are considered; comments and segment URIs are ignored. The
 // HMAC-rewritten playlists produced by RewritePlaylistHMAC preserve
 // #EXTINF lines verbatim, so this works regardless of whether the caller
 // has already rewritten the playlist for edge verification.
 //
 // EXTINF format (RFC 8216 §4.4.4.1): "#EXTINF:<duration>,[<title>]". The
 // fractional-second form (e.g. "#EXTINF:9.9833,") is the one FFmpeg emits
-// for CMAF segments; we round to the nearest millisecond.
-func readPlaylistSegmentDurationsMs(playlistPath string) ([]int, error) {
+// for CMAF segments; we scale to dashTimescale (μs) and round.
+func readPlaylistSegmentDurationsTicks(playlistPath string) ([]int, error) {
 	f, err := os.Open(playlistPath)
 	if err != nil {
 		return nil, err
@@ -280,7 +375,7 @@ func readPlaylistSegmentDurationsMs(playlistPath string) ([]int, error) {
 		if parseErr != nil || secs <= 0 {
 			continue
 		}
-		durs = append(durs, int(math.Round(secs*1000)))
+		durs = append(durs, int(math.Round(secs*float64(dashTimescale))))
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err

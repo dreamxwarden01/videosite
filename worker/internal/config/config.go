@@ -21,8 +21,13 @@ import (
 // are passed through unchanged (no upsampling).
 //
 // GOPSeconds is the keyframe interval in seconds — the FFmpeg keyint flag is
-// computed as round(GOPSeconds * effective_fps) at arg-build time so GOP
-// stays a constant 2s regardless of source frame rate.
+// computed as ceil(GOPSeconds * effective_fps) at arg-build time and
+// -force_key_frames pins the cadence to multiples of GOPSeconds so every
+// rendition cuts at the same instants regardless of source frame rate.
+//
+// SegmentDuration is in seconds and accepts fractional values. The worker may
+// override this at runtime to align with a probed source GOP — see
+// slot/job.go runTranscode for the per-job override that propagates here.
 type OutputProfile struct {
 	Name             string  `json:"name"`
 	Width            int     `json:"width"`
@@ -32,7 +37,7 @@ type OutputProfile struct {
 	Codec            string  `json:"codec"`
 	Profile          string  `json:"profile"`
 	Preset           string  `json:"preset"`
-	SegmentDuration  int     `json:"segment_duration"`
+	SegmentDuration  float64 `json:"segment_duration"`
 	GOPSeconds       float64 `json:"gop_seconds"`
 }
 

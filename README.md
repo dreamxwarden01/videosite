@@ -19,6 +19,7 @@ A private video course platform with hardware-accelerated distributed transcodin
 - Automatic encoder detection and load-balanced job distribution
 - EBU R128 two-pass audio loudness normalization
 - Smart profile filtering: skips upscaling, remuxes when re-encoding is unnecessary
+- Source GOP probed up-front (first 60s of packets); when the source has a constant GOP ≤ 2s, every rendition adopts the source frame cadence so all segments line up — remuxed top-resolution profiles inherit source IDRs and transcoded lower-resolution profiles force-key-frame to the same time grid. DASH manifest collapses from `<SegmentTimeline>` (one entry per segment per rendition) to per-Representation `<SegmentTemplate duration="…">` when segments are uniform, scaling O(profiles) instead of O(segments × profiles); μs-precision timescale eliminates declared-vs-actual drift on multi-hour content. Video and audio AdaptationSets decide uniformity independently — video usually compacts, audio falls back to `<SegmentTimeline>` only when the AAC encoder's per-segment drift exceeds tolerance.
 
 ## Architecture
 

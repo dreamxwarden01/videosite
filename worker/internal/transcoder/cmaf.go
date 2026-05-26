@@ -85,7 +85,14 @@ func RemuxVideo(ctx context.Context, sourcePath, outputDir string, profile confi
 		"-map", "0:v:0",
 		"-c:v", "copy",
 		"-an",
-		"-hls_time", fmt.Sprintf("%d", profile.SegmentDuration),
+		// Pass -hls_time slightly under the true chosen_seg so the muxer always
+		// cuts on the natural IDR rather than skipping past it. Without the
+		// margin, %.3f rounds chosen_seg UP (e.g. true 7.807807s → "7.808") and
+		// cumulative drift eventually places the threshold milliseconds past
+		// the source's natural IDR — the muxer then waits for the NEXT IDR and
+		// emits a segment one source-GOP longer than intended. 100ms is well
+		// under the smallest realistic GOP (~250ms).
+		"-hls_time", fmt.Sprintf("%.3f", hlsTimeArg(profile.SegmentDuration)),
 		"-hls_playlist_type", "vod",
 		"-hls_segment_type", "fmp4",
 		"-hls_fmp4_init_filename", initName,
@@ -95,6 +102,35 @@ func RemuxVideo(ctx context.Context, sourcePath, outputDir string, profile confi
 	}
 
 	return RunFFmpegWithProgress(ctx, duration, logFile, args...)
+}
+
+// hlsTimeArg returns the safe -hls_time value for the given chosen segment
+// duration. We subtract a 1ms epsilon for two reasons:
+//
+//  1. Round-up protection: the muxer's "first IDR ≥ start + hls_time" lookup
+//     skips the natural source IDR if hls_time's %.3f representation lands
+//     fractionally *above* the true segment-end PTS (e.g., true 7.8078s
+//     formatted as "7.808" loses the IDR at 7.8078s and waits for 9.760s).
+//     1ms is enough to stay below source-grid PTS rounding.
+//
+//  2. Don't induce cumulative drift: ffmpeg's HLS muxer uses *cumulative*
+//     thresholds (N × hls_time), so a large margin accumulates over N
+//     segments. With 1ms × N segments, drift stays well under one source
+//     GOP (~2s) even for multi-hour videos — large margins (e.g., 100ms)
+//     produce a short segment every ~20 segments once cumulative drift
+//     pushes the threshold before a natural IDR.
+//
+// chosenSegSec is expected to already be snapped to source-GOP multiples
+// via slot/job.go computeGOPDecision when useSourceGOP is set.
+func hlsTimeArg(chosenSegSec float64) float64 {
+	const safetyMarginSec = 0.001
+	t := chosenSegSec - safetyMarginSec
+	if t < 0.5 {
+		// Defensive: for absurdly small chosen_seg the margin would dominate.
+		// Fall back to 99.9% of the value rather than going negative.
+		t = chosenSegSec * 0.999
+	}
+	return t
 }
 
 // TranscodeAudio produces a single AAC-LC fMP4 HLS audio rendition at
@@ -120,7 +156,8 @@ func RemuxVideo(ctx context.Context, sourcePath, outputDir string, profile confi
 func TranscodeAudio(
 	ctx context.Context,
 	sourcePath, outputDir string,
-	audioBitrateKbps, segmentDurationSec int,
+	audioBitrateKbps int,
+	segmentDurationSec float64,
 	loudnormFilter string,
 	audioStreamCount int,
 	duration float64,
@@ -184,7 +221,7 @@ func TranscodeAudio(
 	// tail-stall (player waiting on a missing trailing audio segment).
 	args = append(args, "-t", fmt.Sprintf("%.3f", duration))
 	args = append(args,
-		"-hls_time", fmt.Sprintf("%d", segmentDurationSec),
+		"-hls_time", fmt.Sprintf("%.3f", segmentDurationSec),
 		"-hls_playlist_type", "vod",
 		"-hls_segment_type", "fmp4",
 		"-hls_fmp4_init_filename", initName,
@@ -226,12 +263,16 @@ func buildBaseVideoArgs(hwArgs []string, sourcePath, outputDir string, profile c
 	segmentPattern := filepath.ToSlash(filepath.Join(outputDir, "segment_%04d.m4s"))
 	initName := "init.mp4"
 
-	keyint := int(math.Round(profile.GOPSeconds * effectiveFps))
+	// ceil so the first frame at-or-after GOPSeconds becomes the next IDR;
+	// matches the time-based -force_key_frames expression below. At 23.976
+	// fps + 2.0s target → 48 frames (2.002s real), within the per-job
+	// tolerance carried in slot/job.go computeGOPDecision.
+	keyint := int(math.Ceil(profile.GOPSeconds * effectiveFps))
 	if keyint < 1 {
 		keyint = 1
 	}
 
-	args := make([]string, 0, 30+len(hwArgs))
+	args := make([]string, 0, 32+len(hwArgs))
 	args = append(args, hwArgs...)
 	args = append(args,
 		"-i", sourcePath,
@@ -243,9 +284,23 @@ func buildBaseVideoArgs(hwArgs []string, sourcePath, outputDir string, profile c
 		"-vf", vfFilter,
 		"-profile:v", profile.Profile,
 		"-an",
+		// -g is the ceiling (encoder won't go longer than this); -force_key_frames
+		// pins the actual cadence in seconds so every rendition in the same job
+		// cuts at identical time grid positions regardless of effective fps.
+		// Scene-cut IDRs are explicitly NOT suppressed (no -sc_threshold 0) —
+		// extras only add seek points without disturbing segmentation.
+		//
+		// The 1ms epsilon on -force_key_frames mirrors hlsTimeArg's
+		// safety-margin logic. ffprobe quantizes source PTS to ms, so even
+		// a snapped chosenGOPSec can round a few μs above the true rational
+		// frame PTS; subtracting 1ms guarantees frame N (the natural source
+		// IDR) lands at-or-above the threshold and the encoder fires there
+		// rather than skipping to frame N+1 (which produces +1-frame GOPs
+		// and cross-rendition misalignment).
 		"-g", fmt.Sprintf("%d", keyint),
-		"-sc_threshold", "0",
-		"-hls_time", fmt.Sprintf("%d", profile.SegmentDuration),
+		"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%g)", profile.GOPSeconds-0.001),
+		// See hlsTimeArg / RemuxVideo for the safety-margin rationale.
+		"-hls_time", fmt.Sprintf("%.3f", hlsTimeArg(profile.SegmentDuration)),
 		"-hls_playlist_type", "vod",
 		"-hls_segment_type", "fmp4",
 		"-hls_fmp4_init_filename", initName,

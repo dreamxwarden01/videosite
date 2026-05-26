@@ -102,6 +102,94 @@ func h264ProfileIDC(profile string) (idc, compat int) {
 	return 0, 0
 }
 
+// ProbeGOP samples the first 60s of video packets to determine the source's
+// GOP cadence. Returns (mean GOP duration, max-deviation variance, IDR count
+// in window, error).
+//
+// The worker uses these to decide whether to adopt the source GOP for the
+// entire job (every rendition cuts at the same instants, enabling DASH
+// SegmentTemplate-without-Timeline) or fall back to a fixed default.
+//
+// Sources with fewer than 3 IDRs in the window are treated as "indeterminate"
+// — caller should fall back to the default. Same for the ffprobe-missing case.
+func ProbeGOP(filePath string) (gopSec float64, varianceSec float64, idrCount int, err error) {
+	// -read_intervals 0%+60 reads packets between time 0 and 60s in.
+	// -select_streams v:0 limits to the first video stream.
+	// -show_entries packet=pts_time,flags emits only the fields we need.
+	cmd := exec.Command(ffprobePath,
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_packets",
+		"-read_intervals", "0%+60",
+		"-show_entries", "packet=pts_time,flags",
+		"-print_format", "json",
+		filePath,
+	)
+	out, runErr := cmd.Output()
+	if runErr != nil {
+		if isExecMissing(runErr) {
+			return 0, 0, 0, fmt.Errorf("%w: %v", ErrFFmpegMissing, runErr)
+		}
+		return 0, 0, 0, fmt.Errorf("ffprobe gop probe: %w", runErr)
+	}
+
+	var parsed struct {
+		Packets []struct {
+			PTSTime string `json:"pts_time"`
+			Flags   string `json:"flags"`
+		} `json:"packets"`
+	}
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		return 0, 0, 0, fmt.Errorf("parse ffprobe packets: %w", err)
+	}
+
+	// Collect PTS times for keyframe packets. ffprobe marks keyframes by
+	// setting the first character of "flags" to 'K' (e.g. "K_" or "K__").
+	var idrTimes []float64
+	for _, p := range parsed.Packets {
+		if len(p.Flags) == 0 || p.Flags[0] != 'K' {
+			continue
+		}
+		t, ferr := strconv.ParseFloat(p.PTSTime, 64)
+		if ferr != nil {
+			continue
+		}
+		idrTimes = append(idrTimes, t)
+	}
+
+	if len(idrTimes) < 3 {
+		return 0, 0, len(idrTimes), nil
+	}
+
+	// Compute inter-IDR intervals from the second IDR onward (the first IDR is
+	// usually at t=0, which doesn't contribute an interval).
+	intervals := make([]float64, 0, len(idrTimes)-1)
+	for i := 1; i < len(idrTimes); i++ {
+		intervals = append(intervals, idrTimes[i]-idrTimes[i-1])
+	}
+
+	var sum float64
+	for _, iv := range intervals {
+		sum += iv
+	}
+	mean := sum / float64(len(intervals))
+
+	// Max-deviation variance (not stddev) — easier to reason about against the
+	// 100ms tolerance the caller compares to.
+	var maxDev float64
+	for _, iv := range intervals {
+		dev := iv - mean
+		if dev < 0 {
+			dev = -dev
+		}
+		if dev > maxDev {
+			maxDev = dev
+		}
+	}
+
+	return mean, maxDev, len(idrTimes), nil
+}
+
 // ProbeResult holds the results from probing a source file.
 //
 // AudioCodec is the codec of the **first** audio stream (track 0) — not the
