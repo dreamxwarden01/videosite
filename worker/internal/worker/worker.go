@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -516,13 +517,27 @@ func (w *Worker) shutdown() {
 	// Cleanup temp directories
 	util.CleanupAllTemp()
 
-	// Clean the logs directory. Logs are only needed while errors are being
-	// investigated; on a clean shutdown they are removed so the next run
-	// starts fresh. Any logs worth keeping should be copied out beforehand.
-	if err := os.RemoveAll(slot.LogsDir); err != nil {
-		slog.Warn("Failed to clean logs directory", "err", err)
+	// Clear log files but keep the logs/ directory itself. Logs are only
+	// needed while errors are being investigated; on a clean shutdown they
+	// are deleted so the next run starts fresh. Keeping the dir preserves
+	// any external bind-mount (e.g. a Docker volume) and means ffmpegLogPath's
+	// lazy MkdirAll fast-paths on the next invocation. Anything worth keeping
+	// should be copied out beforehand.
+	if entries, err := os.ReadDir(slot.LogsDir); err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("Failed to list logs directory", "err", err)
+		}
 	} else {
-		w.ui.Logf("Logs cleaned.")
+		var failed int
+		for _, e := range entries {
+			if err := os.RemoveAll(filepath.Join(slot.LogsDir, e.Name())); err != nil {
+				slog.Warn("Failed to remove log entry", "name", e.Name(), "err", err)
+				failed++
+			}
+		}
+		if failed == 0 {
+			w.ui.Logf("Logs cleaned.")
+		}
 	}
 
 	w.ui.Logf("Worker stopped.")
