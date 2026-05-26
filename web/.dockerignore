@@ -1,0 +1,24 @@
+# Don't ship installed deps or built assets — every stage rebuilds them.
+node_modules
+client/node_modules
+client/dist
+
+# Secrets / runtime config — never bake into an image.
+.env
+.env.*
+!.env.example
+
+# OS + editor junk
+.DS_Store
+*.log
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Claude Code workspace
+.claude/
+
+# Stray markdown drafts at the web/ root (none today, defensive). README and
+# audit docs live at the repo root and aren't in this build context anyway.
+*.md
