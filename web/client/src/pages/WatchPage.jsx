@@ -580,7 +580,11 @@ export default function WatchPage() {
               <>{Math.floor(video.duration_seconds / 3600)}h {Math.floor((video.duration_seconds % 3600) / 60)}m</>
             )}
           </p>
-          {video.description && <p className="mt-2">{video.description}</p>}
+          {video.description && (
+            <p className="mt-2" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+              {video.description}
+            </p>
+          )}
         </div>
       </div>
     </div>

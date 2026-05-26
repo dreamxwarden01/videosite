@@ -138,6 +138,15 @@ router.post('/videos/:id', requireAuth, checkPermission('changeVideo'), async (r
         }
 
         const { title, description, week, lecture_date } = req.body;
+
+        if (typeof description === 'string' && description.length > 15000) {
+            return res.status(422).json({
+                error: 'Description exceeds the 15000 character limit',
+                max: 15000,
+                got: description.length,
+            });
+        }
+
         const updates = {};
         if (title !== undefined) updates.title = title;
         if (description !== undefined) updates.description = description;

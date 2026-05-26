@@ -2,6 +2,11 @@ import { useState, useRef, useEffect } from 'react';
 import { multipartUpload, UploadConflictError, UploadAbortedError, UploadRetryExhaustedError, ALLOWED_VIDEO_EXTENSIONS, validateVideoFile } from '../services/uploadService';
 import { useToast } from '../context/ToastContext';
 
+// Mirror of the server-side cap (POST /api/upload/create + POST /api/videos/:id).
+// .length counts UTF-16 code units, matching the server check, so the client
+// and server never disagree about what's over the line.
+const MAX_DESCRIPTION_CHARS = 15000;
+
 function parseFilename(filename, courses) {
   const base = filename.replace(/\.[^.]+$/, '');
   const match = base.match(/^(.+?)_Week(\d+)_(\d{8})/i);
@@ -43,6 +48,7 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
   const [week, setWeek] = useState('');
   const [date, setDate] = useState('');
   const [description, setDescription] = useState('');
+  const [descriptionTouched, setDescriptionTouched] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadText, setUploadText] = useState('');
@@ -64,6 +70,7 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
       setWeek('');
       setDate('');
       setDescription('');
+      setDescriptionTouched(false);
       setUploading(false);
       setUploadProgress(0);
       setUploadText('');
@@ -216,7 +223,9 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
     onUploadComplete();
   }
 
-  const canUpload = file && title.trim() && courseId && !uploading;
+  const descriptionTooLong = description.length > MAX_DESCRIPTION_CHARS;
+  const descriptionInvalid = descriptionTouched && descriptionTooLong;
+  const canUpload = file && title.trim() && courseId && !uploading && !descriptionTooLong;
 
   // Success screen
   if (successTitle) {
@@ -368,10 +377,21 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
               className="form-control"
               value={description}
               onChange={e => setDescription(e.target.value)}
+              onBlur={() => setDescriptionTouched(true)}
+              onFocus={() => setDescriptionTouched(false)}
               disabled={uploading}
               rows={3}
               placeholder="Optional description"
+              style={descriptionInvalid ? { borderColor: '#dc3545' } : undefined}
             />
+            <div style={{
+              fontSize: '12px',
+              marginTop: '4px',
+              textAlign: 'right',
+              color: descriptionTooLong ? '#dc3545' : '#6b7280',
+            }}>
+              {description.length.toLocaleString()} / {MAX_DESCRIPTION_CHARS.toLocaleString()}
+            </div>
           </div>
 
           {/* Progress bar */}

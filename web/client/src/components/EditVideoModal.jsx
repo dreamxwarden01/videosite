@@ -3,6 +3,11 @@ import { apiPost } from '../api';
 import { multipartUpload, UploadConflictError, UploadAbortedError, UploadRetryExhaustedError, ALLOWED_VIDEO_EXTENSIONS, validateVideoFile } from '../services/uploadService';
 import { useToast } from '../context/ToastContext';
 
+// Mirror of the server-side cap (POST /api/videos/:id). .length counts UTF-16
+// code units, matching the server check, so client and server never disagree
+// about what's over the line.
+const MAX_DESCRIPTION_CHARS = 15000;
+
 export default function EditVideoModal({ isOpen, video, courseName, canReplace, onClose, onComplete }) {
   const { showToast } = useToast();
   const fileInputRef = useRef(null);
@@ -12,6 +17,7 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
   const [week, setWeek] = useState('');
   const [date, setDate] = useState('');
   const [description, setDescription] = useState('');
+  const [descriptionTouched, setDescriptionTouched] = useState(false);
   const [file, setFile] = useState(null);
   const [dragActive, setDragActive] = useState(false);
   const [fileError, setFileError] = useState('');
@@ -39,6 +45,7 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
       setWeek(w);
       setDate(d);
       setDescription(desc);
+      setDescriptionTouched(false);
       setOrigTitle(t);
       setOrigWeek(w);
       setOrigDate(d);
@@ -68,6 +75,8 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
   const hasFile = !!file;
   const canReplaceFile = canReplace && video.status === 'finished';
   const isProcessing = video.status !== 'finished' && video.status !== 'error';
+  const descriptionTooLong = description.length > MAX_DESCRIPTION_CHARS;
+  const descriptionInvalid = descriptionTouched && descriptionTooLong;
 
   // Determine button label and enabled state
   let actionLabel = 'Save';
@@ -330,9 +339,20 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
               className="form-control"
               value={description}
               onChange={e => setDescription(e.target.value)}
+              onBlur={() => setDescriptionTouched(true)}
+              onFocus={() => setDescriptionTouched(false)}
               disabled={busy}
               rows={3}
+              style={descriptionInvalid ? { borderColor: '#dc3545' } : undefined}
             />
+            <div style={{
+              fontSize: '12px',
+              marginTop: '4px',
+              textAlign: 'right',
+              color: descriptionTooLong ? '#dc3545' : '#6b7280',
+            }}>
+              {description.length.toLocaleString()} / {MAX_DESCRIPTION_CHARS.toLocaleString()}
+            </div>
           </div>
 
           {/* Progress bar */}
@@ -352,7 +372,7 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
                 <button className="btn btn-secondary" onClick={handleClose} disabled={busy}>
                   Cancel
                 </button>
-                <button className="btn btn-primary" onClick={handleAction} disabled={busy || !actionEnabled}>
+                <button className="btn btn-primary" onClick={handleAction} disabled={busy || !actionEnabled || descriptionTooLong}>
                   {busy ? 'Saving...' : actionLabel}
                 </button>
               </>

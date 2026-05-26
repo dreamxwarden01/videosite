@@ -69,6 +69,14 @@ router.post('/upload/create', requireAuth, checkPermission('uploadVideo'), async
             return res.status(400).json({ error: 'courseId, filename, fileSize, and title are required' });
         }
 
+        if (typeof description === 'string' && description.length > 15000) {
+            return res.status(422).json({
+                error: 'Description exceeds the 15000 character limit',
+                max: 15000,
+                got: description.length,
+            });
+        }
+
         const inputError = validateUploadInputs(filename, fileSize);
         if (inputError) {
             return res.status(400).json({ error: inputError });
