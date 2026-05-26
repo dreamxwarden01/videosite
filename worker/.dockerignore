@@ -1,0 +1,24 @@
+# Compiled binaries — the image rebuilds inside its own builder stage.
+videosite-worker-*
+
+# Runtime state. Created at first setup / hardware detect, never baked into
+# an image and never committed to the repo.
+config.json
+capabilities.json
+cert/
+logs/
+temp/
+
+# OS + editor junk
+.DS_Store
+*.log
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Claude Code workspace
+.claude/
+
+# Notes (CLAUDE.md is a context-only file, not needed at runtime)
+*.md
