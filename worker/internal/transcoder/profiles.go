@@ -2,9 +2,23 @@ package transcoder
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"time"
 	"videosite-worker/internal/config"
+)
+
+// GOP-boost tuning. When the source has a longer GOP than the target we plan
+// to encode at, we give the transcoded output a moderate bitrate bonus so the
+// extra I-frames don't eat into the P-frame budget. log2 makes the boost grow
+// gracefully with the tightening ratio (10s→5s and 5s→2.5s each add one unit
+// of boost) and the cap prevents runaway inflation on extreme ratios. The
+// bonus is always clamped to whatever per-profile ceiling already applies
+// (config max, and cascade cap for non-top profiles), so the boost can never
+// exceed the user's intended bandwidth for that rendition.
+const (
+	gopBoostPerOctave = 0.15 // +15% per doubling of GOP density
+	gopBoostMax       = 0.40 // hard cap at +40%
 )
 
 // FilteredProfile is an output profile selected for transcoding.
@@ -57,25 +71,33 @@ func FilterProfiles(probe *ProbeResult, profiles []config.OutputProfile) []Filte
 	return selected
 }
 
-// ApplyBitrateCaps applies cascading bitrate caps to the selected profiles.
+// ApplyBitrateCaps applies cascading bitrate caps to the selected profiles
+// and, for transcoded outputs whose target GOP is tighter than the source's,
+// applies a moderate GOP-tightening bitrate boost.
 //
-// Profiles are processed top-to-bottom (highest resolution first). For each profile:
+// Profiles must already have their final per-profile GOPSeconds + CanRemux
+// values populated by the caller (runTranscode does this before calling us)
+// so the boost reads accurate per-profile target GOPs and the cascade sees
+// the post-flip CanRemux flags.
+//
+// Profiles are processed top-to-bottom (highest resolution first). For each
+// profile:
 //   - Remux: effective bitrate = source bitrate (streams are copied verbatim).
-//     This keeps master.m3u8 BANDWIDTH accurate without capping anything artificially.
-//   - Top-most profile or same resolution as source: no cascading cap — use config max.
-//   - Lower-resolution profiles: effective = min(config max, 70% of upper grade effective).
+//     This keeps master.m3u8 BANDWIDTH accurate without capping artificially.
+//   - Top-most profile or same resolution as source: no cascading cap — start
+//     from config max, then clamp to source bitrate (if known).
+//   - Lower-resolution profiles: start from min(config max, 70% of upper
+//     effective), then clamp to source bitrate.
 //
-// Finally, every effective bitrate is clamped to the source bitrate (when known)
-// so the configured value behaves as a ceiling rather than a forced target — a
-// low-bitrate source never gets re-encoded at a higher bitrate than it started
-// with. The remux and cascade branches are already ≤ source by construction;
-// this clamp only changes the top-level / same-resolution transcode case (e.g.
-// 720p source with only the 720p profile selected — without the clamp it would
-// inflate to the configured 720p target).
+// Then, for non-remux profiles where sourceGOPSec > p.GOPSeconds, the
+// effective bitrate is boosted toward the per-profile ceiling — the same
+// min(config, cascade) value the non-boost path would honor — so the
+// cascade contract stays exact even when boosts fire. Remux profiles never
+// boost; their GOP is the source GOP by construction.
 //
 // The result is written back into FilteredProfile.VideoBitrateKbps so that
-// TranscodeToHLS args and WriteMasterPlaylist BANDWIDTH are automatically consistent.
-func ApplyBitrateCaps(jobID string, profiles []FilteredProfile, sourceHeight, sourceBitrateKbps int) []FilteredProfile {
+// TranscodeToHLS args and WriteMasterPlaylist BANDWIDTH stay consistent.
+func ApplyBitrateCaps(jobID string, profiles []FilteredProfile, sourceHeight, sourceBitrateKbps int, sourceGOPSec float64) []FilteredProfile {
 	upperEffective := 0 // effective bitrate of the profile immediately above in the cascade
 
 	for i := range profiles {
@@ -84,9 +106,21 @@ func ApplyBitrateCaps(jobID string, profiles []FilteredProfile, sourceHeight, so
 		isTopLevel := upperEffective == 0
 		sameResAsSource := p.Height == sourceHeight
 
+		// ceiling is the highest value this profile's effective bitrate is
+		// allowed to reach: config max, plus the cascade cap when applicable.
+		// The boost path uses the same ceiling, which is why a boost can
+		// never push a lower profile above 70% of its upper neighbor.
+		ceiling := configBitrate
+		if !isTopLevel && !sameResAsSource {
+			cascadeCap := int(float64(upperEffective) * 0.7)
+			if cascadeCap < ceiling {
+				ceiling = cascadeCap
+			}
+		}
+
 		var effective int
 		if p.CanRemux {
-			// Remux copies streams verbatim — the actual output bitrate IS the source bitrate.
+			// Remux copies streams verbatim — output bitrate IS the source bitrate.
 			// If source bitrate is unknown, fall back to config max.
 			if sourceBitrateKbps > 0 {
 				effective = sourceBitrateKbps
@@ -98,13 +132,11 @@ func ApplyBitrateCaps(jobID string, profiles []FilteredProfile, sourceHeight, so
 				effective = configBitrate
 			}
 		} else if isTopLevel || sameResAsSource {
-			// Top of the cascade, or same resolution as source: no cascading limit.
 			effective = configBitrate
 		} else {
-			// Cascading cap: must not exceed 70% of the grade above.
-			cascadeCap := int(float64(upperEffective) * 0.7)
-			if cascadeCap < configBitrate {
-				effective = cascadeCap
+			// Cascading cap.
+			if ceiling < configBitrate {
+				effective = ceiling
 				fmt.Printf("%s [%s] %s bitrate capped: config %dk → %dk (70%% of %s %dk)\n",
 					time.Now().Format("[2006-01-02 15:04:05]"), jobID, p.Name, configBitrate, effective, profiles[i-1].Name, upperEffective)
 			} else {
@@ -113,13 +145,35 @@ func ApplyBitrateCaps(jobID string, profiles []FilteredProfile, sourceHeight, so
 		}
 
 		// Source-bitrate ceiling: never re-encode above the source's own bitrate.
-		// Only fires when the source bitrate is known AND the branch above didn't
+		// Only fires when source bitrate is known AND the branch above didn't
 		// already pull it down (remux already equals source; cascade is already
 		// ≤ 0.7 × upper which is itself ≤ source by induction).
 		if sourceBitrateKbps > 0 && effective > sourceBitrateKbps {
 			fmt.Printf("%s [%s] %s bitrate capped: %dk → %dk (source bitrate)\n",
 				time.Now().Format("[2006-01-02 15:04:05]"), jobID, p.Name, effective, sourceBitrateKbps)
 			effective = sourceBitrateKbps
+		}
+
+		// GOP-tightening boost. Only for non-remux profiles where we have
+		// usable per-profile and source GOP numbers, and the target is
+		// strictly tighter than the source. Boost is capped at the same
+		// ceiling the cascade uses, so this cannot violate the 70% rule for
+		// lower profiles or exceed the user's config max for any profile.
+		if !p.CanRemux && sourceGOPSec > 0 && p.GOPSeconds > 0 && sourceGOPSec > p.GOPSeconds && effective < ceiling {
+			ratio := sourceGOPSec / p.GOPSeconds
+			boost := gopBoostPerOctave * math.Log2(ratio)
+			if boost > gopBoostMax {
+				boost = gopBoostMax
+			}
+			boosted := int(float64(effective) * (1 + boost))
+			if boosted > ceiling {
+				boosted = ceiling
+			}
+			if boosted > effective {
+				fmt.Printf("%s [%s] %s bitrate boosted: %dk → %dk (+%.1f%%, source GOP %.3fs → target %.3fs)\n",
+					time.Now().Format("[2006-01-02 15:04:05]"), jobID, p.Name, effective, boosted, float64(boosted-effective)*100/float64(effective), sourceGOPSec, p.GOPSeconds)
+				effective = boosted
+			}
 		}
 
 		p.VideoBitrateKbps = effective

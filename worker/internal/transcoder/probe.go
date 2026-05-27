@@ -102,25 +102,32 @@ func h264ProfileIDC(profile string) (idc, compat int) {
 	return 0, 0
 }
 
-// ProbeGOP samples the first 60s of video packets to determine the source's
+// ProbeGOP samples the first 120s of video packets to determine the source's
 // GOP cadence. Returns (mean GOP duration, max-deviation variance, IDR count
 // in window, error).
 //
 // The worker uses these to decide whether to adopt the source GOP for the
 // entire job (every rendition cuts at the same instants, enabling DASH
-// SegmentTemplate-without-Timeline) or fall back to a fixed default.
+// SegmentTemplate-without-Timeline) or fall back to a fixed default. The
+// probed mean is also stashed by the caller so the bitrate-cap logic can
+// boost transcoded outputs when GOP tightens (longer source GOP → tighter
+// target GOP needs proportionally more bits to preserve quality).
+//
+// 120s is a deliberate compromise: doubles IDR-sample confidence vs 60s
+// (matters most around the 10–30s GOP range), still only ~1–2s wall clock
+// since ffprobe walks packet headers without decoding.
 //
 // Sources with fewer than 3 IDRs in the window are treated as "indeterminate"
 // — caller should fall back to the default. Same for the ffprobe-missing case.
 func ProbeGOP(filePath string) (gopSec float64, varianceSec float64, idrCount int, err error) {
-	// -read_intervals 0%+60 reads packets between time 0 and 60s in.
+	// -read_intervals 0%+120 reads packets between time 0 and 120s in.
 	// -select_streams v:0 limits to the first video stream.
 	// -show_entries packet=pts_time,flags emits only the fields we need.
 	cmd := exec.Command(ffprobePath,
 		"-v", "error",
 		"-select_streams", "v:0",
 		"-show_packets",
-		"-read_intervals", "0%+60",
+		"-read_intervals", "0%+120",
 		"-show_entries", "packet=pts_time,flags",
 		"-print_format", "json",
 		filePath,

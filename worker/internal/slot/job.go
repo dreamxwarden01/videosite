@@ -134,6 +134,13 @@ type Job struct {
 	// =false means we fall back to defaultGOPSec / targetSegSec for the
 	// whole job.
 	//
+	// sourceGOPSec holds the *probed* source GOP duration whenever the probe
+	// succeeded (≥3 IDRs in window), independent of whether we adopt it for
+	// output. ApplyBitrateCaps reads it to boost transcoded outputs when the
+	// target GOP is tighter than the source — a low-bitrate long-GOP source
+	// re-encoded at a tighter GOP otherwise loses noticeable quality.
+	// 0 means the probe failed or didn't see enough IDRs.
+	//
 	// targetSegSec is the desired segment duration in seconds (from the
 	// first profile's SegmentDuration, defaulting to defaultTargetSeg). It's
 	// stashed here so runTranscode can re-derive per-profile chosenSegSec
@@ -825,7 +832,16 @@ func (j *Job) computeGOPDecision(sourcePath string, probe *transcoder.ProbeResul
 		j.UI.Logf("[%s] gop probe failed: %v — falling back to default %.1fs GOP", j.JobID, err, defaultGOPSec)
 	}
 
-	if err == nil && idrCount >= 3 && variance <= gopToleranceSec && gop > 0 && gop <= maxRemuxGOPSec {
+	// Stash the probed mean whenever the probe produced a usable number, even
+	// if we don't adopt it for output. ApplyBitrateCaps uses this as the
+	// "source GOP" for the tightening-boost heuristic; sources with variable
+	// or too-few-IDR probe results leave sourceGOPSec at 0 and skip the boost.
+	probeUsable := err == nil && idrCount >= 3 && gop > 0
+	if probeUsable {
+		j.sourceGOPSec = gop
+	}
+
+	if probeUsable && variance <= gopToleranceSec && gop <= maxRemuxGOPSec {
 		snapped := gop
 		if probe != nil && probe.FrameRate > 0 {
 			framesPerGOP := math.Round(gop * probe.FrameRate)
@@ -833,7 +849,7 @@ func (j *Job) computeGOPDecision(sourcePath string, probe *transcoder.ProbeResul
 				snapped = framesPerGOP / probe.FrameRate
 			}
 		}
-		j.sourceGOPSec = snapped
+		j.sourceGOPSec = snapped // overwrite with fps-snapped value when we adopt it for output
 		j.chosenGOPSec = snapped
 		j.useSourceGOP = true
 	} else {
@@ -1297,7 +1313,6 @@ func (j *Job) handleError(phase string, err error) error {
 // init segments, and .m4s segments — ready for upload by the caller.
 func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 	profiles := transcoder.FilterProfiles(probe, j.OutputProfiles)
-	profiles = transcoder.ApplyBitrateCaps(j.JobID, profiles, probe.Height, probe.VideoBitrateKbps)
 	if len(profiles) == 0 {
 		return fmt.Errorf("no suitable output profiles for source %dx%d", probe.Width, probe.Height)
 	}
@@ -1319,6 +1334,10 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 	// If the source GOP wasn't adopted (variable or > maxRemuxGOPSec), force
 	// re-encode for every profile: remux would import the source's variable
 	// IDR positions, breaking the constant-duration invariant.
+	//
+	// Runs BEFORE ApplyBitrateCaps so the cap logic sees post-flip CanRemux
+	// and reads the final per-profile GOPSeconds (used by the GOP-tightening
+	// bitrate boost inside ApplyBitrateCaps).
 	for i := range profiles {
 		p := &profiles[i]
 		if j.useSourceGOP && probe.FrameRate > 0 {
@@ -1339,6 +1358,8 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 			p.CanRemux = false
 		}
 	}
+
+	profiles = transcoder.ApplyBitrateCaps(j.JobID, profiles, probe.Height, probe.VideoBitrateKbps, j.sourceGOPSec)
 
 	sourcePath := filepath.Join(j.tempDir, "source.mp4")
 	audioName := fmt.Sprintf("aac_%dk", j.AudioBitrateKbps)
