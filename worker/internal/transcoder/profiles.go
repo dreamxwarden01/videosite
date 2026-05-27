@@ -65,6 +65,14 @@ func FilterProfiles(probe *ProbeResult, profiles []config.OutputProfile) []Filte
 //   - Top-most profile or same resolution as source: no cascading cap — use config max.
 //   - Lower-resolution profiles: effective = min(config max, 70% of upper grade effective).
 //
+// Finally, every effective bitrate is clamped to the source bitrate (when known)
+// so the configured value behaves as a ceiling rather than a forced target — a
+// low-bitrate source never gets re-encoded at a higher bitrate than it started
+// with. The remux and cascade branches are already ≤ source by construction;
+// this clamp only changes the top-level / same-resolution transcode case (e.g.
+// 720p source with only the 720p profile selected — without the clamp it would
+// inflate to the configured 720p target).
+//
 // The result is written back into FilteredProfile.VideoBitrateKbps so that
 // TranscodeToHLS args and WriteMasterPlaylist BANDWIDTH are automatically consistent.
 func ApplyBitrateCaps(jobID string, profiles []FilteredProfile, sourceHeight, sourceBitrateKbps int) []FilteredProfile {
@@ -102,6 +110,16 @@ func ApplyBitrateCaps(jobID string, profiles []FilteredProfile, sourceHeight, so
 			} else {
 				effective = configBitrate
 			}
+		}
+
+		// Source-bitrate ceiling: never re-encode above the source's own bitrate.
+		// Only fires when the source bitrate is known AND the branch above didn't
+		// already pull it down (remux already equals source; cascade is already
+		// ≤ 0.7 × upper which is itself ≤ source by induction).
+		if sourceBitrateKbps > 0 && effective > sourceBitrateKbps {
+			fmt.Printf("%s [%s] %s bitrate capped: %dk → %dk (source bitrate)\n",
+				time.Now().Format("[2006-01-02 15:04:05]"), jobID, p.Name, effective, sourceBitrateKbps)
+			effective = sourceBitrateKbps
 		}
 
 		p.VideoBitrateKbps = effective
