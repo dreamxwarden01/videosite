@@ -33,6 +33,31 @@ const statusInterval = 2 * time.Second
 // wall-clock window (not a tick count) — ticks drift under CPU pressure.
 const statusSilenceAbort = 60 * time.Second
 
+// Shutdown budget. Sized so the worker is fully cleaned up well inside
+// Docker's default 60 s stop-grace-period (which sends SIGKILL after the
+// window expires). Total worst-case wall clock: 40 + 10 + 3 = 53 s, leaving
+// ~7 s of headroom before SIGKILL would land.
+const (
+	// gracefulShutdownTimeout is how long we wait for jobs to finish naturally
+	// after the stop signal. Non-uploading jobs were already cancelled by
+	// initiateGracefulStop; uploading/completing jobs get this window to wrap
+	// up before being hard-aborted.
+	gracefulShutdownTimeout = 40 * time.Second
+
+	// forcefulShutdownTimeout is how long we wait after hard-aborting all
+	// remaining jobs for them to actually unwind (HTTP requests timing out,
+	// ffmpeg processes exiting, status entries flipping to "aborted"). After
+	// this, we exit even if some goroutines are still wedged.
+	forcefulShutdownTimeout = 10 * time.Second
+
+	// shutdownFlushTimeout caps the final /tasks/status POST during shutdown.
+	// Tighter than the in-flight statusInterval ctx because a dead server
+	// would otherwise burn 10 s here and push us past Docker's SIGKILL
+	// deadline. Anything we fail to flush in 3 s is recovered server-side by
+	// the stale-task reaper.
+	shutdownFlushTimeout = 3 * time.Second
+)
+
 // Worker is the main transcoding worker.
 type Worker struct {
 	manager   *slot.Manager
@@ -491,20 +516,37 @@ func (w *Worker) handleAuthFailure() {
 }
 
 func (w *Worker) shutdown() {
-	w.ui.Logf("Shutting down... waiting for active jobs")
+	w.ui.Logf("Shutting down... waiting for active jobs (graceful, %s)", gracefulShutdownTimeout)
 
-	// Wait for active jobs with 30-second timeout
+	// Single done channel for both phases — w.wg.Wait() returns when the last
+	// job goroutine exits, regardless of which phase triggered the unwind.
 	done := make(chan struct{})
 	go func() {
 		w.wg.Wait()
 		close(done)
 	}()
 
+	// Phase 1 — graceful: wait gracefulShutdownTimeout for jobs that
+	// initiateGracefulStop left running (uploading / completing).
 	select {
 	case <-done:
-		slog.Info("All jobs completed")
-	case <-time.After(30 * time.Second):
-		slog.Warn("Shutdown timeout — some jobs may not have completed")
+		slog.Info("All jobs completed gracefully")
+	case <-time.After(gracefulShutdownTimeout):
+		// Phase 2 — hard abort. Cancel everything still active, including
+		// uploads we were politely waiting on. Then give forcefulShutdownTimeout
+		// for the cancellations to propagate (HTTP timeouts, ffmpeg exit, status
+		// updates flipping to "aborted").
+		remaining := w.manager.ActiveJobs()
+		w.ui.Logf("Graceful deadline reached — aborting %d remaining job(s)", len(remaining))
+		for _, job := range remaining {
+			job.Cancel()
+		}
+		select {
+		case <-done:
+			slog.Info("All jobs aborted cleanly")
+		case <-time.After(forcefulShutdownTimeout):
+			slog.Warn("Forceful deadline reached — exiting with jobs still in flight")
+		}
 	}
 
 	// Final status flush: w.ctx is already cancelled by the time we get here,
@@ -546,14 +588,20 @@ func (w *Worker) shutdown() {
 // flushShutdownStatuses pushes any queued terminal statuses (aborted/failed)
 // that accumulated during shutdown. The regular status loop exits on
 // w.ctx.Done before it can report them, so we send one final batch here
-// with a detached 10 s context. Without this, the server waits out its own
-// processing-timeout before requeueing jobs the worker already gave up on.
+// with a detached, tight context. Without this, the server waits out its
+// own processing-timeout before requeueing jobs the worker already gave up
+// on.
+//
+// The timeout (shutdownFlushTimeout) is intentionally short so a dead /
+// unreachable server can't push total shutdown past Docker's SIGKILL
+// deadline. Anything we fail to deliver here is recovered server-side by
+// the stale-task reaper anyway.
 func (w *Worker) flushShutdownStatuses() {
 	statuses := w.manager.SnapshotStatuses()
 	if len(statuses) == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownFlushTimeout)
 	defer cancel()
 	if _, err := api.ReportStatus(ctx, statuses); err != nil {
 		slog.Warn("Final status flush failed", "err", err, "count", len(statuses))
