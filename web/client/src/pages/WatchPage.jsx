@@ -192,6 +192,32 @@ export default function WatchPage() {
       player.configure('streaming.bufferingGoal', 60);
       player.configure('streaming.rebufferingGoal', 2);
 
+      // Retry policy for flaky / mobile networks.
+      //
+      // Shaka's defaults (maxAttempts=2, baseDelay=1s) give up after a single
+      // retry ~1.5s after the initial failure — easily killed by cell-handoff
+      // blackouts (3-5s) or hotspot dropouts. With these values:
+      //   - common-case recovery (1-3 retries) completes in ~1-4 seconds
+      //   - real outages get ~4 minutes of patient retry before erroring out
+      //     (10 retries × ~20s timeout + ~57s of cumulative backoff)
+      // baseFactor=1.5 keeps the middle retries dense (matches typical
+      // cell-handoff recovery windows) rather than spreading to minutes.
+      // stallTimeout=3s and connectionTimeout=5s fail dead connections fast
+      // so we get back to retrying on a fresh socket sooner.
+      //
+      // Applied to both streaming (segments + DRM) and manifest fetches.
+      const retryParams = {
+        maxAttempts: 11,        // 1 initial + 10 retries
+        baseDelay: 500,         // 0.5s before first retry
+        backoffFactor: 1.5,     // gentle growth: 0.5→0.75→1.1→1.7→2.5s…
+        fuzzFactor: 0.5,        // ±50% jitter to avoid thundering herd
+        timeout: 20000,         // 20s per-attempt ceiling
+        stallTimeout: 3000,     // 3s of no bytes → retry
+        connectionTimeout: 5000, // 5s to open a new TCP+TLS connection
+      };
+      player.configure('streaming.retryParameters', retryParams);
+      player.configure('manifest.retryParameters', retryParams);
+
       // HMAC token request filter
       if (tokenRef.current && data.r2PublicDomain) {
         const networkEngine = player.getNetworkingEngine();
