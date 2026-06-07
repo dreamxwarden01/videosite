@@ -140,6 +140,12 @@ export default function TranscodingPage() {
               <div className="job-meta">
                 {job.courseName}
                 {job.jobId && <> &middot; Job: {job.jobId}</>}
+                {/* Worker label (or last 6 of the key id when the operator
+                    didn't set a label). Skipped entirely for queued/unleased
+                    rows — no worker has touched them yet. */}
+                {job.workerKeyId && (
+                  <> &middot; Worker: {job.workerLabel || job.workerKeyId.slice(-6)}</>
+                )}
                 &middot; Uploaded: {formatTime(job.uploadTime)}
               </div>
               {showProgress && (

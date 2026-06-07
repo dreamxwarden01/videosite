@@ -1307,9 +1307,27 @@
         "responses": { "200": { "description": "{ keyId, keySecret }" } } }
     },
 
-    "/api/admin/settings/worker-keys/{keyId}/revoke": {
+    "/api/admin/settings/worker-keys/{keyId}/pause": {
       "parameters": [{ "in": "path", "name": "keyId", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 64 } }],
-      "put": { "tags": ["admin-settings"], "operationId": "admin_worker_key_revoke", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+      "post": { "tags": ["admin-settings"], "operationId": "admin_worker_key_pause", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/admin/settings/worker-keys/{keyId}/resume": {
+      "parameters": [{ "in": "path", "name": "keyId", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 64 } }],
+      "post": { "tags": ["admin-settings"], "operationId": "admin_worker_key_resume", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }], "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
+    },
+
+    "/api/admin/settings/worker-keys/{keyId}/reactivate": {
+      "parameters": [{ "in": "path", "name": "keyId", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 64 } }],
+      "post": { "tags": ["admin-settings"], "operationId": "admin_worker_key_reactivate", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "responses": { "200": { "description": "{ keyId, secret }" } } }
+    },
+
+    "/api/admin/settings/worker-keys/{keyId}/rename": {
+      "parameters": [{ "in": "path", "name": "keyId", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 64 } }],
+      "post": { "tags": ["admin-settings"], "operationId": "admin_worker_key_rename", "security": [{ "sessionCookie": [] }, { "sessionCookie": [], "mfaChallenge": [] }],
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "$ref": "#/components/responses/NoContent" } } }
     },
 
     "/api/admin/settings/worker-keys/{keyId}": {

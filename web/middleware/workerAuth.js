@@ -2,11 +2,20 @@ const { getPool } = require('../config/database');
 const { getClient } = require('../services/redis');
 const { workerSessionKey, WORKER_TTL_SECONDS, DIRTY_WORKER_SESSIONS } = require('../services/workerAuthService');
 const { getClientIp } = require('./auth');
+const { normalizeIP, ipMatchesSession } = require('../services/ipHelpers');
 
 // Bearer-token worker session middleware. Looks the token up in Redis first,
 // falls back to the worker_sessions DB row on miss (and warm-loads the cache),
 // enforces IP binding, and refreshes last_seen + TTL on every hit. Sets
 // req.worker = { keyId, sessionId } on success.
+//
+// IP binding uses ipMatchesSession (services/ipHelpers.js): /64 prefix match
+// for IPv6 pairs, full /32 match for IPv4. This lets an IPv6 worker's privacy
+// extensions rotate the host part of its address (which happens whenever a
+// /128 is "deprecated" by the OS, often every few hours) without invalidating
+// the session — same machine, same customer prefix, same auth context. A
+// genuine network change (different /64, or any IPv4 change) still kills the
+// session and forces a reauth, which is where the leak detection fires.
 async function requireWorkerSession(req, res, next) {
     const authHeader = req.headers['authorization'] || '';
     const m = authHeader.match(/^Bearer\s+(.+)$/i);
@@ -14,7 +23,7 @@ async function requireWorkerSession(req, res, next) {
         return res.status(401).json({ error: 'Missing bearer token' });
     }
     const token = m[1];
-    const clientIp = getClientIp(req) || '';
+    const clientIp = normalizeIP(getClientIp(req) || '');
     const redis = getClient();
     const cacheKey = workerSessionKey(token);
 
@@ -64,8 +73,10 @@ async function requireWorkerSession(req, res, next) {
                 .exec();
         }
 
-        // IP binding — any mismatch kills the session.
-        if (ipAddress !== clientIp) {
+        // IP binding. /64 for IPv6 / full /32 for IPv4. On full mismatch,
+        // kill the session in Redis + DB and force a reauth (which is where
+        // leak detection lives).
+        if (!ipMatchesSession(ipAddress, clientIp)) {
             await redis.multi()
                 .del(cacheKey)
                 .srem(DIRTY_WORKER_SESSIONS, token)
@@ -75,15 +86,21 @@ async function requireWorkerSession(req, res, next) {
             return res.status(401).json({ error: 'IP mismatch' });
         }
 
+        // /64 match (or exact IPv4 match). If the client's full /128 has
+        // shifted within the same /64 (privacy extension rotation), silently
+        // update the stored IP in Redis so future comparisons are against the
+        // freshest /128. DB row stays on the original IP — no harm done, on a
+        // cold reload the /64 comparison still passes.
+        const ipChanged = ipAddress !== clientIp;
+
         // Refresh last_seen + sliding TTL in Redis only. The flusher
         // (services/flusher.js) drains dirty:session:worker every 15 min
         // and writes last_seen back to the DB worker_sessions row.
         const now = Date.now();
-        await redis.multi()
-            .hset(cacheKey, 'last_seen', String(now))
-            .expire(cacheKey, WORKER_TTL_SECONDS)
-            .sadd(DIRTY_WORKER_SESSIONS, token)
-            .exec();
+        const tx = redis.multi().hset(cacheKey, 'last_seen', String(now));
+        if (ipChanged) tx.hset(cacheKey, 'ip_address', clientIp);
+        tx.expire(cacheKey, WORKER_TTL_SECONDS).sadd(DIRTY_WORKER_SESSIONS, token);
+        await tx.exec();
 
         req.worker = { keyId, sessionId };
         next();

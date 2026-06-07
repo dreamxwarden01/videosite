@@ -26,7 +26,16 @@ const { listRoles, getRoleById, createRole, updateRole, deleteRole, roleIdExists
 
 // Services - Settings
 const { getPool } = require('../../config/database');
-const { generateWorkerKeyPair, revokeWorkerKey, deleteWorkerKey, listWorkerKeys } = require('../../services/workerAuthService');
+const {
+    generateWorkerKeyPair,
+    rotateWorkerKeySecret,
+    setWorkerKeyStatus,
+    deactivateWorkerKey,
+    renameWorkerKey,
+    deleteWorkerKey,
+    listWorkerKeys,
+    STATUS_ACTIVE, STATUS_PAUSED, STATUS_DEACTIVATED,
+} = require('../../services/workerAuthService');
 const { generateSecretKey, isHmacConfigured, setSetting } = require('../../services/tokenService');
 
 // Services - Transcoding Profiles
@@ -1320,10 +1329,12 @@ router.put('/admin/settings/turnstile-gate/toggle', requireAuth, checkPermission
     }
 });
 
-// POST /api/admin/settings/worker-keys — create worker key
+// POST /api/admin/settings/worker-keys — create worker key.
+// Label is optional; the admin UI now collects it inside the post-click modal
+// (with a blank-allowed input) rather than inline, so an empty body is normal.
 router.post('/admin/settings/worker-keys', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
     try {
-        const { label } = req.body;
+        const { label } = req.body || {};
         const { keyId, secret } = await generateWorkerKeyPair(label, res.locals.user.user_id);
         res.json({ keyId, secret });
     } catch (err) {
@@ -1332,26 +1343,71 @@ router.post('/admin/settings/worker-keys', requireAuth, checkPermission('manageS
     }
 });
 
-// PUT /api/admin/settings/worker-keys/:keyId/revoke — revoke key
-router.put('/admin/settings/worker-keys/:keyId/revoke', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+// POST /api/admin/settings/worker-keys/:keyId/pause — pause an active key.
+// Worker keeps its current bearer token, polling returns empty, lease rejects.
+router.post('/admin/settings/worker-keys/:keyId/pause', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
     try {
-        await revokeWorkerKey(req.params.keyId);
+        const ok = await setWorkerKeyStatus(req.params.keyId, STATUS_PAUSED);
+        if (!ok) return res.status(404).json({ error: 'Key not found' });
         res.status(204).end();
     } catch (err) {
-        console.error('API revoke worker key error:', err);
-        res.status(500).json({ error: 'Failed to revoke worker key' });
+        console.error('API pause worker key error:', err);
+        res.status(500).json({ error: 'Failed to pause worker key' });
     }
 });
 
-// DELETE /api/admin/settings/worker-keys/:keyId — delete key
+// POST /api/admin/settings/worker-keys/:keyId/resume — unpause back to active.
+router.post('/admin/settings/worker-keys/:keyId/resume', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+    try {
+        const ok = await setWorkerKeyStatus(req.params.keyId, STATUS_ACTIVE);
+        if (!ok) return res.status(404).json({ error: 'Key not found' });
+        res.status(204).end();
+    } catch (err) {
+        console.error('API resume worker key error:', err);
+        res.status(500).json({ error: 'Failed to resume worker key' });
+    }
+});
+
+// POST /api/admin/settings/worker-keys/:keyId/reactivate — bring a deactivated
+// key back, but only via a forced secret rotation. The old secret (potentially
+// compromised, since deactivation usually came from the leak detector) is
+// invalidated; the new plaintext secret is returned once for the operator to
+// copy into the worker's config.
+router.post('/admin/settings/worker-keys/:keyId/reactivate', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+    try {
+        const secret = await rotateWorkerKeySecret(req.params.keyId);
+        const ok = await setWorkerKeyStatus(req.params.keyId, STATUS_ACTIVE);
+        if (!ok) return res.status(404).json({ error: 'Key not found' });
+        res.json({ keyId: req.params.keyId, secret });
+    } catch (err) {
+        console.error('API reactivate worker key error:', err);
+        res.status(500).json({ error: 'Failed to reactivate worker key' });
+    }
+});
+
+// POST /api/admin/settings/worker-keys/:keyId/rename — change the human label.
+// Empty label is accepted (means "clear the label"). Client greys the
+// Continue button when the value hasn't changed; the server doesn't enforce.
+router.post('/admin/settings/worker-keys/:keyId/rename', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+    try {
+        const { label } = req.body || {};
+        const ok = await renameWorkerKey(req.params.keyId, typeof label === 'string' ? label.trim() : '');
+        if (!ok) return res.status(404).json({ error: 'Key not found' });
+        res.status(204).end();
+    } catch (err) {
+        console.error('API rename worker key error:', err);
+        res.status(500).json({ error: 'Failed to rename worker key' });
+    }
+});
+
+// DELETE /api/admin/settings/worker-keys/:keyId — permanent delete. Replaces
+// the old Revoke→Delete two-step. Works in any status; the client shows a
+// confirmation warning before the call.
 router.delete('/admin/settings/worker-keys/:keyId', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
     try {
-        const deleted = await deleteWorkerKey(req.params.keyId);
-        if (deleted) {
-            res.status(204).end();
-        } else {
-            res.status(400).json({ error: 'Cannot delete an active key. Revoke it first.' });
-        }
+        const ok = await deleteWorkerKey(req.params.keyId);
+        if (!ok) return res.status(404).json({ error: 'Key not found' });
+        res.status(204).end();
     } catch (err) {
         console.error('API delete worker key error:', err);
         res.status(500).json({ error: 'Failed to delete worker key' });
@@ -1619,17 +1675,22 @@ router.get('/admin/transcoding/jobs', requireAuth, checkPermission('manageSite')
     try {
         const pool = getPool();
 
-        // Get all non-cleared tasks with video and course info
+        // Get all non-cleared tasks with video, course, and (when leased)
+        // worker-key info. LEFT JOIN on worker_access_keys so queued/unleased
+        // rows (worker_key_id IS NULL) and hard-deleted-key rows still render.
         const [rows] = await pool.execute(
             `SELECT pq.task_id, pq.job_id, pq.status, pq.progress, pq.error_message,
                     pq.created_at AS upload_time, pq.leased_at,
                     pq.last_heartbeat, pq.error_at, pq.updated_at,
+                    pq.worker_key_id,
+                    wak.label AS worker_label,
                     v.title AS video_title, v.video_id, v.status AS video_status,
                     v.processing_progress AS video_progress,
                     c.course_name
              FROM processing_queue pq
              JOIN videos v ON pq.video_id = v.video_id
              JOIN courses c ON v.course_id = c.course_id
+             LEFT JOIN worker_access_keys wak ON pq.worker_key_id = wak.key_id
              WHERE pq.cleared = 0
              ORDER BY pq.created_at DESC`
         );
@@ -1663,7 +1724,9 @@ router.get('/admin/transcoding/jobs', requireAuth, checkPermission('manageSite')
                 leasedAt: row.leased_at,
                 lastHeartbeat: overlay?.last_heartbeat ? new Date(overlay.last_heartbeat) : row.last_heartbeat,
                 errorAt: row.error_at,
-                updatedAt: row.updated_at
+                updatedAt: row.updated_at,
+                workerKeyId: row.worker_key_id,
+                workerLabel: row.worker_label,
             };
 
             if (row.status === 'error') {

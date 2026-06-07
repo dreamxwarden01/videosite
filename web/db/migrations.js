@@ -903,6 +903,35 @@ async function runMigrations() {
                     `);
                     await pool.execute(`DELETE FROM site_settings WHERE setting_key = 'hmac_token_validity'`);
                 }
+            },
+            {
+                id: '038_worker_access_keys_status',
+                up: async () => {
+                    // Replace the boolean is_active with a tri-state status:
+                    //   'active'      - normal, accepts auth and polls
+                    //   'paused'      - admin-paused; auth still works (so the
+                    //                   running worker keeps a valid session)
+                    //                   but polling returns empty and lease
+                    //                   rejects, so no new jobs flow.
+                    //   'deactivated' - revoked by leak detection or admin;
+                    //                   auth refuses, existing sessions are
+                    //                   cleared at deactivation time.
+                    //
+                    // Existing is_active=1 rows map to 'active', is_active=0 to
+                    // 'deactivated'. The new column is added first, backfilled,
+                    // then is_active is dropped.
+                    await pool.execute(`
+                        ALTER TABLE worker_access_keys
+                          ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'active' AFTER label
+                    `);
+                    await pool.execute(`
+                        UPDATE worker_access_keys
+                           SET status = CASE WHEN is_active = 1 THEN 'active' ELSE 'deactivated' END
+                    `);
+                    await pool.execute(`
+                        ALTER TABLE worker_access_keys DROP COLUMN is_active
+                    `);
+                }
             }
         ];
 

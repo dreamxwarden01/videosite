@@ -66,10 +66,13 @@ export default function AppShell() {
           <Footer />
         </>
       ) : isWatchPage ? (
-        <main className="container container-player">
-          {showPlaybackBanner && <PlaybackDisabledBanner />}
-          <Outlet />
-        </main>
+        <>
+          <main className="container container-player">
+            {showPlaybackBanner && <PlaybackDisabledBanner />}
+            <Outlet />
+          </main>
+          <Footer />
+        </>
       ) : (
         <>
           <main className="container">

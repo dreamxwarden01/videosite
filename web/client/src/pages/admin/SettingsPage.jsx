@@ -77,8 +77,22 @@ export default function SettingsPage() {
 
   // Worker Keys
   const [workerKeys, setWorkerKeys] = useState([]);
-  const [workerLabel, setWorkerLabel] = useState('');
   const [generatingKey, setGeneratingKey] = useState(false);
+  // Generate modal: opens after the user clicks "Generate New Key" so they
+  // can type an optional label before submitting (replaces the old inline form).
+  const [generateModalOpen, setGenerateModalOpen] = useState(false);
+  const [generateLabel, setGenerateLabel] = useState('');
+  // Rename modal: pre-fills the current label; Continue button greys out if
+  // the value hasn't changed (label can be cleared by submitting an empty
+  // string).
+  const [renameModalState, setRenameModalState] = useState(null); // { keyId, originalLabel } | null
+  const [renameLabel, setRenameLabel] = useState('');
+  const [renameSaving, setRenameSaving] = useState(false);
+  // Reactivate modal: warns about secret rotation; on Continue, calls the
+  // reactivate endpoint and pipes the rotated secret through the existing
+  // newWorkerKey display modal.
+  const [reactivateModalState, setReactivateModalState] = useState(null); // { keyId } | null
+  const [reactivateSaving, setReactivateSaving] = useState(false);
 
   // Validation & dirty tracking
   const [errors, setErrors] = useState({});
@@ -611,17 +625,27 @@ export default function SettingsPage() {
   };
 
   // Worker keys
-  const handleGenerateWorkerKey = async (e) => {
-    e.preventDefault();
+
+  // Open the generate modal. Label entry now happens inside the modal so the
+  // panel header can stay clean with just one button.
+  const handleOpenGenerateModal = () => {
+    setGenerateLabel('');
+    setGenerateModalOpen(true);
+  };
+
+  const handleConfirmGenerate = async () => {
     setGeneratingKey(true);
     try {
-      const { ok, data } = await mfaFetch('/api/admin/settings/worker-keys', { method: 'POST', body: { label: workerLabel } });
+      const { ok, data } = await mfaFetch('/api/admin/settings/worker-keys', {
+        method: 'POST',
+        body: { label: generateLabel.trim() || null },
+      });
       if (!ok) throw new Error(data?.error || 'Failed to generate worker key');
 
+      setGenerateModalOpen(false);
       setNewWorkerKey({ keyId: data.keyId, secret: data.secret });
       setWkKeyIdCopyLabel('Copy');
       setWkSecretCopyLabel('Copy');
-      setWorkerLabel('');
     } catch (err) {
       showToast(err.message);
     } finally {
@@ -634,23 +658,74 @@ export default function SettingsPage() {
     fetchSettings();
   };
 
-  const handleRevokeWorkerKey = async (keyId) => {
-    if (!await confirm('Revoke this worker key?')) return;
+  const handlePauseWorkerKey = async (keyId) => {
     try {
-      const { ok, data } = await mfaFetch(`/api/admin/settings/worker-keys/${keyId}/revoke`, { method: 'PUT' });
+      const { ok, data } = await mfaFetch(`/api/admin/settings/worker-keys/${keyId}/pause`, { method: 'POST' });
+      if (ok) { showToast('Worker key paused.', 'success'); fetchSettings(); }
+      else showToast(data?.error || 'Failed to pause worker key.');
+    } catch (err) { showToast(err.message); }
+  };
+
+  const handleResumeWorkerKey = async (keyId) => {
+    try {
+      const { ok, data } = await mfaFetch(`/api/admin/settings/worker-keys/${keyId}/resume`, { method: 'POST' });
+      if (ok) { showToast('Worker key resumed.', 'success'); fetchSettings(); }
+      else showToast(data?.error || 'Failed to resume worker key.');
+    } catch (err) { showToast(err.message); }
+  };
+
+  const handleOpenRenameModal = (wk) => {
+    setRenameModalState({ keyId: wk.key_id, originalLabel: wk.label || '' });
+    setRenameLabel(wk.label || '');
+  };
+
+  const handleConfirmRename = async () => {
+    if (!renameModalState) return;
+    setRenameSaving(true);
+    try {
+      const { ok, data } = await mfaFetch(`/api/admin/settings/worker-keys/${renameModalState.keyId}/rename`, {
+        method: 'POST',
+        body: { label: renameLabel.trim() },
+      });
       if (ok) {
-        showToast('Worker key revoked.', 'success');
+        showToast('Worker key renamed.', 'success');
+        setRenameModalState(null);
         fetchSettings();
       } else {
-        showToast(data?.error || 'Failed to revoke worker key.');
+        showToast(data?.error || 'Failed to rename worker key.');
       }
     } catch (err) {
       showToast(err.message);
+    } finally {
+      setRenameSaving(false);
+    }
+  };
+
+  const handleOpenReactivateModal = (keyId) => {
+    setReactivateModalState({ keyId });
+  };
+
+  const handleConfirmReactivate = async () => {
+    if (!reactivateModalState) return;
+    setReactivateSaving(true);
+    try {
+      const { ok, data } = await mfaFetch(`/api/admin/settings/worker-keys/${reactivateModalState.keyId}/reactivate`, { method: 'POST' });
+      if (!ok) throw new Error(data?.error || 'Failed to reactivate worker key');
+      setReactivateModalState(null);
+      // Pipe the rotated secret through the same one-time-display modal used
+      // for initial generation. Same shape: { keyId, secret }.
+      setNewWorkerKey({ keyId: data.keyId, secret: data.secret });
+      setWkKeyIdCopyLabel('Copy');
+      setWkSecretCopyLabel('Copy');
+    } catch (err) {
+      showToast(err.message);
+    } finally {
+      setReactivateSaving(false);
     }
   };
 
   const handleDeleteWorkerKey = async (keyId) => {
-    if (!await confirm('Permanently delete this worker key?')) return;
+    if (!await confirm('Permanently delete this worker key? This action cannot be undone — any worker still running with this key will lose its session and be unable to reauth.')) return;
     try {
       const { ok, data } = await mfaFetch(`/api/admin/settings/worker-keys/${keyId}`, { method: 'DELETE' });
       if (ok) {
@@ -1299,17 +1374,11 @@ export default function SettingsPage() {
           <h2>Worker Access Keys</h2>
         </div>
 
-        <form onSubmit={handleGenerateWorkerKey} className="mb-3" style={{ maxWidth: '400px' }}>
-          <div className="form-group">
-            <label htmlFor="workerLabel">Label (optional)</label>
-            <input type="text" id="workerLabel" className="form-control"
-              value={workerLabel} onChange={e => setWorkerLabel(e.target.value)}
-              placeholder="e.g. Transcoding Server 1" />
-          </div>
-          <button type="submit" className="btn btn-primary btn-sm" disabled={generatingKey}>
-            {generatingKey ? 'Generating...' : 'Generate New Key'}
+        <div className="mb-3">
+          <button type="button" className="btn btn-primary btn-sm" onClick={handleOpenGenerateModal}>
+            Generate New Key
           </button>
-        </form>
+        </div>
 
         <div className="table-wrap">
           <table>
@@ -1324,26 +1393,40 @@ export default function SettingsPage() {
               </tr>
             </thead>
             <tbody>
-              {workerKeys.map(wk => (
-                <tr key={wk.key_id}>
-                  <td><code>{wk.key_id}</code></td>
-                  <td>{wk.label || '-'}</td>
-                  <td>
-                    <span className={`status ${wk.is_active ? 'status-finished' : 'status-error'}`}>
-                      {wk.is_active ? 'Active' : 'Revoked'}
-                    </span>
-                  </td>
-                  <td>{wk.last_used_at ? new Date(wk.last_used_at).toLocaleString() : 'Never'}</td>
-                  <td>{new Date(wk.created_at).toLocaleDateString()}</td>
-                  <td>
-                    {wk.is_active ? (
-                      <button className="btn btn-danger btn-sm" onClick={() => handleRevokeWorkerKey(wk.key_id)}>Revoke</button>
-                    ) : (
+              {workerKeys.map(wk => {
+                const status = wk.status || 'active';
+                const isActive = status === 'active';
+                const isPaused = status === 'paused';
+                const isDeactivated = status === 'deactivated';
+                const statusLabel = status.charAt(0).toUpperCase() + status.slice(1);
+                const statusClass = isActive ? 'status-finished'
+                  : isPaused ? 'status-pending'
+                  : 'status-error';
+                return (
+                  <tr key={wk.key_id}>
+                    <td><code>{wk.key_id}</code></td>
+                    <td>{wk.label || '-'}</td>
+                    <td><span className={`status ${statusClass}`}>{statusLabel}</span></td>
+                    <td>{wk.last_used_at ? new Date(wk.last_used_at).toLocaleString() : 'Never'}</td>
+                    <td>{new Date(wk.created_at).toLocaleDateString()}</td>
+                    <td style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                      {isActive && (
+                        <button className="btn btn-sm" onClick={() => handlePauseWorkerKey(wk.key_id)}>Pause</button>
+                      )}
+                      {isPaused && (
+                        <button className="btn btn-sm" onClick={() => handleResumeWorkerKey(wk.key_id)}>Resume</button>
+                      )}
+                      {isDeactivated && (
+                        <button className="btn btn-sm" onClick={() => handleOpenReactivateModal(wk.key_id)}>Reactivate</button>
+                      )}
+                      {!isDeactivated && (
+                        <button className="btn btn-sm" onClick={() => handleOpenRenameModal(wk)}>Rename</button>
+                      )}
                       <button className="btn btn-danger btn-sm" onClick={() => handleDeleteWorkerKey(wk.key_id)}>Delete</button>
-                    )}
-                  </td>
-                </tr>
-              ))}
+                    </td>
+                  </tr>
+                );
+              })}
               {workerKeys.length === 0 && (
                 <tr>
                   <td colSpan="6" className="text-muted" style={{ textAlign: 'center' }}>No worker keys</td>
@@ -1475,6 +1558,99 @@ export default function SettingsPage() {
             </div>
             <div className="wk-modal-footer">
               <button type="button" className="btn btn-primary btn-sm" onClick={handleCloseHmacModal}>OK</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Generate Worker Key Modal — label entry happens here so the panel
+          can stay clean with just one button. Empty label is allowed. */}
+      {generateModalOpen && (
+        <div className="content-overlay active" onClick={() => !generatingKey && setGenerateModalOpen(false)}>
+          <div className="wk-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '420px' }}>
+            <div className="wk-modal-header"><h3>Generate Worker Key</h3></div>
+            <div className="wk-modal-body">
+              <div className="form-group">
+                <label htmlFor="generateLabel">Label (optional)</label>
+                <input id="generateLabel" type="text" className="form-control"
+                  value={generateLabel}
+                  onChange={e => setGenerateLabel(e.target.value)}
+                  placeholder="e.g. Transcoding Server 1"
+                  disabled={generatingKey}
+                  autoFocus
+                />
+              </div>
+            </div>
+            <div className="wk-modal-footer" style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+              <button type="button" className="btn btn-secondary btn-sm"
+                onClick={() => setGenerateModalOpen(false)} disabled={generatingKey}>Cancel</button>
+              <button type="button" className="btn btn-primary btn-sm"
+                onClick={handleConfirmGenerate} disabled={generatingKey}>
+                {generatingKey ? 'Generating…' : 'Continue'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Rename Worker Key Modal — Continue greyed if the value hasn't
+          changed. Empty label clears the label. */}
+      {renameModalState && (
+        <div className="content-overlay active" onClick={() => !renameSaving && setRenameModalState(null)}>
+          <div className="wk-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '420px' }}>
+            <div className="wk-modal-header"><h3>Rename Worker Key</h3></div>
+            <div className="wk-modal-body">
+              <div className="form-group">
+                <label htmlFor="renameLabel">Label</label>
+                <input id="renameLabel" type="text" className="form-control"
+                  value={renameLabel}
+                  onChange={e => setRenameLabel(e.target.value)}
+                  placeholder="(leave blank to clear)"
+                  disabled={renameSaving}
+                  autoFocus
+                />
+              </div>
+            </div>
+            <div className="wk-modal-footer" style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+              <button type="button" className="btn btn-secondary btn-sm"
+                onClick={() => setRenameModalState(null)} disabled={renameSaving}>Cancel</button>
+              <button type="button" className="btn btn-primary btn-sm"
+                onClick={handleConfirmRename}
+                disabled={renameSaving || renameLabel.trim() === (renameModalState.originalLabel || '').trim()}>
+                {renameSaving ? 'Saving…' : 'Continue'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Reactivate Worker Key Modal — warns that the secret will rotate,
+          since deactivation is usually a leak-detection event and the old
+          secret must be considered compromised. On Continue, the rotated
+          secret is shown via the same one-time-display modal as initial
+          generation. */}
+      {reactivateModalState && (
+        <div className="content-overlay active" onClick={() => !reactivateSaving && setReactivateModalState(null)}>
+          <div className="wk-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '480px' }}>
+            <div className="wk-modal-header"><h3>Reactivate Worker Key</h3></div>
+            <div className="wk-modal-body">
+              <p>
+                Reactivating will <strong>rotate the worker key secret</strong>. The previous
+                secret will no longer authenticate — any worker still using it must
+                be updated with the new secret.
+              </p>
+              <p className="text-muted text-sm" style={{ marginTop: '12px' }}>
+                The new secret will be displayed once after you click Continue.
+                Make sure to copy it before closing the next dialog.
+              </p>
+            </div>
+            <div className="wk-modal-footer" style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+              <button type="button" className="btn btn-secondary btn-sm"
+                onClick={() => setReactivateModalState(null)} disabled={reactivateSaving}>Cancel</button>
+              <button type="button" className="btn btn-primary btn-sm"
+                onClick={handleConfirmReactivate} disabled={reactivateSaving}>
+                {reactivateSaving ? 'Rotating…' : 'Continue'}
+              </button>
             </div>
           </div>
         </div>

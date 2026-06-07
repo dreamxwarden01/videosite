@@ -1,8 +1,14 @@
 const express = require('express');
 const router = express.Router();
-const { validateWorkerKey, createWorkerSession } = require('../../services/workerAuthService');
+const {
+    validateWorkerKey, createWorkerSession,
+    getWorkerKeyStatus, deactivateWorkerKey,
+    checkAndRecordAuthAttempt,
+    STATUS_ACTIVE, STATUS_PAUSED,
+} = require('../../services/workerAuthService');
 const { requireWorkerSession } = require('../../middleware/workerAuth');
 const { getClientIp } = require('../../middleware/auth');
+const { normalizeIP } = require('../../services/ipHelpers');
 const {
     reserveTasks, leaseTasks, reportJobStatuses,
     completeTask, generateUploadUrls,
@@ -13,6 +19,11 @@ const {
 
 // POST /api/worker/auth — issue a bearer token.
 // No middleware on this route; it's the entry point.
+//
+// Order of checks is deliberate: credentials first, leak detection second.
+// Recording the IP only after the secret matches means a wrong-secret probe
+// from a random IP can't fill the recent-list and false-positive a legit
+// reauth from the operator. The leak detector lives in workerAuthService.
 router.post('/worker/auth', async (req, res) => {
     try {
         const { keyId, keySecret } = req.body || {};
@@ -20,12 +31,24 @@ router.post('/worker/auth', async (req, res) => {
             return res.status(400).json({ error: 'keyId and keySecret are required' });
         }
 
-        const valid = await validateWorkerKey(keyId, keySecret);
-        if (!valid) {
-            return res.status(401).json({ error: 'Invalid or revoked worker key' });
+        const status = await validateWorkerKey(keyId, keySecret);
+        if (!status) {
+            return res.status(401).json({ error: 'Invalid or deactivated worker key' });
         }
 
+        // Leak detection. Runs only on a credential-validated request so it
+        // can't be poisoned by external probing. A 'leak' verdict means we
+        // saw this IP before for this key within the live 60s window, with a
+        // different IP currently holding the most-recent slot — the ping-pong
+        // signature an attacker reauth would produce.
         const ip = getClientIp(req) || '';
+        const normalizedIp = normalizeIP(ip);
+        const verdict = await checkAndRecordAuthAttempt(keyId, normalizedIp);
+        if (verdict === 'leak') {
+            await deactivateWorkerKey(keyId);
+            return res.status(401).json({ error: 'Credential leak detected; key has been deactivated.' });
+        }
+
         const { bearerToken, expiresInSeconds } = await createWorkerSession(keyId, ip);
 
         res.json({ bearerToken, expiresInSeconds });
@@ -36,8 +59,22 @@ router.post('/worker/auth', async (req, res) => {
 });
 
 // GET /api/worker/tasks/available?availableSlot=N — reserve up to N tasks atomically.
+//
+// Returns an empty list when the key is paused — the worker keeps polling
+// without realising work is being withheld, which is exactly what we want
+// (no behavioural change on the worker side; the admin holds the lever).
+// A deactivated key would have had its session killed at deactivation time,
+// so we shouldn't see one here, but if a race lets a request through we 401.
 router.get('/worker/tasks/available', requireWorkerSession, async (req, res) => {
     try {
+        const status = await getWorkerKeyStatus(req.worker.keyId);
+        if (status !== STATUS_ACTIVE && status !== STATUS_PAUSED) {
+            return res.status(401).json({ error: 'Worker key is no longer active' });
+        }
+        if (status === STATUS_PAUSED) {
+            return res.json({ tasks: [] });
+        }
+
         const slotRaw = parseInt(req.query.availableSlot, 10);
         const slots = Number.isFinite(slotRaw) && slotRaw > 0 ? Math.min(slotRaw, 32) : 0;
         if (slots <= 0) {
@@ -67,8 +104,18 @@ router.get('/worker/tasks/available', requireWorkerSession, async (req, res) => 
 // POST /api/worker/tasks/lease — lease an array of previously-reserved videoIds.
 // Request: { videoIds: [1234, 1235, ...] }
 // Response: { results: [ { videoId, status: "leased"|"taken"|"notfound", ...spec } ] }
+//
+// Re-checks the key status; a paused / deactivated key shouldn't be granted
+// leases even if a task somehow made it into reserveTasks before the status
+// changed. Failure shape matches a normal "can't lease" so the worker just
+// treats it as nothing-to-do and keeps polling.
 router.post('/worker/tasks/lease', requireWorkerSession, async (req, res) => {
     try {
+        const status = await getWorkerKeyStatus(req.worker.keyId);
+        if (status !== STATUS_ACTIVE) {
+            return res.json({ results: [] });
+        }
+
         const { videoIds } = req.body || {};
         if (!Array.isArray(videoIds) || videoIds.length === 0) {
             return res.status(400).json({ error: 'videoIds[] is required' });
