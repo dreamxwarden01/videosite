@@ -1399,9 +1399,12 @@ export default function SettingsPage() {
                 const isPaused = status === 'paused';
                 const isDeactivated = status === 'deactivated';
                 const statusLabel = status.charAt(0).toUpperCase() + status.slice(1);
+                // Three classes mapped to existing palette: green / yellow / red.
+                // status-paused and status-deactivated alias status-queued and
+                // status-error respectively (see style.css "Status Badges").
                 const statusClass = isActive ? 'status-finished'
-                  : isPaused ? 'status-pending'
-                  : 'status-error';
+                  : isPaused ? 'status-paused'
+                  : 'status-deactivated';
                 return (
                   <tr key={wk.key_id}>
                     <td><code>{wk.key_id}</code></td>

@@ -473,13 +473,16 @@ textarea.form-control {
 }
 
 /* === Content-Area Overlay (confirm dialog, worker key modal) === */
+/* Full-viewport dim + modal-centering surface. Previously cropped to the
+   admin content area (top: 56px, left: 240px, right: 0, bottom: 43px) so
+   the sidebar / header / footer stayed visible behind the dim; switched to
+   inset: 0 so admin-page modals (worker key, HMAC, email service, etc.)
+   center against the whole browser window — same shape the confirm-overlay
+   uses. z-index 900 still keeps it below confirm/MFA challenges (1100). */
 .content-overlay {
     display: none;
     position: fixed;
-    top: 56px;
-    left: 240px;
-    right: 0;
-    bottom: 43px;
+    inset: 0;
     background: rgba(0, 0, 0, 0.18);
     z-index: 900;
     align-items: center;
@@ -579,7 +582,9 @@ textarea.form-control {
 
 @media (max-width: 768px) {
     body:has(.admin-layout) .toast-container { left: 0; }
-    .content-overlay { left: 0; }
+    /* .content-overlay used to need its own left: 0 override here when the
+       admin sidebar hid; now that the overlay is full-viewport by default
+       there's nothing left to flip. */
 }
 
 /* === Status Badges === */
@@ -594,7 +599,7 @@ textarea.form-control {
     background: #d1fae5;
     color: #065f46;
 }
-.status-queued {
+.status-queued, .status-paused {
     background: #fef3c7;
     color: #92400e;
 }
@@ -602,7 +607,7 @@ textarea.form-control {
     background: #dbeafe;
     color: #1e40af;
 }
-.status-error {
+.status-error, .status-deactivated {
     background: #fee2e2;
     color: #991b1b;
 }
@@ -827,9 +832,15 @@ textarea.form-control {
     pointer-events: none;
 }
 
-/* Watch page: page-level scroll. The container reserves bottom space for the
-   fixed footer so the last bit of the info card doesn't slide underneath. */
+/* Watch page: page-level scroll, viewport-edge scrollbar. .container above
+   restricts width via `width: min(100%, max(60vw, 100vh))` so its scrollbar
+   sits well inside the viewport on wide monitors; .container-player undoes
+   that for the watch page so the scrollbar lands at the actual right edge.
+   The inner .player-container keeps its own max-width and margin: 0 auto
+   for the centered player layout. */
 .container-player {
+    width: 100%;
+    max-width: none;
     padding-bottom: 56px;
 }
 
