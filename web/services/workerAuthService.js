@@ -37,20 +37,60 @@ async function generateWorkerKeyPair(label, createdBy) {
     return { keyId, secret };
 }
 
-// Rotate the secret on an existing key. Used by reactivate — generates a new
-// plaintext secret, replaces the stored hash, and clears every existing
-// session for the key (so any old bearer that was issued before the rotation
-// is immediately invalid). Returns the new plaintext secret, shown once.
-async function rotateWorkerKeySecret(keyId) {
+// Reactivate a deactivated key. Server-side precondition: the row must
+// actually be in 'deactivated' state. Without the check, an admin (or anyone
+// who hijacks an admin session) could trigger reactivate on a healthy
+// 'active' key and disrupt the running worker via the forced secret rotation
+// — the UI hides the button in that case, but client trust isn't a fence.
+//
+// Does the rotation + status flip inside a single `FOR UPDATE` transaction
+// so two concurrent reactivate calls can't double-rotate (the loser blocks
+// on the row lock, then re-reads status='active' and exits via not_deactivated).
+//
+// Returns one of:
+//   { ok: true,  secret }            — new plaintext secret, show once
+//   { ok: false, reason: 'not_found' }       — keyId doesn't exist
+//   { ok: false, reason: 'not_deactivated' } — key is already active or paused
+async function reactivateWorkerKey(keyId) {
     const pool = getPool();
-    const secret = crypto.randomBytes(32).toString('base64url');
-    const secretHash = await argon2.hash(secret, { type: argon2.argon2id });
-    await pool.execute(
-        'UPDATE worker_access_keys SET key_secret = ? WHERE key_id = ?',
-        [secretHash, keyId]
-    );
+    const conn = await pool.getConnection();
+    let result;
+    try {
+        await conn.beginTransaction();
+        const [rows] = await conn.execute(
+            'SELECT status FROM worker_access_keys WHERE key_id = ? FOR UPDATE',
+            [keyId]
+        );
+        if (rows.length === 0) {
+            await conn.rollback();
+            return { ok: false, reason: 'not_found' };
+        }
+        if (rows[0].status !== STATUS_DEACTIVATED) {
+            await conn.rollback();
+            return { ok: false, reason: 'not_deactivated' };
+        }
+
+        const secret = crypto.randomBytes(32).toString('base64url');
+        const secretHash = await argon2.hash(secret, { type: argon2.argon2id });
+        await conn.execute(
+            'UPDATE worker_access_keys SET key_secret = ?, status = ? WHERE key_id = ?',
+            [secretHash, STATUS_ACTIVE, keyId]
+        );
+        await conn.commit();
+        result = { ok: true, secret };
+    } catch (err) {
+        try { await conn.rollback(); } catch {}
+        throw err;
+    } finally {
+        conn.release();
+    }
+
+    // Session purge happens after the row lock is released. Any bearer
+    // issued under the now-replaced secret is invalid the moment Redis
+    // drops the session entry; the next worker request 401s and forces a
+    // fresh /api/worker/auth with the operator's freshly-pasted secret.
     await clearSessionsForKey(keyId);
-    return secret;
+    return result;
 }
 
 // validateWorkerKey returns the row's status string on credential success, or
@@ -302,7 +342,7 @@ async function cleanupExpiredWorkerSessions() {
 
 module.exports = {
     generateWorkerKeyPair,
-    rotateWorkerKeySecret,
+    reactivateWorkerKey,
     validateWorkerKey,
     getWorkerKeyStatus,
     setWorkerKeyStatus,

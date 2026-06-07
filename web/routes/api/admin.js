@@ -28,7 +28,7 @@ const { listRoles, getRoleById, createRole, updateRole, deleteRole, roleIdExists
 const { getPool } = require('../../config/database');
 const {
     generateWorkerKeyPair,
-    rotateWorkerKeySecret,
+    reactivateWorkerKey,
     setWorkerKeyStatus,
     deactivateWorkerKey,
     renameWorkerKey,
@@ -1373,12 +1373,21 @@ router.post('/admin/settings/worker-keys/:keyId/resume', requireAuth, checkPermi
 // compromised, since deactivation usually came from the leak detector) is
 // invalidated; the new plaintext secret is returned once for the operator to
 // copy into the worker's config.
+//
+// Server-side requires the key to actually be in 'deactivated' state — the
+// client only renders the button for that status, but a direct API call from
+// a hijacked admin session could otherwise hit this on an 'active' key and
+// disrupt a healthy worker via the forced rotation. Returns 409 on a
+// preconditioned-failed status.
 router.post('/admin/settings/worker-keys/:keyId/reactivate', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
     try {
-        const secret = await rotateWorkerKeySecret(req.params.keyId);
-        const ok = await setWorkerKeyStatus(req.params.keyId, STATUS_ACTIVE);
-        if (!ok) return res.status(404).json({ error: 'Key not found' });
-        res.json({ keyId: req.params.keyId, secret });
+        const result = await reactivateWorkerKey(req.params.keyId);
+        if (!result.ok) {
+            if (result.reason === 'not_found') return res.status(404).json({ error: 'Key not found' });
+            if (result.reason === 'not_deactivated') return res.status(409).json({ error: 'Key is not deactivated; cannot reactivate.' });
+            return res.status(500).json({ error: 'Failed to reactivate worker key' });
+        }
+        res.json({ keyId: req.params.keyId, secret: result.secret });
     } catch (err) {
         console.error('API reactivate worker key error:', err);
         res.status(500).json({ error: 'Failed to reactivate worker key' });
