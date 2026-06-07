@@ -22,9 +22,72 @@ const (
 )
 
 // FilteredProfile is an output profile selected for transcoding.
+//
+// OutW / OutH are the actual encoded output dimensions for this profile —
+// derived from the source dims via ActualOutputDims so the configured
+// profile.Width / profile.Height act as a *bounding box*, never as a forced
+// target. They're written into manifests (HLS RESOLUTION, DASH @width/@height)
+// and into the filter chain so output dims match what the manifests advertise.
+// All renditions of the same source share the same aspect ratio (modulo
+// even-rounding error of ≤ 0.1%), because every profile's OutW/OutH is
+// computed from the same source dims.
 type FilteredProfile struct {
 	config.OutputProfile
 	CanRemux bool // true if source matches this profile's specs
+	OutW     int  // actual encoded output width (≤ profile.Width)
+	OutH     int  // actual encoded output height (≤ profile.Height)
+}
+
+// ActualOutputDims computes the encoded dimensions a source should land at
+// when targeting a profile of (tgtW × tgtH). Treats the target as a bounding
+// box: the output preserves the source's aspect ratio, fits inside the target
+// on both axes, is divisible by 2 (required by h.264 and every hardware
+// encoder we use), and never upscales a source that's already smaller than
+// the target on both axes.
+//
+// Examples:
+//   src 1280×832, tgt 1280×720 → 1108×720  (height-bound, width shrinks)
+//   src 2560×1664, tgt 1280×720 → 1108×720 (same shape, source ½ size)
+//   src 640×360,  tgt 854×480  → 640×360   (no upscale)
+//   src 3840×1620 (21:9), tgt 1920×1080 → 1920×810  (width-bound, ultrawide)
+//   src 1080×1920 (vertical), tgt 1920×1080 → 608×1080 (height-bound, tall)
+func ActualOutputDims(srcW, srcH, tgtW, tgtH int) (outW, outH int) {
+	if srcW <= 0 || srcH <= 0 || tgtW <= 0 || tgtH <= 0 {
+		// Defensive fallback. Probe failure shouldn't happen here in
+		// practice — runTranscode has already validated probe dims.
+		return tgtW &^ 1, tgtH &^ 1
+	}
+
+	// Pick the smaller scale factor so both axes fit, then clamp at 1.0 so we
+	// never upscale a small source up to the target box.
+	sw := float64(tgtW) / float64(srcW)
+	sh := float64(tgtH) / float64(srcH)
+	s := sw
+	if sh < s {
+		s = sh
+	}
+	if s > 1.0 {
+		s = 1.0
+	}
+
+	outW = int(float64(srcW) * s)
+	outH = int(float64(srcH) * s)
+
+	// Even dims for h.264 / hardware encoders. Round down via &^1 — at
+	// worst we drop one pixel per axis (sub-0.1% of size for any realistic
+	// resolution), which is invisible and keeps the aspect ratio essentially
+	// intact.
+	outW &^= 1
+	outH &^= 1
+
+	// Safety floor — degenerate inputs shouldn't trip us into a zero dim.
+	if outW < 2 {
+		outW = 2
+	}
+	if outH < 2 {
+		outH = 2
+	}
+	return
 }
 
 // FilterProfiles selects which output profiles to use based on source properties.

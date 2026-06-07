@@ -1317,6 +1317,16 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 		return fmt.Errorf("no suitable output profiles for source %dx%d", probe.Width, probe.Height)
 	}
 
+	// Compute the actual encoded output dims per profile. The configured
+	// profile.Width/Height is treated as a bounding box; every rendition keeps
+	// the source's aspect ratio, never upscales, and lands on even dims.
+	// Sharing the same source means every rendition has the same aspect
+	// (modulo ≤ 0.1% even-rounding error) — lower profiles inherit it for free.
+	for i := range profiles {
+		p := &profiles[i]
+		p.OutW, p.OutH = transcoder.ActualOutputDims(probe.Width, probe.Height, p.Width, p.Height)
+	}
+
 	// Apply the per-job GOP / segment decision to every rendition, re-snapping
 	// per-profile when fps caps cause different renditions to land on
 	// different output frame grids.
@@ -1663,8 +1673,8 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 		}
 		variants = append(variants, transcoder.Variant{
 			Name:             p.Name,
-			Width:            p.Width,
-			Height:           p.Height,
+			Width:            p.OutW,
+			Height:           p.OutH,
 			VideoBitrateKbps: p.VideoBitrateKbps,
 			Codecs:           codecStr,
 			FrameRate:        outFps,
@@ -1754,7 +1764,7 @@ func (j *Job) transcodeVideoProfile(ctx context.Context, encoder *config.Encoder
 		onProgress(0)
 
 		logFile := ffmpegLogPath(j.JobID, profile.Name, tierLabel)
-		progressCh, errCh := transcoder.TranscodeVideo(ctx, sourcePath, profileDir, profile.OutputProfile, *encoder, probe.DurationSeconds, swDecode, logFile, probe.Width, probe.Height, probe.FrameRate)
+		progressCh, errCh := transcoder.TranscodeVideo(ctx, sourcePath, profileDir, profile.OutputProfile, *encoder, probe.DurationSeconds, swDecode, logFile, profile.OutW, profile.OutH, probe.FrameRate)
 
 		for pct := range progressCh {
 			onProgress(pct)

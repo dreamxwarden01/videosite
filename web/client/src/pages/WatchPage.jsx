@@ -165,6 +165,7 @@ export default function WatchPage() {
     let tickVisHandler = null;
     let pauseHandler = null;
     let pagehideHandler = null;
+    let metadataHandler = null;
     // Beacon flush — populated inside player.load().then once tracking state
     // is initialized. Used by both the pagehide handler (tab close, full
     // reload) and this effect's cleanup (client-side route nav, e.g. clicking
@@ -188,6 +189,19 @@ export default function WatchPage() {
         seekOnTaps: isTouchDevice,
         doubleClickForFullscreen: !isTouchDevice,
       });
+
+      // Adopt the loaded video's actual aspect ratio. The container starts at
+      // 16:9 (CSS placeholder) so layout reserves the right amount of space
+      // before metadata arrives; once we know the real dims, we override
+      // inline so non-16:9 content (1280×832, vertical phone, etc.) renders
+      // without baked-in or CSS-imposed letterboxing. Reset on cleanup.
+      metadataHandler = () => {
+        const c = containerRef.current;
+        if (c && videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
+          c.style.aspectRatio = `${videoEl.videoWidth} / ${videoEl.videoHeight}`;
+        }
+      };
+      videoEl.addEventListener('loadedmetadata', metadataHandler);
 
       player.configure('streaming.bufferingGoal', 60);
       player.configure('streaming.rebufferingGoal', 2);
@@ -494,6 +508,11 @@ export default function WatchPage() {
       if (tickVisHandler) document.removeEventListener('visibilitychange', tickVisHandler);
       if (pauseHandler) videoEl.removeEventListener('pause', pauseHandler);
       if (pagehideHandler) window.removeEventListener('pagehide', pagehideHandler);
+      if (metadataHandler) videoEl.removeEventListener('loadedmetadata', metadataHandler);
+      // Clear the inline aspect-ratio override so the next mount starts fresh
+      // from the 16:9 CSS placeholder (avoids carrying the previous video's
+      // aspect into the new video's initial render).
+      if (containerRef.current) containerRef.current.style.aspectRatio = '';
       try { ui?.destroy(); } catch {}
       try { player.destroy(); } catch {}
     };

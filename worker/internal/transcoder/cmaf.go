@@ -31,7 +31,7 @@ import (
 //
 // progressCh and errCh behave exactly like RunFFmpegWithProgress — callers
 // drain progressCh until close and then read a single error from errCh.
-func TranscodeVideo(ctx context.Context, sourcePath, outputDir string, profile config.OutputProfile, encoder config.Encoder, duration float64, swDecode bool, logFile string, srcW, srcH int, srcFrameRate float64) (<-chan int, <-chan error) {
+func TranscodeVideo(ctx context.Context, sourcePath, outputDir string, profile config.OutputProfile, encoder config.Encoder, duration float64, swDecode bool, logFile string, outW, outH int, srcFrameRate float64) (<-chan int, <-chan error) {
 	os.MkdirAll(outputDir, 0755)
 
 	ffmpegEncoder := hardware.FFmpegEncoderName[encoder.EncoderType]
@@ -39,7 +39,11 @@ func TranscodeVideo(ctx context.Context, sourcePath, outputDir string, profile c
 		ffmpegEncoder = "libx264"
 	}
 
-	hwArgs, vfFilter := resolveHWArgs(encoder, swDecode, srcW, srcH, profile.Width, profile.Height)
+	// outW/outH are the actual encoded dims (bounding-box fit, aspect-preserving,
+	// even, never upscaled — computed by ActualOutputDims in the job runner).
+	// They're handed straight to every filter so the encoder output matches what
+	// the HLS / DASH manifests advertise.
+	hwArgs, vfFilter := resolveHWArgs(encoder, swDecode, outW, outH)
 
 	// Effective output fps drives the keyint (-g) computation in
 	// buildBaseVideoArgs. Sources slower than the cap pass through at source

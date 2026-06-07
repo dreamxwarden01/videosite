@@ -886,7 +886,8 @@ textarea.form-control {
 }
 .video-player {
     width: 100%;
-    aspect-ratio: 16/9;
+    aspect-ratio: 16/9;        /* placeholder; overridden inline once metadata loads */
+    max-height: 80vh;          /* keep vertical/tall sources from filling the page */
     background: #000;
     border-radius: 8px;
     overflow: hidden;

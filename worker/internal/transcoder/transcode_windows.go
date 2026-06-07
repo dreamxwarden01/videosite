@@ -27,15 +27,14 @@ func applyEncoderOpts(args []string, encoder config.Encoder, ffmpegEncoder strin
 // tier on Windows.
 //
 // hwArgs contains FFmpeg global-input flags (-hwaccel … -init_hw_device …)
-// injected before -i; vfFilter is the value passed to -vf and handles scaling
-// + padding as required by the target profile.
-//
-// QSV's vpp_qsv cannot pad, so padding sources force tier-2 (CPU scale+pad).
-func resolveHWArgs(encoder config.Encoder, swDecode bool, srcW, srcH, tgtW, tgtH int) (hwArgs []string, vfFilter string) {
-	cpuVF := fmt.Sprintf(
-		"scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2",
-		tgtW, tgtH, tgtW, tgtH,
-	)
+// injected before -i; vfFilter is the value passed to -vf and scales to the
+// pre-computed output dims. No padding — the caller has already computed
+// outW/outH to preserve the source aspect ratio inside the target bounding
+// box, so every encoder path scales straight to the literal target. scale_cuda
+// and vpp_qsv would otherwise warp non-16:9 sources because they have no
+// native aspect-preserving option in the versions we ship against.
+func resolveHWArgs(encoder config.Encoder, swDecode bool, outW, outH int) (hwArgs []string, vfFilter string) {
+	cpuVF := fmt.Sprintf("scale=%d:%d", outW, outH)
 
 	switch encoder.EncoderType {
 	case hardware.EncoderNVENC:
@@ -56,29 +55,26 @@ func resolveHWArgs(encoder config.Encoder, swDecode bool, srcW, srcH, tgtW, tgtH
 				"-hwaccel_output_format", "cuda",
 				"-threads", "1",
 			}
-			vfFilter = fmt.Sprintf("scale_cuda=%d:%d", tgtW, tgtH)
+			vfFilter = fmt.Sprintf("scale_cuda=%d:%d", outW, outH)
 			return
 		}
 		// Tier 2: CPU decode+scale, GPU encode via h264_nvenc.
 		vfFilter = cpuVF
 	case hardware.EncoderQSV:
-		// Check if padding is needed (source aspect ratio differs from output).
-		// vpp_qsv cannot pad, so fall back to CPU scale/pad when needed.
-		needsPad := srcW > 0 && srcH > 0 &&
-			srcW*tgtH != srcH*tgtW
-
-		if !swDecode && !needsPad {
-			// Full GPU: QSV decode → vpp_qsv scale → h264_qsv encode.
+		if !swDecode {
+			// Full GPU: QSV decode → vpp_qsv scale → h264_qsv encode. The
+			// pre-computed outW/outH preserve aspect, so vpp_qsv's lack of
+			// pad support is no longer a problem — nothing pads.
 			hwArgs = []string{
 				"-init_hw_device", fmt.Sprintf("qsv=hw:%d", encoder.DeviceIndex),
 				"-hwaccel", "qsv",
 				"-hwaccel_device", "hw",
 				"-hwaccel_output_format", "qsv",
 			}
-			vfFilter = fmt.Sprintf("vpp_qsv=w=%d:h=%d", tgtW, tgtH)
+			vfFilter = fmt.Sprintf("vpp_qsv=w=%d:h=%d", outW, outH)
 			return
 		}
-		// Tier 2: CPU decode + CPU scale/pad → h264_qsv encode.
+		// Tier 2: CPU decode + CPU scale → h264_qsv encode.
 		vfFilter = cpuVF
 	default: // SOFTWARE
 		vfFilter = cpuVF
