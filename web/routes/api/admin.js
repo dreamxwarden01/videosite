@@ -29,12 +29,12 @@ const { getPool } = require('../../config/database');
 const {
     generateWorkerKeyPair,
     reactivateWorkerKey,
-    setWorkerKeyStatus,
+    pauseWorkerKey,
+    resumeWorkerKey,
     deactivateWorkerKey,
     renameWorkerKey,
     deleteWorkerKey,
     listWorkerKeys,
-    STATUS_ACTIVE, STATUS_PAUSED, STATUS_DEACTIVATED,
 } = require('../../services/workerAuthService');
 const { generateSecretKey, isHmacConfigured, setSetting } = require('../../services/tokenService');
 
@@ -1345,10 +1345,20 @@ router.post('/admin/settings/worker-keys', requireAuth, checkPermission('manageS
 
 // POST /api/admin/settings/worker-keys/:keyId/pause — pause an active key.
 // Worker keeps its current bearer token, polling returns empty, lease rejects.
+//
+// Rejects when the key is deactivated (409). UX hides the button in that
+// case but a direct API call would otherwise quietly flip status='paused'
+// on a security-disabled key — the worker is still locked out by the auth-
+// time deactivated check, but the operator's mental model would diverge
+// from what the row actually says.
 router.post('/admin/settings/worker-keys/:keyId/pause', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
     try {
-        const ok = await setWorkerKeyStatus(req.params.keyId, STATUS_PAUSED);
-        if (!ok) return res.status(404).json({ error: 'Key not found' });
+        const result = await pauseWorkerKey(req.params.keyId);
+        if (!result.ok) {
+            if (result.reason === 'not_found') return res.status(404).json({ error: 'Key not found' });
+            if (result.reason === 'invalid_state') return res.status(409).json({ error: 'Key is deactivated; use Reactivate first.' });
+            return res.status(500).json({ error: 'Failed to pause worker key' });
+        }
         res.status(204).end();
     } catch (err) {
         console.error('API pause worker key error:', err);
@@ -1357,10 +1367,19 @@ router.post('/admin/settings/worker-keys/:keyId/pause', requireAuth, checkPermis
 });
 
 // POST /api/admin/settings/worker-keys/:keyId/resume — unpause back to active.
+//
+// Strict precondition: status must be 'active' (idempotent no-op) or
+// 'paused'. A 'deactivated' key would otherwise quietly skip the secret-
+// rotation that reactivate forces — that's a direct bypass of leak
+// detection, hence the 409 rather than a tolerant fallthrough.
 router.post('/admin/settings/worker-keys/:keyId/resume', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
     try {
-        const ok = await setWorkerKeyStatus(req.params.keyId, STATUS_ACTIVE);
-        if (!ok) return res.status(404).json({ error: 'Key not found' });
+        const result = await resumeWorkerKey(req.params.keyId);
+        if (!result.ok) {
+            if (result.reason === 'not_found') return res.status(404).json({ error: 'Key not found' });
+            if (result.reason === 'invalid_state') return res.status(409).json({ error: 'Key is deactivated; use Reactivate first.' });
+            return res.status(500).json({ error: 'Failed to resume worker key' });
+        }
         res.status(204).end();
     } catch (err) {
         console.error('API resume worker key error:', err);
@@ -1397,11 +1416,18 @@ router.post('/admin/settings/worker-keys/:keyId/reactivate', requireAuth, checkP
 // POST /api/admin/settings/worker-keys/:keyId/rename — change the human label.
 // Empty label is accepted (means "clear the label"). Client greys the
 // Continue button when the value hasn't changed; the server doesn't enforce.
+//
+// Rejects when the key is deactivated — spec is "Reactivate + Delete only"
+// in that column, and the UI hides Rename to match.
 router.post('/admin/settings/worker-keys/:keyId/rename', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
     try {
         const { label } = req.body || {};
-        const ok = await renameWorkerKey(req.params.keyId, typeof label === 'string' ? label.trim() : '');
-        if (!ok) return res.status(404).json({ error: 'Key not found' });
+        const result = await renameWorkerKey(req.params.keyId, typeof label === 'string' ? label.trim() : '');
+        if (!result.ok) {
+            if (result.reason === 'not_found') return res.status(404).json({ error: 'Key not found' });
+            if (result.reason === 'deactivated') return res.status(409).json({ error: 'Deactivated keys cannot be renamed.' });
+            return res.status(500).json({ error: 'Failed to rename worker key' });
+        }
         res.status(204).end();
     } catch (err) {
         console.error('API rename worker key error:', err);

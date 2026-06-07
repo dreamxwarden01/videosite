@@ -134,10 +134,10 @@ async function getWorkerKeyStatus(keyId) {
     return rows.length === 0 ? null : rows[0].status;
 }
 
-// Set the key's status. Returns true if the row existed. When transitioning
-// to 'deactivated' the caller is responsible for clearing the auth-attempt
-// list — leak detection's own code path does this inline; the manual admin
-// path goes through deactivateWorkerKey which handles it.
+// Unconditional status setter. Internal only — exposed callers go through
+// transitionWorkerKeyStatus (which enforces a precondition) or deactivate
+// /reactivate (which carry extra side effects). Used by deactivateWorkerKey
+// where we want the row pinned to 'deactivated' regardless of current state.
 async function setWorkerKeyStatus(keyId, status) {
     const pool = getPool();
     const [result] = await pool.execute(
@@ -145,6 +145,62 @@ async function setWorkerKeyStatus(keyId, status) {
         [status, keyId]
     );
     return result.affectedRows > 0;
+}
+
+// transitionWorkerKeyStatus pins the row, checks current status against
+// allowedStates, and atomically writes targetState. Used by pause + resume
+// to guarantee a deactivated key can't be quietly returned to service
+// without going through the reactivate (secret-rotation) flow. Idempotent
+// on the already-at-target case so a duplicate click isn't treated as a
+// bug; strict on any current state outside allowedStates.
+//
+// Returns:
+//   { ok: true,  idempotent: false }                 — row was changed
+//   { ok: true,  idempotent: true  }                 — row already at target
+//   { ok: false, reason: 'not_found' }               — keyId doesn't exist
+//   { ok: false, reason: 'invalid_state', currentStatus }
+async function transitionWorkerKeyStatus(keyId, allowedStates, targetState) {
+    const pool = getPool();
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+        const [rows] = await conn.execute(
+            'SELECT status FROM worker_access_keys WHERE key_id = ? FOR UPDATE',
+            [keyId]
+        );
+        if (rows.length === 0) {
+            await conn.rollback();
+            return { ok: false, reason: 'not_found' };
+        }
+        const current = rows[0].status;
+        if (!allowedStates.includes(current)) {
+            await conn.rollback();
+            return { ok: false, reason: 'invalid_state', currentStatus: current };
+        }
+        if (current === targetState) {
+            await conn.commit();
+            return { ok: true, idempotent: true };
+        }
+        await conn.execute(
+            'UPDATE worker_access_keys SET status = ? WHERE key_id = ?',
+            [targetState, keyId]
+        );
+        await conn.commit();
+        return { ok: true, idempotent: false };
+    } catch (err) {
+        try { await conn.rollback(); } catch {}
+        throw err;
+    } finally {
+        conn.release();
+    }
+}
+
+async function pauseWorkerKey(keyId) {
+    return transitionWorkerKeyStatus(keyId, [STATUS_ACTIVE, STATUS_PAUSED], STATUS_PAUSED);
+}
+
+async function resumeWorkerKey(keyId) {
+    return transitionWorkerKeyStatus(keyId, [STATUS_ACTIVE, STATUS_PAUSED], STATUS_ACTIVE);
 }
 
 // Move a key into the 'deactivated' state, kill all in-flight sessions, and
@@ -157,13 +213,45 @@ async function deactivateWorkerKey(keyId) {
     await clearAuthAttempts(keyId);
 }
 
+// Rename rejects a deactivated key — spec says deactivated has only
+// Reactivate + Delete in the action column. UX hides the Rename button
+// for that status; this enforces the same rule on the API side. Same
+// FOR UPDATE pattern as pause/resume so a concurrent deactivate doesn't
+// slip a label change through after the row has been compromised.
+//
+// Returns:
+//   { ok: true }                          — label was changed
+//   { ok: false, reason: 'not_found' }
+//   { ok: false, reason: 'deactivated' }
 async function renameWorkerKey(keyId, label) {
     const pool = getPool();
-    const [result] = await pool.execute(
-        'UPDATE worker_access_keys SET label = ? WHERE key_id = ?',
-        [label && label.length ? label : null, keyId]
-    );
-    return result.affectedRows > 0;
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+        const [rows] = await conn.execute(
+            'SELECT status FROM worker_access_keys WHERE key_id = ? FOR UPDATE',
+            [keyId]
+        );
+        if (rows.length === 0) {
+            await conn.rollback();
+            return { ok: false, reason: 'not_found' };
+        }
+        if (rows[0].status === STATUS_DEACTIVATED) {
+            await conn.rollback();
+            return { ok: false, reason: 'deactivated' };
+        }
+        await conn.execute(
+            'UPDATE worker_access_keys SET label = ? WHERE key_id = ?',
+            [label && label.length ? label : null, keyId]
+        );
+        await conn.commit();
+        return { ok: true };
+    } catch (err) {
+        try { await conn.rollback(); } catch {}
+        throw err;
+    } finally {
+        conn.release();
+    }
 }
 
 // Hard delete. The caller (admin UI) shows a warning before invoking this;
@@ -343,9 +431,10 @@ async function cleanupExpiredWorkerSessions() {
 module.exports = {
     generateWorkerKeyPair,
     reactivateWorkerKey,
+    pauseWorkerKey,
+    resumeWorkerKey,
     validateWorkerKey,
     getWorkerKeyStatus,
-    setWorkerKeyStatus,
     deactivateWorkerKey,
     renameWorkerKey,
     deleteWorkerKey,
