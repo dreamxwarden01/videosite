@@ -588,22 +588,24 @@ export default function SettingsPage() {
   //    the full path (no substring) so the message MACed is the entire
   //    file path. One concat per rule, well within Cloudflare's limit.
   //
-  // BOTH rules read the verify token from `http.request.uri.query`
-  // (which Cloudflare URL-decodes), NOT from `http.request.uri` raw.
-  // This matters because the standard-base64 MAC contains `+` and `/`
-  // roughly 75% of the time, and the browser URL-encodes those to %2B /
-  // %2F. The raw `http.request.uri` keeps them encoded; `.query`
-  // decodes them back so the MAC validates byte-for-byte against what
-  // the server signed. A separator-length=8 + `http.request.uri` poster
-  // rule looked elegant but silently broke ~75% of poster loads.
+  // Both rules pass the literal string "s" as the 6th argument. This
+  // tells the function to expect URL-safe base64 MACs (43 chars, no
+  // padding, alphabet [A-Za-z0-9_-]) instead of standard base64 (44
+  // chars, alphabet [A-Za-z0-9+/=]). Standard base64 contains chars that
+  // require URL-encoding when embedded in a query string, and the encoded
+  // form depends on the browser — that ambiguity is what was causing the
+  // intermittent 403s. URL-safe base64 has zero chars that need
+  // encoding, so the wire format is unambiguous and the function's regex
+  // matches deterministically. The server's tokenService._sign uses
+  // Node's `digest('base64url')` to match.
   //
   // Both rules block (action set in Cloudflare dashboard) when no valid
   // token is present. Mutually exclusive on path via the ends_with check.
   const buildWafRule = (secret) => {
     const host = r2PublicDomain || 'your-cdn-domain.com';
     const validity = hmacTokenValidity || '600';
-    const playback = `(http.host eq "${host}") and not ends_with(http.request.uri.path, "/poster.jpg") and not (\n    starts_with(http.request.uri.query, "verify=") and\n    is_timed_hmac_valid_v0(\n        "${secret}",\n        concat(\n            substring(http.request.uri.path, 0, 79),\n            "?",\n            substring(http.request.uri.query, 7, 200)\n        ),\n        ${validity},\n        http.request.timestamp.sec,\n        1\n    )\n)`;
-    const poster = `(http.host eq "${host}") and ends_with(http.request.uri.path, "/poster.jpg") and not (\n    starts_with(http.request.uri.query, "verify=") and\n    is_timed_hmac_valid_v0(\n        "${secret}",\n        concat(\n            http.request.uri.path,\n            "?",\n            substring(http.request.uri.query, 7, 200)\n        ),\n        ${validity},\n        http.request.timestamp.sec,\n        1\n    )\n)`;
+    const playback = `(http.host eq "${host}") and not ends_with(http.request.uri.path, "/poster.jpg") and not (\n    starts_with(http.request.uri.query, "verify=") and\n    is_timed_hmac_valid_v0(\n        "${secret}",\n        concat(\n            substring(http.request.uri.path, 0, 79),\n            "?",\n            substring(http.request.uri.query, 7, 200)\n        ),\n        ${validity},\n        http.request.timestamp.sec,\n        1,\n        "s"\n    )\n)`;
+    const poster = `(http.host eq "${host}") and ends_with(http.request.uri.path, "/poster.jpg") and not (\n    starts_with(http.request.uri.query, "verify=") and\n    is_timed_hmac_valid_v0(\n        "${secret}",\n        concat(\n            http.request.uri.path,\n            "?",\n            substring(http.request.uri.query, 7, 200)\n        ),\n        ${validity},\n        http.request.timestamp.sec,\n        1,\n        "s"\n    )\n)`;
     return { playback, poster };
   };
 

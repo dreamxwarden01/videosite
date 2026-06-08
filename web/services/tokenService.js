@@ -91,6 +91,15 @@ async function isHmacEnabled() {
 // each construct their own message format. Returns null when HMAC is
 // disabled or the secret is missing — every signing path collapses to "no
 // token" identically, which keeps the un-configured branch a no-op.
+//
+// Encoding: URL-safe base64 without padding (Node's `base64url`). This is
+// what Cloudflare's `is_timed_hmac_valid_v0` expects when its 6th arg is
+// the string flag "s". Standard base64 (+/=) requires URL-encoding in the
+// MessageMAC string — which is fragile because the encoded form depends on
+// the browser, and the regex the function uses to parse the MAC
+// `(.{43,})` matches different char counts depending on encoding. URL-safe
+// base64 has none of those chars at all, so the wire format is
+// unambiguous: 43 chars exactly, drawn from [A-Za-z0-9_-], no padding.
 async function _sign(message) {
     const enabled = await isHmacEnabled();
     if (!enabled) return null;
@@ -101,7 +110,7 @@ async function _sign(message) {
     const secret = await getSecretSetting('hmac_secret_key');
     if (!secret) return null;
 
-    return crypto.createHmac('sha256', secret).update(message).digest('base64');
+    return crypto.createHmac('sha256', secret).update(message).digest('base64url');
 }
 
 async function generateToken(path) {
