@@ -896,6 +896,12 @@ router.get('/admin/settings', requireAuth, checkPermission('manageSite'), requir
             video_hmac_enabled: settingsMap.video_hmac_enabled === 'true',
             video_hmac_secret_configured: !!settingsMap.hmac_secret_key,
             video_hmac_token_validity: settingsMap.video_hmac_token_validity || '600',
+            // R2 public domain ships down so the SettingsPage WAF rule
+            // builder can auto-fill the `(http.host eq "…")` clause instead
+            // of leaving a placeholder for the admin to edit. Sourced from
+            // env (not site_settings) — it's an infrastructure detail
+            // settled at deploy time, not a tenant-level toggle.
+            r2_public_domain: process.env.R2_PUBLIC_DOMAIN || '',
             email_hmac_secret_configured: !!settingsMap.email_secret_key,
             email_with_service_credentials: settingsMap.email_with_service_credentials === 'true',
             email_access_secret_configured: !!settingsMap.cf_access_client_secret,

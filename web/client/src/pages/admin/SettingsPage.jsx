@@ -49,8 +49,16 @@ export default function SettingsPage() {
   const [hmacSaving, setHmacSaving] = useState(false);
   const [generatedHmacKey, setGeneratedHmacKey] = useState(null);
   const [hmacKeyCopyLabel, setHmacKeyCopyLabel] = useState('Copy');
-  const [hmacRuleCopyLabel, setHmacRuleCopyLabel] = useState('click to copy');
+  // Separate copy-button labels for each rule — the modal renders two
+  // WAF rules now (playback prefix scope + poster file scope), and each
+  // copy button transitions independently.
+  const [playbackRuleCopyLabel, setPlaybackRuleCopyLabel] = useState('click to copy');
+  const [posterRuleCopyLabel, setPosterRuleCopyLabel] = useState('click to copy');
   const [hmacInitMode, setHmacInitMode] = useState(false);
+  // R2 public domain from env (server-side, deploy-time setting). Used to
+  // auto-fill the host clause in the WAF rules so the admin doesn't have
+  // to edit a placeholder.
+  const [r2PublicDomain, setR2PublicDomain] = useState('');
 
   // Email Sending (sister section under the same Cloudflare card). The
   // email-sender Worker holds the matching secret in EMAIL_HMAC_SECRET.
@@ -149,6 +157,7 @@ export default function SettingsPage() {
         setEmailServiceClientId(cf.email_access_client_id || null);
         setHmacEnabled(!!cf.video_hmac_enabled);
         setHmacTokenValidity(cf.video_hmac_token_validity || '600');
+        setR2PublicDomain(cf.r2_public_domain || '');
         setWorkerTurnstileEnabled(!!cf.turnstile_worker_gate);
         setWorkerKeys(data.workerKeys || []);
         setRoles(data.roles || []);
@@ -399,7 +408,8 @@ export default function SettingsPage() {
       if (ok && data?.secret) {
         setGeneratedHmacKey(data.secret);
         setHmacKeyCopyLabel('Copy');
-        setHmacRuleCopyLabel('click to copy');
+        setPlaybackRuleCopyLabel('click to copy');
+        setPosterRuleCopyLabel('click to copy');
         setHmacHasKey(true);
         setHmacInitMode(isInit);
       } else {
@@ -564,33 +574,46 @@ export default function SettingsPage() {
     }
   };
 
+  // Build the two Cloudflare WAF rules. They share one secret + one
+  // validity but use different `is_timed_hmac_valid_v0` invocations:
+  //
+  //  - PLAYBACK (prefix scope): manifest + every segment under
+  //    /{64-char hash}/{12-char job}/. Uses `concat(substring(path,0,79),
+  //    "?", substring(query,7,200))` so a single token covers every file
+  //    under the job prefix. Excludes poster.jpg so the poster rule has
+  //    sole jurisdiction over that file.
+  //
+  //  - POSTER (file scope): just /{...}/poster.jpg. Uses
+  //    `http.request.uri` directly with separator length 8 (the byte
+  //    length of "?verify="). Cloudflare's parser extracts the path
+  //    portion and verifies HMAC(secret, path + timestamp) against the
+  //    supplied MAC — same algorithm as the playback rule, just no
+  //    concat call needed. This is mandatory because Cloudflare WAF
+  //    expressions cap concat() at one call per rule.
+  //
+  // Both rules block (action set in Cloudflare dashboard) when no valid
+  // token is present. Mutually exclusive on path via the ends_with check.
   const buildWafRule = (secret) => {
-    // R2 public domain no longer ships in the settings response — admin
-    // edits the placeholder before pasting into Cloudflare.
-    //
-    // Two MAC scopes joined by `or`:
-    //   1. Prefix-scope (manifest + segments): signs the first 79 chars of
-    //      the path (always /{64-char hash}/{12-char job}/) so one token
-    //      grants access to every file under that job. Used for the .mpd
-    //      manifest and every .m4s / .mp4 init it references.
-    //   2. File-scope (poster): signs the full path so the token validates
-    //      against exactly one URL. Used for the per-video poster.jpg
-    //      surfaced on the course list page and as Media Session artwork.
-    //
-    // Both scopes share the same secret and validity. The `or` short-
-    // circuits to true on whichever signature matches the requested path
-    // — there's no MAC collision risk because the messages signed are
-    // structurally different (path prefix vs. full path).
-    const host = 'your-cdn-domain.com';
+    const host = r2PublicDomain || 'your-cdn-domain.com';
     const validity = hmacTokenValidity || '600';
-    return `(http.host eq "${host}") and not (\n    starts_with(http.request.uri.query, "verify=") and (\n        is_timed_hmac_valid_v0(\n            "${secret}",\n            concat(\n                substring(http.request.uri.path, 0, 79),\n                "?",\n                substring(http.request.uri.query, 7, 200)\n            ),\n            ${validity},\n            http.request.timestamp.sec,\n            1\n        )\n        or\n        is_timed_hmac_valid_v0(\n            "${secret}",\n            concat(\n                http.request.uri.path,\n                "?",\n                substring(http.request.uri.query, 7, 200)\n            ),\n            ${validity},\n            http.request.timestamp.sec,\n            1\n        )\n    )\n)`;
+    const playback = `(http.host eq "${host}") and not ends_with(http.request.uri.path, "/poster.jpg") and not (\n    starts_with(http.request.uri.query, "verify=") and\n    is_timed_hmac_valid_v0(\n        "${secret}",\n        concat(\n            substring(http.request.uri.path, 0, 79),\n            "?",\n            substring(http.request.uri.query, 7, 200)\n        ),\n        ${validity},\n        http.request.timestamp.sec,\n        1\n    )\n)`;
+    const poster = `(http.host eq "${host}") and ends_with(http.request.uri.path, "/poster.jpg") and not (\n    starts_with(http.request.uri.query, "verify=") and\n    is_timed_hmac_valid_v0(\n        "${secret}",\n        http.request.uri,\n        ${validity},\n        http.request.timestamp.sec,\n        8\n    )\n)`;
+    return { playback, poster };
   };
 
-  const handleCopyWafRule = () => {
+  const handleCopyPlaybackRule = () => {
     if (!generatedHmacKey) return;
-    navigator.clipboard.writeText(buildWafRule(generatedHmacKey)).then(() => {
-      setHmacRuleCopyLabel('copied!');
-      setTimeout(() => setHmacRuleCopyLabel('click to copy'), 1500);
+    navigator.clipboard.writeText(buildWafRule(generatedHmacKey).playback).then(() => {
+      setPlaybackRuleCopyLabel('copied!');
+      setTimeout(() => setPlaybackRuleCopyLabel('click to copy'), 1500);
+    }).catch(() => {});
+  };
+
+  const handleCopyPosterRule = () => {
+    if (!generatedHmacKey) return;
+    navigator.clipboard.writeText(buildWafRule(generatedHmacKey).poster).then(() => {
+      setPosterRuleCopyLabel('copied!');
+      setTimeout(() => setPosterRuleCopyLabel('click to copy'), 1500);
     }).catch(() => {});
   };
 
@@ -1558,19 +1581,31 @@ export default function SettingsPage() {
               <p className="wk-warning">Save this key now — it won't be shown again.</p>
 
               <div className="wk-field" style={{ marginTop: '16px' }}>
-                <label>Cloudflare WAF Rule Expression</label>
-                <textarea readOnly value={buildWafRule(generatedHmacKey)}
+                <label>Cloudflare WAF Rule — Playback (manifest + segments)</label>
+                <textarea readOnly value={buildWafRule(generatedHmacKey).playback}
                   onClick={e => e.target.select()}
-                  style={{ width: '100%', minHeight: '200px', fontFamily: 'monospace', fontSize: '12px', padding: '10px', border: '1px solid #d1d5db', borderRadius: '6px', resize: 'vertical', cursor: 'text', background: '#f9fafb', boxSizing: 'border-box' }} />
+                  style={{ width: '100%', minHeight: '160px', fontFamily: 'monospace', fontSize: '12px', padding: '10px', border: '1px solid #d1d5db', borderRadius: '6px', resize: 'vertical', cursor: 'text', background: '#f9fafb', boxSizing: 'border-box' }} />
                 <div style={{ textAlign: 'right', marginTop: '4px' }}>
-                  <span onClick={handleCopyWafRule}
+                  <span onClick={handleCopyPlaybackRule}
                     style={{ color: '#9ca3af', fontSize: '13px', cursor: 'pointer' }}>
-                    {hmacRuleCopyLabel}
+                    {playbackRuleCopyLabel}
+                  </span>
+                </div>
+              </div>
+              <div className="wk-field" style={{ marginTop: '12px' }}>
+                <label>Cloudflare WAF Rule — Poster (per-file)</label>
+                <textarea readOnly value={buildWafRule(generatedHmacKey).poster}
+                  onClick={e => e.target.select()}
+                  style={{ width: '100%', minHeight: '120px', fontFamily: 'monospace', fontSize: '12px', padding: '10px', border: '1px solid #d1d5db', borderRadius: '6px', resize: 'vertical', cursor: 'text', background: '#f9fafb', boxSizing: 'border-box' }} />
+                <div style={{ textAlign: 'right', marginTop: '4px' }}>
+                  <span onClick={handleCopyPosterRule}
+                    style={{ color: '#9ca3af', fontSize: '13px', cursor: 'pointer' }}>
+                    {posterRuleCopyLabel}
                   </span>
                 </div>
               </div>
               <p className="text-muted" style={{ fontSize: '13px', marginTop: '8px' }}>
-                Set the action to <strong>Block</strong> with a 403 response.
+                Paste each as a <strong>separate</strong> Cloudflare WAF custom rule. Set the action to <strong>Block</strong> with a 403 response for both.
               </p>
             </div>
             <div className="wk-modal-footer">
