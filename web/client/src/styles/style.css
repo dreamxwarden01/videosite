@@ -684,7 +684,7 @@ textarea.form-control {
  * cleanly without baking padding into the source JPEG. The dark bg fills
  * the letterbox gap. */
 .video-poster-thumb {
-    width: 80px;
+    width: 100px;
     aspect-ratio: 16 / 9;
     background: #1a1a1a;
     border-radius: 4px;
@@ -699,6 +699,18 @@ textarea.form-control {
     max-height: 100%;
     object-fit: contain;
     display: block;
+}
+/* Mobile: when a row has a poster thumbnail AND its status is
+ * "Available" (the finished+playable state), drop the redundant badge.
+ * The poster itself + clickable row are enough signal that the video is
+ * ready; the badge just eats horizontal space on narrow screens. Rows
+ * without a poster (play-icon fallback) keep the badge so the state is
+ * still obvious. Non-finished states (processing/error) always show the
+ * badge regardless. */
+@media (max-width: 768px) {
+    .video-item .video-poster-thumb ~ .video-actions .status-finished {
+        display: none;
+    }
 }
 .video-info {
     flex: 1;
