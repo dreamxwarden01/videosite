@@ -144,8 +144,14 @@ func ReportStatus(ctx context.Context, jobs []JobStatus) ([]JobAck, error) {
 var completeRetryDelays = []time.Duration{0, 1 * time.Second, 2 * time.Second, 3 * time.Second, 4 * time.Second}
 
 // CompletePayload is the JSON body of POST /api/worker/tasks/complete.
+//
+// HasPoster signals that the worker wrote a poster.jpg into the job output
+// dir and the upload sweep included it. The server flips videos.has_poster
+// on the back of this so the course list page knows to mint a per-file
+// signed URL. Omitted when false — the server defaults to 0.
 type CompletePayload struct {
 	DurationSeconds float64 `json:"durationSeconds,omitempty"`
+	HasPoster       bool    `json:"hasPoster,omitempty"`
 }
 
 // CompleteTask reports a single job completion with up to 5 retries
@@ -156,6 +162,9 @@ func CompleteTask(ctx context.Context, jobID string, payload CompletePayload) er
 	body := map[string]interface{}{"jobId": jobID}
 	if payload.DurationSeconds > 0 {
 		body["durationSeconds"] = payload.DurationSeconds
+	}
+	if payload.HasPoster {
+		body["hasPoster"] = true
 	}
 
 	var lastErr error

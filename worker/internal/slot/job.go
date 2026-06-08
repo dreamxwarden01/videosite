@@ -124,6 +124,7 @@ type Job struct {
 	tempDir        string
 	outputDir      string
 	duration       float64
+	hasPoster      bool         // true if poster.jpg was successfully extracted and queued for upload
 	phase          atomic.Value // current phase: "downloading", "probing", "transcoding", "uploading", "completing"
 
 	// Per-job GOP / segment decisions, populated in probe().
@@ -307,6 +308,13 @@ func (j *Job) Run() error {
 		return j.handleError("probe", err)
 	}
 
+	// Best-effort poster extraction. Runs between probe and transcode so
+	// the poster is ready by the time the upload sweep walks outputDir,
+	// and it's available even if transcoding later fails partway (the
+	// course list page can still show something useful). Failures here
+	// do NOT fail the job — we just log and keep going.
+	j.extractPoster(probe.DurationSeconds)
+
 	// 3-6. PROCESSING:
 	//   video goroutine (serial per-profile fMP4 HLS, no audio) ||
 	//   audio goroutine (single AAC fMP4 rendition with optional two-pass norm)
@@ -328,7 +336,10 @@ func (j *Job) Run() error {
 	// (5 attempts, 0/1/2/3/4 s backoff, 204 success, 404 = gone, 401 re-auth).
 	j.phase.Store("completing")
 	j.UI.UpdateStage(j.JobID, "completing", 100)
-	err = api.CompleteTask(j.ctx, j.JobID, api.CompletePayload{DurationSeconds: j.duration})
+	err = api.CompleteTask(j.ctx, j.JobID, api.CompletePayload{
+		DurationSeconds: j.duration,
+		HasPoster:       j.hasPoster,
+	})
 	if err != nil && !errors.Is(err, api.ErrJobNotFound) && !errors.Is(err, api.ErrCompleteRetriesExhausted) {
 		j.UI.Logf("[%s] ERROR: failed to report completion: %v", j.JobID, err)
 	}
@@ -795,6 +806,44 @@ func (j *Job) probe() (*transcoder.ProbeResult, error) {
 	j.SetStage("processing", 9)
 
 	return probe, nil
+}
+
+// extractPoster picks a representative frame from the source and saves it as
+// poster.jpg at the root of outputDir. The upload sweep later in the
+// pipeline picks it up like any other rendition file, so no separate upload
+// path is needed — the file just shows up at R2 key
+// `{hashed_video_id}/{jobId}/poster.jpg`.
+//
+// Best-effort: any failure (ffmpeg error, missing dir, etc.) is logged but
+// does NOT fail the job. j.hasPoster only flips to true on confirmed
+// success, which controls whether the worker reports has_poster=true at
+// /tasks/complete.
+//
+// duration comes from the probe; if it's ≤0 we skip cleanly.
+func (j *Job) extractPoster(duration float64) {
+	if duration <= 0 {
+		j.UI.Logf("[%s] poster: skipped (no duration from probe)", j.JobID)
+		return
+	}
+
+	// outputDir is created lazily by the per-rendition mkdirs deeper in the
+	// transcode path. We need it now, before any of those run, so the
+	// poster file has somewhere to live.
+	if err := os.MkdirAll(j.outputDir, 0755); err != nil {
+		j.UI.Logf("[%s] poster: failed to create outputDir: %v", j.JobID, err)
+		return
+	}
+
+	sourcePath := filepath.Join(j.tempDir, "source.mp4")
+	posterPath := filepath.Join(j.outputDir, "poster.jpg")
+
+	if err := transcoder.ExtractPoster(j.ctx, sourcePath, posterPath, duration); err != nil {
+		j.UI.Logf("[%s] poster: extract failed (continuing without): %v", j.JobID, err)
+		return
+	}
+
+	j.hasPoster = true
+	j.UI.Logf("[%s] poster: extracted to %s", j.JobID, posterPath)
 }
 
 // GOP decision constants. All in seconds.

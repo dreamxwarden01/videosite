@@ -214,7 +214,7 @@ async function updateTaskStatus(jobId, status, progress = null, errorMessage = n
     return { found: true };
 }
 
-async function completeTask(jobId, durationSeconds = null) {
+async function completeTask(jobId, durationSeconds = null, hasPoster = false) {
     clearStaleTimer(jobId);
     await transcodeCache.clearJob(jobId);
     const pool = getPool();
@@ -240,6 +240,12 @@ async function completeTask(jobId, durationSeconds = null) {
         if (durationSeconds !== null) {
             fields.push('duration_seconds = ?');
             values.push(durationSeconds);
+        }
+        // Only flip has_poster on true. Worker omits the field when the
+        // poster step failed; we leave the column at its default 0 so the
+        // list page falls back to the play-icon for that video.
+        if (hasPoster) {
+            fields.push('has_poster = 1');
         }
         values.push(task[0].video_id);
 
@@ -593,6 +599,12 @@ function contentTypeForFile(filename) {
     // or R2 rejects the signed PUT with SignatureDoesNotMatch.
     if (filename.endsWith('.m4s') || filename.endsWith('.mp4')) {
         return ('/' + filename).includes('/audio/') ? 'audio/mp4' : 'video/mp4';
+    }
+    // Per-video poster thumbnail (poster.jpg). The worker writes one of
+    // these into the job output dir alongside the manifest, so the existing
+    // upload sweep picks it up like any other rendition file.
+    if (filename.endsWith('.jpg') || filename.endsWith('.jpeg')) {
+        return 'image/jpeg';
     }
     return 'application/octet-stream';
 }

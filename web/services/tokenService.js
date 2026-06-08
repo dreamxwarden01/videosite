@@ -86,7 +86,12 @@ async function isHmacEnabled() {
     return val === 'true';
 }
 
-async function generateToken(path) {
+// Shared signing body. Caller supplies the full message string to MAC; we
+// don't append the timestamp here so prefix-scope and file-scope tokens can
+// each construct their own message format. Returns null when HMAC is
+// disabled or the secret is missing — every signing path collapses to "no
+// token" identically, which keeps the un-configured branch a no-op.
+async function _sign(message) {
     const enabled = await isHmacEnabled();
     if (!enabled) return null;
 
@@ -96,11 +101,37 @@ async function generateToken(path) {
     const secret = await getSecretSetting('hmac_secret_key');
     if (!secret) return null;
 
+    return crypto.createHmac('sha256', secret).update(message).digest('base64');
+}
+
+async function generateToken(path) {
     const issuedAt = Math.floor(Date.now() / 1000);
     // Cloudflare message format: path concatenated with timestamp (no separator)
-    const message = `${path}${issuedAt}`;
-    const mac = crypto.createHmac('sha256', secret).update(message).digest('base64');
+    const mac = await _sign(`${path}${issuedAt}`);
+    if (mac === null) return null;
+    return `${issuedAt}-${mac}`;
+}
 
+/**
+ * Generate a Cloudflare-compatible HMAC token for a specific file path.
+ *
+ * Unlike generateToken (which signs a prefix and grants access to every
+ * file under it), this signs the full file path — the resulting token
+ * validates against exactly one URL.
+ *
+ *   "/{hashedVideoId}/{jobId}/poster.jpg"
+ *
+ * The WAF rule extension for this scope is a second is_timed_hmac_valid_v0
+ * call inside the existing rule, joined by `or`, using http.request.uri.path
+ * directly (no substring). One secret, one validity setting, two MAC scopes.
+ *
+ * @param {string} fullPath - Complete resource path (no prefix scope)
+ * @returns {string|null} Token "{issuedAt}-{base64_mac}", or null if not configured
+ */
+async function generateFileToken(fullPath) {
+    const issuedAt = Math.floor(Date.now() / 1000);
+    const mac = await _sign(`${fullPath}${issuedAt}`);
+    if (mac === null) return null;
     return `${issuedAt}-${mac}`;
 }
 
@@ -126,6 +157,7 @@ async function getTokenValiditySeconds() {
 
 module.exports = {
     generateToken,
+    generateFileToken,
     generateSecretKey,
     isHmacConfigured,
     isHmacEnabled,

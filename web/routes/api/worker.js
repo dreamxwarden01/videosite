@@ -148,16 +148,16 @@ router.post('/worker/tasks/status', requireWorkerSession, async (req, res) => {
 });
 
 // POST /api/worker/tasks/complete — single-job completion.
-// Request: { jobId, durationSeconds? }
+// Request: { jobId, durationSeconds?, hasPoster? }
 // Response: 204 on success, 404 if jobId unknown.
 router.post('/worker/tasks/complete', requireWorkerSession, async (req, res) => {
     try {
-        const { jobId, durationSeconds } = req.body || {};
+        const { jobId, durationSeconds, hasPoster } = req.body || {};
         if (!jobId) {
             return res.status(400).json({ error: 'jobId is required' });
         }
 
-        const found = await completeTask(jobId, durationSeconds || null);
+        const found = await completeTask(jobId, durationSeconds || null, hasPoster === true);
         if (!found) {
             return res.status(404).json({ error: 'Job not found' });
         }

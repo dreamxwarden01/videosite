@@ -678,6 +678,28 @@ textarea.form-control {
     font-size: 13px;
     padding-left: 2px;
 }
+/* Poster thumbnail avatar that replaces the play-icon when has_poster=1.
+ * Native aspect ratio stays in the file; the wrapper enforces a 16:9 box
+ * with object-fit: contain so portrait / non-16:9 posters letterbox
+ * cleanly without baking padding into the source JPEG. The dark bg fills
+ * the letterbox gap. */
+.video-poster-thumb {
+    width: 80px;
+    aspect-ratio: 16 / 9;
+    background: #1a1a1a;
+    border-radius: 4px;
+    flex-shrink: 0;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.video-poster-thumb img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    display: block;
+}
 .video-info {
     flex: 1;
     min-width: 0;

@@ -130,6 +130,10 @@ func contentTypeForFile(filePath string) string {
 			return "audio/mp4"
 		}
 		return "video/mp4"
+	case strings.HasSuffix(lower, ".jpg"), strings.HasSuffix(lower, ".jpeg"):
+		// Per-video poster thumbnail written by the worker alongside the
+		// manifest. Picked up by the normal upload sweep.
+		return "image/jpeg"
 	default:
 		return "application/octet-stream"
 	}

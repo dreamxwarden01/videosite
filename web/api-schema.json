@@ -1509,7 +1509,8 @@
                 "additionalProperties": false,
                 "properties": {
                   "jobId":           { "type": "string", "minLength": 1, "maxLength": 128 },
-                  "durationSeconds": { "type": "number", "minimum": 0 }
+                  "durationSeconds": { "type": "number", "minimum": 0 },
+                  "hasPoster":       { "type": "boolean" }
                 }
               }
             }

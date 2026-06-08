@@ -42,9 +42,13 @@ export default function CoursePage() {
 
   const [course, setCourse] = useState(null);
   const [videos, setVideos] = useState([]);
+  const [r2PublicDomain, setR2PublicDomain] = useState('');
   const [pagination, setPagination] = useState({ page: 1, totalPages: 1, total: 0, limit: 10 });
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  // Track which video posters 404'd / errored so we can swap to the play-icon
+  // without keeping a broken <img> in the DOM. Keyed by video_id.
+  const [posterFailed, setPosterFailed] = useState({});
 
   const fetchCourse = useCallback(async (silent = false) => {
     if (!silent) { if (!loading) setRefreshing(true); }
@@ -53,6 +57,7 @@ export default function CoursePage() {
       if (ok && data) {
         setCourse(data.course);
         setVideos(data.videos || []);
+        setR2PublicDomain(data.r2PublicDomain || '');
         setPagination(data.pagination);
         if (siteName) document.title = `${data.course.course_name} - ${siteName}`;
       }
@@ -88,6 +93,32 @@ export default function CoursePage() {
     return <p className="text-muted">Course not found.</p>;
   }
 
+  // Avatar slot for a video row. Three-way fallback:
+  //   1. Server says has_poster (posterPath + posterToken present) AND no
+  //      prior load error for this video_id → render <img>.
+  //   2. Image previously errored (404 / token expired / network) → swap
+  //      to the play-icon glyph. We don't retry within the same page load.
+  //   3. No posterPath from the server → straight to play-icon.
+  // The CSS sets aspect-ratio: 16/9 on the wrapper so the row height stays
+  // uniform whether we render an image or the glyph.
+  const renderAvatar = (video) => {
+    const hasPoster = video.posterPath && video.posterToken && r2PublicDomain && !posterFailed[video.video_id];
+    if (hasPoster) {
+      const src = `https://${r2PublicDomain}${video.posterPath}?verify=${video.posterToken}`;
+      return (
+        <div className="video-poster-thumb">
+          <img
+            src={src}
+            alt=""
+            loading="lazy"
+            onError={() => setPosterFailed(prev => ({ ...prev, [video.video_id]: true }))}
+          />
+        </div>
+      );
+    }
+    return <div className="video-play-icon">&#9654;</div>;
+  };
+
   return (
     <div className="card card-page">
       <div className="card-header">
@@ -120,7 +151,7 @@ export default function CoursePage() {
                       style={{ textDecoration: 'none', color: 'inherit' }}
                       onClick={() => sessionStorage.setItem(storageKey, JSON.stringify({ page, limit }))}
                     >
-                      <div className="video-play-icon">&#9654;</div>
+                      {renderAvatar(video)}
                       <div className="video-info">
                         <h4>{video.title}</h4>
                         <div className="video-meta">
@@ -135,7 +166,7 @@ export default function CoursePage() {
                     </Link>
                   ) : video.status === 'finished' && !canPlay ? (
                     <div key={video.video_id} className="video-item disabled">
-                      <div className="video-play-icon">&#9654;</div>
+                      {renderAvatar(video)}
                       <div className="video-info">
                         <h4>{video.title}</h4>
                         <div className="video-meta">

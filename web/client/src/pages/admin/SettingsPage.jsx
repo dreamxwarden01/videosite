@@ -567,9 +567,23 @@ export default function SettingsPage() {
   const buildWafRule = (secret) => {
     // R2 public domain no longer ships in the settings response — admin
     // edits the placeholder before pasting into Cloudflare.
+    //
+    // Two MAC scopes joined by `or`:
+    //   1. Prefix-scope (manifest + segments): signs the first 79 chars of
+    //      the path (always /{64-char hash}/{12-char job}/) so one token
+    //      grants access to every file under that job. Used for the .mpd
+    //      manifest and every .m4s / .mp4 init it references.
+    //   2. File-scope (poster): signs the full path so the token validates
+    //      against exactly one URL. Used for the per-video poster.jpg
+    //      surfaced on the course list page and as Media Session artwork.
+    //
+    // Both scopes share the same secret and validity. The `or` short-
+    // circuits to true on whichever signature matches the requested path
+    // — there's no MAC collision risk because the messages signed are
+    // structurally different (path prefix vs. full path).
     const host = 'your-cdn-domain.com';
     const validity = hmacTokenValidity || '600';
-    return `(http.host eq "${host}") and not (\n    starts_with(http.request.uri.query, "verify=") and\n    is_timed_hmac_valid_v0(\n        "${secret}",\n        concat(\n            substring(http.request.uri.path, 0, 79),\n            "?",\n            substring(http.request.uri.query, 7, 200)\n        ),\n        ${validity},\n        http.request.timestamp.sec,\n        1\n    )\n)`;
+    return `(http.host eq "${host}") and not (\n    starts_with(http.request.uri.query, "verify=") and (\n        is_timed_hmac_valid_v0(\n            "${secret}",\n            concat(\n                substring(http.request.uri.path, 0, 79),\n                "?",\n                substring(http.request.uri.query, 7, 200)\n            ),\n            ${validity},\n            http.request.timestamp.sec,\n            1\n        )\n        or\n        is_timed_hmac_valid_v0(\n            "${secret}",\n            concat(\n                http.request.uri.path,\n                "?",\n                substring(http.request.uri.query, 7, 200)\n            ),\n            ${validity},\n            http.request.timestamp.sec,\n            1\n        )\n    )\n)`;
   };
 
   const handleCopyWafRule = () => {

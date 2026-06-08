@@ -566,6 +566,45 @@ export default function WatchPage() {
     return () => document.body.classList.remove('theater-mode');
   }, [theaterActive]);
 
+  // Media Session metadata — drives iOS Control Center / Dynamic Island,
+  // Android notification shade, and any connected Bluetooth display. Shaka
+  // doesn't populate this on its own, so we set it explicitly once we have
+  // the video metadata and (optionally) a signed poster URL.
+  //
+  // artwork is omitted when the video lacks a poster; iOS falls back to a
+  // generic icon in that case. The poster URL uses the per-file HMAC token
+  // — same secret as playback, separate signature scope (handled by the
+  // OR branch in the Cloudflare WAF rule).
+  //
+  // Cleanup clears metadata on unmount so navigating away doesn't leave
+  // the previous video lingering in Control Center.
+  useEffect(() => {
+    if (!data || !data.video) return;
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    const { video, posterPath, posterToken, r2PublicDomain } = data;
+    const artwork = [];
+    if (posterPath && posterToken && r2PublicDomain) {
+      artwork.push({
+        src: `https://${r2PublicDomain}${posterPath}?verify=${posterToken}`,
+        sizes: '640x360',
+        type: 'image/jpeg',
+      });
+    }
+    try {
+      navigator.mediaSession.metadata = new window.MediaMetadata({
+        title: video.title || '',
+        artist: video.course_name || '',
+        album: video.week ? `Week ${video.week}` : '',
+        artwork,
+      });
+    } catch {
+      // MediaMetadata may not exist on older browsers — gracefully skip.
+    }
+    return () => {
+      try { navigator.mediaSession.metadata = null; } catch {}
+    };
+  }, [data]);
+
   if (loading) return <LoadingSpinner />;
 
   if (error) {

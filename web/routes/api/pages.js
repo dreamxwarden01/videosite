@@ -4,7 +4,7 @@ const { requireAuth } = require('../../middleware/auth');
 const { getPool } = require('../../config/database');
 const { getUserById, verifyPassword, updateUser } = require('../../services/userService');
 const { getUserSessions, deleteUserSessions } = require('../../config/session');
-const { generateToken, getTokenValiditySeconds } = require('../../services/tokenService');
+const { generateToken, generateFileToken, getTokenValiditySeconds } = require('../../services/tokenService');
 const mfaService = require('../../services/mfaService');
 const { mapEmailErrorHttp } = require('../../services/emailService');
 const { getUserMfaMethods, isUserMfaEnabled, maskEmail, validateChallenge, consumeChallenge } = mfaService;
@@ -111,14 +111,19 @@ router.get('/courses/:courseId', requireAuth, async (req, res) => {
 
         const total = countRows[0].total;
 
-        res.json({
-            course: {
-                course_id: course.course_id,
-                course_name: course.course_name,
-                description: course.description,
-                is_active: course.is_active,
-            },
-            videos: videos.map(v => ({
+        // Per-video poster signing. The course list page swaps the
+        // play-icon for a thumbnail when a video has has_poster=1, but the
+        // R2 URL needs a per-file HMAC token to clear the WAF rule's
+        // file-scope branch (the prefix-scope token only signs the manifest
+        // path region, not the .jpg sitting at prefix + "poster.jpg"). We
+        // mint one token per row up front so the client doesn't have to
+        // refresh per-image — the validity matches the playback token.
+        //
+        // Mint only when has_poster=1; otherwise the client falls back to
+        // the play-icon glyph without ever touching R2.
+        const publicDomain = process.env.R2_PUBLIC_DOMAIN || '';
+        const posterVideos = await Promise.all(videos.map(async (v) => {
+            const out = {
                 video_id: v.video_id,
                 course_id: v.course_id,
                 title: v.title,
@@ -128,7 +133,25 @@ router.get('/courses/:courseId', requireAuth, async (req, res) => {
                 duration_seconds: v.duration_seconds,
                 status: v.status,
                 processing_progress: v.processing_progress,
-            })),
+            };
+            if (v.has_poster && v.hashed_video_id && v.processing_job_id) {
+                const posterPath = `/${v.hashed_video_id}/${v.processing_job_id}/poster.jpg`;
+                const posterToken = await generateFileToken(posterPath);
+                out.posterPath = posterPath;
+                out.posterToken = posterToken || '';
+            }
+            return out;
+        }));
+
+        res.json({
+            course: {
+                course_id: course.course_id,
+                course_name: course.course_name,
+                description: course.description,
+                is_active: course.is_active,
+            },
+            videos: posterVideos,
+            r2PublicDomain: publicDomain,
             pagination: {
                 page,
                 totalPages: Math.ceil(total / limit) || 1,
@@ -177,6 +200,17 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
 
         const hmacToken = await generateToken(basePath);
         const tokenValiditySeconds = await getTokenValiditySeconds();
+
+        // Per-file poster token for Media Session artwork (iOS Dynamic
+        // Island, Android notification shade). Only minted when the video
+        // actually has a poster; the watch page just omits the artwork
+        // entry from MediaMetadata when these come back null/empty.
+        let posterPath = null;
+        let posterToken = null;
+        if (video.has_poster) {
+            posterPath = `${basePath}poster.jpg`;
+            posterToken = await generateFileToken(posterPath);
+        }
 
         // Resume position rules:
         //   1. Videos shorter than 120s always restart from the beginning —
@@ -231,6 +265,8 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
             hmacToken: hmacToken || '',
             r2PublicDomain: publicDomain || '',
             tokenValiditySeconds,
+            posterPath: posterPath || '',
+            posterToken: posterToken || '',
         });
     } catch (err) {
         console.error('API watch error:', err);
