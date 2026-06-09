@@ -712,6 +712,82 @@ textarea.form-control {
         display: none;
     }
 }
+
+/* === Skeleton Loader ===
+ * Left-to-right shimmer used for: course header (title + subtitle), each
+ * video row (poster, title line, meta line, status pill), and the poster
+ * image's own wrapper while the JPG is in flight. Single shared
+ * background animation; per-shape sizing on variants. */
+@keyframes skeleton-shimmer {
+    0%   { background-position: -150% 0; }
+    100% { background-position: 150% 0; }
+}
+.skeleton {
+    background: linear-gradient(
+        90deg,
+        #e5e7eb 0%,
+        #f3f4f6 50%,
+        #e5e7eb 100%
+    );
+    background-size: 200% 100%;
+    animation: skeleton-shimmer 1.4s linear infinite;
+    border-radius: 4px;
+}
+/* Header shapes — sit in place of the course title + "Course #N" line. */
+.skeleton-page-title {
+    height: 22px;
+    width: 220px;
+    max-width: 60%;
+}
+.skeleton-page-subtitle {
+    height: 13px;
+    width: 90px;
+    margin-top: 6px;
+}
+/* Row shapes — slot into the same flex layout as a real .video-item. */
+.skeleton-row {
+    /* Inherits .video-item padding/border via the shared class — only the
+     * inner placeholders are skeletoned. */
+    pointer-events: none;
+}
+.skeleton-video-title {
+    height: 14px;
+    width: 50%;
+    margin-bottom: 8px;
+}
+.skeleton-video-meta {
+    height: 11px;
+    width: 35%;
+}
+.skeleton-status-pill {
+    width: 72px;
+    height: 22px;
+    border-radius: 12px;
+}
+/* Match the existing rule: status badge hidden on mobile for poster
+ * rows. The skeleton mirrors the same rule so the loading state lines up
+ * pixel-for-pixel with what comes after. */
+@media (max-width: 768px) {
+    .skeleton-status-pill { display: none; }
+}
+/* Poster wrapper: when an actual image is in flight, the wrapper carries
+ * `.loading` and gets the shimmer background. Once onLoad fires, the
+ * `.loading` class goes away and the wrapper falls back to its dark
+ * letterbox bg. The img itself fades from opacity 0 → 1 via the
+ * inline-style transition driven by per-video posterLoaded state. */
+.video-poster-thumb.loading {
+    background: linear-gradient(
+        90deg,
+        #e5e7eb 0%,
+        #f3f4f6 50%,
+        #e5e7eb 100%
+    );
+    background-size: 200% 100%;
+    animation: skeleton-shimmer 1.4s linear infinite;
+}
+.video-poster-thumb img {
+    transition: opacity 0.2s ease-out;
+}
 .video-info {
     flex: 1;
     min-width: 0;
