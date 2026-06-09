@@ -755,9 +755,23 @@ textarea.form-control {
     width: 50%;
     margin-bottom: 8px;
 }
-.skeleton-video-meta {
+/* Each meta piece is its own placeholder so the loading state matches
+ * the real row exactly: optional week-badge pill + date span + duration
+ * span, separated by .video-meta's 6px gap. The width and shape of each
+ * mirror typical content ("Week 3" ≈ 50px in the rounded pill, "2026-05-23"
+ * ≈ 72px text, "2h 3m" ≈ 42px text). */
+.skeleton-meta-badge {
+    height: 16px;
+    width: 50px;
+    border-radius: 4px;
+}
+.skeleton-meta-date {
     height: 11px;
-    width: 35%;
+    width: 72px;
+}
+.skeleton-meta-duration {
+    height: 11px;
+    width: 42px;
 }
 .skeleton-status-pill {
     width: 72px;

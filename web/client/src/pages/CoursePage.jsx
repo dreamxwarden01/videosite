@@ -16,15 +16,20 @@ function formatDuration(seconds) {
 // Skeleton row used during both initial load and pagination switch.
 // Carries .video-item so it shares the real row's flex layout, padding,
 // and bottom border — the skeleton lines up pixel-for-pixel with what
-// replaces it. Pointer events disabled so a misplaced click doesn't
-// register on an empty row.
+// replaces it. The inner meta line reuses .video-meta to inherit the
+// same flex gap/wrap behavior, so the week-badge / date / duration
+// placeholders sit on a row the same way the real spans do.
 function SkeletonRow() {
   return (
     <div className="video-item skeleton-row">
       <div className="skeleton skeleton-poster" style={{ width: 100, aspectRatio: '16 / 9', flexShrink: 0 }} />
       <div className="video-info">
         <div className="skeleton skeleton-video-title" />
-        <div className="skeleton skeleton-video-meta" />
+        <div className="video-meta">
+          <div className="skeleton skeleton-meta-badge" />
+          <div className="skeleton skeleton-meta-date" />
+          <div className="skeleton skeleton-meta-duration" />
+        </div>
       </div>
       <div className="video-actions">
         <div className="skeleton skeleton-status-pill" />
