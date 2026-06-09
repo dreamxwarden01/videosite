@@ -6,6 +6,12 @@ import { useToast } from '../context/ToastContext';
 import { apiGet } from '../api';
 import Pagination from '../components/Pagination';
 
+// Poster reload budget. The img re-fires onError on any non-2xx and on
+// network-level failures, with no status visibility. We retry blindly
+// up to this many times before giving up on the poster and falling
+// through to the play-icon glyph.
+const MAX_POSTER_RETRIES = 10;
+
 function formatDuration(seconds) {
   if (!seconds) return '';
   const h = Math.floor(seconds / 3600);
@@ -86,6 +92,18 @@ export default function CoursePage() {
   // just finished transcoding and flipped has_poster=1) get their URL
   // on first appearance, so the freshly-available poster still loads.
   const posterUrlsRef = useRef({});
+  // Per-video retry counter for poster loads. Bumped on every `<img>`
+  // onError firing, capped at MAX_POSTER_RETRIES. The count is appended
+  // to the URL as `&r=N` so React (and the browser) see a different src
+  // and actually re-fetch instead of serving the cached failure. After
+  // MAX_POSTER_RETRIES the entry flips to posterFailed and the play-icon
+  // glyph takes over. Transient failures the browser bubbles up as
+  // onError include: 429 from R2, 5xx from the edge, TCP RST, TLS
+  // handshake fail, DNS hiccups, and any network stall the cellular
+  // stack gives up on. Linear backoff 0.5/1/1.5/.../5 s — total wait
+  // across 10 retries is ~27.5 s, which comfortably outlasts an LTE
+  // handoff or a 30 s edge cool-down.
+  const [posterRetries, setPosterRetries] = useState({});
 
   const fetchCourse = useCallback(async (silent = false) => {
     if (!silent) { if (!loading) setRefreshing(true); }
@@ -119,14 +137,17 @@ export default function CoursePage() {
     return () => clearInterval(timer);
   }, [videos]);
 
-  // posterLoaded / posterFailed deliberately persist across `videos`
-  // changes. Stale entries for video_ids that aren't currently rendered
-  // are harmless; what matters is that re-appearing video_ids (during
-  // auto-refresh or back-pagination) keep their `loaded` flag so the
-  // skeleton doesn't flash. Failed entries persist too — if a poster
-  // 404'd once during the session, the chance the next token works is
-  // ~zero (same CDN, same WAF), and we'd just trigger another failed
-  // fetch. A full page reload retries from scratch.
+  // posterLoaded / posterFailed / posterRetries deliberately persist
+  // across `videos` changes. Stale entries for video_ids that aren't
+  // currently rendered are harmless; what matters is that re-appearing
+  // video_ids (during auto-refresh or back-pagination) keep their
+  // `loaded` flag so the skeleton doesn't flash. Failed entries persist
+  // too — once the MAX_POSTER_RETRIES budget is exhausted we treat the
+  // poster as permanently broken for this session (likely a 404 or a
+  // bad token, neither of which retries cure). A full page reload
+  // resets all three maps. Retry counts persist so partial budgets
+  // carry across pagination — e.g. if a poster failed 3 times on page
+  // 1, navigates to page 2, comes back, it gets 7 more shots, not 10.
 
   const updateParams = (newPage, newLimit) => {
     // Always include page so URL params override the one-shot sessionStorage restore
@@ -140,29 +161,37 @@ export default function CoursePage() {
   }
 
   // Avatar slot for a video row. Three-way fallback:
-  //   1. Server says has_poster (posterPath + posterToken present) AND no
-  //      prior load error for this video_id → render <img>. Wrapper
-  //      shows the skeleton shimmer until onLoad fires, then the img
-  //      fades in over the dark letterbox bg.
-  //   2. Image previously errored (404 / token expired / network) → swap
-  //      to the play-icon glyph. We don't retry within the same page load.
+  //   1. Server says has_poster (posterPath + posterToken present) AND
+  //      the retry budget isn't exhausted → render <img>. Wrapper shows
+  //      the skeleton shimmer until onLoad fires, then the img fades in
+  //      over the dark letterbox bg. On any onError we schedule a
+  //      delayed bump of posterRetries — that changes the URL (via
+  //      `&r=N`) and triggers a fresh fetch.
+  //   2. MAX_POSTER_RETRIES exceeded for this video_id → swap to the
+  //      play-icon glyph. Most likely the object 404s or the token is
+  //      bad; either way more retries won't help.
   //   3. No posterPath from the server → straight to play-icon.
   // The CSS sets aspect-ratio: 16/9 on the wrapper so the row height stays
   // uniform whether we render an image or the glyph.
   const renderAvatar = (video) => {
     const hasPoster = video.posterPath && video.posterToken && r2PublicDomain && !posterFailed[video.video_id];
     if (hasPoster) {
-      // Cached URL stays stable across auto-refresh polls. We only
-      // generate a fresh URL the first time we see this video_id with a
-      // poster present; after that, the same URL is reused. If the
-      // backing token expires the cached image is already in the
-      // browser's memory cache, so the rendered <img> keeps showing the
-      // old data — no 403 visible to the user.
-      let src = posterUrlsRef.current[video.video_id];
-      if (!src) {
-        src = `https://${r2PublicDomain}${video.posterPath}?verify=${video.posterToken}`;
-        posterUrlsRef.current[video.video_id] = src;
+      // Cached base URL stays stable across auto-refresh polls. We only
+      // generate it the first time we see this video_id with a poster
+      // present; after that, the same URL is reused. If the backing
+      // token expires the cached image is already in the browser's
+      // memory cache, so the rendered <img> keeps showing the old data
+      // — no 403 visible to the user.
+      let baseSrc = posterUrlsRef.current[video.video_id];
+      if (!baseSrc) {
+        baseSrc = `https://${r2PublicDomain}${video.posterPath}?verify=${video.posterToken}`;
+        posterUrlsRef.current[video.video_id] = baseSrc;
       }
+      const retries = posterRetries[video.video_id] || 0;
+      // Append `&r=N` so React + the browser see a distinct URL on each
+      // retry attempt. Without this, the failed fetch is in the memory
+      // cache and the browser would just replay the same failure.
+      const src = retries > 0 ? `${baseSrc}&r=${retries}` : baseSrc;
       const loaded = !!posterLoaded[video.video_id];
       return (
         <div className={`video-poster-thumb ${loaded ? '' : 'loading'}`}>
@@ -171,7 +200,25 @@ export default function CoursePage() {
             alt=""
             loading="lazy"
             onLoad={() => setPosterLoaded(prev => ({ ...prev, [video.video_id]: true }))}
-            onError={() => setPosterFailed(prev => ({ ...prev, [video.video_id]: true }))}
+            onError={() => {
+              // Closure-captured `retries` reflects the count at render
+              // time, which matches the URL the browser actually tried.
+              // After MAX, give up — fall through to play-icon glyph.
+              if (retries >= MAX_POSTER_RETRIES) {
+                setPosterFailed(prev => ({ ...prev, [video.video_id]: true }));
+                return;
+              }
+              // Linear backoff: 0.5/1/1.5/.../5 s. The setState uses the
+              // functional form so it stays correct even if other img
+              // errors land for sibling videos in between.
+              const delay = 500 + retries * 500;
+              setTimeout(() => {
+                setPosterRetries(prev => ({
+                  ...prev,
+                  [video.video_id]: (prev[video.video_id] || 0) + 1,
+                }));
+              }, delay);
+            }}
             style={{ opacity: loaded ? 1 : 0 }}
           />
         </div>

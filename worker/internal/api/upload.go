@@ -43,14 +43,23 @@ func GetUploadURLs(ctx context.Context, jobID string, filenames []string) (map[s
 }
 
 // maxUploadRetries is the number of additional attempts after the first try
-// for 5xx responses (total attempts = maxUploadRetries + 1).
+// for transient errors (408/429/5xx, plus statusCode == 0 network errors).
+// Total attempts = maxUploadRetries + 1 = 6.
 const maxUploadRetries = 5
 
 // UploadFile uploads a local file to a presigned PUT URL.
 //
 //   - Returns ErrUploadForbidden on HTTP 403: caller must regenerate the token.
-//   - Retries up to maxUploadRetries times (1 second between attempts) on 5xx.
+//   - Retries up to maxUploadRetries times (1 second between attempts) on
+//     transient errors:
+//   - 408 Request Timeout (R2 edge timed out waiting on body)
+//   - 429 Too Many Requests (account-level burst rate limit)
+//   - 5xx (gateway / origin overload — 502/503 are routine edge hiccups)
+//   - statusCode == 0 (network-level failure: TCP RST, TLS handshake fail,
+//     DNS hiccup, transport timeout — all benefit from a brief retry)
 //   - Respects ctx cancellation at every retry boundary and within the request.
+//     A statusCode == 0 caused by ctx cancellation hits the loop-top ctx.Err()
+//     check on the next iteration and exits cleanly without further retries.
 func UploadFile(ctx context.Context, filePath, presignedURL string) error {
 	var lastErr error
 	for attempt := 0; attempt <= maxUploadRetries; attempt++ {
@@ -68,13 +77,18 @@ func UploadFile(ctx context.Context, filePath, presignedURL string) error {
 			return ErrUploadForbidden
 		}
 
-		// 5xx: transient R2/gateway error — retry with delay
-		if statusCode >= 500 && attempt < maxUploadRetries {
-			slog.Warn("Upload 5xx, retrying",
+		// Transient: 408/429/5xx, or network-level failure (statusCode == 0).
+		// Retry with a fixed 1 s delay — no exponential backoff. R2 burst
+		// throttles and Cloudflare edge hiccups typically clear within a
+		// second or two, so 5 retries (~5 s total) is plenty.
+		isTransient := statusCode == 0 || statusCode == 408 || statusCode == 429 || statusCode >= 500
+		if isTransient && attempt < maxUploadRetries {
+			slog.Warn("Upload transient error, retrying",
 				"file", filepath.Base(filePath),
 				"status", statusCode,
 				"attempt", attempt+1,
-				"max", maxUploadRetries)
+				"max", maxUploadRetries,
+				"err", err)
 			lastErr = err
 			select {
 			case <-ctx.Done():
@@ -84,7 +98,7 @@ func UploadFile(ctx context.Context, filePath, presignedURL string) error {
 			continue
 		}
 
-		// Other errors (4xx except 403, network errors) or exhausted retries
+		// Persistent error (4xx other than 403/408/429) or retries exhausted
 		return fmt.Errorf("upload %s: %w", filepath.Base(filePath), err)
 	}
 	return fmt.Errorf("upload %s: failed after %d retries: %w", filepath.Base(filePath), maxUploadRetries, lastErr)
