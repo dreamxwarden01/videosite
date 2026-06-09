@@ -605,6 +605,113 @@ export default function WatchPage() {
     };
   }, [data]);
 
+  // Media Session action handlers + position state. These are what make
+  // the lock-screen / Control Center / Dynamic Island / Android
+  // notification controls actually do something:
+  //
+  //   - play / pause    : the obvious buttons.
+  //   - seekto          : the scrubber on the lock screen (iOS) and the
+  //                       progress bar on Android's media notification.
+  //   - seekforward /   : the skip-±10s buttons (or ±15s, or whatever
+  //     seekbackward      the OS surfaces). Spec says we honour the
+  //                       seekOffset the OS passes; we default to 10 s
+  //                       if it's missing (per the MDN reference impl).
+  //
+  // setPositionState drives the elapsed-time / progress display. It has
+  // to be refreshed on every playback transition (play, pause, seek,
+  // ratechange, loadedmetadata) — otherwise the OS scrubber drifts away
+  // from the real currentTime. We avoid touching it until duration is
+  // a finite positive number; for VOD that's settled by the time
+  // loadedmetadata fires, but Shaka can momentarily report Infinity
+  // while it's switching periods.
+  //
+  // setActionHandler with `null` removes the handler; we do that on
+  // cleanup so navigating away doesn't leave the previous video's
+  // play/pause wired to a stale ref.
+  useEffect(() => {
+    if (!data || !data.video) return;
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    const v = videoRef.current;
+    if (!v) return;
+    const ms = navigator.mediaSession;
+
+    const updatePosition = () => {
+      try {
+        if ('setPositionState' in ms
+            && typeof v.duration === 'number'
+            && isFinite(v.duration)
+            && v.duration > 0) {
+          ms.setPositionState({
+            duration: v.duration,
+            playbackRate: v.playbackRate || 1,
+            position: Math.min(Math.max(v.currentTime || 0, 0), v.duration),
+          });
+        }
+      } catch {
+        // Some Chromium builds throw if position state is set too
+        // aggressively (rate limit). Silently swallow — the next
+        // event will retry.
+      }
+    };
+
+    const setHandler = (action, handler) => {
+      try { ms.setActionHandler(action, handler); } catch {}
+    };
+
+    setHandler('play', () => {
+      // play() returns a promise that can reject if the browser blocks
+      // playback (autoplay policy mid-session); ignore the rejection so
+      // the OS button just no-ops instead of throwing.
+      const p = v.play();
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    });
+    setHandler('pause', () => v.pause());
+    setHandler('seekto', (details) => {
+      if (!details || typeof details.seekTime !== 'number') return;
+      if (details.fastSeek && typeof v.fastSeek === 'function') {
+        v.fastSeek(details.seekTime);
+      } else {
+        v.currentTime = details.seekTime;
+      }
+      updatePosition();
+    });
+    setHandler('seekforward', (details) => {
+      const off = (details && details.seekOffset) || 10;
+      const target = Math.min((v.currentTime || 0) + off, v.duration || Infinity);
+      v.currentTime = target;
+      updatePosition();
+    });
+    setHandler('seekbackward', (details) => {
+      const off = (details && details.seekOffset) || 10;
+      v.currentTime = Math.max((v.currentTime || 0) - off, 0);
+      updatePosition();
+    });
+
+    // Position state events. timeupdate fires ~4x/sec during playback;
+    // setPositionState rate-limits internally on Chrome, so the
+    // overhead is negligible.
+    v.addEventListener('play', updatePosition);
+    v.addEventListener('pause', updatePosition);
+    v.addEventListener('seeked', updatePosition);
+    v.addEventListener('ratechange', updatePosition);
+    v.addEventListener('loadedmetadata', updatePosition);
+    v.addEventListener('timeupdate', updatePosition);
+
+    return () => {
+      v.removeEventListener('play', updatePosition);
+      v.removeEventListener('pause', updatePosition);
+      v.removeEventListener('seeked', updatePosition);
+      v.removeEventListener('ratechange', updatePosition);
+      v.removeEventListener('loadedmetadata', updatePosition);
+      v.removeEventListener('timeupdate', updatePosition);
+      setHandler('play', null);
+      setHandler('pause', null);
+      setHandler('seekto', null);
+      setHandler('seekforward', null);
+      setHandler('seekbackward', null);
+    };
+  }, [data]);
+
   if (loading) return <LoadingSpinner />;
 
   if (error) {
@@ -651,7 +758,14 @@ export default function WatchPage() {
       </div>
       <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
         <div className="video-player" ref={containerRef} data-shaka-player-container>
-          <video ref={videoRef} id="video-element" autoPlay />
+          {/* `playsInline` is the iOS Safari kill switch for background
+              audio: without it, locking the screen or app-switching
+              hard-pauses the <video> the moment the document hides.
+              `autoPlay` only fires on mobile when the video is muted, but
+              the attribute is still useful for desktop and for the first
+              play-after-user-tap on mobile (the tap counts as the user
+              gesture that authorizes subsequent programmatic playback). */}
+          <video ref={videoRef} id="video-element" autoPlay playsInline />
         </div>
       </div>
       <div className="player-scroll">
