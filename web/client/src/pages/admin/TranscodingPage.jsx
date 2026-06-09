@@ -146,7 +146,7 @@ export default function TranscodingPage() {
                 {job.workerKeyId && (
                   <> &middot; Worker: {job.workerLabel || job.workerKeyId.slice(-6)}</>
                 )}
-                &middot; Uploaded: {formatTime(job.uploadTime)}
+                {' '}&middot; Uploaded: {formatTime(job.uploadTime)}
               </div>
               {showProgress && (
                 <>

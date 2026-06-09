@@ -3,6 +3,8 @@ import { useToast } from '../context/ToastContext';
 import { useConfirm } from './ConfirmModal';
 import { apiPost } from '../api';
 import { startUploadHeartbeat } from '../services/uploadHeartbeat';
+import CourseSelector from './CourseSelector';
+import useFullWindowDrop from '../hooks/useFullWindowDrop';
 
 const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB
 const BLOCKED_EXTENSIONS = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.ts', '.m3u8'];
@@ -16,14 +18,10 @@ export default function UploadMaterialModal({ isOpen, onClose, courses, preselec
   const { showToast } = useToast();
   const confirm = useConfirm();
   const fileInputRef = useRef(null);
-  const dropdownRef = useRef(null);
 
   const [file, setFile] = useState(null);
-  const [dragActive, setDragActive] = useState(false);
   const [filename, setFilename] = useState('');
   const [courseId, setCourseId] = useState(preselectedCourseId || '');
-  const [courseSearch, setCourseSearch] = useState('');
-  const [showDropdown, setShowDropdown] = useState(false);
   const [week, setWeek] = useState('');
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
@@ -40,8 +38,6 @@ export default function UploadMaterialModal({ isOpen, onClose, courses, preselec
       setFile(null);
       setFilename('');
       setCourseId(preselectedCourseId || '');
-      setCourseSearch('');
-      setShowDropdown(false);
       setWeek('');
       setUploading(false);
       setUploadProgress(0);
@@ -60,23 +56,18 @@ export default function UploadMaterialModal({ isOpen, onClose, courses, preselec
     return () => window.removeEventListener('beforeunload', handler);
   }, [uploading]);
 
-  // Close dropdown on outside click
-  useEffect(() => {
-    function handleClick(e) {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target)) {
-        setShowDropdown(false);
-      }
-    }
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, []);
+  // Whole-tab drag-drop. Same pattern as UploadModal — anywhere in the
+  // tab is the effective drop zone while the modal is open and not
+  // mid-upload. handleFileSelect runs validation (extension blocklist,
+  // 100 MB cap) before accepting the file.
+  const { dragActive: windowDragActive } = useFullWindowDrop({
+    enabled: isOpen && !uploading && !successTitle,
+    onFile: (f) => handleFileSelect(f),
+  });
 
   if (!isOpen) return null;
 
   const selectedCourse = courses.find(c => String(c.course_id) === String(courseId));
-  const filteredCourses = courses.filter(c =>
-    c.course_name.toLowerCase().includes(courseSearch.toLowerCase())
-  );
 
   function handleFileSelect(selectedFile) {
     if (!selectedFile) return;
@@ -106,24 +97,6 @@ export default function UploadMaterialModal({ isOpen, onClose, courses, preselec
     } else {
       setFilename(selectedFile.name);
     }
-  }
-
-  function handleDrop(e) {
-    e.preventDefault();
-    setDragActive(false);
-    if (uploading) return;
-    const f = e.dataTransfer.files[0];
-    if (f) handleFileSelect(f);
-  }
-
-  function handleDragOver(e) {
-    e.preventDefault();
-    if (!uploading) setDragActive(true);
-  }
-
-  function handleDragLeave(e) {
-    e.preventDefault();
-    setDragActive(false);
   }
 
   const filenameValid = filename.trim().length > 0 && filename.trim().length <= 255 && !/[/\\]/.test(filename);
@@ -290,12 +263,10 @@ export default function UploadMaterialModal({ isOpen, onClose, courses, preselec
           <button className="modal-close" onClick={handleClose} disabled={uploading}>&times;</button>
         </div>
         <div className="modal-body">
-          {/* Drop zone */}
+          {/* Drop zone — click target for the file picker. Drag-and-drop
+              itself is handled at the window level by useFullWindowDrop. */}
           <div
-            className={`upload-dropzone${dragActive ? ' drag-active' : ''}${file ? ' has-file' : ''}`}
-            onDrop={handleDrop}
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
+            className={`upload-dropzone${file ? ' has-file' : ''}`}
             onClick={() => !uploading && fileInputRef.current?.click()}
             style={{ pointerEvents: uploading ? 'none' : 'auto' }}
           >
@@ -339,38 +310,12 @@ export default function UploadMaterialModal({ isOpen, onClose, courses, preselec
                 style={{ background: '#f3f4f6' }}
               />
             ) : (
-              <div className="course-select-wrap" ref={dropdownRef}>
-                <input
-                  type="text"
-                  className="form-control"
-                  value={showDropdown ? courseSearch : (selectedCourse?.course_name || courseSearch)}
-                  onChange={e => {
-                    setCourseSearch(e.target.value);
-                    setCourseId('');
-                    setShowDropdown(true);
-                  }}
-                  onFocus={() => setShowDropdown(true)}
-                  disabled={uploading}
-                  placeholder="Search for a course..."
-                />
-                {showDropdown && filteredCourses.length > 0 && (
-                  <div className="course-select-dropdown">
-                    {filteredCourses.map(c => (
-                      <div
-                        key={c.course_id}
-                        className="course-select-option"
-                        onClick={() => {
-                          setCourseId(String(c.course_id));
-                          setCourseSearch(c.course_name);
-                          setShowDropdown(false);
-                        }}
-                      >
-                        {c.course_name}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+              <CourseSelector
+                courses={courses}
+                value={courseId}
+                onChange={setCourseId}
+                disabled={uploading}
+              />
             )}
           </div>
 
@@ -415,6 +360,18 @@ export default function UploadMaterialModal({ isOpen, onClose, courses, preselec
           </div>
         </div>
       </div>
+      {/* Full-window drop overlay — same surface as the video upload
+          modal so drag interactions feel identical across both flows. */}
+      {windowDragActive && (
+        <div className="full-window-drop-overlay">
+          <div className="full-window-drop-overlay-message">
+            Drop the file here
+            <span className="full-window-drop-overlay-message-sub">
+              Anywhere on the page works
+            </span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

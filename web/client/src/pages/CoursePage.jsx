@@ -75,10 +75,17 @@ export default function CoursePage() {
   const [posterFailed, setPosterFailed] = useState({});
   // Track which posters have finished loading. Keyed by video_id. The
   // wrapper carries `.loading` (shimmer bg) until the entry flips true,
-  // at which point the bg snaps to dark and the img fades in. Cleared
-  // whenever the videos list changes (new page → new images, stale
-  // entries no longer match).
+  // at which point the bg snaps to dark and the img fades in.
   const [posterLoaded, setPosterLoaded] = useState({});
+  // Cache of poster URLs by video_id. Each /api/courses fetch mints a
+  // fresh posterToken — without this cache the auto-refresh (every 5 s
+  // while a sibling video is processing) would change img.src on every
+  // poll, triggering a re-fetch from R2 even though the image hasn't
+  // actually changed. We cache the first URL we compute per video and
+  // reuse it for the lifetime of the page. New videos (e.g. one that
+  // just finished transcoding and flipped has_poster=1) get their URL
+  // on first appearance, so the freshly-available poster still loads.
+  const posterUrlsRef = useRef({});
 
   const fetchCourse = useCallback(async (silent = false) => {
     if (!silent) { if (!loading) setRefreshing(true); }
@@ -112,15 +119,14 @@ export default function CoursePage() {
     return () => clearInterval(timer);
   }, [videos]);
 
-  // Reset poster loaded/failed state when the visible video set changes
-  // (pagination, refresh). Stale entries don't hurt correctness — the new
-  // images use different keys — but keeping them around bloats state for
-  // no reason. Failed state especially should clear so retried/new
-  // posters get a fresh chance.
-  useEffect(() => {
-    setPosterLoaded({});
-    setPosterFailed({});
-  }, [videos]);
+  // posterLoaded / posterFailed deliberately persist across `videos`
+  // changes. Stale entries for video_ids that aren't currently rendered
+  // are harmless; what matters is that re-appearing video_ids (during
+  // auto-refresh or back-pagination) keep their `loaded` flag so the
+  // skeleton doesn't flash. Failed entries persist too — if a poster
+  // 404'd once during the session, the chance the next token works is
+  // ~zero (same CDN, same WAF), and we'd just trigger another failed
+  // fetch. A full page reload retries from scratch.
 
   const updateParams = (newPage, newLimit) => {
     // Always include page so URL params override the one-shot sessionStorage restore
@@ -146,7 +152,17 @@ export default function CoursePage() {
   const renderAvatar = (video) => {
     const hasPoster = video.posterPath && video.posterToken && r2PublicDomain && !posterFailed[video.video_id];
     if (hasPoster) {
-      const src = `https://${r2PublicDomain}${video.posterPath}?verify=${video.posterToken}`;
+      // Cached URL stays stable across auto-refresh polls. We only
+      // generate a fresh URL the first time we see this video_id with a
+      // poster present; after that, the same URL is reused. If the
+      // backing token expires the cached image is already in the
+      // browser's memory cache, so the rendered <img> keeps showing the
+      // old data — no 403 visible to the user.
+      let src = posterUrlsRef.current[video.video_id];
+      if (!src) {
+        src = `https://${r2PublicDomain}${video.posterPath}?verify=${video.posterToken}`;
+        posterUrlsRef.current[video.video_id] = src;
+      }
       const loaded = !!posterLoaded[video.video_id];
       return (
         <div className={`video-poster-thumb ${loaded ? '' : 'loading'}`}>
@@ -164,43 +180,55 @@ export default function CoursePage() {
     return <div className="video-play-icon">&#9654;</div>;
   };
 
-  // True whenever we want skeleton rows instead of real content — initial
-  // fetch and pagination switch alike. Auto-refresh polls (silent=true)
-  // don't set either flag so background updates don't flash the
-  // skeleton. We cap visible rows so a 50-per-page setting doesn't
-  // render 50 animated divs; 8 is enough to fill a typical viewport.
-  const showSkeleton = loading || refreshing;
+  // The video list shows skeleton rows on initial fetch AND on
+  // pagination switch — the per-page videos always change, so a flash
+  // of skeleton + new content reads correctly. Auto-refresh polls
+  // (silent=true) don't trigger either flag, so processing-status
+  // updates stay live in place.
+  const showListSkeleton = loading || refreshing;
+  // The course header (title / "Course #N") and the description above
+  // the list only skeleton on the INITIAL load — pagination keeps the
+  // same course, so those values don't change and showing a fresh
+  // placeholder every time the user clicks Next is just noise. After
+  // first load `course` stays populated across refreshes, so we render
+  // the real values until something else clears them (route change, etc.).
+  const showHeaderSkeleton = loading || !course;
   const skeletonCount = Math.min(limit, 8);
 
   return (
     <div className="card card-page">
       <div className="card-header">
         <div style={{ flex: 1, minWidth: 0 }}>
-          {showSkeleton ? (
+          {showHeaderSkeleton ? (
             <>
               <div className="skeleton skeleton-page-title" />
               <div className="skeleton skeleton-page-subtitle" />
             </>
-          ) : course ? (
+          ) : (
             <>
               <h2>{course.course_name}</h2>
               <p className="text-muted text-sm">Course #{course.course_id}</p>
             </>
-          ) : null}
+          )}
         </div>
         <Link to="/" className="btn btn-secondary btn-sm">Back to Courses</Link>
       </div>
 
       <div className="card-body">
-        {showSkeleton ? (
+        {/* Description sits above whatever's in the body (skeleton or
+            real rows) — once `course` is populated it survives
+            pagination refreshes so the user keeps reading what they
+            were reading. */}
+        {course?.description && (
+          <p className="text-muted mb-3">{course.description}</p>
+        )}
+        {showListSkeleton ? (
           <div>
             {Array.from({ length: skeletonCount }).map((_, i) => <SkeletonRow key={i} />)}
           </div>
         ) : (
           <>
-            {course.description && (
-              <p className="text-muted mb-3">{course.description}</p>
-            )}
+            {/* (description rendered above; this branch is just for the list) */}
 
             {videos.length === 0 && pagination.total === 0 ? (
               <p className="text-muted">No videos in this course yet.</p>
@@ -271,7 +299,7 @@ export default function CoursePage() {
         )}
       </div>
 
-      {!showSkeleton && pagination.total > 0 && (
+      {!showListSkeleton && pagination.total > 0 && (
         <Pagination
           page={pagination.page}
           totalPages={pagination.totalPages}

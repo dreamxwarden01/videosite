@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect } from 'react';
 import { multipartUpload, UploadConflictError, UploadAbortedError, UploadRetryExhaustedError, ALLOWED_VIDEO_EXTENSIONS, validateVideoFile } from '../services/uploadService';
 import { useToast } from '../context/ToastContext';
+import CourseSelector from './CourseSelector';
+import useFullWindowDrop from '../hooks/useFullWindowDrop';
 
 // Mirror of the server-side cap (POST /api/upload/create + POST /api/videos/:id).
 // .length counts UTF-16 code units, matching the server check, so the client
@@ -40,11 +42,8 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
   const abortRef = useRef(null);
 
   const [file, setFile] = useState(null);
-  const [dragActive, setDragActive] = useState(false);
   const [title, setTitle] = useState('');
   const [courseId, setCourseId] = useState(preselectedCourseId || '');
-  const [courseSearch, setCourseSearch] = useState('');
-  const [showDropdown, setShowDropdown] = useState(false);
   const [week, setWeek] = useState('');
   const [date, setDate] = useState('');
   const [description, setDescription] = useState('');
@@ -57,16 +56,12 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
   const [successTitle, setSuccessTitle] = useState('');
   const [fileError, setFileError] = useState('');
 
-  const dropdownRef = useRef(null);
-
   // Reset state when modal opens
   useEffect(() => {
     if (isOpen) {
       setFile(null);
       setTitle('');
       setCourseId(preselectedCourseId || '');
-      setCourseSearch('');
-      setShowDropdown(false);
       setWeek('');
       setDate('');
       setDescription('');
@@ -89,23 +84,18 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
     return () => window.removeEventListener('beforeunload', handler);
   }, [uploading]);
 
-  // Close dropdown on outside click
-  useEffect(() => {
-    function handleClick(e) {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target)) {
-        setShowDropdown(false);
-      }
-    }
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, []);
+  // Always-defined so we can use it after the early return below — hooks
+  // can't run conditionally. Pulls the dragged file straight into the
+  // file picker validator regardless of where in the tab the user
+  // dropped it.
+  const { dragActive: windowDragActive } = useFullWindowDrop({
+    enabled: isOpen && !uploading && !successTitle,
+    onFile: (f) => handleFileSelect(f),
+  });
 
   if (!isOpen) return null;
 
   const selectedCourse = courses.find(c => String(c.course_id) === String(courseId));
-  const filteredCourses = courses.filter(c =>
-    c.course_name.toLowerCase().includes(courseSearch.toLowerCase())
-  );
 
   function handleFileSelect(selectedFile) {
     if (!selectedFile) return;
@@ -137,24 +127,6 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
       if (parsed.week) setWeek(parsed.week);
       if (parsed.date) setDate(parsed.date);
     }
-  }
-
-  function handleDrop(e) {
-    e.preventDefault();
-    setDragActive(false);
-    if (uploading) return;
-    const f = e.dataTransfer.files[0];
-    if (f) handleFileSelect(f);
-  }
-
-  function handleDragOver(e) {
-    e.preventDefault();
-    if (!uploading) setDragActive(true);
-  }
-
-  function handleDragLeave(e) {
-    e.preventDefault();
-    setDragActive(false);
   }
 
   async function handleUpload() {
@@ -257,12 +229,12 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
           <button className="modal-close" onClick={handleClose} disabled={uploading}>&times;</button>
         </div>
         <div className="modal-body">
-          {/* Drop zone */}
+          {/* Drop zone — click target for the file picker. Drag-and-drop
+              itself is handled at the window level by useFullWindowDrop
+              so dropping anywhere on the tab works, not just on this
+              small rectangle. */}
           <div
-            className={`upload-dropzone${dragActive ? ' drag-active' : ''}${file ? ' has-file' : ''}`}
-            onDrop={handleDrop}
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
+            className={`upload-dropzone${file ? ' has-file' : ''}`}
             onClick={() => !uploading && fileInputRef.current?.click()}
             style={{ pointerEvents: uploading ? 'none' : 'auto' }}
           >
@@ -310,38 +282,12 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
                 )}
               </>
             ) : (
-              <div className="course-select-wrap" ref={dropdownRef}>
-                <input
-                  type="text"
-                  className="form-control"
-                  value={showDropdown ? courseSearch : (selectedCourse?.course_name || courseSearch)}
-                  onChange={e => {
-                    setCourseSearch(e.target.value);
-                    setCourseId('');
-                    setShowDropdown(true);
-                  }}
-                  onFocus={() => setShowDropdown(true)}
-                  disabled={uploading}
-                  placeholder="Search for a course..."
-                />
-                {showDropdown && filteredCourses.length > 0 && (
-                  <div className="course-select-dropdown">
-                    {filteredCourses.map(c => (
-                      <div
-                        key={c.course_id}
-                        className="course-select-option"
-                        onClick={() => {
-                          setCourseId(String(c.course_id));
-                          setCourseSearch(c.course_name);
-                          setShowDropdown(false);
-                        }}
-                      >
-                        {c.course_name}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+              <CourseSelector
+                courses={courses}
+                value={courseId}
+                onChange={setCourseId}
+                disabled={uploading}
+              />
             )}
           </div>
 
@@ -420,6 +366,22 @@ export default function UploadModal({ isOpen, onClose, courses, preselectedCours
           </div>
         </div>
       </div>
+      {/* Full-window drop overlay. The hook flips windowDragActive
+          true on dragenter of a Files drag and false on dragleave/drop.
+          The overlay z-index sits above everything else so a drop
+          anywhere in the tab is captured here. The actual file plumbing
+          (validateVideoFile etc.) lives in handleFileSelect, which the
+          hook calls via its onFile callback. */}
+      {windowDragActive && (
+        <div className="full-window-drop-overlay">
+          <div className="full-window-drop-overlay-message">
+            Drop the video here
+            <span className="full-window-drop-overlay-message-sub">
+              Anywhere on the page works
+            </span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

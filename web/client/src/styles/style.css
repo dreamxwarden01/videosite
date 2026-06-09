@@ -1546,6 +1546,13 @@ a.pagination-btn:hover {
     z-index: 10;
     box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
 }
+/* Portaled variant lives at document.body level with position: fixed.
+ * z-index has to clear the modal overlay (1000) so the dropdown sits
+ * above modal contents, but stay below the full-window drop overlay
+ * (10000) so a drag-into-window doesn't get masked by the open menu. */
+.course-select-dropdown-portal {
+    z-index: 1100;
+}
 .course-select-option {
     padding: 8px 12px;
     cursor: pointer;
@@ -1553,6 +1560,57 @@ a.pagination-btn:hover {
 }
 .course-select-option:hover {
     background: #f3f4f6;
+}
+
+/* === Full-window drop overlay ===
+ * Shown by upload modals while a file is being dragged anywhere over
+ * the tab. Sits above everything else (modal overlay = 1000, portaled
+ * dropdown = 1100) so the drop indicator is the only thing the user
+ * can interact with mid-drag. The whole overlay receives drop events;
+ * the inner box is just for the message — the entire rectangle is the
+ * effective drop zone. */
+.full-window-drop-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    background: rgba(59, 130, 246, 0.18);
+    backdrop-filter: blur(2px);
+    -webkit-backdrop-filter: blur(2px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: auto;
+    animation: full-window-drop-fade-in 0.12s ease-out;
+}
+.full-window-drop-overlay::before {
+    content: '';
+    position: absolute;
+    inset: 16px;
+    border: 3px dashed #3b82f6;
+    border-radius: 12px;
+    pointer-events: none;
+}
+.full-window-drop-overlay-message {
+    background: #fff;
+    color: #1e40af;
+    font-size: 18px;
+    font-weight: 600;
+    padding: 24px 36px;
+    border-radius: 10px;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
+    text-align: center;
+    pointer-events: none;
+}
+.full-window-drop-overlay-message-sub {
+    display: block;
+    margin-top: 6px;
+    font-size: 13px;
+    color: #6b7280;
+    font-weight: 400;
+}
+@keyframes full-window-drop-fade-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
 }
 
 /* === Clickable Table Rows === */

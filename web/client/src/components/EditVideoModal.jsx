@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { apiPost } from '../api';
 import { multipartUpload, UploadConflictError, UploadAbortedError, UploadRetryExhaustedError, ALLOWED_VIDEO_EXTENSIONS, validateVideoFile } from '../services/uploadService';
 import { useToast } from '../context/ToastContext';
+import useFullWindowDrop from '../hooks/useFullWindowDrop';
 
 // Mirror of the server-side cap (POST /api/videos/:id). .length counts UTF-16
 // code units, matching the server check, so client and server never disagree
@@ -19,7 +20,6 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
   const [description, setDescription] = useState('');
   const [descriptionTouched, setDescriptionTouched] = useState(false);
   const [file, setFile] = useState(null);
-  const [dragActive, setDragActive] = useState(false);
   const [fileError, setFileError] = useState('');
 
   // Original values for change detection
@@ -51,7 +51,6 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
       setOrigDate(d);
       setOrigDesc(desc);
       setFile(null);
-      setDragActive(false);
       setFileError('');
       setBusy(false);
       setUploading(false);
@@ -68,6 +67,15 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
     window.addEventListener('beforeunload', handler);
     return () => window.removeEventListener('beforeunload', handler);
   }, [uploading]);
+
+  // canReplaceFile is recomputed inside the render below, but we also
+  // need it here to gate the drop hook before the early return. Falling
+  // back to false when video is null keeps the hook signature stable.
+  const canReplaceFileEarly = !!video && canReplace && video.status === 'finished';
+  const { dragActive: windowDragActive } = useFullWindowDrop({
+    enabled: isOpen && canReplaceFileEarly && !busy && !uploading && !successTitle,
+    onFile: (f) => handleFileSelect(f),
+  });
 
   if (!isOpen || !video) return null;
 
@@ -102,23 +110,6 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
       return;
     }
     setFile(selectedFile);
-  }
-
-  function handleDrop(e) {
-    e.preventDefault();
-    setDragActive(false);
-    if (busy || !canReplaceFile) return;
-    handleFileSelect(e.dataTransfer.files[0]);
-  }
-
-  function handleDragOver(e) {
-    e.preventDefault();
-    if (!busy && canReplaceFile) setDragActive(true);
-  }
-
-  function handleDragLeave(e) {
-    e.preventDefault();
-    setDragActive(false);
   }
 
   async function handleAbort() {
@@ -246,14 +237,14 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
           <button className="modal-close" onClick={uploading ? handleAbort : handleClose} disabled={busy && !uploading}>&times;</button>
         </div>
         <div className="modal-body">
-          {/* Drop zone — shown if user has replace permission */}
+          {/* Drop zone — shown if user has replace permission. Click
+              target for the file picker; drag-and-drop itself is handled
+              at the window level by useFullWindowDrop so the user can
+              drop anywhere in the tab. */}
           {canReplace && (
             canReplaceFile ? (
               <div
-                className={`upload-dropzone${dragActive ? ' drag-active' : ''}${file ? ' has-file' : ''}`}
-                onDrop={handleDrop}
-                onDragOver={handleDragOver}
-                onDragLeave={handleDragLeave}
+                className={`upload-dropzone${file ? ' has-file' : ''}`}
                 onClick={() => !busy && fileInputRef.current?.click()}
                 style={{ pointerEvents: busy ? 'none' : 'auto' }}
               >
@@ -385,6 +376,21 @@ export default function EditVideoModal({ isOpen, video, courseName, canReplace, 
           </div>
         </div>
       </div>
+      {/* Full-window drop overlay — same surface as the upload modals.
+          Only enabled when the video is actually replaceable (status
+          'finished' + caller has the permission), so it never appears
+          on a processing / error edit where the dropzone itself is
+          greyed out. */}
+      {windowDragActive && (
+        <div className="full-window-drop-overlay">
+          <div className="full-window-drop-overlay-message">
+            Drop the replacement video here
+            <span className="full-window-drop-overlay-message-sub">
+              Anywhere on the page works
+            </span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
