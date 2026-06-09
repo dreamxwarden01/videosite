@@ -37,11 +37,16 @@ import (
 // boundary level (per-segment switching still works, just not at the
 // frame-aligned guarantee).
 //
-// Why mixed uniform / SegmentTimeline coexists: ffmpeg's native AAC
-// encoder + apad combination drifts ~66ms/segment and inserts a ~2s
-// "correction" segment every ~30, regardless of the -hls_time target —
-// so even uniform-video jobs typically need SegmentTimeline on audio.
-// Each rendition decides for itself.
+// Why mixed uniform / SegmentTimeline coexists: video renditions can
+// be either uniform (steady GOP cadence + integer GOPs per segment) or
+// not (fps-cap rounding, source-GOP adopt, etc.). Audio is uniform
+// when TranscodeAudio is fed an AAC-frame-aligned -hls_time (every
+// segment is exactly N frames at 48 kHz, so the modal equals the
+// average). Pre-alignment, the muxer would pick 281 or 282 frames per
+// segment to chase a non-aligned 6.0 s target and the run-length
+// timeline path was the only honest representation; now the uniform
+// path is the common case for audio too. Each rendition decides for
+// itself based on its actual playlist EXTINFs.
 //
 // File layout referenced:
 //

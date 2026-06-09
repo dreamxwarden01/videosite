@@ -126,6 +126,40 @@ func RemuxVideo(ctx context.Context, sourcePath, outputDir string, profile confi
 //
 // chosenSegSec is expected to already be snapped to source-GOP multiples
 // via slot/job.go computeGOPDecision when useSourceGOP is set.
+// aacAlignedSegmentDuration returns the AAC-frame-aligned segment duration
+// closest to the requested target, for the given output sample rate.
+//
+// AAC-LC frames are 1024 PCM samples wide, so the only durations the
+// encoder can actually produce on a clean boundary are integer multiples
+// of 1024/sampleRate seconds. For a 48000 Hz output that's ~21.333 ms per
+// frame; at a 6.0 s target, the candidates are 281 frames (5.99467 s) or
+// 282 frames (6.016 s). FFmpeg's HLS muxer, given a non-aligned
+// -hls_time, picks whichever frame count is closer at each cut and
+// alternates to keep cumulative drift near zero — producing the
+// 281/282/281/282 oscillation that bit us. Feeding it an exactly-aligned
+// target removes that ambiguity: every cut lands on the same frame
+// count, every segment is identical, and the worker's uniform check
+// reflects reality.
+//
+// Picks via round() so the chosen alignment is whichever side of the
+// target is closer (matching Cloudflare's pattern — they target 4.0 s on
+// 44.1 kHz audio and ship 173 frames = 4.01701 s because 173 is closer
+// than 172). For a 6.0 s target on 48 kHz, round picks 281 (5.995 s).
+//
+// Defensive: if computation underflows to ≤ 0 (absurd inputs), fall
+// through to the unmodified target so we don't hand FFmpeg garbage.
+func aacAlignedSegmentDuration(targetSec float64, sampleRateHz int) float64 {
+	if targetSec <= 0 || sampleRateHz <= 0 {
+		return targetSec
+	}
+	const aacFrameSamples = 1024
+	frames := math.Round(targetSec * float64(sampleRateHz) / float64(aacFrameSamples))
+	if frames < 1 {
+		frames = 1
+	}
+	return frames * float64(aacFrameSamples) / float64(sampleRateHz)
+}
+
 func hlsTimeArg(chosenSegSec float64) float64 {
 	const safetyMarginSec = 0.001
 	t := chosenSegSec - safetyMarginSec
@@ -224,8 +258,23 @@ func TranscodeAudio(
 	// segDur), which matches the video playlist and prevents the HLS
 	// tail-stall (player waiting on a missing trailing audio segment).
 	args = append(args, "-t", fmt.Sprintf("%.3f", duration))
+	// Snap -hls_time to an exact integer number of AAC-LC frames at our
+	// fixed 48 kHz output rate. Without this, FFmpeg's HLS muxer treats
+	// the requested 6.0 s as a soft target and alternates between 281
+	// and 282 frames per segment (5.9947 s / 6.016 s) to average out
+	// near 6.0 s — producing a playlist that LOOKS uniform within the
+	// worker's 100 ms tolerance but actually has a ~1.9 s cumulative
+	// drift over a 90-min job. That drift pushes
+	// `ceil(period / @duration)` one segment past what the worker
+	// actually wrote, and Shaka 404s on the phantom tail.
+	//
+	// With an AAC-aligned target the cut point IS the target — every
+	// segment is exactly the same frame count, the modal-equals-average
+	// invariant holds, and DASH's SegmentTemplate@duration tells the
+	// truth.
+	alignedSegSec := aacAlignedSegmentDuration(segmentDurationSec, 48000)
 	args = append(args,
-		"-hls_time", fmt.Sprintf("%.3f", segmentDurationSec),
+		"-hls_time", fmt.Sprintf("%.6f", alignedSegSec),
 		"-hls_playlist_type", "vod",
 		"-hls_segment_type", "fmp4",
 		"-hls_fmp4_init_filename", initName,
