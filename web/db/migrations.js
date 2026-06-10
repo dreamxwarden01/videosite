@@ -952,6 +952,71 @@ async function runMigrations() {
                           ADD COLUMN has_poster TINYINT(1) NOT NULL DEFAULT 0
                     `);
                 }
+            },
+            {
+                id: '040_copy_posters_to_per_course_layout',
+                up: async () => {
+                    // Move every existing per-video poster from the per-job
+                    // `{hashed_video_id}/{processing_job_id}/poster.jpg` key
+                    // into the per-course `posters/{course_id}/{video_id}.jpg`
+                    // layout. This change unlocks two things downstream:
+                    //   1. Course delete sweeps `posters/{course_id}/` as one
+                    //      R2 prefix instead of needing per-video logic.
+                    //   2. Re-uploading the same video_id overwrites the
+                    //      poster in place (stable key, no orphan).
+                    //
+                    // Strategy: R2 server-side CopyObject — no download/upload
+                    // round trip. The old key stays in place (~35 KB per
+                    // video) until the video or course is deleted; the hash-
+                    // prefix sweep in deletionService catches it then.
+                    //
+                    // Per-row try/catch so a single missing source object
+                    // (e.g. the poster was hand-deleted out of R2) doesn't
+                    // abort the whole pass. Idempotent — if the migration
+                    // table loses a row and we re-run, CopyObject overwrites
+                    // the destination, which is fine. The schema_migrations
+                    // entry guards against the normal case.
+                    const { CopyObjectCommand } = require('@aws-sdk/client-s3');
+                    const { getR2Client, getR2BucketName } = require('../config/r2');
+                    const r2 = getR2Client();
+                    const bucket = getR2BucketName();
+
+                    const [rows] = await pool.execute(`
+                        SELECT video_id, course_id, hashed_video_id, processing_job_id
+                          FROM videos
+                         WHERE has_poster = 1
+                           AND hashed_video_id IS NOT NULL
+                           AND processing_job_id IS NOT NULL
+                    `);
+                    if (rows.length === 0) {
+                        console.log('Migration 040: no posters to copy');
+                        return;
+                    }
+
+                    let copied = 0;
+                    let skipped = 0;
+                    for (const row of rows) {
+                        const oldKey = `${row.hashed_video_id}/${row.processing_job_id}/poster.jpg`;
+                        const newKey = `posters/${row.course_id}/${row.video_id}.jpg`;
+                        try {
+                            await r2.send(new CopyObjectCommand({
+                                Bucket: bucket,
+                                Key: newKey,
+                                CopySource: `${bucket}/${oldKey}`,
+                                ContentType: 'image/jpeg',
+                                CacheControl: 'public, max-age=31536000, immutable',
+                                MetadataDirective: 'REPLACE',
+                            }));
+                            copied++;
+                        } catch (err) {
+                            console.error(
+                                `Migration 040: failed to copy ${oldKey} → ${newKey}: ${err.message}`
+                            );
+                            skipped++;
+                        }
+                    }
+                    console.log(`Migration 040: copied ${copied} poster(s), skipped ${skipped}`);
+                }
             }
         ];
 

@@ -132,7 +132,8 @@ async function deleteVideo(videoId) {
 
     // 1. Pre-fetch video info (need it for R2 cleanup planning, before DB cascade)
     const [videoRows] = await pool.execute(
-        `SELECT hashed_video_id, r2_source_key, status FROM videos WHERE video_id = ?`,
+        `SELECT course_id, hashed_video_id, r2_source_key, status, has_poster
+         FROM videos WHERE video_id = ?`,
         [videoId]
     );
 
@@ -181,7 +182,7 @@ async function deleteVideo(videoId) {
     // 6. Enqueue R2 cleanup. Reaper retries on transient R2 failures and
     //    survives server restarts.
     if (videoRows.length > 0) {
-        const { hashed_video_id, r2_source_key, status } = videoRows[0];
+        const { course_id, hashed_video_id, r2_source_key, status, has_poster } = videoRows[0];
         const isProcessing = ['worker_downloading', 'processing', 'worker_uploading'].includes(status);
 
         // Source file: always immediate (extract directory from r2_source_key).
@@ -200,6 +201,18 @@ async function deleteVideo(videoId) {
             execute_at: executeAt,
             source: 'video_delete',
         });
+
+        // Per-course poster lives outside the hash prefix at
+        // `posters/{course_id}/{video_id}.jpg` — the hash-prefix delete above
+        // doesn't catch it. Enqueue a single-object delete. Same execute_at
+        // as the output prefix so a mid-upload poster.jpg PUT doesn't race
+        // the reaper.
+        if (has_poster && course_id != null) {
+            await deletionService.enqueueKey(`posters/${course_id}/${videoId}.jpg`, {
+                execute_at: executeAt,
+                source: 'video_delete',
+            });
+        }
     }
 }
 

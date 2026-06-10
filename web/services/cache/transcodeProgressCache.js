@@ -21,11 +21,14 @@ const key = (jobId) => `progress:transcode:${jobId}`;
 // subsequent heartbeats find the job alive without a DB query).
 // hashed_video_id is stored here so generateUploadUrls can build R2 paths
 // without re-fetching the videos JOIN on every upload-URL batch.
-async function initOnLease(jobId, videoId, hashedVideoId, queueStatus, videoStatus) {
+// course_id is stored alongside so the same routine can rewrite the
+// poster.jpg upload key to the per-course layout `posters/{cid}/{vid}.jpg`.
+async function initOnLease(jobId, videoId, hashedVideoId, courseId, queueStatus, videoStatus) {
     const redis = getClient();
     await redis.hset(key(jobId), {
         video_id: String(videoId),
         hashed_video_id: hashedVideoId || '',
+        course_id: courseId != null ? String(courseId) : '',
         queue_status: queueStatus,
         video_status: videoStatus,
         progress: '0',
@@ -63,6 +66,7 @@ async function getProgress(jobId) {
     return {
         video_id: hash.video_id ? parseInt(hash.video_id, 10) : null,
         hashed_video_id: hash.hashed_video_id || null,
+        course_id: hash.course_id ? parseInt(hash.course_id, 10) : null,
         queue_status: hash.queue_status || null,
         video_status: hash.video_status || null,
         progress: hash.progress !== undefined ? parseInt(hash.progress, 10) : null,

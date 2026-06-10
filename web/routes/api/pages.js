@@ -115,9 +115,15 @@ router.get('/courses/:courseId', requireAuth, async (req, res) => {
         // play-icon for a thumbnail when a video has has_poster=1, but the
         // R2 URL needs a per-file HMAC token to clear the WAF rule's
         // file-scope branch (the prefix-scope token only signs the manifest
-        // path region, not the .jpg sitting at prefix + "poster.jpg"). We
-        // mint one token per row up front so the client doesn't have to
+        // path region, not the .jpg sitting at the per-course poster key).
+        // We mint one token per row up front so the client doesn't have to
         // refresh per-image — the validity matches the playback token.
+        //
+        // The poster path is `/posters/{course_id}/{video_id}.jpg` — stable
+        // across re-encodes so a replacement video overwrites in place, and
+        // course delete sweeps the entire `posters/{course_id}/` prefix in
+        // one go. The client reconstructs the full URL from courseId +
+        // video_id + this token, so we no longer ship posterPath.
         //
         // Mint only when has_poster=1; otherwise the client falls back to
         // the play-icon glyph without ever touching R2.
@@ -134,10 +140,9 @@ router.get('/courses/:courseId', requireAuth, async (req, res) => {
                 status: v.status,
                 processing_progress: v.processing_progress,
             };
-            if (v.has_poster && v.hashed_video_id && v.processing_job_id) {
-                const posterPath = `/${v.hashed_video_id}/${v.processing_job_id}/poster.jpg`;
+            if (v.has_poster) {
+                const posterPath = `/posters/${v.course_id}/${v.video_id}.jpg`;
                 const posterToken = await generateFileToken(posterPath);
-                out.posterPath = posterPath;
                 out.posterToken = posterToken || '';
             }
             return out;
@@ -204,11 +209,13 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
         // Per-file poster token for Media Session artwork (iOS Dynamic
         // Island, Android notification shade). Only minted when the video
         // actually has a poster; the watch page just omits the artwork
-        // entry from MediaMetadata when these come back null/empty.
-        let posterPath = null;
+        // entry from MediaMetadata when this comes back null/empty.
+        // Path is `/posters/{course_id}/{video_id}.jpg` — the client
+        // reconstructs the URL from the values it already has on
+        // res.json.video below, so we don't ship posterPath.
         let posterToken = null;
         if (video.has_poster) {
-            posterPath = `${basePath}poster.jpg`;
+            const posterPath = `/posters/${video.course_id}/${video.video_id}.jpg`;
             posterToken = await generateFileToken(posterPath);
         }
 
@@ -265,7 +272,6 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
             hmacToken: hmacToken || '',
             r2PublicDomain: publicDomain || '',
             tokenValiditySeconds,
-            posterPath: posterPath || '',
             posterToken: posterToken || '',
         });
     } catch (err) {

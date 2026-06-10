@@ -416,7 +416,7 @@ async function leaseTask(videoId, workerKeyId) {
 
     // Seed the heartbeat cache. Subsequent /worker/tasks/status (running)
     // hits HEXISTS this key as the "is the job alive" gate — no DB query.
-    await transcodeCache.initOnLease(jobId, task.video_id, task.hashed_video_id, 'leased', 'worker_downloading');
+    await transcodeCache.initOnLease(jobId, task.video_id, task.hashed_video_id, task.course_id, 'leased', 'worker_downloading');
 
     // Generate presigned download URL
     const { GetObjectCommand } = require('@aws-sdk/client-s3');
@@ -538,7 +538,7 @@ async function reportJobStatuses(jobs) {
                 if (!found) {
                     const task = await getTaskByJobId(jobId);
                     if (task && task.status !== 'completed' && task.status !== 'error') {
-                        await transcodeCache.initOnLease(jobId, task.video_id, task.hashed_video_id, mapped.queue, mapped.video);
+                        await transcodeCache.initOnLease(jobId, task.video_id, task.hashed_video_id, task.course_id, mapped.queue, mapped.video);
                         found = await transcodeCache.recordHeartbeat(
                             jobId, mapped.queue, mapped.video, progress, stageKey || 'processing'
                         );
@@ -610,18 +610,31 @@ function contentTypeForFile(filename) {
 }
 
 // Generate presigned PUT URLs for uploading HLS output files.
-// Reads hashed_video_id from the transcode-progress cache (populated by
-// initOnLease) to avoid the JOIN on every upload-URL batch. Falls back
-// to DB on cache miss (e.g. Redis cold-restart before any heartbeat).
+// Reads hashed_video_id (+ course_id, video_id for the poster rewrite) from
+// the transcode-progress cache (populated by initOnLease) to avoid the JOIN
+// on every upload-URL batch. Falls back to DB on cache miss (e.g. Redis
+// cold-restart before any heartbeat).
+//
+// Key layout per filename:
+//   - "poster.jpg" → `posters/{course_id}/{video_id}.jpg` (stable per-video
+//      location so a re-encode overwrites in place, and course delete can
+//      sweep `posters/{course_id}/` as one prefix).
+//   - everything else → `{hashed_video_id}/{job_id}/{filename}` (job-scoped
+//      so retries land in a fresh subtree and orphans clear when the parent
+//      hash prefix is reaped).
 async function generateUploadUrls(jobId, filenames) {
     let hashedVideoId = null;
+    let courseId = null;
+    let videoId = null;
     const cached = await transcodeCache.getProgress(jobId);
     if (cached && cached.hashed_video_id) {
         hashedVideoId = cached.hashed_video_id;
+        courseId = cached.course_id;
+        videoId = cached.video_id;
     } else {
         const pool = getPool();
         const [rows] = await pool.execute(
-            `SELECT v.hashed_video_id
+            `SELECT v.video_id, v.course_id, v.hashed_video_id
              FROM processing_queue pq
              JOIN videos v ON pq.video_id = v.video_id
              WHERE pq.job_id = ?`,
@@ -629,6 +642,8 @@ async function generateUploadUrls(jobId, filenames) {
         );
         if (rows.length === 0) return null;
         hashedVideoId = rows[0].hashed_video_id;
+        courseId = rows[0].course_id;
+        videoId = rows[0].video_id;
     }
 
     const { PutObjectCommand } = require('@aws-sdk/client-s3');
@@ -640,7 +655,9 @@ async function generateUploadUrls(jobId, filenames) {
     const urls = {};
 
     for (const filename of filenames) {
-        const key = `${hashedVideoId}/${jobId}/${filename}`;
+        const key = (filename === 'poster.jpg' && courseId != null && videoId != null)
+            ? `posters/${courseId}/${videoId}.jpg`
+            : `${hashedVideoId}/${jobId}/${filename}`;
         const contentType = contentTypeForFile(filename);
         const command = new PutObjectCommand({ Bucket: bucket, Key: key, ContentType: contentType, CacheControl: 'public, max-age=31536000, immutable' });
         urls[filename] = await getSignedUrl(r2, command, { expiresIn: 43200 }); // 12 hours

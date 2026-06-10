@@ -162,6 +162,12 @@ async function deleteCourse(courseId) {
     // Attachments: one prefix for all course materials.
     // DB rows are gone via FK CASCADE on course_materials.course_id.
     await deletionService.enqueuePrefix(`attachments/${courseId}/`, { source: 'course_delete' });
+
+    // Per-course posters: one prefix sweeps every video's poster in one go.
+    // Posters live at `posters/{course_id}/{video_id}.jpg` outside the
+    // per-video hash prefixes above, so this is the only path that catches
+    // them at course-delete time.
+    await deletionService.enqueuePrefix(`posters/${courseId}/`, { source: 'course_delete' });
 }
 
 async function listCourses(page = 1, limit = 10) {

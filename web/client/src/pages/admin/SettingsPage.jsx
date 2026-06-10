@@ -580,12 +580,12 @@ export default function SettingsPage() {
   //  - PLAYBACK (prefix scope): manifest + every segment under
   //    /{64-char hash}/{12-char job}/. Uses `concat(substring(path,0,79),
   //    "?", substring(query,7,200))` so a single token covers every file
-  //    under the job prefix. Excludes poster.jpg so the poster rule has
-  //    sole jurisdiction over that file.
+  //    under the job prefix. Excludes the /posters/ subtree so the
+  //    poster rule has sole jurisdiction over those files.
   //
-  //  - POSTER (file scope): just /{...}/poster.jpg. Uses
-  //    `concat(http.request.uri.path, "?", substring(query, 7, 200))` —
-  //    the full path (no substring) so the message MACed is the entire
+  //  - POSTER (file scope): just /posters/{course_id}/{video_id}.jpg.
+  //    Uses `concat(http.request.uri.path, "?", substring(query, 7, 200))`
+  //    — the full path (no substring) so the message MACed is the entire
   //    file path. One concat per rule, well within Cloudflare's limit.
   //
   // Both rules pass the literal string "s" as the 6th argument. This
@@ -600,12 +600,12 @@ export default function SettingsPage() {
   // Node's `digest('base64url')` to match.
   //
   // Both rules block (action set in Cloudflare dashboard) when no valid
-  // token is present. Mutually exclusive on path via the ends_with check.
+  // token is present. Mutually exclusive on path via the starts_with check.
   const buildWafRule = (secret) => {
     const host = r2PublicDomain || 'your-cdn-domain.com';
     const validity = hmacTokenValidity || '600';
-    const playback = `(http.host eq "${host}") and not ends_with(http.request.uri.path, "/poster.jpg") and not (\n    starts_with(http.request.uri.query, "verify=") and\n    is_timed_hmac_valid_v0(\n        "${secret}",\n        concat(\n            substring(http.request.uri.path, 0, 79),\n            "?",\n            substring(http.request.uri.query, 7, 200)\n        ),\n        ${validity},\n        http.request.timestamp.sec,\n        1,\n        "s"\n    )\n)`;
-    const poster = `(http.host eq "${host}") and ends_with(http.request.uri.path, "/poster.jpg") and not (\n    starts_with(http.request.uri.query, "verify=") and\n    is_timed_hmac_valid_v0(\n        "${secret}",\n        concat(\n            http.request.uri.path,\n            "?",\n            substring(http.request.uri.query, 7, 200)\n        ),\n        ${validity},\n        http.request.timestamp.sec,\n        1,\n        "s"\n    )\n)`;
+    const playback = `(http.host eq "${host}") and not starts_with(http.request.uri.path, "/posters/") and not (\n    starts_with(http.request.uri.query, "verify=") and\n    is_timed_hmac_valid_v0(\n        "${secret}",\n        concat(\n            substring(http.request.uri.path, 0, 79),\n            "?",\n            substring(http.request.uri.query, 7, 200)\n        ),\n        ${validity},\n        http.request.timestamp.sec,\n        1,\n        "s"\n    )\n)`;
+    const poster = `(http.host eq "${host}") and starts_with(http.request.uri.path, "/posters/") and not (\n    starts_with(http.request.uri.query, "verify=") and\n    is_timed_hmac_valid_v0(\n        "${secret}",\n        concat(\n            http.request.uri.path,\n            "?",\n            substring(http.request.uri.query, 7, 200)\n        ),\n        ${validity},\n        http.request.timestamp.sec,\n        1,\n        "s"\n    )\n)`;
     return { playback, poster };
   };
 

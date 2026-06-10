@@ -174,7 +174,7 @@ export default function CoursePage() {
   // The CSS sets aspect-ratio: 16/9 on the wrapper so the row height stays
   // uniform whether we render an image or the glyph.
   const renderAvatar = (video) => {
-    const hasPoster = video.posterPath && video.posterToken && r2PublicDomain && !posterFailed[video.video_id];
+    const hasPoster = video.posterToken && r2PublicDomain && !posterFailed[video.video_id];
     if (hasPoster) {
       // Cached base URL stays stable across auto-refresh polls. We only
       // generate it the first time we see this video_id with a poster
@@ -182,9 +182,13 @@ export default function CoursePage() {
       // token expires the cached image is already in the browser's
       // memory cache, so the rendered <img> keeps showing the old data
       // — no 403 visible to the user.
+      //
+      // Path is `/posters/{course_id}/{video_id}.jpg` — same shape the
+      // server signs the token against. The server stopped shipping
+      // posterPath since the client has all the parts already.
       let baseSrc = posterUrlsRef.current[video.video_id];
       if (!baseSrc) {
-        baseSrc = `https://${r2PublicDomain}${video.posterPath}?verify=${video.posterToken}`;
+        baseSrc = `https://${r2PublicDomain}/posters/${courseId}/${video.video_id}.jpg?verify=${video.posterToken}`;
         posterUrlsRef.current[video.video_id] = baseSrc;
       }
       const retries = posterRetries[video.video_id] || 0;

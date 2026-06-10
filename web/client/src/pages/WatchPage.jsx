@@ -581,11 +581,14 @@ export default function WatchPage() {
   useEffect(() => {
     if (!data || !data.video) return;
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
-    const { video, posterPath, posterToken, r2PublicDomain } = data;
+    const { video, posterToken, r2PublicDomain } = data;
     const artwork = [];
-    if (posterPath && posterToken && r2PublicDomain) {
+    // Path is `/posters/{course_id}/{video_id}.jpg` — matches what the
+    // server signs the token against. Server no longer ships posterPath
+    // since the client has both ids on hand.
+    if (posterToken && r2PublicDomain && video.course_id && video.video_id) {
       artwork.push({
-        src: `https://${r2PublicDomain}${posterPath}?verify=${posterToken}`,
+        src: `https://${r2PublicDomain}/posters/${video.course_id}/${video.video_id}.jpg?verify=${posterToken}`,
         sizes: '640x360',
         type: 'image/jpeg',
       });
