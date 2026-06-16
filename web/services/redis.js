@@ -23,6 +23,17 @@ function buildOptions() {
         port: parseInt(process.env.REDIS_PORT || '6379'),
         password: process.env.REDIS_PASSWORD || undefined,
         db: parseInt(process.env.REDIS_DB || '0'),
+        // Project-level key prefix. ioredis prepends this transparently to
+        // every command (writes, reads, MULTI, scans, key-name args) so the
+        // per-cache `key()` factories stay un-prefixed in code and we get
+        // a clean namespace at the wire level. Costs ~10 bytes per key in
+        // RAM, buys collision-safety when an operator points another app
+        // (SSO, email queue, dev script) at the same Redis instance.
+        // Override via env if you ever want to disable (empty string) or
+        // pick a different namespace per deployment.
+        keyPrefix: process.env.REDIS_KEY_PREFIX !== undefined
+            ? process.env.REDIS_KEY_PREFIX
+            : 'videosite:',
         // Lazy-connect so requiring this module is a no-op until connect()
         // is explicitly called (lets the install flow boot without Redis).
         lazyConnect: true,
@@ -67,7 +78,7 @@ async function connect() {
         console.warn('Redis: could not verify server config (CONFIG may be disabled):', err.message);
     }
 
-    console.log(`Redis connected to ${opts.host}:${opts.port} (db=${opts.db}).`);
+    console.log(`Redis connected to ${opts.host}:${opts.port} (db=${opts.db}, prefix="${opts.keyPrefix}").`);
     return client;
 }
 
