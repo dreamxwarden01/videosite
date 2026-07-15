@@ -415,10 +415,10 @@ export default function CourseView({ tab }) {
           </p>
         </div>
         <div className="vs-seg">
-          <button className={'vs-seg-btn' + (isVideos ? ' on' : '')} onClick={() => goTab('videos')}><PlayIcon />Videos</button>
-          <button className={'vs-seg-btn' + (!isVideos ? ' on' : '')} onClick={() => goTab('materials')}>
+          <button className={'vs-seg-btn' + (isVideos ? ' on' : '')} onClick={() => goTab('videos')} aria-label="Videos"><PlayIcon /><span className="vs-seg-lbl">Videos</span></button>
+          <button className={'vs-seg-btn' + (!isVideos ? ' on' : '')} onClick={() => goTab('materials')} aria-label="Materials">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M14 3v4a1 1 0 0 0 1 1h4" /><path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" /></svg>
-            Materials
+            <span className="vs-seg-lbl">Materials</span>
           </button>
         </div>
       </div>

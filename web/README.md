@@ -35,5 +35,6 @@ signs in and lands as videosite's superadmin.
 
 Ships as `ghcr.io/dreamxwarden01/videosite-web` (built from `main`). Secrets, certs, and real user
 data are git-ignored and must never be committed. Three crypto keys carried from the original
-deployment — `SETTINGS_SECRET_ENCRYPTION_KEY`, `MFA_ENCRYPTION_KEY`, `SESSION_SECRET` — **must never
-be rotated** (they decrypt existing sealed settings / MFA at rest).
+deployment — `SETTINGS_SECRET_ENCRYPTION_KEY`, `MFA_ENCRYPTION_KEY`, `SESSION_SECRET` — have **no
+rotation path yet**; don't regenerate them (they sign existing sessions and decrypt sealed settings /
+MFA at rest).

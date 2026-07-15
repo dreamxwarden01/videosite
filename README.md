@@ -165,7 +165,7 @@ Copy `web/.env.example` to `web/.env` and fill in. OIDC/SSO connection details (
 | `MFA_ENCRYPTION_KEY` | 32-byte hex key for MFA secrets at rest (preserved from the original deployment) |
 | `SETTINGS_SECRET_ENCRYPTION_KEY` | 32-byte hex key for encrypting sensitive `site_settings` rows (HMAC playback secret, CF Access service-token secret). Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
 
-> `SESSION_SECRET`, `MFA_ENCRYPTION_KEY`, and `SETTINGS_SECRET_ENCRYPTION_KEY` are carried from the original deployment and **must never be rotated** — they decrypt existing sessions / MFA / sealed settings at rest.
+> `SESSION_SECRET`, `MFA_ENCRYPTION_KEY`, and `SETTINGS_SECRET_ENCRYPTION_KEY` are carried from the original deployment — they sign existing sessions and decrypt MFA secrets / sealed settings at rest. **Key rotation isn't wired up yet** (there's no re-encryption path), so don't regenerate them — e.g. by re-running install — or you'll drop every session and orphan the data encrypted under the old keys.
 
 ## Project Structure
 
@@ -208,4 +208,4 @@ worker/
 
 ## Deployment
 
-Ships as `ghcr.io/dreamxwarden01/videosite-web` (built from `main`). Secrets, certs, and real user data are git-ignored and must never be committed. The three carried crypto keys above must never be rotated.
+Ships as `ghcr.io/dreamxwarden01/videosite-web` (built from `main`). Secrets, certs, and real user data are git-ignored and must never be committed. The three carried crypto keys above have no rotation path yet — don't regenerate them (see the note under Environment Variables).
