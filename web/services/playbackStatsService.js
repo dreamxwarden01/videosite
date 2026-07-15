@@ -96,7 +96,7 @@ async function getCourseStats(courseId) {
 
     // Roster. Enrolled first (always), then non-enrolled all-access watchers.
     const [enrolled] = await pool.execute(
-        `SELECT u.user_id, u.username, u.display_name
+        `SELECT u.user_id, u.username, u.display_name, u.sso_avatar AS avatar
          FROM enrollments e JOIN users u ON e.user_id = u.user_id
          WHERE e.course_id = ?`,
         [courseId]
@@ -112,7 +112,7 @@ async function getCourseStats(courseId) {
         // override and the role grants it. Written as an explicit INCLUDE — a
         // NULL override_value would make NOT(...) itself NULL and drop rows.
         const [aa] = await pool.execute(
-            `SELECT u.user_id, u.username, u.display_name
+            `SELECT u.user_id, u.username, u.display_name, u.sso_avatar AS avatar
              FROM users u
              LEFT JOIN role_permissions rp
                     ON rp.role_id = u.role_id
@@ -134,6 +134,7 @@ async function getCourseStats(courseId) {
             user_id: u.user_id,
             username: u.username,
             display_name: u.display_name,
+            avatar: u.avatar,
             total_watch_seconds: e.total,
             last_watch_at: e.lastMs > 0 ? new Date(e.lastMs).toISOString() : null,
             source,

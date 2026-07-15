@@ -55,16 +55,32 @@ router.get('/settings/public', async (req, res) => {
     }
 });
 
-// GET /api/avatar/:file — the caller's own profile picture, mirrored from the
-// SSO (disk cache, S2S fetch on miss). Name changes with content, so a year of
+// The admin surfaces that surface OTHER users' avatar filenames to the client:
+// the users list (manageUser), user edit (changeUser), playback stats
+// (viewPlaybackStat), enrollment (manageEnrolment). A caller holding one of these
+// may fetch others' avatars.
+const canViewOtherAvatars = (u) =>
+    !!(u.permissions && (u.permissions.manageUser || u.permissions.changeUser
+        || u.permissions.viewPlaybackStat || u.permissions.manageEnrolment));
+
+// GET /api/avatar/:file — a profile picture, mirrored from the SSO (disk cache,
+// S2S fetch on miss). Own avatar always; other users' avatars only for admins on
+// the surfaces above. Filenames are {sub}-{16hex} capability URLs (unguessable,
+// and only ever returned to those admins), and we still validate the file against
+// a real current avatar before fetching. Name changes with content, so a year of
 // private+immutable is exactly right.
 router.get('/avatar/:file', requireAuth, async (req, res) => {
     const user = res.locals.user;
     const file = String(req.params.file);
-    if (!user.sso_avatar || file !== user.sso_avatar) {
-        return res.status(404).json({ error: 'Not found' });
+    const { readOrFetch, FILE_RE } = require('../../services/avatarService');
+
+    let allowed = !!user.sso_avatar && file === user.sso_avatar;
+    if (!allowed && FILE_RE.test(file) && canViewOtherAvatars(user)) {
+        const [rows] = await getPool().execute('SELECT 1 FROM users WHERE sso_avatar = ? LIMIT 1', [file]);
+        allowed = rows.length > 0;
     }
-    const { readOrFetch } = require('../../services/avatarService');
+    if (!allowed) return res.status(404).json({ error: 'Not found' });
+
     const buf = await readOrFetch(file);
     if (!buf) return res.status(404).json({ error: 'Not found' });
     res.set('Cache-Control', 'private, max-age=31536000, immutable');

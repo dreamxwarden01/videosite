@@ -89,7 +89,7 @@ export default function AppShell() {
   const missingPlay = !!user && !user.permissions?.allowPlayback;
   // Material access is irrelevant on the video-playback page (no materials there),
   // so its message only applies on the course pages — never on /watch/*.
-  const missingMat = !!user && !user.permissions?.accessAttachments && !location.pathname.startsWith('/watch/');
+  const missingMat = !!user && !user.permissions?.accessAttachments && !location.pathname.includes('/watch/');
   const showBanner = (missingPlay || missingMat) && isPlaybackPage;
 
   // The new student pages (welcome + course view + watch) get an

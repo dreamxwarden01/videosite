@@ -400,10 +400,10 @@ router.delete('/admin/courses/:courseId/transcoding-profiles', requireAuth, chec
 // the admin CoursePage: the client measures how many rows fit and asks for
 // exactly that many. `dir` is whitelisted to the literals 'ASC'/'DESC' BEFORE
 // it reaches the service, so the ORDER BY interpolation is injection-safe.
-// No requireStepup here: the users LIST is a read the redesigned client shows
-// without a page-guard, so a read-scoped step-up would deadlock it. The WRITE
-// user routes keep their 'user' step-up (a write-scoped policy leaves GETs open).
-router.get('/admin/users', requireAuth, checkPermission('manageUser'), async (req, res) => {
+// Gated by the 'user' step-up like the other admin lists: in RW scope the GET
+// challenges and the client's useStepupGuard renders the verify card in the list
+// area; a write-only scope still leaves the list open (see middleware/stepup.js).
+router.get('/admin/users', requireAuth, checkPermission('manageUser'), requireStepup('user'), async (req, res) => {
     try {
         const page = parseInt(req.query.page) || 1;
         const limit = Math.min(60, Math.max(1, parseInt(req.query.limit) || 10));

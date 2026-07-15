@@ -119,12 +119,9 @@ function OtpInput({ value, onChange, disabled, hasError, onClearError, onSubmit 
 /* ------------------------------------------------------------------ */
 /*  MfaChallengeUI                                                     */
 /* ------------------------------------------------------------------ */
-const RESEND_COOLDOWN = 60;
-
 export default function MfaChallengeUI({
   challengeId,
   allowedMethods,
-  maskedEmail,
   apiBase = '/api/mfa',
   onSuccess,
   onCancel,
@@ -134,28 +131,16 @@ export default function MfaChallengeUI({
   // Always show method selection — user must choose explicitly
   const [step, setStep] = useState('select');
 
-  // OTP digits (shared between email + authenticator)
+  // OTP digits (authenticator code entry)
   const [digits, setDigits] = useState(['', '', '', '', '', '']);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [failCount, setFailCount] = useState(0);
 
-  // Resend cooldown for email step
-  const [resendCountdown, setResendCountdown] = useState(0);
-  const [otpValidityMinutes, setOtpValidityMinutes] = useState(null);
   const [otpError, setOtpError] = useState(false);
   const [rateLimitCountdown, setRateLimitCountdown] = useState(0);
-  const otpInputsRef = useRef(null);
-  const countdownEndRef = useRef(0);
-  const countdownTimerRef = useRef(null);
   const rateLimitEndRef = useRef(0);
   const rateLimitTimerRef = useRef(null);
-
-  // Email send state on method select screen
-  const [emailSending, setEmailSending] = useState(false);
-  const [emailDailyLimitReached, setEmailDailyLimitReached] = useState(false);
-  const [inlineError, setInlineError] = useState('');
-  const [otpAlreadySent, setOtpAlreadySent] = useState(false);
 
   /* ---------- helpers ---------- */
 
@@ -169,23 +154,6 @@ export default function MfaChallengeUI({
     }, 50);
     setError('');
   };
-
-  const startResendTimer = useCallback((seconds = RESEND_COOLDOWN) => {
-    if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
-    countdownEndRef.current = Date.now() + seconds * 1000;
-    setResendCountdown(seconds);
-
-    countdownTimerRef.current = setInterval(() => {
-      const remaining = Math.ceil((countdownEndRef.current - Date.now()) / 1000);
-      if (remaining <= 0) {
-        clearInterval(countdownTimerRef.current);
-        countdownTimerRef.current = null;
-        setResendCountdown(0);
-      } else {
-        setResendCountdown(remaining);
-      }
-    }, 1000);
-  }, []);
 
   const startRateLimitTimer = useCallback((seconds) => {
     if (rateLimitTimerRef.current) clearInterval(rateLimitTimerRef.current);
@@ -207,42 +175,9 @@ export default function MfaChallengeUI({
   // Cleanup timers on unmount
   useEffect(() => {
     return () => {
-      if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
       if (rateLimitTimerRef.current) clearInterval(rateLimitTimerRef.current);
     };
   }, []);
-
-  /* ---------- send OTP (email) ---------- */
-
-  const sendOtp = useCallback(async () => {
-    try {
-      const { ok, data, status } = await apiPost(`${apiBase}/send-otp`, { challengeId });
-      if (ok) {
-        if (data?.otpValidityMinutes) setOtpValidityMinutes(data.otpValidityMinutes);
-        setOtpAlreadySent(true);
-        startResendTimer();
-        return { ok: true };
-      }
-      if (status === 429) {
-        if (data && typeof data.retryAfter === 'number') {
-          startResendTimer(data.retryAfter);
-          return { ok: false, retryAfter: data.retryAfter, error: data.error };
-        }
-        if (data && data.retryAfter === null) {
-          // Daily limit
-          setEmailDailyLimitReached(true);
-          return { ok: false, dailyLimit: true };
-        }
-        // Cloudflare non-JSON 429
-        startResendTimer(30);
-        return { ok: false, retryAfter: 30, error: 'Too many requests.' };
-      }
-      return { ok: false, error: data?.error || data?.message || 'Failed to send code.' };
-    } catch {
-      return { ok: false, error: 'Unable to reach the server.' };
-    }
-  }, [apiBase, challengeId, startResendTimer]);
-
 
   /* ---------- verify ---------- */
 
@@ -273,10 +208,6 @@ export default function MfaChallengeUI({
       if (data?.mustResend) {
         setError('Code expired. Please request a new code.');
         resetOtp(true);
-      } else if (newFails >= 5 && method === 'email') {
-        setError('Too many attempts. Please request a new code.');
-        resetOtp(true);
-        sendOtp();
       } else {
         setError(data?.message || 'Verification failed. Please try again.');
         resetOtp(true);
@@ -294,16 +225,6 @@ export default function MfaChallengeUI({
       return;
     }
     handleVerify(method, code);
-  };
-
-  /* ---------- resend ---------- */
-
-  const handleResend = async () => {
-    if (resendCountdown > 0) return;
-    resetOtp();
-    setFailCount(0);
-    const result = await sendOtp();
-    if (!result.ok && result.error) setError(result.error);
   };
 
   /* ---------- passkey ---------- */
@@ -355,8 +276,6 @@ export default function MfaChallengeUI({
     setFailCount(0);
     setError('');
     setLoading(false);
-    setInlineError('');
-    // Preserve resend cooldown timer — don't clear countdownTimerRef/resendCountdown
     if (rateLimitTimerRef.current) {
       clearInterval(rateLimitTimerRef.current);
       rateLimitTimerRef.current = null;
@@ -365,36 +284,7 @@ export default function MfaChallengeUI({
     setStep('select');
   };
 
-  const goToMethod = async (method) => {
-    if (method === 'email') {
-      if (otpAlreadySent) {
-        // Returning to OTP entry — no re-send, existing code still valid
-        resetOtp();
-        setFailCount(0);
-        setError('');
-        setStep('email');
-        return;
-      }
-      // First time: send OTP, only transition on success
-      setEmailSending(true);
-      setInlineError('');
-      const result = await sendOtp();
-      setEmailSending(false);
-      if (result.ok) {
-        resetOtp();
-        setFailCount(0);
-        setError('');
-        setStep('email');
-      } else if (result.dailyLimit) {
-        // emailDailyLimitReached already set by sendOtp
-      } else if (result.retryAfter) {
-        // Timer already running, button shows countdown
-      } else if (result.error) {
-        setInlineError(result.error);
-      }
-      return;
-    }
-    // Non-email methods: immediate transition
+  const goToMethod = (method) => {
     resetOtp();
     setFailCount(0);
     setError('');
@@ -426,22 +316,6 @@ export default function MfaChallengeUI({
       <>
         <h2 style={{ marginBottom: '20px', textAlign: 'center' }}>{title}</h2>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginBottom: '20px' }}>
-          {allowedMethods.includes('email') && (() => {
-            // Grey out: daily limit, actively sending, or 429 backoff before first successful send
-            const disabled = emailDailyLimitReached || emailSending || (!otpAlreadySent && resendCountdown > 0);
-            let subtitle;
-            if (emailDailyLimitReached) subtitle = 'Daily limit reached';
-            else if (emailSending) subtitle = 'Sending code...';
-            else if (!otpAlreadySent && resendCountdown > 0) subtitle = `Please wait ${resendCountdown}s before requesting a code`;
-            else if (resendCountdown > 0) subtitle = `Code sent — resend in ${resendCountdown}s`;
-            else subtitle = otpAlreadySent ? `Send a new code to ${maskedEmail}` : `Send a code to ${maskedEmail}`;
-            return (
-              <button className="mfa-method-option" onClick={() => goToMethod('email')} disabled={disabled} style={disabled ? { opacity: 0.5, cursor: 'not-allowed' } : {}}>
-                <strong>Email verification</strong>
-                <span className="text-muted text-sm">{subtitle}</span>
-              </button>
-            );
-          })()}
           {allowedMethods.includes('authenticator') && (
             <button className="mfa-method-option" onClick={() => goToMethod('authenticator')}>
               <strong>Authenticator app</strong>
@@ -455,61 +329,9 @@ export default function MfaChallengeUI({
             </button>
           )}
         </div>
-        {inlineError && <div className="field-error" style={{ textAlign: 'center', marginBottom: '12px' }}>{inlineError}</div>}
         <button className="btn btn-secondary" style={{ width: '100%', justifyContent: 'center' }} onClick={onCancel}>
           Cancel
         </button>
-      </>
-    );
-  } else if (step === 'email') {
-    content = emailDailyLimitReached ? (
-      <>
-        <h2 style={{ marginBottom: '8px', textAlign: 'center' }}>Check your email</h2>
-        <p style={{ textAlign: 'center', color: '#555', marginBottom: '24px' }}>
-          You've reached the daily email verification limit. Please try again tomorrow.
-        </p>
-        <button className="btn btn-secondary" style={{ width: '100%', justifyContent: 'center' }} onClick={handleBack}>
-          Back
-        </button>
-      </>
-    ) : (
-      <>
-        <h2 style={{ marginBottom: '8px', textAlign: 'center' }}>Check your email</h2>
-        <p style={{ textAlign: 'center', color: '#555', marginBottom: '4px' }}>
-          We sent a code to {maskedEmail}
-        </p>
-        <p style={{ textAlign: 'center', color: '#6b7280', fontSize: '13px', marginBottom: '20px' }}>
-          The code expires in {otpValidityMinutes || 5} minutes
-        </p>
-
-        <OtpInput value={digits} onChange={setDigits} disabled={loading} hasError={otpError} onClearError={() => setOtpError(false)} onSubmit={() => handleOtpVerify('email')} />
-
-        {error && <div className="field-error" style={{ textAlign: 'center', marginTop: '8px' }}>{error}</div>}
-
-        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '12px', marginBottom: '20px' }}>
-          <button
-            className="btn btn-sm btn-secondary"
-            disabled={resendCountdown > 0 || loading}
-            onClick={handleResend}
-            type="button"
-          >
-            {resendCountdown > 0 ? `Resend in ${resendCountdown}s` : 'Resend'}
-          </button>
-        </div>
-
-        <div style={{ display: 'flex', gap: '10px' }}>
-          <button className="btn btn-secondary" style={{ flex: 1, justifyContent: 'center' }} onClick={handleBack} disabled={loading}>
-            Back
-          </button>
-          <button
-            className="btn btn-primary"
-            style={{ flex: 1, justifyContent: 'center' }}
-            disabled={loading || digits.join('').length !== 6}
-            onClick={() => handleOtpVerify('email')}
-          >
-            {loading ? 'Verifying...' : 'Verify'}
-          </button>
-        </div>
       </>
     );
   } else if (step === 'authenticator') {

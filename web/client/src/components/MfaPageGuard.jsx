@@ -66,7 +66,6 @@ export default function MfaPageGuard({
           isModal={true}
           challengeId={mfaBlock.challengeId}
           allowedMethods={mfaBlock.allowedMethods}
-          maskedEmail={mfaBlock.maskedEmail}
           apiBase="/api/mfa/challenge"
           onSuccess={onSuccess}
           onCancel={onCancel}

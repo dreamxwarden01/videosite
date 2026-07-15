@@ -113,7 +113,7 @@ const spaPaths = [
     // Authenticated user pages
     '/course/:courseId',
     '/course/:courseId/materials',  // materials tab of the course view
-    '/watch/:videoId',
+    '/course/:courseId/watch/:videoId',  // video playback (nested so the sidebar keeps the course highlighted)
 
     // Admin
     '/admin/courses',

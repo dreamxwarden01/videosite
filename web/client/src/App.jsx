@@ -42,7 +42,10 @@ export default function App() {
                   <Route path="/" element={<HomePage />} />
                   <Route path="/course/:courseId" element={<CourseView tab="videos" />} />
                   <Route path="/course/:courseId/materials" element={<CourseView tab="materials" />} />
-                  <Route path="/watch/:videoId" element={<WatchPage />} />
+                  {/* Nested under the course so the URL carries courseId — keeps
+                      the sidebar course highlighted (react-router descendant match)
+                      while watching. */}
+                  <Route path="/course/:courseId/watch/:videoId" element={<WatchPage />} />
 
                   {/* Admin */}
                   <Route path="/admin/courses" element={<CoursesPage />} />

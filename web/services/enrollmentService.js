@@ -104,7 +104,7 @@ async function getUserEnrollments(userId) {
 async function getEnrollableStudents(actingUserLevel) {
     const pool = getPool();
     const [rows] = await pool.execute(
-        `SELECT u.user_id, u.username, u.display_name
+        `SELECT u.user_id, u.username, u.display_name, u.sso_avatar AS avatar
          FROM users u
          JOIN roles r ON u.role_id = r.role_id
          LEFT JOIN role_permissions rp

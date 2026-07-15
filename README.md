@@ -1,16 +1,14 @@
 # VideoSite
 
-A private video course platform with hardware-accelerated distributed transcoding, built with Express and Go.
+A private video course platform with hardware-accelerated distributed transcoding, built with Express and Go. Identity is delegated to **[DreamSSO](https://github.com/dreamxwarden01/dreamsso)** — videosite is an OpenID Connect **relying party** and holds no passwords of its own.
 
 ## Features
 
 **Web Server**
+- **OpenID Connect relying party** of DreamSSO — sign-in, registration, MFA, and password reset all live in the SSO. A user's global identity is the SSO-minted `sub` (UUIDv7), used directly as videosite's own `user_id`. videosite keeps its own **roles, permissions, and content** (courses, videos, materials, playback, transcoding), re-checked on every request. Step-up for sensitive admin actions is delegated to the SSO (redirect takeover).
 - Course and video management with role-based access control and per-user permission overrides
 - Chunked resumable uploads with presigned URLs (Cloudflare R2)
 - Adaptive bitrate streaming via Shaka Player — HLS for Apple devices (native Safari), MPEG-DASH elsewhere, both served from a single CMAF (fMP4) segment set
-- Multi-factor authentication (TOTP, OTP, WebAuthn/passkeys), including username-less passkey "quick sign in" (single round trip)
-- Invitation-based registration with Cloudflare Turnstile CAPTCHA — verification runs at the origin by default, or can be moved to the edge via the optional `turnstile-gate` Cloudflare Worker
-- Transactional email via a dedicated `email-sender` Cloudflare Worker (Cloudflare Email Sending) — HMAC-signed origin→worker requests, optional Cloudflare Access service-token layer for Super-Bot-Fight-Mode bypass, at-rest encryption of stored secrets
 
 **Transcoding Worker**
 - Unified Go binary for macOS (arm64), Windows (amd64), and Linux (amd64) via build tags
@@ -26,9 +24,7 @@ A private video course platform with hardware-accelerated distributed transcodin
 ```
 Browser (React SPA)
     |
-    v
-Cloudflare Edge (optional turnstile-gate Worker — gates 5 sign-in/registration POSTs)
-    |
+    |  OpenID Connect (authorization-code)  ──►  DreamSSO (identity provider)
     v
 Express Server ---- MySQL/MariaDB
     |             \
@@ -40,16 +36,15 @@ Cloudflare R2 (S3-compatible storage)
 Go Worker(s) --- FFmpeg
 ```
 
-1. User uploads a video through the browser in chunks (presigned PUT to R2)
-2. Server creates a processing job; worker picks it up via polling
-3. Worker downloads the source from R2, transcodes to multi-bitrate CMAF (fMP4) with HLS and DASH manifests, uploads segments back to R2
-4. Browser streams the video using Shaka Player with HMAC-authenticated URLs — the player picks HLS or DASH based on client capabilities
+1. Sign-in is the OIDC authorization-code flow to DreamSSO; videosite issues its own session cookie after the callback and maps the SSO `sub` to its `user_id`
+2. User uploads a video through the browser in chunks (presigned PUT to R2)
+3. Server creates a processing job; worker picks it up via polling
+4. Worker downloads the source from R2, transcodes to multi-bitrate CMAF (fMP4) with HLS and DASH manifests, uploads segments back to R2
+5. Browser streams the video using Shaka Player with HMAC-authenticated URLs — the player picks HLS or DASH based on client capabilities
 
 Redis sits between the server and DB to absorb hot reads and high-frequency writes. Sessions, permissions, settings, and video / course / user / enrollment metadata are read-cached with explicit invalidation. Watch progress (`/api/watch-progress`) and worker transcoding heartbeats land in Redis only and a background flusher drains them to DB every 15 minutes — eliminating per-tick DB writes during active playback and transcoding. An anti-cheat rate limiter on `/api/watch-progress` rejects claimed watch time exceeding wall-clock elapsed.
 
-The optional `cloudflare/workers/turnstile-gate` Worker, when deployed, sits in front of the five Turnstile-gated POST endpoints (`/api/login`, `/api/register/start`, `/api/register/complete`, `/api/password-reset/request`, `/api/auth/passkey/options`). It verifies the token via Cloudflare's siteverify, strips it from the body, and forwards to origin. The origin admin toggle ("Cloudflare → Turnstile Verification at Worker") tells the Express layer to skip its own siteverify call when the Worker is in front. Off by default — opt in from the admin Settings page.
-
-The `cloudflare/workers/email-sender` Worker is the outbound side: every transactional email (registration, password reset, MFA OTPs, email-change verification) is HMAC-signed on the origin and POSTed to a Worker Route on the site hostname; the Worker authenticates the request, calls Cloudflare Email Sending (`env.EMAIL.send`), and returns a structured response the origin maps to user-visible errors. Sensitive site_settings rows — HMAC playback secret, email-worker HMAC, Cloudflare Access service-token secret — are encrypted at rest with `SETTINGS_SECRET_ENCRYPTION_KEY` (AES-256-GCM, `enc:v1:iv:tag:ct`).
+**Authentication.** The Express layer is the OIDC relying party (`web/lib/oidc.js`). videosite self-mints an Ed25519 **client key** and serves the public half at `/.well-known/jwks.json`; the SSO fetches it (no key handoff). The SSO federates *who you are*; *what you can do* is videosite's own role/permission engine, re-evaluated on every request. Sensitive admin actions require a fresh step-up window, which redirects to the SSO and back. Sensitive `site_settings` rows — the HMAC playback secret and the Cloudflare Access service-token secret — are encrypted at rest with `SETTINGS_SECRET_ENCRYPTION_KEY` (AES-256-GCM, `enc:v1:iv:tag:ct`).
 
 ## Tech Stack
 
@@ -62,19 +57,19 @@ The `cloudflare/workers/email-sender` Worker is the outbound side: every transac
 | Video Player | Shaka Player (HLS + DASH, CMAF) |
 | Storage | Cloudflare R2 |
 | Worker | Go 1.25, FFmpeg |
-| Edge | Cloudflare Workers (Wrangler 3+) — Turnstile gate (optional), Email sender (required for outbound email) |
-| Auth | Cookie sessions, Argon2, WebAuthn |
-| Email | Cloudflare Email Sending (via `email-sender` Worker) |
+| Identity | OpenID Connect — DreamSSO (login-first; `sub` = `user_id`) |
+| Sessions | Signed cookie sessions (issued after the OIDC callback) |
+| Worker auth | Bearer API keys, Argon2id-hashed at rest |
 
 ## Prerequisites
 
+- A running **[DreamSSO](https://github.com/dreamxwarden01/dreamsso)** instance — the identity provider videosite authenticates against (registered as an OIDC client at first-run)
 - **Node.js** (v20.19+ or v22.12+) and npm
 - **Go** 1.25+
 - **MySQL** or **MariaDB**
 - **Redis** 6+ — see [Redis configuration](#redis-configuration) below
 - **FFmpeg** and **FFprobe** (in PATH)
 - **Cloudflare R2** bucket with API credentials
-- (Optional) **Cloudflare Turnstile** site key for CAPTCHA
 
 ## Setup
 
@@ -125,6 +120,8 @@ cd web/client
 npx vite                # dev server on :5173, proxies API to :3000
 ```
 
+**First run.** videosite boots unconfigured behind a token-locked `/install` wizard: infrastructure → site → SSO connection (issuer, client id, portal URL) → optional mTLS → the **connect** hard-gate that registers videosite at the SSO and publishes its role catalogue. No account is created at install — whoever holds the SSO's root org role signs in and lands as videosite's superadmin (the SSO's `roles.sync` re-points the top org role at videosite's top role).
+
 ### Worker
 
 The worker uses an interactive first-run setup to configure server connection, API keys, and mTLS.
@@ -152,30 +149,23 @@ On first run, the worker will:
 
 Edit `capabilities.json` to enable/disable encoders or adjust per-encoder concurrent job limits.
 
-### Cloudflare Workers
-
-Two Workers live under `cloudflare/workers/`. Each has its own `wrangler.jsonc` and README with setup steps.
-
-- **`email-sender/`** — required for any outbound email (registration, password reset, MFA OTPs, email-change verification). One-time setup: verify your sender domain in Cloudflare Email Sending → `npm install && npm run deploy` → `wrangler secret put EMAIL_HMAC_SECRET` (paste the value from admin Settings → Cloudflare → Email Sending → Initialize Key). Without it, every email-sending endpoint returns 503 "Email sending is not configured."
-- **`turnstile-gate/`** — optional. Move Turnstile verification to the edge instead of the origin. Origin-side verification is the default and works without any Worker; opt in via admin Settings → Cloudflare.
-
-Both Workers mount as **Worker Routes** under the existing site hostname (not custom domains) so no fresh hostname enters the Certificate Transparency log — avoids advertising the routes to drive-by scanners. The `email-sender` Worker optionally accepts Cloudflare Access service-token credentials configured per-deployment (admin Settings → Cloudflare → Email Sending → "Send email with service credentials") to bypass Super-Bot-Fight-Mode via a WAF rule on `cf.access.authenticated`.
-
 ## Environment Variables
 
-Copy `web/.env.example` to `web/.env` and fill in:
+Copy `web/.env.example` to `web/.env` and fill in. OIDC/SSO connection details (issuer, client id, portal URL) are **not** environment variables — they're set through the `/install` wizard and stored in `site_settings`; the OIDC client key is a file (`OIDC_CLIENT_KEY_FILE`).
 
 | Variable | Description |
 |----------|-------------|
 | `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` | MySQL connection |
 | `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_DB` | Redis connection (password optional, DB defaults to 0) |
+| `REDIS_KEY_PREFIX` | Project-level key prefix (defaults to `videosite:`) so one Redis instance can host multiple apps |
 | `R2_ENDPOINT`, `R2_BUCKET_NAME`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | Cloudflare R2 storage |
 | `R2_PUBLIC_DOMAIN` | Custom domain for video delivery |
-| `SESSION_SECRET` | Secret for session encryption |
+| `SESSION_SECRET` | Secret for session cookie signing |
 | `PORT` | Server port (default: 3000) |
-| `MFA_ENCRYPTION_KEY` | 32-byte hex key for encrypting MFA secrets (TOTP shared secrets, emailed OTPs) |
-| `SETTINGS_SECRET_ENCRYPTION_KEY` | 32-byte hex key for encrypting sensitive `site_settings` rows (HMAC playback secret, email-worker HMAC, CF Access service-token secret). Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
-| `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | Cloudflare Turnstile CAPTCHA |
+| `MFA_ENCRYPTION_KEY` | 32-byte hex key for MFA secrets at rest (preserved from the original deployment) |
+| `SETTINGS_SECRET_ENCRYPTION_KEY` | 32-byte hex key for encrypting sensitive `site_settings` rows (HMAC playback secret, CF Access service-token secret). Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+
+> `SESSION_SECRET`, `MFA_ENCRYPTION_KEY`, and `SETTINGS_SECRET_ENCRYPTION_KEY` are carried from the original deployment and **must never be rotated** — they decrypt existing sessions / MFA / sealed settings at rest.
 
 ## Project Structure
 
@@ -185,16 +175,15 @@ web/
   api-schema.json        # OpenAPI 3.0 schema (Cloudflare API Shield-compatible)
   config/                # Database, R2, session config
   db/                    # Schema and migrations
-  middleware/            # Auth, permissions, MFA, installer
-  routes/                # API and auth route handlers
+  lib/                   # OIDC relying-party client (lib/oidc.js) + helpers
+  middleware/            # Auth, permissions, step-up, installer
+  routes/                # API + the OIDC RP flow (/auth/*) + admin + worker API
   services/              # Business logic
     cache/               # Per-resource Redis caches (read-through + invalidation)
-    redis.js             # ioredis client + boot connect / sanity warnings
-    flusher.js           # Periodic write-coalescing (sessions, watch, transcode)
   client/                # React SPA (Vite)
     src/
       components/        # Shared UI components
-      context/           # Auth, site, toast contexts
+      context/           # Auth, site, toast, step-up contexts
       pages/             # Page components
       hooks/             # Custom React hooks
       styles/            # CSS
@@ -215,15 +204,8 @@ worker/
     ui/                  # Terminal UI — per-job progress bars with scroll-above log
     util/                # Helpers
     worker/              # Main loop, console commands, progress
-
-cloudflare/
-  workers/
-    turnstile-gate/      # Optional edge Turnstile verification Worker
-      src/index.js       # Fetch handler — siteverify + strip + forward
-      wrangler.jsonc     # Routes + compat date (secret set via dashboard)
-      README.md          # Deploy steps + admin-toggle coordination rules
-    email-sender/        # Outbound transactional email via CF Email Sending
-      src/index.js       # HMAC verify + env.EMAIL.send (with structured errors)
-      wrangler.jsonc     # Route, send_email binding, EMAIL_FROM_ADDRESS var
-      README.md          # Sender-domain verification + secret rotation rules
 ```
+
+## Deployment
+
+Ships as `ghcr.io/dreamxwarden01/videosite-web` (built from `main`). Secrets, certs, and real user data are git-ignored and must never be committed. The three carried crypto keys above must never be rotated.

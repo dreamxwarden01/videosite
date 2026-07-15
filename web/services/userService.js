@@ -68,7 +68,7 @@ async function findOrCreateBySub(claims) {
 async function getUserById(userId) {
     const pool = getPool();
     const [rows] = await pool.execute(
-        `SELECT u.*, r.role_name, r.permission_level
+        `SELECT u.*, u.sso_avatar AS avatar, r.role_name, r.permission_level
          FROM users u JOIN roles r ON u.role_id = r.role_id
          WHERE u.user_id = ?`,
         [idBuf(userId)]

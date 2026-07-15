@@ -28,8 +28,7 @@ export default function useMfaChallenge() {
         pendingRef.current = { url, options, resolve, reject };
         setMfaState({
           challengeId: result.data.challengeId,
-          allowedMethods: result.data.allowedMethods,
-          maskedEmail: result.data.maskedEmail
+          allowedMethods: result.data.allowedMethods
         });
       });
     }

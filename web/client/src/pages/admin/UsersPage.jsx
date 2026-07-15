@@ -8,6 +8,8 @@ import useFitHeight from '../../hooks/useFitHeight';
 import VsPager from '../../components/VsPager';
 import SortMenu from '../../components/SortMenu';
 import Avatar from '../../components/Avatar';
+import useStepupGuard from '../../hooks/useStepupGuard';
+import StepUpBlock from '../../components/StepUpBlock';
 
 // 'admin:'-prefixed flat keys, matching CoursesPage's page/sort memory.
 const PAGE_KEY = 'admin:users:page';
@@ -30,6 +32,10 @@ export default function UsersPage() {
   const { siteName } = useSite();
   const { showToast } = useToast();
   const navigate = useNavigate();
+  // Same step-up gate as the other admin lists: a GET 403 step_up_required flips
+  // `blocked` and the verify card fills the list area (StepUpProvider drives the
+  // SSO redirect; a fresh window on return unblocks the reload).
+  const { blocked, guardFetch, verify } = useStepupGuard('user');
 
   const [users, setUsers] = useState([]);
   const [total, setTotal] = useState(0);
@@ -77,15 +83,17 @@ export default function UsersPage() {
     const run = () => {
       setLoading(true);
       const q = query.trim();
-      apiGet(`/api/admin/users?page=${page}&limit=${pageSize}&dir=${sort.dir}` + (q ? `&q=${encodeURIComponent(q)}` : ''))
-        .then(({ data, ok }) => {
+      guardFetch(`/api/admin/users?page=${page}&limit=${pageSize}&dir=${sort.dir}` + (q ? `&q=${encodeURIComponent(q)}` : ''))
+        .then(({ data, ok, status }) => {
           if (!alive) return;
           if (ok && data) {
             setUsers(data.users || []);
             setTotal(data.total || 0);
             setTotalPages(data.totalPages || 1);
             setLoaded(true);
-          } else {
+          } else if (!(status === 403 && data?.code === 'step_up_required')) {
+            // step_up_required flips `blocked` inside guardFetch → the verify card
+            // renders in the list area; anything else is a real error.
             showToast(data?.error || 'Failed to load users.');
           }
           setLoading(false);
@@ -97,7 +105,7 @@ export default function UsersPage() {
     const delay = query.trim() && page === 1 ? 250 : 0;
     const t = setTimeout(run, delay);
     return () => { alive = false; clearTimeout(t); };
-  }, [canManage, fitReady, page, pageSize, sort.dir, query, showToast]);
+  }, [canManage, fitReady, page, pageSize, sort.dir, query, showToast, guardFetch]);
 
   if (!canManage) {
     return <div className="vs-cv-empty">Permission denied.</div>;
@@ -147,7 +155,9 @@ export default function UsersPage() {
           border. Before the first measurement (rowH 0) the skeleton sizes
           naturally. Skeleton rows are the same height as real rows (#185). */}
       <div className="vs-cv-card" ref={cardRef} style={rowH > 0 ? { height: pageSize * (rowH + 1) } : undefined}>
-        {showSkeleton ? (
+        {blocked ? (
+          <StepUpBlock onVerify={verify} />
+        ) : showSkeleton ? (
           // Skeleton rows MUST be the same height as real rows, or useFitHeight
           // measures a different rowH on the skeleton↔real swap, flips pageSize,
           // and (pageSize being a fetch dep) refetches forever — the limit=8↔9
@@ -190,7 +200,7 @@ export default function UsersPage() {
         )}
       </div>
 
-      {!showSkeleton && total > 0 && (
+      {!showSkeleton && !blocked && total > 0 && (
         <VsPager
           page={curPage} pages={pages} total={total} from={from} to={to} unit="users" onPage={setPage}
           sortControl={<SortMenu fields={SORT_FIELDS} sort={sort} onChange={changeSort} />}

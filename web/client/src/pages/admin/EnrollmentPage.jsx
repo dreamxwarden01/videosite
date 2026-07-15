@@ -257,7 +257,7 @@ export default function EnrollmentPage() {
                   className={'vs-enroll-srow' + (s.user_id === selectedId ? ' on' : '')}
                   onClick={() => pickStudent(s.user_id)}
                 >
-                  <Avatar user={{ display_name: s.display_name, username: s.username }} name={s.display_name || s.username} className="vs-cv-av" />
+                  <Avatar user={s} name={s.display_name || s.username} className="vs-cv-av" />
                   <div className="vs-cv-rmn">
                     <p className="vs-cv-rt">{s.display_name || s.username}</p>
                     <p className="vs-cv-rs">@{s.username}</p>
@@ -278,7 +278,7 @@ export default function EnrollmentPage() {
               <>
                 <button type="button" className="vs-enroll-back" onClick={backToList}><ChevronL /> Students</button>
                 <div className="vs-edit-head">
-                  <Avatar user={{ display_name: selectedStudent.display_name, username: selectedStudent.username }} name={selectedStudent.display_name || selectedStudent.username} className="vs-pmenu-av" />
+                  <Avatar user={selectedStudent} name={selectedStudent.display_name || selectedStudent.username} className="vs-pmenu-av" />
                   <div className="vs-edit-idn">
                     <p className="vs-edit-name">{selectedStudent.display_name || selectedStudent.username}</p>
                     <p className="vs-edit-sub">@{selectedStudent.username}</p>

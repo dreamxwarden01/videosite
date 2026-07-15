@@ -40,7 +40,6 @@ export default function useMfaPageGuard() {
         setMfaBlock({
           challengeId: result.data.challengeId,
           allowedMethods: result.data.allowedMethods,
-          maskedEmail: result.data.maskedEmail,
           pendingTtlSeconds: result.data.pendingTtlSeconds || 900,
           receivedAt: Date.now(),
         });

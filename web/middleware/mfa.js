@@ -5,13 +5,11 @@ const {
     consumeChallenge,
     findValidLongStatus,
     createChallenge,
-    maskEmail,
     isUserMfaEnabled,
     getUserMfaMethodTypes,
     ensureBmfa,
     rotateBmfaIfNeeded
 } = require('../services/mfaService');
-const { getPool } = require('../config/database');
 
 /**
  * Factory that returns Express middleware enforcing MFA for a given scenario.
@@ -109,25 +107,13 @@ function requireMfaForScenario(scenario, options) {
                 canReuse: policy.reuse === 'persistent' && !opts.forceOneTime
             });
 
-            // Fetch user email for masking
-            const pool = getPool();
-            const [[userRow]] = await pool.execute(
-                'SELECT email FROM users WHERE user_id = ?',
-                [user.user_id]
-            );
-            const maskedEmail = userRow && userRow.email ? maskEmail(userRow.email) : null;
-
             // Filter allowed methods to what the user actually has
-            const filteredMethods = challenge.allowedMethods.filter(m => {
-                if (m === 'email') return !!(userRow && userRow.email);
-                return userMethods.includes(m);
-            });
+            const filteredMethods = challenge.allowedMethods.filter(m => userMethods.includes(m));
 
             return res.status(403).json({
                 requireMFA: true,
                 challengeId: challenge.id,
                 allowedMethods: filteredMethods,
-                maskedEmail,
                 pendingTtlSeconds: challenge.pendingTtlSeconds
             });
         } catch (err) {

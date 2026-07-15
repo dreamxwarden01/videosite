@@ -65,7 +65,6 @@ INSERT INTO site_settings (setting_key, setting_value) VALUES
     ('session_max_days', '15'),
     ('enable_registration', 'false'),
     ('require_invitation_code', 'true'),
-    ('emailed_link_validity_minutes', '30'),
     ('registration_default_role', '2'),
     ('hmac_enabled', 'false'),
     ('hmac_token_validity', '600');

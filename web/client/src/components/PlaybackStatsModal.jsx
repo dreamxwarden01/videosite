@@ -222,7 +222,7 @@ export default function PlaybackStatsModal({ courseId, courseCode, courseName, c
 
       {mfaState && (
         <MfaChallengeUI isModal challengeId={mfaState.challengeId} allowedMethods={mfaState.allowedMethods}
-          maskedEmail={mfaState.maskedEmail} apiBase="/api/mfa/challenge"
+          apiBase="/api/mfa/challenge"
           onSuccess={onMfaSuccess} onCancel={onMfaCancel} title="Verify to continue" />
       )}
       <MfaSetupRequiredModal mfaSetupState={mfaSetupState} onDismiss={dismissMfaSetup} />
