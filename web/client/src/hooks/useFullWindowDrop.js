@@ -3,33 +3,46 @@ import { useEffect, useRef, useState } from 'react';
 /**
  * Watches window-level drag-and-drop events while `enabled` is true.
  *
- * Returns `{ dragActive }`. The flag flips true on the first dragenter
- * carrying files and false again when the drag leaves the window (or a
- * drop fires). Use it to show a full-screen overlay that becomes the
- * effective drop zone, so the user doesn't have to land precisely on
- * the modal's small dropzone div.
+ * Returns `{ dragActive, refusing }`. `dragActive` flips true on the first
+ * dragenter carrying files and false again when the drag leaves the window
+ * (or a drop fires). Use it to show a full-screen overlay that becomes the
+ * effective drop zone, so the user doesn't have to land precisely on the
+ * modal's small dropzone div.
  *
- * `onFile(file)` is invoked with the first file from a drop event.
+ * `onFiles(files)` is invoked with an array of the dropped files — sliced to
+ * a single element when `multiple` is false.
  *
- * Files-only filtering: dragenter fires for anything (text selections,
- * DOM nodes, image URLs from other tabs). We only enter the active
- * state when the dataTransfer advertises a "Files" type, so dragging a
- * text snippet over the page doesn't open the overlay.
+ * `refuse`: keep listening and keep showing the overlay, but reject the drop.
+ * The cursor gets dropEffect 'none', the drop is swallowed, and `refusing` is
+ * true so the overlay can turn red. This is what an in-progress upload wants:
+ * silently ignoring the drop would read as a bug, and tearing the listeners
+ * down would let the browser navigate to file:// instead.
  *
- * Drag depth: every child element fires its own dragenter/dragleave
- * pair as the cursor crosses element boundaries. To avoid the overlay
- * flickering, we count enters minus leaves; the active state stays true
- * as long as the counter is positive. A `drop` event resets it
- * regardless of count, and a clean transition to count=0 turns it off.
+ * Files-only filtering: dragenter fires for anything (text selections, DOM
+ * nodes, image URLs from other tabs). We only enter the active state when the
+ * dataTransfer advertises a "Files" type, so dragging a text snippet over the
+ * page doesn't open the overlay.
  *
- * `onFile` is captured into a ref so the callback can be redefined per
- * render without re-registering listeners — keeps the dependency array
- * stable and the document listeners attached for the modal's lifetime.
+ * Drag depth: every child element fires its own dragenter/dragleave pair as
+ * the cursor crosses element boundaries. To avoid the overlay flickering, we
+ * count enters minus leaves; the active state stays true as long as the
+ * counter is positive. A `drop` event resets it regardless of count, and a
+ * clean transition to count=0 turns it off.
+ *
+ * `onFiles` and `refuse` are captured into refs so they can be redefined per
+ * render without re-registering listeners — keeps the dependency array stable
+ * and the document listeners attached for the modal's lifetime. In particular
+ * `refuse` must NOT be a dependency: flipping it mid-drag would tear down the
+ * listeners and strand the depth counter, leaving the overlay stuck open.
  */
-export default function useFullWindowDrop({ enabled, onFile }) {
+export default function useFullWindowDrop({ enabled, multiple = false, refuse = false, onFiles }) {
     const [dragActive, setDragActive] = useState(false);
-    const onFileRef = useRef(onFile);
-    onFileRef.current = onFile;
+    const onFilesRef = useRef(onFiles);
+    onFilesRef.current = onFiles;
+    const refuseRef = useRef(refuse);
+    refuseRef.current = refuse;
+    const multipleRef = useRef(multiple);
+    multipleRef.current = multiple;
 
     useEffect(() => {
         if (!enabled) {
@@ -69,17 +82,22 @@ export default function useFullWindowDrop({ enabled, onFile }) {
             if (!isFileDrag(e)) return;
             // Without preventDefault here the browser refuses the drop
             // and navigates to file:// instead — long-standing HTML5
-            // DnD quirk.
+            // DnD quirk. That applies while refusing too, which is why
+            // we keep the listener attached rather than disabling it.
             e.preventDefault();
-            if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+            if (e.dataTransfer) e.dataTransfer.dropEffect = refuseRef.current ? 'none' : 'copy';
         };
         const handleDrop = (e) => {
             if (!isFileDrag(e)) return;
             e.preventDefault();
             depth = 0;
             setDragActive(false);
-            const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-            if (file && onFileRef.current) onFileRef.current(file);
+            if (refuseRef.current) return;
+            const dropped = e.dataTransfer && e.dataTransfer.files
+                ? Array.from(e.dataTransfer.files)
+                : [];
+            if (!dropped.length || !onFilesRef.current) return;
+            onFilesRef.current(multipleRef.current ? dropped : dropped.slice(0, 1));
         };
 
         window.addEventListener('dragenter', handleEnter);
@@ -94,5 +112,5 @@ export default function useFullWindowDrop({ enabled, onFile }) {
         };
     }, [enabled]);
 
-    return { dragActive };
+    return { dragActive, refusing: dragActive && refuse };
 }

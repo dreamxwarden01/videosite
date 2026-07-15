@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { requireAuth } = require('../../middleware/auth');
 const { checkPermission } = require('../../middleware/permissions');
-const { getPool } = require('../../config/database');
+const { getPool, idBuf } = require('../../config/database');
 const {
     generateMaterialId,
     getPresignedUploadUrl,
@@ -41,7 +41,7 @@ async function checkEnrollment(user, courseId) {
     const pool = getPool();
     const [rows] = await pool.execute(
         'SELECT 1 FROM enrollments WHERE user_id = ? AND course_id = ?',
-        [user.user_id, courseId]
+        [idBuf(user.user_id), courseId]
     );
     return rows.length > 0;
 }
@@ -59,27 +59,29 @@ router.get('/materials/courses', requireAuth, checkPermission('accessAttachments
 });
 
 // ── 2. GET /materials/courses/:courseId — list materials for a course ──
-router.get('/materials/courses/:courseId', requireAuth, checkPermission('accessAttachments'), async (req, res) => {
+router.get('/materials/courses/:courseId', requireAuth, async (req, res) => {
     try {
         const user = res.locals.user;
         const courseId = parseInt(req.params.courseId);
 
         if (!await checkEnrollment(user, courseId)) {
-            return res.status(403).json({ error: 'You are not enrolled in this course.' });
+            return res.status(403).json({ error: 'You are not enrolled in this course.', code: 'COURSE_FORBIDDEN' });
         }
 
         const course = await courseCache.getCourseMeta(courseId);
-        if (!course || course.is_active !== 1) return res.status(404).json({ error: 'Course not found.' });
+        if (!course || course.is_active !== 1) return res.status(404).json({ error: 'Course not found.', code: 'COURSE_NOT_FOUND' });
 
         const materials = await getMaterialsByCourse(courseId);
         res.json({
+            courseCode: course.course_code,
             courseName: course.course_name,
+            moduleLabel: course.module_label,
             materials: materials.map(m => ({
                 material_id: m.material_id,
                 filename: m.filename,
                 file_size: m.file_size,
                 content_type: m.content_type,
-                week: m.week,
+                module_number: m.module_number,
                 uploaded_by: m.uploaded_by,
                 created_at: m.created_at,
             })),
@@ -105,9 +107,9 @@ router.post('/materials/courses/:courseId/upload', requireAuth, checkPermission(
             return res.status(403).json({ error: 'You are not enrolled in this course.' });
         }
 
-        const { filename, fileSize, contentType, week } = req.body;
-        if (!filename || !fileSize || !week) {
-            return res.status(400).json({ error: 'filename, fileSize, and week are required.' });
+        const { filename, fileSize, contentType, module_number } = req.body;
+        if (!filename || !fileSize || !module_number) {
+            return res.status(400).json({ error: 'filename, fileSize, and a module number are required.' });
         }
         if (fileSize > MAX_FILE_SIZE) {
             return res.status(400).json({ error: 'File size exceeds 100 MB limit.' });
@@ -205,14 +207,14 @@ router.post('/materials/:uploadId/complete', requireAuth, checkPermission('uploa
         await applyHeaders(session.object_key, session.content_type);
 
         // Insert the real `course_materials` row.
-        const week = req.body && typeof req.body.week === 'string' ? req.body.week : null;
+        const module_number = req.body && typeof req.body.module_number === 'string' ? req.body.module_number : null;
         const materialId = await createMaterialRecord(
             session.course_id,
             session.object_key,
             session.original_filename,
             session.file_size_bytes,
             session.content_type,
-            week,
+            module_number,
             userId
         );
 
@@ -247,8 +249,9 @@ router.post('/materials/:uploadId/abort', requireAuth, checkPermission('uploadAt
     }
 });
 
-// ── 7. GET /materials/:materialId/download — presigned download URL ──
-router.get('/materials/:materialId/download', requireAuth, checkPermission('accessAttachments'), async (req, res) => {
+// ── 7. Presigned material URL — /view opens inline (browser), /download is an
+//    attachment. Enrollment-scoped on top of accessAttachments. ──
+async function sendMaterialUrl(req, res, inline) {
     try {
         const user = res.locals.user;
         const materialId = parseInt(req.params.materialId);
@@ -259,27 +262,36 @@ router.get('/materials/:materialId/download', requireAuth, checkPermission('acce
         }
 
         if (!await checkEnrollment(user, material.course_id)) {
-            return res.status(403).json({ error: 'You are not enrolled in this course.' });
+            return res.status(403).json({ error: 'You are not enrolled in this course.', code: 'COURSE_FORBIDDEN' });
         }
 
-        const inline = req.query.mode === 'view';
         const downloadUrl = await getPresignedDownloadUrl(material.object_key, material.filename, { inline });
         res.json({ downloadUrl });
     } catch (err) {
-        console.error('Material download error:', err);
-        res.status(500).json({ error: 'Failed to generate download URL.' });
+        console.error('Material URL error:', err);
+        res.status(500).json({ error: 'Failed to generate file URL.' });
     }
-});
+}
+router.get('/materials/:materialId/view', requireAuth, checkPermission('accessAttachments'), (req, res) => sendMaterialUrl(req, res, true));
+router.get('/materials/:materialId/download', requireAuth, checkPermission('accessAttachments'), (req, res) => sendMaterialUrl(req, res, req.query.mode === 'view'));
 
-// ── 8. PUT /materials/:materialId — edit filename/week ──
+// ── 8. PUT /materials/:materialId — edit filename/module_number ──
 router.put('/materials/:materialId', requireAuth, checkPermission('uploadAttachments'), async (req, res) => {
     try {
+        const user = res.locals.user;
         const materialId = parseInt(req.params.materialId);
-        const { filename, week } = req.body;
+        const { filename, module_number } = req.body;
 
         const material = await getMaterialById(materialId);
         if (!material) {
             return res.status(404).json({ error: 'Material not found.' });
+        }
+
+        // The permission alone is not enough: it is global, while a course-scoped
+        // admin is bounded by enrollment. Without this, any holder of
+        // uploadAttachments could rename a material in any course by its id.
+        if (!await checkEnrollment(user, material.course_id)) {
+            return res.status(403).json({ error: 'You are not enrolled in this course.', code: 'COURSE_FORBIDDEN' });
         }
 
         if (filename !== undefined) {
@@ -290,11 +302,11 @@ router.put('/materials/:materialId', requireAuth, checkPermission('uploadAttachm
                 return res.status(400).json({ error: 'Filename cannot contain path separators.' });
             }
         }
-        if (week !== undefined && !week) {
+        if (module_number !== undefined && !module_number) {
             return res.status(400).json({ error: 'Week is required.' });
         }
 
-        await updateMaterial(materialId, { filename, week });
+        await updateMaterial(materialId, { filename, module_number });
         res.status(204).end();
     } catch (err) {
         console.error('Material update error:', err);
@@ -305,7 +317,19 @@ router.put('/materials/:materialId', requireAuth, checkPermission('uploadAttachm
 // ── 9. DELETE /materials/:materialId — delete material + R2 object ──
 router.delete('/materials/:materialId', requireAuth, checkPermission('deleteAttachments'), async (req, res) => {
     try {
+        const user = res.locals.user;
         const materialId = parseInt(req.params.materialId);
+
+        // Resolve the material BEFORE deleting: deleteAttachments is a global
+        // permission, but a course-scoped admin is bounded by enrollment.
+        // Without this, any holder could delete a material in any course by id.
+        const material = await getMaterialById(materialId);
+        if (!material) {
+            return res.status(404).json({ error: 'Material not found.' });
+        }
+        if (!await checkEnrollment(user, material.course_id)) {
+            return res.status(403).json({ error: 'You are not enrolled in this course.', code: 'COURSE_FORBIDDEN' });
+        }
 
         const objectKey = await deleteMaterial(materialId);
         if (!objectKey) {

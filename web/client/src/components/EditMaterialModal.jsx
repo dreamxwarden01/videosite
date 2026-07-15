@@ -1,96 +1,94 @@
 import { useState, useEffect } from 'react';
-import { useToast } from '../context/ToastContext';
 import { apiPut } from '../api';
+import { useToast } from '../context/ToastContext';
+import { moduleTerm } from '../utils/moduleLabel';
 
-export default function EditMaterialModal({ isOpen, onClose, onEdited, material }) {
+const CloseIcon = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+);
+
+export default function EditMaterialModal({ material, moduleLabel, onClose, onSaved }) {
   const { showToast } = useToast();
-  const [filename, setFilename] = useState('');
-  const [week, setWeek] = useState('');
+  const [filename, setFilename] = useState(material.filename || '');
+  const [week, setWeek] = useState(material.module_number || '');
   const [saving, setSaving] = useState(false);
 
-  // Populate fields when material changes or modal opens
   useEffect(() => {
-    if (isOpen && material) {
-      setFilename(material.filename || '');
-      setWeek(material.week || '');
-    }
-  }, [isOpen, material]);
+    const onKey = (e) => { if (e.key === 'Escape' && !saving) onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [saving, onClose]);
 
-  if (!isOpen || !material) return null;
-
-  const filenameValid = filename.trim().length > 0 && filename.trim().length <= 255 && !/[/\\]/.test(filename);
+  const trimmedName = filename.trim();
+  const filenameValid = trimmedName.length > 0 && trimmedName.length <= 255 && !/[/\\]/.test(filename);
   const weekValid = week.trim().length > 0;
-  const hasChanges = filename.trim() !== (material.filename || '') || week.trim() !== (material.week || '');
+  const hasChanges = trimmedName !== (material.filename || '') || week.trim() !== (material.module_number || '');
   const canSave = filenameValid && weekValid && hasChanges && !saving;
 
-  const handleSubmit = async (e) => {
+  const moduleWord = moduleTerm(moduleLabel);
+
+  async function handleSave(e) {
     e.preventDefault();
     if (!canSave) return;
     setSaving(true);
-    try {
-      const { ok, data } = await apiPut(`/api/materials/${material.material_id}`, {
-        filename: filename.trim(),
-        week: week.trim() || undefined,
-      });
-      if (ok) {
-        showToast('Material updated.', 'success');
-        onEdited();
-      } else {
-        showToast(data?.error || 'Failed to update material.');
-      }
-    } catch (err) {
-      showToast(err.message);
-    } finally {
+    const { ok, data } = await apiPut(`/api/materials/${material.material_id}`, {
+      filename: trimmedName,
+      module_number: week.trim(),
+    });
+    if (ok) {
+      showToast('Material updated.', 'success');
+      onSaved();
+    } else {
+      showToast(data?.error || 'Failed to update material.');
       setSaving(false);
     }
-  };
+  }
 
   return (
-    <div className="modal-overlay active" onClick={() => {}}>
-      <div className="upload-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '480px' }}>
-        <div className="modal-header">
-          <h3>Edit Material</h3>
-          <button className="modal-close" onClick={onClose}>&times;</button>
+    <div className="vs-scrim">
+      <form className="vs-modal" onSubmit={handleSave}>
+        <div className="vs-modal-head">
+          <h3 className="vs-modal-title">Edit Material</h3>
+          <button type="button" className="vs-modal-x" onClick={onClose} disabled={saving}><CloseIcon /></button>
         </div>
-        <div className="modal-body">
-          <form onSubmit={handleSubmit}>
-            <div className="form-group">
-              <label htmlFor="edit_mat_filename">Filename</label>
-              <input
-                type="text" id="edit_mat_filename"
-                className={`form-control${filename && !filenameValid ? ' input-error' : ''}`}
-                value={filename}
-                onChange={e => setFilename(e.target.value)}
-                maxLength={255}
-                autoComplete="off"
-                autoFocus
-              />
-              {filename && !filenameValid && (
-                <span className="field-error">Filename must be 1-255 characters without path separators.</span>
-              )}
-            </div>
+        <div className="vs-modal-body">
+          <div className="vs-field">
+            <label className="vs-label" htmlFor="edit_mat_filename">Filename</label>
+            <input
+              type="text" id="edit_mat_filename"
+              className={`vs-input${filename && !filenameValid ? ' err' : ''}`}
+              value={filename}
+              onChange={e => setFilename(e.target.value)}
+              maxLength={255}
+              autoComplete="off"
+              autoFocus
+              disabled={saving}
+            />
+            {filename && !filenameValid && (
+              <p className="vs-hint err">Filename must be 1-255 characters without path separators.</p>
+            )}
+          </div>
 
-            <div className="form-group">
-              <label htmlFor="edit_mat_week">Week <span style={{ color: '#dc3545' }}>*</span></label>
-              <input
-                type="text" id="edit_mat_week"
-                className="form-control"
-                value={week}
-                onChange={e => setWeek(e.target.value)}
-                maxLength={20}
-                autoComplete="off"
-              />
-            </div>
-
-            <div className="flex gap-2" style={{ justifyContent: 'flex-end' }}>
-              <button type="button" className="btn btn-secondary" onClick={onClose}>Cancel</button>
-              <button type="submit" className="btn btn-primary" disabled={!canSave}>
-                {saving ? 'Saving...' : 'Save Changes'}
-              </button>
-            </div>
-          </form>
+          <div className="vs-field">
+            <label className="vs-label" htmlFor="edit_mat_module">{moduleWord} number</label>
+            <input
+              type="text" id="edit_mat_module"
+              className="vs-input"
+              value={week}
+              onChange={e => setWeek(e.target.value)}
+              maxLength={50}
+              autoComplete="off"
+              disabled={saving}
+            />
+          </div>
         </div>
-      </div>
+        <div className="vs-modal-foot">
+          <button type="button" className="vs-btn" onClick={onClose} disabled={saving}>Cancel</button>
+          <button type="submit" className="vs-btn vs-btn-primary" disabled={!canSave}>
+            {saving ? 'Saving...' : 'Save changes'}
+          </button>
+        </div>
+      </form>
     </div>
   );
 }

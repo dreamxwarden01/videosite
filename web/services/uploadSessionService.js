@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { getPool } = require('../config/database');
+const { getPool, idBuf } = require('../config/database');
 const { abortMultipartUpload } = require('./uploadService');
 const uploadHeartbeatCache = require('./cache/uploadHeartbeatCache');
 const deletionService = require('./deletionService');
@@ -164,7 +164,7 @@ async function resetStaleUploads() {
  * (single PUT) requires `contentType` and leaves multipart fields null.
  * Caller is responsible for passing the right combination.
  */
-async function createSession({ type, uploadId, videoId, courseId, title, week, lectureDate, description,
+async function createSession({ type, uploadId, videoId, courseId, title, module_number, lectureDate, description,
                                 r2UploadId, objectKey, contentType, originalFilename, fileSizeBytes, totalParts, createdBy }) {
     if (type !== 'video' && type !== 'attachment') {
         throw new Error(`createSession: type must be 'video' or 'attachment', got ${type}`);
@@ -172,12 +172,12 @@ async function createSession({ type, uploadId, videoId, courseId, title, week, l
     const pool = getPool();
     await pool.execute(
         `INSERT INTO upload_sessions
-         (upload_id, video_id, course_id, title, week, lecture_date, description,
+         (upload_id, video_id, course_id, title, module_number, lecture_date, description,
           r2_upload_id, object_key, content_type, original_filename, file_size_bytes, total_parts, created_by, type)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [uploadId, videoId || null, courseId, title || null, week || null, lectureDate || null,
+        [uploadId, videoId || null, courseId, title || null, module_number || null, lectureDate || null,
          description || null, r2UploadId || null, objectKey, contentType || null,
-         originalFilename, fileSizeBytes, totalParts || null, createdBy, type]
+         originalFilename, fileSizeBytes, totalParts || null, idBuf(createdBy), type]
     );
     // Seed Redis so subsequent heartbeats never touch DB.
     await uploadHeartbeatCache.init(uploadId, { userId: createdBy, type });
@@ -208,17 +208,17 @@ async function heartbeat(uploadId, userId) {
 
 /**
  * Check for metadata conflict (new video uploads): same course + title
- * + week + lecture_date. Attachments are excluded because they don't
- * use title/week metadata for uniqueness.
+ * + module_number + lecture_date. Attachments are excluded because they don't
+ * use title/module_number metadata for uniqueness.
  */
-async function checkMetadataConflict(courseId, title, week, lectureDate) {
+async function checkMetadataConflict(courseId, title, module_number, lectureDate) {
     const pool = getPool();
 
     // Check existing videos
     const [videoRows] = await pool.execute(
         `SELECT video_id, title FROM videos
-         WHERE course_id = ? AND title <=> ? AND week <=> ? AND lecture_date <=> ?`,
-        [courseId, title, week || null, lectureDate || null]
+         WHERE course_id = ? AND title <=> ? AND module_number <=> ? AND lecture_date <=> ?`,
+        [courseId, title, module_number || null, lectureDate || null]
     );
     if (videoRows.length > 0) {
         return { type: 'video', videoId: videoRows[0].video_id };
@@ -227,10 +227,10 @@ async function checkMetadataConflict(courseId, title, week, lectureDate) {
     // Check active upload sessions — videos only
     const [sessionRows] = await pool.execute(
         `SELECT upload_id, created_by FROM upload_sessions
-         WHERE course_id = ? AND title <=> ? AND week <=> ? AND lecture_date <=> ?
+         WHERE course_id = ? AND title <=> ? AND module_number <=> ? AND lecture_date <=> ?
            AND status IN ('active', 'completing')
            AND type = 'video'`,
-        [courseId, title, week || null, lectureDate || null]
+        [courseId, title, module_number || null, lectureDate || null]
     );
     if (sessionRows.length > 0) {
         return { type: 'upload', uploadId: sessionRows[0].upload_id };

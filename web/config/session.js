@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { getPool } = require('./database');
+const { getPool, idBuf } = require('./database');
 const sessionCache = require('../services/cache/sessionCache');
 
 function generateSessionId() {
@@ -8,8 +8,10 @@ function generateSessionId() {
 
 async function getSessionLimits() {
     const settingsCache = require('../services/cache/settingsCache');
-    const inactivityDays = parseInt(await settingsCache.getSetting('session_inactivity_days', '3')) || 3;
-    const maxDays = parseInt(await settingsCache.getSetting('session_max_days', '15')) || 15;
+    // Shortened under OIDC (was 3 / 15): re-auth is cheap via the SSO, so the app
+    // session is short-lived. Site-settings rows still override these defaults.
+    const inactivityDays = parseInt(await settingsCache.getSetting('session_inactivity_days', '1')) || 1;
+    const maxDays = parseInt(await settingsCache.getSetting('session_max_days', '3')) || 3;
     return { inactivityDays, maxDays };
 }
 
@@ -18,17 +20,18 @@ async function getInactivityTtlSeconds() {
     return inactivityDays * 24 * 60 * 60;
 }
 
-async function createSession(userId, userAgent, ipAddress) {
+async function createSession(userId, userAgent, ipAddress, ssoSid = null, ssoExpiresAt = null) {
     const pool = getPool();
     const sessionId = generateSessionId();
     const now = new Date();
 
     // Audit row in the sessions table; admin-view UI reads this and overlays
-    // live values from Redis.
+    // live values from Redis. sso_expires_at = the SSO session's absolute expiry
+    // (from the id_token's sess_exp) — enforced in isSessionValid.
     await pool.execute(
-        `INSERT INTO sessions (session_id, user_id, last_seen, last_sign_in, user_agent, ip_address)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [sessionId, userId, now, now, userAgent || null, ipAddress || null]
+        `INSERT INTO sessions (session_id, user_id, last_seen, last_sign_in, user_agent, ip_address, sso_sid, sso_expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [sessionId, idBuf(userId), now, now, userAgent || null, ipAddress || null, ssoSid, ssoExpiresAt]
     );
 
     const ttl = await getInactivityTtlSeconds();
@@ -38,9 +41,27 @@ async function createSession(userId, userAgent, ipAddress) {
         lastSeen: now,
         ipAddress,
         userAgent,
+        ssoExpiresAt,
     }, ttl);
 
     return sessionId;
+}
+
+// Delete every videosite session bound to an SSO master session (id_token `sid`).
+// Used for rotate-on-login (drop the browser's prior session for this SSO session)
+// and for OIDC back-channel logout. Clears both the Redis cache and the DB row.
+async function deleteSessionsBySsoSid(ssoSid) {
+    if (!ssoSid) return 0;
+    const pool = getPool();
+    const [rows] = await pool.execute(
+        'SELECT session_id, user_id FROM sessions WHERE sso_sid = ?',
+        [ssoSid]
+    );
+    for (const row of rows) {
+        await sessionCache.deleteSession(row.session_id, row.user_id);
+    }
+    await pool.execute('DELETE FROM sessions WHERE sso_sid = ?', [ssoSid]);
+    return rows.length;
 }
 
 // Read the session record. Tries Redis first; on miss, falls back to the DB
@@ -61,7 +82,7 @@ async function getSession(sessionId) {
     // (Redis expired it) and is invalid, or Redis was cold-restarted.
     const pool = getPool();
     const [rows] = await pool.execute(
-        `SELECT session_id, user_id, last_seen, last_sign_in, user_agent, ip_address
+        `SELECT session_id, user_id, last_seen, last_sign_in, user_agent, ip_address, sso_expires_at
          FROM sessions WHERE session_id = ?`,
         [sessionId]
     );
@@ -70,6 +91,7 @@ async function getSession(sessionId) {
     const row = rows[0];
     const lastSeenMs = new Date(row.last_seen).getTime();
     const lastSignInMs = new Date(row.last_sign_in).getTime();
+    const ssoExpMs = row.sso_expires_at ? new Date(row.sso_expires_at).getTime() : null;
 
     // If DB row is itself past idle threshold, treat as expired — don't
     // repopulate Redis, let isSessionValid drive the cleanup.
@@ -83,6 +105,7 @@ async function getSession(sessionId) {
             last_seen: lastSeenMs,
             ip_address: row.ip_address,
             user_agent: row.user_agent,
+            sso_expires_at: ssoExpMs,
             _stale: true,
         };
     }
@@ -95,6 +118,7 @@ async function getSession(sessionId) {
         lastSeen: lastSeenMs,
         ipAddress: row.ip_address,
         userAgent: row.user_agent,
+        ssoExpiresAt: ssoExpMs,
     }, remainingTtl);
 
     return {
@@ -104,6 +128,7 @@ async function getSession(sessionId) {
         last_seen: lastSeenMs,
         ip_address: row.ip_address,
         user_agent: row.user_agent,
+        sso_expires_at: ssoExpMs,
     };
 }
 
@@ -164,12 +189,12 @@ async function deleteUserSessions(userId, exceptSessionId) {
         const pool = getPool();
         await pool.execute(
             'DELETE FROM sessions WHERE user_id = ? AND session_id != ?',
-            [userId, exceptSessionId]
+            [idBuf(userId), exceptSessionId]
         );
     } else {
         await sessionCache.deleteAllForUser(userId);
         const pool = getPool();
-        await pool.execute('DELETE FROM sessions WHERE user_id = ?', [userId]);
+        await pool.execute('DELETE FROM sessions WHERE user_id = ?', [idBuf(userId)]);
     }
 }
 
@@ -180,7 +205,7 @@ async function getUserSessions(userId) {
     const [rows] = await pool.execute(
         `SELECT session_id, last_seen, last_sign_in, user_agent, ip_address, created_at
          FROM sessions WHERE user_id = ? ORDER BY last_seen DESC`,
-        [userId]
+        [idBuf(userId)]
     );
 
     if (rows.length === 0) return [];
@@ -211,6 +236,8 @@ async function isSessionValid(session) {
     const maxMs = maxDays * 24 * 60 * 60 * 1000;
     if (Date.now() - session.last_seen > inactivityMs) return false;
     if (Date.now() - session.last_sign_in > maxMs) return false;
+    // Never outlive the SSO session behind this login (id_token sess_exp).
+    if (session.sso_expires_at && Date.now() > Number(session.sso_expires_at)) return false;
     return true;
 }
 
@@ -236,15 +263,62 @@ async function getSessionMaxDays() {
     return (await getSessionLimits()).maxDays;
 }
 
+// --- step-up (sudo) window ---
+// The SSO step-up ceremony returns a fresh factor; the callback stamps it on the
+// session's DB row (stepup_at + stepup_method). The gate and the status endpoint
+// read it straight from the DB — it's deliberately NOT mirrored into the Redis
+// session cache (the few gated actions tolerate one extra read, and this avoids a
+// cache-coherence surface on a security-sensitive value).
+async function stampSessionStepup(sessionId, method) {
+    const pool = getPool();
+    // Bind the timestamp as a JS Date (like createSession's last_seen) rather than
+    // SQL NOW(), so freshness is measured against the same clock the gate uses
+    // (Date.now()) — no dependency on the DB session time_zone matching Node's.
+    await pool.execute(
+        'UPDATE sessions SET stepup_at = ?, stepup_method = ? WHERE session_id = ?',
+        [new Date(), method, sessionId]
+    );
+}
+
+// Burn a session's step-up window (reuse:'one-time' scenarios clear it after a
+// successful mutation so the next one re-verifies).
+async function clearSessionStepup(sessionId) {
+    const pool = getPool();
+    await pool.execute(
+        'UPDATE sessions SET stepup_at = NULL, stepup_method = NULL WHERE session_id = ?',
+        [sessionId]
+    );
+}
+
+// Returns { stepupAt: epochMs|null, method: string|null } for a session, or null
+// if the row is gone.
+async function getSessionStepup(sessionId) {
+    const pool = getPool();
+    const [rows] = await pool.execute(
+        'SELECT stepup_at, stepup_method FROM sessions WHERE session_id = ?',
+        [sessionId]
+    );
+    if (rows.length === 0) return null;
+    const r = rows[0];
+    return {
+        stepupAt: r.stepup_at ? new Date(r.stepup_at).getTime() : null,
+        method: r.stepup_method || null,
+    };
+}
+
 module.exports = {
     createSession,
     getSession,
     getSessionById,
     updateSessionActivity,
     deleteSession,
+    deleteSessionsBySsoSid,
     deleteUserSessions,
     getUserSessions,
     isSessionValid,
     cleanExpiredSessions,
     getSessionMaxDays,
+    stampSessionStepup,
+    getSessionStepup,
+    clearSessionStepup,
 };

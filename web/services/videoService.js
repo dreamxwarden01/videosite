@@ -1,6 +1,7 @@
 const crypto = require('crypto');
-const { getPool } = require('../config/database');
+const { getPool, idBuf } = require('../config/database');
 const videoCache = require('./cache/videoCache');
+const courseListCache = require('./cache/courseListCache');
 
 const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
@@ -48,30 +49,32 @@ async function createVideo(courseId, title, options = {}) {
     const videoType = options.video_type === 'cmaf' ? 'cmaf' : 'ts';
 
     const [result] = await pool.execute(
-        `INSERT INTO videos (course_id, title, description, week, lecture_date,
+        `INSERT INTO videos (course_id, title, description, module_number, lecture_date,
          original_filename, file_size_bytes, uploaded_by, hashed_video_id, r2_source_key, video_type)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
             courseId, title,
             options.description || null,
-            options.week || null,
+            options.module_number || null,
             options.lecture_date || null,
             options.original_filename || null,
             options.file_size_bytes || null,
-            options.uploaded_by || null,
+            idBuf(options.uploaded_by || null),
             hashedVideoId,
             options.r2_source_key || null,
             videoType
         ]
     );
 
+    // Course list base caches video_count per course — a new video changes it.
+    await courseListCache.invalidate();
     return { videoId: result.insertId, hashedVideoId };
 }
 
 async function getVideoById(videoId) {
     const pool = getPool();
     const [rows] = await pool.execute(
-        `SELECT v.*, c.course_name
+        `SELECT v.*, c.course_code, c.course_name
          FROM videos v JOIN courses c ON v.course_id = c.course_id
          WHERE v.video_id = ?`,
         [videoId]
@@ -86,7 +89,7 @@ async function updateVideo(videoId, updates) {
 
     if (updates.title !== undefined) { fields.push('title = ?'); values.push(updates.title); }
     if (updates.description !== undefined) { fields.push('description = ?'); values.push(updates.description); }
-    if (updates.week !== undefined) { fields.push('week = ?'); values.push(updates.week); }
+    if (updates.module_number !== undefined) { fields.push('module_number = ?'); values.push(updates.module_number); }
     if (updates.lecture_date !== undefined) { fields.push('lecture_date = ?'); values.push(updates.lecture_date); }
     if (updates.status !== undefined) { fields.push('status = ?'); values.push(updates.status); }
     if (updates.processing_job_id !== undefined) { fields.push('processing_job_id = ?'); values.push(updates.processing_job_id); }
@@ -173,6 +176,7 @@ async function deleteVideo(videoId) {
     //    → worker gets 404 on next API call)
     await pool.execute('DELETE FROM videos WHERE video_id = ?', [videoId]);
     await videoCache.invalidate(videoId);
+    await courseListCache.invalidate();
     await require('./cache/watchProgressCache').clearForVideo(videoId);
     // Drop heartbeat cache so the worker's next status ping detects the abort.
     if (taskRows.length > 0 && taskRows[0].job_id) {

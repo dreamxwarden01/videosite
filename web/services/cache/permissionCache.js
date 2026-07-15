@@ -17,7 +17,7 @@
 // request. A user's role change or override change clears only that user.
 
 const { getClient } = require('../redis');
-const { getPool } = require('../../config/database');
+const { getPool, idBuf } = require('../../config/database');
 const { ALL_PERMISSIONS } = require('../permissionConstants');
 
 const ROLE_TTL = 24 * 60 * 60;   // 24h
@@ -71,13 +71,13 @@ async function loadUserFromDb(userId) {
     const pool = getPool();
     const [userRows] = await pool.execute(
         'SELECT role_id FROM users WHERE user_id = ?',
-        [userId]
+        [idBuf(userId)]
     );
     if (userRows.length === 0) return null;
 
     const [overrideRows] = await pool.execute(
         'SELECT permission_key, override_value FROM user_permission_overrides WHERE user_id = ?',
-        [userId]
+        [idBuf(userId)]
     );
 
     const obj = {

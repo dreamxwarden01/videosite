@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { requireAuth } = require('../../middleware/auth');
-const { getPool } = require('../../config/database');
+const { getPool, idBuf } = require('../../config/database');
 const { getVideoById, updateVideo, deleteVideo } = require('../../services/videoService');
 const deletionService = require('../../services/deletionService');
 const { generateToken, getTokenValiditySeconds } = require('../../services/tokenService');
@@ -130,14 +130,14 @@ router.post('/videos/:id', requireAuth, checkPermission('changeVideo'), async (r
             const pool = getPool();
             const [enrollment] = await pool.execute(
                 'SELECT 1 FROM enrollments WHERE user_id = ? AND course_id = ?',
-                [user.user_id, video.course_id]
+                [idBuf(user.user_id),video.course_id]
             );
             if (enrollment.length === 0) {
                 return res.status(403).json({ error: 'Not enrolled in this course' });
             }
         }
 
-        const { title, description, week, lecture_date } = req.body;
+        const { title, description, module_number, lecture_date } = req.body;
 
         if (typeof description === 'string' && description.length > 15000) {
             return res.status(422).json({
@@ -150,7 +150,7 @@ router.post('/videos/:id', requireAuth, checkPermission('changeVideo'), async (r
         const updates = {};
         if (title !== undefined) updates.title = title;
         if (description !== undefined) updates.description = description;
-        if (week !== undefined) updates.week = week;
+        if (module_number !== undefined) updates.module_number = module_number;
         if (lecture_date !== undefined) updates.lecture_date = lecture_date;
 
         await updateVideo(videoId, updates);
@@ -176,7 +176,7 @@ router.post('/videos/:id/delete', requireAuth, checkPermission('deleteVideo'), a
             const pool = getPool();
             const [enrollment] = await pool.execute(
                 'SELECT 1 FROM enrollments WHERE user_id = ? AND course_id = ?',
-                [user.user_id, courseId]
+                [idBuf(user.user_id),courseId]
             );
             if (enrollment.length === 0) {
                 return res.status(403).json({ error: 'Not enrolled in this course' });
@@ -198,7 +198,7 @@ router.post('/videos/:id/clean-source', requireAuth, checkPermission('changeVide
         const pool = getPool();
 
         const [rows] = await pool.execute(
-            `SELECT r2_source_key, status FROM videos WHERE video_id = ?`,
+            `SELECT r2_source_key, status, course_id FROM videos WHERE video_id = ?`,
             [videoId]
         );
 
@@ -207,6 +207,21 @@ router.post('/videos/:id/clean-source', requireAuth, checkPermission('changeVide
         }
 
         const video = rows[0];
+
+        // Course access: a course-scoped admin (changeVideo without allCourseAccess)
+        // may only clean sources in a course they are enrolled in — same gate the
+        // update/delete/retry handlers apply against the target's course_id.
+        const user = res.locals.user;
+        if (!user.permissions.allCourseAccess) {
+            const [enrollment] = await pool.execute(
+                'SELECT 1 FROM enrollments WHERE user_id = ? AND course_id = ?',
+                [idBuf(user.user_id), video.course_id]
+            );
+            if (enrollment.length === 0) {
+                return res.status(403).json({ error: 'Not enrolled in this course' });
+            }
+        }
+
         if (video.status !== 'finished') {
             return res.status(400).json({ error: 'Video is not in finished state' });
         }
@@ -245,7 +260,7 @@ router.post('/videos/:id/retry', requireAuth, checkPermission('uploadVideo'), as
             const pool = getPool();
             const [enrollment] = await pool.execute(
                 'SELECT 1 FROM enrollments WHERE user_id = ? AND course_id = ?',
-                [user.user_id, video.course_id]
+                [idBuf(user.user_id),video.course_id]
             );
             if (enrollment.length === 0) {
                 return res.status(403).json({ error: 'Not enrolled in this course' });
@@ -291,7 +306,7 @@ router.get('/keys/:videoId', requireAuth, async (req, res) => {
         if (!user.permissions.allCourseAccess) {
             const [enrollment] = await pool.execute(
                 'SELECT 1 FROM enrollments WHERE user_id = ? AND course_id = ?',
-                [user.user_id, video.course_id]
+                [idBuf(user.user_id),video.course_id]
             );
             if (enrollment.length === 0) {
                 return res.status(403).json({ error: 'Not enrolled in this course' });

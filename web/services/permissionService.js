@@ -1,4 +1,4 @@
-const { getPool } = require('../config/database');
+const { getPool, idBuf } = require('../config/database');
 const { ALL_PERMISSIONS } = require('./permissionConstants');
 const cache = require('./cache/permissionCache');
 
@@ -65,14 +65,14 @@ async function setUserOverride(userId, permissionKey, value) {
     if (value === 0) {
         await pool.execute(
             'DELETE FROM user_permission_overrides WHERE user_id = ? AND permission_key = ?',
-            [userId, permissionKey]
+            [idBuf(userId), permissionKey]
         );
     } else {
         await pool.execute(
             `INSERT INTO user_permission_overrides (user_id, permission_key, override_value)
              VALUES (?, ?, ?)
              ON DUPLICATE KEY UPDATE override_value = VALUES(override_value)`,
-            [userId, permissionKey, value]
+            [idBuf(userId), permissionKey, value]
         );
     }
 

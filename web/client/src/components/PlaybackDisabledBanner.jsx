@@ -1,7 +1,17 @@
 import { useEffect, useRef } from 'react';
 
-export default function PlaybackDisabledBanner() {
+// Three states, shown whenever the account lacks playback and/or material access:
+//   both  -> "Playback and material access disabled …"
+//   mat   -> "Material access disabled …"
+//   play  -> "Playback disabled …"
+export default function PlaybackDisabledBanner({ playback = true, materials = false }) {
   const spanRef = useRef(null);
+  const message =
+    playback && materials
+      ? 'Playback and material access disabled on this account. Contact system administration if you require access.'
+      : materials
+        ? 'Material access disabled on this account. Contact system administration if you require access.'
+        : 'Playback disabled on this account. Contact system administration if you require access.';
 
   // CSS can't shrink a wrapping inline-block to the width of its longest
   // rendered line — it always fills the container once the copy exceeds
@@ -25,7 +35,7 @@ export default function PlaybackDisabledBanner() {
     const ro = new ResizeObserver(fit);
     if (span.parentElement) ro.observe(span.parentElement);
     return () => ro.disconnect();
-  }, []);
+  }, [message]); // re-measure when the copy changes (playback ↔ material ↔ both)
 
   return (
     <div className="playback-disabled-banner" role="alert">
@@ -42,7 +52,7 @@ export default function PlaybackDisabledBanner() {
         <rect x="11" y="17" width="2" height="2" rx="1" fill="#fff" />
       </svg>
       <div className="playback-disabled-banner-message">
-        <span ref={spanRef}>Playback disabled on this account. Contact system administration if you require access.</span>
+        <span ref={spanRef}>{message}</span>
       </div>
     </div>
   );

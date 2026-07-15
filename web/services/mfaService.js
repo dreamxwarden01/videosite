@@ -8,8 +8,6 @@ const {
     verifyAuthenticationResponse
 } = require('@simplewebauthn/server');
 const { getPool } = require('../config/database');
-const { sendEmail } = require('./emailService');
-const mfaEmailTemplates = require('./mfaEmailTemplates');
 
 // otplib v13+ uses top-level functions: generateSecret, generateSync, verifySync, generateURI
 
@@ -34,7 +32,7 @@ async function getMfaSettings() {
 async function getScenarioPolicy(scenario) {
     const raw = await getSetting('mfa_policy_' + scenario, null);
     if (!raw) {
-        return { enabled: false, level: 0, scope: 'W', reuse: 'persistent' };
+        return { enabled: false, level: 1, scope: 'W', reuse: 'persistent' };
     }
     try {
         const parsed = JSON.parse(raw);
@@ -48,14 +46,15 @@ async function getScenarioPolicy(scenario) {
             reuse
         };
     } catch {
-        return { enabled: false, level: 0, scope: 'W', reuse: 'persistent' };
+        return { enabled: false, level: 1, scope: 'W', reuse: 'persistent' };
     }
 }
 
+// Email OTP is gone with the SSO migration: levels are 1 (authenticator +
+// passkey) and 2 (passkey only). A residual level-0 policy behaves as 1.
 function getAllowedMethodsForLevel(level) {
     if (level >= 2) return ['passkey'];
-    if (level >= 1) return ['authenticator', 'passkey'];
-    return ['email', 'authenticator', 'passkey'];
+    return ['authenticator', 'passkey'];
 }
 
 async function getLevelTimeoutSeconds(level) {
@@ -216,256 +215,6 @@ async function findValidLongStatus(userId, bmfaToken, requiredLevel) {
 // ---------------------------------------------------------------------------
 // OTP (email)
 // ---------------------------------------------------------------------------
-
-function generateOtp() {
-    const num = crypto.randomInt(1000000);
-    return String(num).padStart(6, '0');
-}
-
-function encryptOtp(code) {
-    const key = getEncryptionKey();
-    const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-    let encrypted = cipher.update(code, 'utf8', 'hex');
-    encrypted += cipher.final('hex');
-    const authTag = cipher.getAuthTag().toString('hex');
-    return iv.toString('hex') + ':' + authTag + ':' + encrypted;
-}
-
-function decryptOtp(encrypted) {
-    if (!encrypted) return null;
-    const parts = encrypted.split(':');
-    if (parts.length !== 3) return null;
-    try {
-        const key = getEncryptionKey();
-        const iv = Buffer.from(parts[0], 'hex');
-        const authTag = Buffer.from(parts[1], 'hex');
-        const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-        decipher.setAuthTag(authTag);
-        let decrypted = decipher.update(parts[2], 'hex', 'utf8');
-        decrypted += decipher.final('utf8');
-        return decrypted;
-    } catch {
-        return null;
-    }
-}
-
-// Issue an OTP for a challenge: reuse the existing code if it was generated
-// recently and still has attempts left, otherwise mint a fresh one.
-// Refreshes otp_sent_at on every call (used for verification expiry);
-// otp_generated_at only moves forward when a new code is minted.
-async function issueOtpForChallenge(challenge, challengeId) {
-    const pool = getPool();
-    const otpTimeoutSeconds = parseInt(await getSetting('mfa_otp_timeout_seconds', '300'), 10) || 300;
-
-    if (challenge.otp_value && challenge.otp_generated_at && challenge.otp_attempts < 5) {
-        const [[timeCheck]] = await pool.execute(
-            `SELECT otp_generated_at >= DATE_SUB(NOW(), INTERVAL ? SECOND) AS within_window
-             FROM mfa_challenges WHERE id = ?`,
-            [otpTimeoutSeconds, challengeId]
-        );
-        if (timeCheck && timeCheck.within_window) {
-            const existing = decryptOtp(challenge.otp_value);
-            if (existing !== null) {
-                await pool.execute(
-                    'UPDATE mfa_challenges SET otp_sent_at = NOW() WHERE id = ?',
-                    [challengeId]
-                );
-                return existing;
-            }
-        }
-    }
-
-    const otp = generateOtp();
-    const otpValue = encryptOtp(otp);
-    await pool.execute(
-        `UPDATE mfa_challenges
-         SET otp_value = ?, otp_generated_at = NOW(), otp_sent_at = NOW(), otp_attempts = 0
-         WHERE id = ?`,
-        [otpValue, challengeId]
-    );
-    return otp;
-}
-
-async function checkOtpRateLimit(userId) {
-    const pool = getPool();
-
-    const [[row]] = await pool.execute(
-        `SELECT total_sent,
-                first_sent < DATE_SUB(NOW(), INTERVAL 24 HOUR) AS is_expired,
-                GREATEST(0, TIMESTAMPDIFF(SECOND, last_sent, NOW())) AS seconds_since_last
-         FROM mfa_otp_rate_limits WHERE user_id = ?`,
-        [userId]
-    );
-
-    // No record — allow
-    if (!row) {
-        return { allowed: true };
-    }
-
-    // Window expired — allow (will reset on send)
-    if (row.is_expired) {
-        return { allowed: true };
-    }
-
-    // Daily limit — 20 sends per user per 24h. Well under the Cloudflare
-    // Email Sending 1000/day cap even if every active user maxes out.
-    if (row.total_sent >= 20) {
-        return { allowed: false, message: 'Daily limit reached' };
-    }
-
-    // Cooldown check (60 seconds between sends)
-    const secondsSinceLast = row.seconds_since_last;
-    if (secondsSinceLast < 60) {
-        const retryAfter = 60 - secondsSinceLast;
-        return {
-            allowed: false,
-            retryAfter,
-            message: `Please wait ${retryAfter} seconds before requesting another code.`
-        };
-    }
-
-    return { allowed: true };
-}
-
-async function sendOtpEmail(challengeId, userId) {
-    // Check rate limit first
-    const rateCheck = await checkOtpRateLimit(userId);
-    if (!rateCheck.allowed) {
-        return { success: false, ...rateCheck };
-    }
-
-    const pool = getPool();
-    const challenge = await getChallenge(challengeId);
-    if (!challenge) {
-        return { success: false, message: 'Challenge not found or expired' };
-    }
-
-    const otp = await issueOtpForChallenge(challenge, challengeId);
-    if (!otp) {
-        return { success: false, message: 'Failed to issue OTP' };
-    }
-
-    // Get user email
-    const [[user]] = await pool.execute(
-        'SELECT email FROM users WHERE user_id = ?',
-        [userId]
-    );
-    if (!user || !user.email) {
-        return { success: false, message: 'User email not found' };
-    }
-
-    // Build email from template based on challenge.message_type
-    const siteName = await getSetting('site_name', 'VideoSite');
-    const otpTimeoutMin = Math.ceil(parseInt(await getSetting('mfa_otp_timeout_seconds', '300')) / 60);
-    const templateBuilders = {
-        login: () => mfaEmailTemplates.buildLoginOtpEmail(otp, siteName, otpTimeoutMin),
-        password_reset: () => mfaEmailTemplates.buildPasswordResetOtpEmail(otp, siteName, otpTimeoutMin),
-        mfa_change: () => mfaEmailTemplates.buildMfaChangeOtpEmail(otp, siteName, otpTimeoutMin, challenge.message_operation || 'Security change'),
-        admin_operation: () => mfaEmailTemplates.buildAdminOperationOtpEmail(otp, siteName, otpTimeoutMin, challenge.message_operation || 'Admin action'),
-        email_verification: () => mfaEmailTemplates.buildEmailVerificationOtpEmail(otp, siteName, otpTimeoutMin)
-    };
-    const builder = templateBuilders[challenge.message_type] || templateBuilders.login;
-    const template = builder();
-
-    const emailResult = await sendEmail({
-        to: user.email,
-        subject: template.subject,
-        html: template.html,
-        text: template.text
-    });
-
-    if (!emailResult.success) {
-        // Pass through the structured error class so the route can map
-        // not_configured / rejected / unavailable to the right HTTP status.
-        return { success: false, error: emailResult.error, message: emailResult.message || 'Failed to send email' };
-    }
-
-    // Update rate limit record
-    await updateOtpRateLimit(userId);
-
-    return { success: true };
-}
-
-async function updateOtpRateLimit(userId) {
-    const pool = getPool();
-
-    const [[existing]] = await pool.execute(
-        `SELECT total_sent,
-                first_sent < DATE_SUB(NOW(), INTERVAL 24 HOUR) AS is_expired
-         FROM mfa_otp_rate_limits WHERE user_id = ?`,
-        [userId]
-    );
-
-    if (!existing) {
-        await pool.execute(
-            'INSERT INTO mfa_otp_rate_limits (user_id, first_sent, last_sent, total_sent) VALUES (?, NOW(), NOW(), 1)',
-            [userId]
-        );
-    } else if (existing.is_expired) {
-        await pool.execute(
-            'UPDATE mfa_otp_rate_limits SET first_sent = NOW(), last_sent = NOW(), total_sent = 1 WHERE user_id = ?',
-            [userId]
-        );
-    } else {
-        await pool.execute(
-            'UPDATE mfa_otp_rate_limits SET last_sent = NOW(), total_sent = total_sent + 1 WHERE user_id = ?',
-            [userId]
-        );
-    }
-}
-
-async function verifyOtp(challengeId, code) {
-    const pool = getPool();
-    const challenge = await getChallenge(challengeId);
-
-    if (!challenge) {
-        return { valid: false, reason: 'Challenge not found or expired' };
-    }
-
-    // Check if max attempts reached before even trying
-    if (challenge.otp_attempts >= 5) {
-        return { valid: false, mustResend: true };
-    }
-
-    // Increment attempts
-    await pool.execute(
-        'UPDATE mfa_challenges SET otp_attempts = otp_attempts + 1 WHERE id = ?',
-        [challengeId]
-    );
-    const newAttempts = challenge.otp_attempts + 1;
-
-    // Check OTP timeout
-    const otpTimeoutSeconds = parseInt(await getSetting('mfa_otp_timeout_seconds', '300'), 10) || 300;
-    const [[timeCheck]] = await pool.execute(
-        `SELECT otp_sent_at >= DATE_SUB(NOW(), INTERVAL ? SECOND) AS within_timeout
-         FROM mfa_challenges WHERE id = ?`,
-        [otpTimeoutSeconds, challengeId]
-    );
-
-    if (!timeCheck || !timeCheck.within_timeout) {
-        return { valid: false, reason: 'Code expired', mustResend: true };
-    }
-
-    if (!challenge.otp_value) {
-        return { valid: false, reason: 'No OTP issued' };
-    }
-
-    const stored = decryptOtp(challenge.otp_value);
-    const isValid = stored !== null && stored === code;
-
-    if (isValid) {
-        await markChallengeVerified(challengeId, 'email');
-        return { valid: true };
-    }
-
-    // Failed verification
-    if (newAttempts >= 5) {
-        return { valid: false, mustResend: true };
-    }
-
-    return { valid: false, attemptsRemaining: 5 - newAttempts };
-}
 
 // ---------------------------------------------------------------------------
 // TOTP (authenticator) — AES-256-GCM encryption
@@ -912,10 +661,10 @@ async function verifyPasskeyLoginAssertion(challengeHandle, credential) {
         return { valid: false, code: 'revoked' };
     }
 
-    // Owner status: a passkey for a deactivated account must not log in.
-    // userCache hits Redis first; cold-start falls back to DB.
+    // Owner must still exist locally (enable/disable is SSO-owned now — a
+    // suspended user's sessions die via the back-channel before this matters).
     const userMeta = await userCache.getUserMeta(passkey.user_id);
-    if (!userMeta || !userMeta.is_active) {
+    if (!userMeta) {
         return { valid: false, code: 'inactive_user' };
     }
 
@@ -1112,54 +861,6 @@ async function getHighestMethodLevel(userId) {
 // Send OTP to arbitrary email (for email verification flow)
 // ---------------------------------------------------------------------------
 
-async function sendOtpToEmail(challengeId, userId, targetEmail) {
-    // Check rate limit first (still keyed on userId)
-    const rateCheck = await checkOtpRateLimit(userId);
-    if (!rateCheck.allowed) {
-        return { success: false, ...rateCheck };
-    }
-
-    const pool = getPool();
-    const challenge = await getChallenge(challengeId);
-    if (!challenge) {
-        return { success: false, message: 'Challenge not found or expired' };
-    }
-
-    const otp = await issueOtpForChallenge(challenge, challengeId);
-    if (!otp) {
-        return { success: false, message: 'Failed to issue OTP' };
-    }
-
-    // Build email from template based on challenge.message_type
-    const siteName = await getSetting('site_name', 'VideoSite');
-    const otpTimeoutMin = Math.ceil(parseInt(await getSetting('mfa_otp_timeout_seconds', '300')) / 60);
-    const templateBuilders = {
-        login: () => mfaEmailTemplates.buildLoginOtpEmail(otp, siteName, otpTimeoutMin),
-        password_reset: () => mfaEmailTemplates.buildPasswordResetOtpEmail(otp, siteName, otpTimeoutMin),
-        mfa_change: () => mfaEmailTemplates.buildMfaChangeOtpEmail(otp, siteName, otpTimeoutMin, challenge.message_operation || 'Security change'),
-        admin_operation: () => mfaEmailTemplates.buildAdminOperationOtpEmail(otp, siteName, otpTimeoutMin, challenge.message_operation || 'Admin action'),
-        email_verification: () => mfaEmailTemplates.buildEmailVerificationOtpEmail(otp, siteName, otpTimeoutMin)
-    };
-    const builder = templateBuilders[challenge.message_type] || templateBuilders.login;
-    const template = builder();
-
-    const emailResult = await sendEmail({
-        to: targetEmail,
-        subject: template.subject,
-        html: template.html,
-        text: template.text
-    });
-
-    if (!emailResult.success) {
-        return { success: false, error: emailResult.error, message: emailResult.message || 'Failed to send email' };
-    }
-
-    // Update rate limit record
-    await updateOtpRateLimit(userId);
-
-    return { success: true };
-}
-
 // ---------------------------------------------------------------------------
 // Cleanup
 // ---------------------------------------------------------------------------
@@ -1168,7 +869,6 @@ async function cleanupExpiredChallenges() {
     try {
         const pool = getPool();
         const pendingTimeout = parseInt(await getSetting('mfa_pending_challenge_timeout_seconds', '900'), 10);
-        const level0Timeout = parseInt(await getSetting('mfa_level_0_timeout_seconds', '604800'), 10);
         const level1Timeout = parseInt(await getSetting('mfa_level_1_timeout_seconds', '3600'), 10);
         const level2Timeout = parseInt(await getSetting('mfa_level_2_timeout_seconds', '600'), 10);
 
@@ -1178,31 +878,20 @@ async function cleanupExpiredChallenges() {
             [pendingTimeout]
         );
 
-        // Verified/consumed challenges: verified_at + level timeout
+        // Verified/consumed challenges: verified_at + level timeout. Level 0
+        // (email) is gone; any residual level-0 rows drain at the level-1 window.
         await pool.execute(
             `DELETE FROM mfa_challenges
              WHERE status IN ('verified', 'consumed')
                AND verified_at IS NOT NULL
                AND CASE mfa_level
-                   WHEN 0 THEN verified_at < DATE_SUB(NOW(), INTERVAL ? SECOND)
-                   WHEN 1 THEN verified_at < DATE_SUB(NOW(), INTERVAL ? SECOND)
+                   WHEN 2 THEN verified_at < DATE_SUB(NOW(), INTERVAL ? SECOND)
                    ELSE verified_at < DATE_SUB(NOW(), INTERVAL ? SECOND)
                END`,
-            [level0Timeout, level1Timeout, level2Timeout]
+            [level2Timeout, level1Timeout]
         );
     } catch (err) {
         console.error('MFA challenge cleanup error:', err.message);
-    }
-}
-
-async function cleanupExpiredOtpRateLimits() {
-    try {
-        const pool = getPool();
-        await pool.execute(
-            'DELETE FROM mfa_otp_rate_limits WHERE first_sent < DATE_SUB(NOW(), INTERVAL 24 HOUR)'
-        );
-    } catch (err) {
-        console.error('MFA OTP rate limit cleanup error:', err.message);
     }
 }
 
@@ -1330,13 +1019,6 @@ module.exports = {
     consumeChallenge,
     findValidLongStatus,
 
-    // OTP (email)
-    generateOtp,
-    checkOtpRateLimit,
-    sendOtpEmail,
-    sendOtpToEmail,
-    verifyOtp,
-
     // TOTP (authenticator)
     getEncryptionKey,
     encryptTotpSecret,
@@ -1377,7 +1059,6 @@ module.exports = {
 
     // Cleanup
     cleanupExpiredChallenges,
-    cleanupExpiredOtpRateLimits,
     cleanupExpiredBmfa,
     cleanupExpiredTotpRateLimits
 };

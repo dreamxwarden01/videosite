@@ -1,92 +1,39 @@
-import { useState, useEffect } from 'react';
-import { Link } from 'react-router-dom';
+import { useEffect } from 'react';
+import { useOutletContext } from 'react-router-dom';
 import { useSite } from '../context/SiteContext';
 import { useAuth } from '../context/AuthContext';
-import { useToast } from '../context/ToastContext';
-import { apiGet } from '../api';
-import LoadingSpinner from '../components/LoadingSpinner';
 
+// Landing shown at "/" — no course selected yet. The courses live in the
+// sidebar, so this is a calm welcome that points the user there.
 export default function HomePage() {
   const { siteName } = useSite();
-  const { user, refresh } = useAuth();
-  const { showToast } = useToast();
-  const [courses, setCourses] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const { user } = useAuth();
+  const { courses } = useOutletContext() ?? {};
 
   useEffect(() => {
-    if (!siteName) return;
-    document.title = siteName;
+    if (siteName) document.title = siteName;
   }, [siteName]);
 
-  // Clear any saved course pagination state — user navigated away from a course
-  useEffect(() => {
-    Object.keys(sessionStorage).forEach(key => {
-      if (key.startsWith('course:') && key.endsWith(':list')) sessionStorage.removeItem(key);
-    });
-  }, []);
-
-  // If the user currently has no playback permission, re-fetch /api/me on
-  // every visit to the course list. Admins can grant the permission at any
-  // time; this gives the banner + greyout a chance to clear without the
-  // user having to sign out and back in. We intentionally don't poll when
-  // permission is already true — no upside, just extra requests.
-  // Truthy check (not `=== false`): /api/me only ships granted permissions,
-  // so a denied permission is `undefined`.
-  useEffect(() => {
-    if (user && !user.permissions?.allowPlayback) {
-      refresh();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const { data, ok } = await apiGet('/api/courses');
-        if (ok && data) setCourses(data.courses || []);
-      } catch {
-        showToast('Failed to load courses.');
-      }
-      setLoading(false);
-    })();
-  }, []);
+  const first = (user?.display_name || user?.username || '').trim().split(/\s+/)[0];
+  const noCourses = Array.isArray(courses) && courses.length === 0;
 
   return (
-    <div className="card card-page">
-      <div className="card-header">
-        <h2>My Courses</h2>
-        {!loading && (
-          <span className="text-muted text-sm">
-            {courses.length} course{courses.length !== 1 ? 's' : ''}
-          </span>
-        )}
-      </div>
-      <div className={`card-body${loading ? ' data-loading' : ''}`}>
-        {loading ? (
-          <div style={{ minHeight: '120px' }}><LoadingSpinner /></div>
-        ) : courses.length === 0 ? (
-          <p className="text-muted">
-            No courses available.
-            {user && !user.permissions?.allCourseAccess && ' You are not enrolled in any courses yet.'}
-          </p>
-        ) : (
-          <div className="course-grid">
-            {courses.map(course => (
-              <Link to={`/course/${course.course_id}`} key={course.course_id} className="course-card">
-                <h3>{course.course_name}</h3>
-                <p className="course-meta">
-                  {course.video_count} video{course.video_count !== 1 ? 's' : ''}
-                </p>
-                {course.description && (
-                  <p className="text-muted mt-1" style={{ fontSize: '13px', marginTop: '8px' }}>
-                    {course.description.length > 120 ? course.description.substring(0, 120) + '...' : course.description}
-                  </p>
-                )}
-              </Link>
-            ))}
-          </div>
-        )}
-      </div>
+    <div className="vs-welcome">
+      <svg className="vs-welcome-ico" width="52" height="52" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <path d="M5 4m0 1a1 1 0 0 1 1 -1h2a1 1 0 0 1 1 1v14a1 1 0 0 1 -1 1h-2a1 1 0 0 1 -1 -1z" />
+        <path d="M9 4m0 1a1 1 0 0 1 1 -1h2a1 1 0 0 1 1 1v14a1 1 0 0 1 -1 1h-2a1 1 0 0 1 -1 -1z" />
+        <path d="M5 8h4" />
+        <path d="M9 16h4" />
+        <path d="M13.803 4.56l2.184 -.53c.562 -.135 1.133 .19 1.282 .732l3.695 13.418a1.02 1.02 0 0 1 -.634 1.219l-.133 .041l-2.184 .53c-.562 .135 -1.133 -.19 -1.282 -.732l-3.695 -13.418a1.02 1.02 0 0 1 .634 -1.219l.133 -.041z" />
+        <path d="M14 9l4 -1" />
+        <path d="M16 16l3.923 -.98" />
+      </svg>
+      <h1>{first ? `Welcome back, ${first}` : `Welcome to ${siteName || 'your media center'}`}</h1>
+      <p>
+        {noCourses
+          ? 'You aren’t enrolled in any courses yet. Once you are, they’ll appear in the sidebar and you can start watching here.'
+          : 'Choose a course from the sidebar to pick up your lectures and materials.'}
+      </p>
     </div>
   );
 }

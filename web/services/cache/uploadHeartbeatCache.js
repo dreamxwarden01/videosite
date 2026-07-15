@@ -58,7 +58,7 @@ async function recordHeartbeat(uploadId, userId) {
     const k = key(uploadId);
     const cached = await redis.hgetall(k);
     if (!cached || !cached.user_id) return false;
-    if (parseInt(cached.user_id, 10) !== userId) return false;
+    if (String(cached.user_id) !== String(userId)) return false;   // UUID hex now, not INT
     await redis.multi()
         .hset(k, 'last_heartbeat', String(Date.now()))
         .expire(k, CACHE_TTL_SECONDS)

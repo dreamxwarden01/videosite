@@ -1,5 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 
+const CloseIcon = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+);
+
 // `type: 'decimal'` accepts fractional values via parseFloat (used for
 // gop_seconds, e.g., 1.5 or 2.0). All other numerics stay integer-only.
 const FIELDS = [
@@ -120,52 +124,50 @@ export default function ProfileEditModal({ isOpen, profile, onClose, onSave }) {
   };
 
   return (
-    <div className="modal-overlay active" onClick={() => {}}>
-      <div className="upload-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '480px' }}>
-        <div className="modal-header">
-          <h3>{profile ? 'Edit Profile' : 'Add Profile'}</h3>
-          <button className="modal-close" onClick={onClose}>&times;</button>
+    <div className="vs-scrim vs-scrim-nested">
+      <form className="vs-modal" onSubmit={handleSubmit}>
+        <div className="vs-modal-head">
+          <h3 className="vs-modal-title">{profile ? 'Edit Profile' : 'Add Profile'}</h3>
+          <button type="button" className="vs-modal-x" onClick={onClose}><CloseIcon /></button>
         </div>
-        <div className="modal-body">
-          <form onSubmit={handleSubmit}>
-            {FIELDS.map(f => (
-              <div className="form-group" key={f.key} style={{ marginBottom: '12px' }}>
-                <label htmlFor={`pf-${f.key}`} style={{ fontSize: '13px', marginBottom: '4px', display: 'block' }}>{f.label}</label>
-                {f.type === 'select' ? (
-                  <select
-                    id={`pf-${f.key}`} className="form-control"
-                    value={form[f.key]} onChange={e => handleChange(f.key, e.target.value)}
-                  >
-                    {f.options.map(o => <option key={o} value={o}>{o}</option>)}
-                  </select>
-                ) : (
-                  <input
-                    id={`pf-${f.key}`}
-                    className={`form-control${touched[f.key] && errors[f.key] ? ' input-error' : ''}`}
-                    type="text"
-                    inputMode={f.type === 'numeric' ? 'numeric' : f.type === 'decimal' ? 'decimal' : undefined}
-                    value={form[f.key]}
-                    onChange={e => handleChange(f.key, e.target.value)}
-                    onBlur={() => handleBlur(f.key)}
-                    onKeyDown={f.type === 'numeric' ? handleDigitOnly : f.type === 'decimal' ? handleDecimalKey : undefined}
-                    onPaste={f.type === 'numeric' ? handleDigitPaste : f.type === 'decimal' ? handleDecimalPaste : undefined}
-                    autoFocus={f.key === 'name'}
-                  />
-                )}
-                {touched[f.key] && errors[f.key] && (
-                  <span className="field-error">{errors[f.key]}</span>
-                )}
-              </div>
-            ))}
-            <div className="flex gap-2" style={{ justifyContent: 'flex-end', marginTop: '16px' }}>
-              <button type="button" className="btn btn-secondary" onClick={onClose}>Cancel</button>
-              <button type="submit" className="btn btn-primary" disabled={!isDirty || hasErrors}>
-                {profile ? 'Save Changes' : 'Add Profile'}
-              </button>
+        <div className="vs-modal-body">
+          {FIELDS.map(f => (
+            <div className="vs-field" key={f.key}>
+              <label className="vs-label" htmlFor={`pf-${f.key}`}>{f.label}</label>
+              {f.type === 'select' ? (
+                <select
+                  id={`pf-${f.key}`} className="vs-select"
+                  value={form[f.key]} onChange={e => handleChange(f.key, e.target.value)}
+                >
+                  {f.options.map(o => <option key={o} value={o}>{o}</option>)}
+                </select>
+              ) : (
+                <input
+                  id={`pf-${f.key}`}
+                  className={`vs-input${touched[f.key] && errors[f.key] ? ' err' : ''}`}
+                  type="text"
+                  inputMode={f.type === 'numeric' ? 'numeric' : f.type === 'decimal' ? 'decimal' : undefined}
+                  value={form[f.key]}
+                  onChange={e => handleChange(f.key, e.target.value)}
+                  onBlur={() => handleBlur(f.key)}
+                  onKeyDown={f.type === 'numeric' ? handleDigitOnly : f.type === 'decimal' ? handleDecimalKey : undefined}
+                  onPaste={f.type === 'numeric' ? handleDigitPaste : f.type === 'decimal' ? handleDecimalPaste : undefined}
+                  autoFocus={f.key === 'name'}
+                />
+              )}
+              {touched[f.key] && errors[f.key] && (
+                <p className="vs-hint err">{errors[f.key]}</p>
+              )}
             </div>
-          </form>
+          ))}
         </div>
-      </div>
+        <div className="vs-modal-foot">
+          <button type="button" className="vs-btn" onClick={onClose}>Cancel</button>
+          <button type="submit" className="vs-btn vs-btn-primary" disabled={!isDirty || hasErrors}>
+            {profile ? 'Save Changes' : 'Add Profile'}
+          </button>
+        </div>
+      </form>
     </div>
   );
 }

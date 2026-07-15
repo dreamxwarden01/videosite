@@ -18,7 +18,7 @@ const key = (id) => `video:meta:${id}`;
 async function loadFromDb(videoId) {
     const pool = getPool();
     const [rows] = await pool.execute(
-        `SELECT video_id, course_id, title, description, week, lecture_date,
+        `SELECT video_id, course_id, title, description, module_number, lecture_date,
                 hashed_video_id, duration_seconds, status, processing_job_id,
                 video_type, original_filename, has_poster
          FROM videos WHERE video_id = ?`,

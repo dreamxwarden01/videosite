@@ -6,7 +6,7 @@
 // callers should check that first and skip this cache when it's true.
 
 const { getClient } = require('../redis');
-const { getPool } = require('../../config/database');
+const { getPool, idBuf } = require('../../config/database');
 
 const TTL = 30 * 60; // 30 min
 const key = (userId) => `enrollment:${userId}`;
@@ -15,7 +15,7 @@ async function loadFromDb(userId) {
     const pool = getPool();
     const [rows] = await pool.execute(
         'SELECT course_id FROM enrollments WHERE user_id = ?',
-        [userId]
+        [idBuf(userId)]
     );
     return rows.map(r => r.course_id);
 }

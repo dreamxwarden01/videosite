@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { getPool } = require('../../config/database');
 const { resolvePermissions } = require('../../services/permissionService');
+const { requireAuth } = require('../../middleware/auth');
 
 // GET /api/me — current session user + permissions
 //
@@ -27,9 +28,13 @@ router.get('/me', async (req, res) => {
             user_id: user.user_id,
             username: user.username,
             display_name: user.display_name,
+            avatar: user.sso_avatar || null,
+            email: user.email || null,
             role_id: user.role_id,
             permissions: granted,
             permission_level: user.permission_level,
+            org_name: await require('../../services/cache/settingsCache').getSetting('sso_org_name', ''),
+            account_portal: await require('../../services/cache/settingsCache').getSetting('sso_account_portal_url', ''),
         }
     });
 });
@@ -39,37 +44,32 @@ router.get('/settings/public', async (req, res) => {
     try {
         const pool = getPool();
         const [rows] = await pool.execute(
-            `SELECT setting_key, setting_value FROM site_settings
-             WHERE setting_key IN ('site_name', 'enable_registration', 'require_invitation_code')`
+            `SELECT setting_value FROM site_settings WHERE setting_key = 'site_name'`
         );
-
-        const settings = {};
-        for (const row of rows) {
-            settings[row.setting_key] = row.setting_value;
-        }
-
-        // Turnstile site key — null when not enabled site-wide (either env
-        // var blank). Client uses null to mean "don't render the widget" and
-        // also "no token needed for protected submits". Empty string would
-        // be ambiguous; null is unambiguous.
-        const { isTurnstileEnabled } = require('../../services/turnstileService');
-        const turnstileSiteKey = isTurnstileEnabled() ? process.env.TURNSTILE_SITE_KEY : null;
-
         res.json({
-            siteName: settings.site_name || 'VideoSite',
-            turnstileSiteKey,
-            registrationEnabled: settings.enable_registration === 'true',
-            invitationRequired: settings.require_invitation_code !== 'false',
+            siteName: rows[0]?.setting_value || 'VideoSite',
         });
     } catch (err) {
         console.error('Failed to load public settings:', err);
-        res.json({
-            siteName: 'VideoSite',
-            turnstileSiteKey: null,
-            registrationEnabled: false,
-            invitationRequired: true,
-        });
+        res.json({ siteName: 'VideoSite' });
     }
+});
+
+// GET /api/avatar/:file — the caller's own profile picture, mirrored from the
+// SSO (disk cache, S2S fetch on miss). Name changes with content, so a year of
+// private+immutable is exactly right.
+router.get('/avatar/:file', requireAuth, async (req, res) => {
+    const user = res.locals.user;
+    const file = String(req.params.file);
+    if (!user.sso_avatar || file !== user.sso_avatar) {
+        return res.status(404).json({ error: 'Not found' });
+    }
+    const { readOrFetch } = require('../../services/avatarService');
+    const buf = await readOrFetch(file);
+    if (!buf) return res.status(404).json({ error: 'Not found' });
+    res.set('Cache-Control', 'private, max-age=31536000, immutable');
+    res.set('Content-Type', 'image/webp');
+    res.send(buf);
 });
 
 module.exports = router;

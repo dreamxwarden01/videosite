@@ -1,31 +1,38 @@
 const express = require('express');
-const crypto = require('crypto');
 const router = express.Router();
 
 // Middleware
 const { requireAuth } = require('../../middleware/auth');
 const { checkPermission, checkPermissionLevel, checkAnyPermission } = require('../../middleware/permissions');
-const { requireMfaForScenario } = require('../../middleware/mfa');
+const { requireStepup } = require('../../middleware/stepup');
 
 // Services - Courses
-const { createCourse, getCourseById, updateCourse, deleteCourse, listCourses } = require('../../services/courseService');
+const { createCourse, getCourseById, updateCourse, deleteCourse, listCourses, listCoursesForAdmin } = require('../../services/courseService');
 const { listCourseVideos } = require('../../services/videoService');
 
+// Course "module" label — the term shown next to each item's number
+// (Week 3 / Chapter 3 / …). Curated allowlist; anything else (blank/unknown)
+// stores NULL, which the client renders as the generic "Module N".
+const MODULE_LABELS = ['week', 'chapter', 'module', 'unit', 'lesson', 'section', 'part', 'topic'];
+const normModuleLabel = (v) => (typeof v === 'string' && MODULE_LABELS.includes(v.trim().toLowerCase())) ? v.trim().toLowerCase() : null;
+
 // Services - Users
-const { createUser, getUserById, updateUser, deleteUser, listUsers, usernameExists, emailExists } = require('../../services/userService');
-const { getAssignableRoles } = require('../../services/roleService');
-const { ALL_PERMISSIONS, getUserOverrides, setUserOverride, getRolePermissions, setRolePermissions } = require('../../services/permissionService');
+const { getUserById, listUsers } = require('../../services/userService');
+const { ALL_PERMISSIONS, getUserOverrides, setUserOverride, getRolePermissions, setRolePermissions, resolveAuthBundle } = require('../../services/permissionService');
+const { PERMISSION_PREREQS, validatePermissionSet } = require('../../services/permissionConstants');
+const { stripToHost, isValidHost } = require('../../services/hostValidation');
 const { deleteUserSessions, getUserSessions } = require('../../config/session');
 const UAParser = require('ua-parser-js');
 
 // Services - Enrollment
-const { addEnrollment, removeEnrollment, getAllUsersWithEnrollment, isEnrolled } = require('../../services/enrollmentService');
+const { addEnrollment, removeEnrollment, isEnrolled, getUserEnrollments, getEnrollableStudents, setEnrollmentBatch } = require('../../services/enrollmentService');
+const playbackStats = require('../../services/playbackStatsService');
 
 // Services - Roles
-const { listRoles, getRoleById, createRole, updateRole, deleteRole, roleIdExists, roleNameExists, permissionLevelExists } = require('../../services/roleService');
+const { listRoles, getRoleById, createRole, updateRole, deleteRole, getNextRoleId, roleIdExists, roleNameExists, permissionLevelExists } = require('../../services/roleService');
 
 // Services - Settings
-const { getPool } = require('../../config/database');
+const { getPool, idBuf } = require('../../config/database');
 const {
     generateWorkerKeyPair,
     reactivateWorkerKey,
@@ -36,16 +43,10 @@ const {
     deleteWorkerKey,
     listWorkerKeys,
 } = require('../../services/workerAuthService');
-const { generateSecretKey, isHmacConfigured, setSetting } = require('../../services/tokenService');
+const { generateSecretKey, isHmacConfigured, setSetting, generateFileToken } = require('../../services/tokenService');
 
 // Services - Transcoding Profiles
 const { getDefaultGlobalProfiles, getEnhancedGlobalProfiles, getCourseProfiles, saveDefaultGlobalProfiles, saveEnhancedGlobalProfiles, saveCourseProfiles, deleteCourseProfiles, countSystemRows, getSystemFlagsByIds, getAudioNormalizationSettings, saveAudioNormalizationSettings, getAudioBitrateDefault, saveAudioBitrateDefault, validateAudioBitrate, validateProfile } = require('../../services/transcodingProfileService');
-
-// Services - Invitations
-const { generateInvitationCode, listInvitationCodes, removeInvitationCode } = require('../../services/registrationService');
-
-// Services - MFA
-const mfaService = require('../../services/mfaService');
 
 // Helper: format UA string (from users routes)
 function formatUserAgent(ua) {
@@ -60,7 +61,7 @@ function formatUserAgent(ua) {
 
 // Helper: block self-targeting on admin mutation endpoints
 function blockSelfTarget(req, res) {
-    if (parseInt(req.params.id) === res.locals.user.user_id) {
+    if (req.params.id === res.locals.user.user_id) {
         res.status(403).json({ error: 'Cannot modify your own account through admin panel' });
         return true;
     }
@@ -71,7 +72,7 @@ function blockSelfTarget(req, res) {
 function requireCourseAccess(req, res, next) {
     if (res.locals.user.permissions.allCourseAccess) return next();
     isEnrolled(res.locals.user.user_id, req.params.courseId).then(enrolled => {
-        if (!enrolled) return res.status(403).json({ error: 'You do not have access to this course' });
+        if (!enrolled) return res.status(403).json({ error: 'You do not have access to this course', code: 'COURSE_FORBIDDEN' });
         next();
     }).catch(err => {
         console.error('Course access check error:', err);
@@ -83,12 +84,19 @@ function requireCourseAccess(req, res, next) {
 //  COURSES
 // ==========================================================================
 
-// GET /api/admin/courses — paginated list
-router.get('/admin/courses', requireAuth, checkPermission('manageCourse'), requireMfaForScenario('course'), async (req, res) => {
+// GET /api/admin/courses — the admin course list. Returns EVERY course the
+// caller may administer in one array (not paginated; the client fit-height-
+// paginates). Enrollment-scoped exactly like GET /api/courses: allCourseAccess
+// sees all, otherwise only courses the caller is enrolled in — the deliberate
+// bound on a course-scoped admin. Crucially NO is_active filter, so a course
+// flipped Inactive stays visible here (that is the bug this fixes). The guard
+// mirrors CoursesPage.jsx's client gate (any one course-admin permission), NOT
+// manageCourse — an admin who passes the client gate but lacks manageCourse
+// would otherwise get a 403 and a blank page.
+router.get('/admin/courses', requireAuth, checkPermission('manageCourse'), async (req, res) => {
     try {
-        const page = parseInt(req.query.page) || 1;
-        const result = await listCourses(page);
-        res.json(result);
+        const courses = await listCoursesForAdmin(res.locals.user.user_id, res.locals.user.permissions.allCourseAccess);
+        res.json({ courses });
     } catch (err) {
         console.error('API admin courses error:', err);
         res.status(500).json({ error: 'Failed to load courses.' });
@@ -96,14 +104,18 @@ router.get('/admin/courses', requireAuth, checkPermission('manageCourse'), requi
 });
 
 // POST /api/admin/courses — create
-router.post('/admin/courses', requireAuth, checkPermission('addCourse'), requireMfaForScenario('course'), async (req, res) => {
+router.post('/admin/courses', requireAuth, checkPermission('addCourse'), async (req, res) => {
     try {
-        const { courseName, description } = req.body;
-        if (!courseName) {
-            return res.status(400).json({ error: 'Course name is required' });
+        const { courseCode, courseName, moduleLabel } = req.body;
+        const code = typeof courseCode === 'string' ? courseCode.trim() : '';
+        if (!code) return res.status(400).json({ error: 'Course code is required' });
+        if (code.length > 15 || !/^[A-Za-z0-9 ]+$/.test(code)) {
+            return res.status(422).json({ error: 'Course code: letters, digits, and spaces, up to 15 characters' });
         }
+        const name = typeof courseName === 'string' ? courseName.trim() : '';
+        if (name.length > 300) return res.status(422).json({ error: 'Course name must be 300 characters or fewer' });
 
-        const { courseId } = await createCourse(courseName, description, res.locals.user.user_id);
+        const { courseId } = await createCourse(code, name || null, normModuleLabel(moduleLabel), res.locals.user.user_id);
         res.json({ success: true, courseId });
     } catch (err) {
         console.error('API create course error:', err);
@@ -118,7 +130,7 @@ function sanitizeAdminVideo(v) {
         course_id: v.course_id,
         title: v.title,
         description: v.description,
-        week: v.week,
+        module_number: v.module_number,
         lecture_date: v.lecture_date,
         duration_seconds: v.duration_seconds,
         original_filename: v.original_filename,
@@ -128,13 +140,14 @@ function sanitizeAdminVideo(v) {
         processing_progress: v.processing_progress,
         processing_error: v.processing_error,
         has_source: !!v.r2_source_key,
+        has_poster: !!v.has_poster,
         created_at: v.created_at,
         updated_at: v.updated_at,
     };
 }
 
 // GET /api/admin/courses/:courseId — single course + videos
-router.get('/admin/courses/:courseId', requireAuth, checkPermission('changeCourse'), requireMfaForScenario('course'), requireCourseAccess, async (req, res) => {
+router.get('/admin/courses/:courseId', requireAuth, checkPermission('changeCourse'), requireCourseAccess, async (req, res) => {
     try {
         const course = await getCourseById(req.params.courseId);
         if (!course) {
@@ -152,7 +165,7 @@ router.get('/admin/courses/:courseId', requireAuth, checkPermission('changeCours
 });
 
 // GET /api/admin/courses/:courseId/edit — course + profiles + audio normalization
-router.get('/admin/courses/:courseId/edit', requireAuth, checkPermission('changeCourse'), requireMfaForScenario('course'), requireCourseAccess, async (req, res) => {
+router.get('/admin/courses/:courseId/edit', requireAuth, checkPermission('changeCourse'), requireCourseAccess, async (req, res) => {
     try {
         const course = await getCourseById(req.params.courseId);
         if (!course) {
@@ -174,13 +187,138 @@ router.get('/admin/courses/:courseId/edit', requireAuth, checkPermission('change
     }
 });
 
-// PUT /api/admin/courses/:courseId — update
-router.put('/admin/courses/:courseId', requireAuth, checkPermission('changeCourse'), requireMfaForScenario('course'), requireCourseAccess, async (req, res) => {
+// GET /api/admin/courses/:courseId/videos — paginated video list for a course
+router.get('/admin/courses/:courseId/videos', requireAuth, checkAnyPermission('uploadVideo', 'changeVideo'), requireCourseAccess, async (req, res) => {
     try {
-        const { courseName, description, is_active, use_custom_profiles, use_enhanced_profiles, audio_normalization } = req.body;
+        const pool = getPool();
+        const courseId = parseInt(req.params.courseId);
+
+        // Verify the course exists. NO is_active check — an inactive course's
+        // videos pane must still open, otherwise the admin can never get back
+        // in to flip it active again. 404 only when the course is truly gone.
+        const courseCache = require('../../services/cache/courseCache');
+        const course = await courseCache.getCourseMeta(courseId);
+        if (!course) {
+            return res.status(404).json({ error: 'Course not found.', code: 'COURSE_NOT_FOUND' });
+        }
+
+        const page = parseInt(req.query.page) || 1;
+        // Fit-to-height paging (mirrors the student CourseView): the client
+        // measures how many rows fit and asks for exactly that many. Clamp to a
+        // sane range instead of the old fixed [10,20,50] whitelist.
+        const limit = Math.min(60, Math.max(1, parseInt(req.query.limit) || 10));
+
+        const [countRows] = await pool.execute(
+            'SELECT COUNT(*) as total FROM videos WHERE course_id = ?',
+            [courseId]
+        );
+        const total = countRows[0].total;
+        const totalPages = Math.max(1, Math.ceil(total / limit));
+        // Clamp an out-of-range page to the LAST page: a stale/oversized page
+        // number (e.g. the client's remembered page after its measured page
+        // size grew) returns the last page's rows instead of an empty set.
+        const effPage = Math.min(Math.max(page, 1), totalPages);
+        const offset = (effPage - 1) * limit;
+
+        // Admin exposes only the "Default" ordering (no Date/Name), so there is
+        // no `sort` param — only direction. `dir` is whitelisted to the literals
+        // 'ASC'/'DESC', so the interpolation is injection-safe. Mirrors the
+        // student default key order; NULL module_number / lecture_date sinks to
+        // the bottom regardless of direction (the IS NULL fragments are pinned
+        // ASC). Admin videos default to DESCENDING.
+        const dir = req.query.dir === 'asc' ? 'ASC' : 'DESC';
+        const [videos] = await pool.execute(
+            `SELECT * FROM videos WHERE course_id = ?
+             ORDER BY (module_number IS NULL) ASC, CAST(module_number AS UNSIGNED) ${dir},
+                      (lecture_date IS NULL) ASC, lecture_date ${dir}, video_id ${dir}
+             LIMIT ${limit} OFFSET ${offset}`,
+            [courseId]
+        );
+        await require('../../services/cache/transcodeProgressCache').applyLiveOverlayToVideos(videos);
+
+        // Per-video poster signing — mirrors pages.js. The poster path
+        // `/posters/{course_id}/{video_id}.jpg` needs a per-file HMAC token to
+        // clear the WAF file-scope branch; mint one per row up front so the
+        // client reconstructs the URL without a per-image refresh. Mint only
+        // when has_poster=1; otherwise the client falls back to the play glyph.
+        const r2PublicDomain = process.env.R2_PUBLIC_DOMAIN || '';
+        const out = await Promise.all(videos.map(async (v) => {
+            const s = sanitizeAdminVideo(v);
+            if (v.has_poster) {
+                s.posterToken = await generateFileToken(`/posters/${v.course_id}/${v.video_id}.jpg`) || '';
+            }
+            return s;
+        }));
+
+        res.json({
+            course: { course_id: course.course_id, course_code: course.course_code, course_name: course.course_name, module_label: course.module_label },
+            videos: out,
+            r2PublicDomain,
+            total,
+            page: effPage,
+            totalPages
+        });
+    } catch (err) {
+        console.error('API admin videos error:', err);
+        res.status(500).json({ error: 'Failed to load videos.' });
+    }
+});
+
+// GET /api/admin/courses/:courseId/materials — materials list for a course,
+// admin surface. Response shape is IDENTICAL to the student
+// GET /api/materials/courses/:courseId so the client swap is a one-line URL
+// change. requireCourseAccess (the LOCAL admin.js one) already bypasses the
+// enrollment check for allCourseAccess. NO is_active check — an inactive
+// course's materials pane must still open; 404 only when the course is missing.
+router.get('/admin/courses/:courseId/materials', requireAuth, checkPermission('manageCourse'), requireCourseAccess, async (req, res) => {
+    try {
+        const courseId = parseInt(req.params.courseId);
+        const courseCache = require('../../services/cache/courseCache');
+        const course = await courseCache.getCourseMeta(courseId);
+        if (!course) {
+            return res.status(404).json({ error: 'Course not found.', code: 'COURSE_NOT_FOUND' });
+        }
+
+        const { getMaterialsByCourse } = require('../../services/materialService');
+        const materials = await getMaterialsByCourse(courseId);
+        res.json({
+            courseCode: course.course_code,
+            courseName: course.course_name,
+            moduleLabel: course.module_label,
+            materials: materials.map(m => ({
+                material_id: m.material_id,
+                filename: m.filename,
+                file_size: m.file_size,
+                content_type: m.content_type,
+                module_number: m.module_number,
+                uploaded_by: m.uploaded_by,
+                created_at: m.created_at,
+            })),
+        });
+    } catch (err) {
+        console.error('API admin materials error:', err);
+        res.status(500).json({ error: 'Failed to load materials.' });
+    }
+});
+
+// PUT /api/admin/courses/:courseId — update
+router.put('/admin/courses/:courseId', requireAuth, checkPermission('changeCourse'), requireCourseAccess, async (req, res) => {
+    try {
+        const { courseCode, courseName, moduleLabel, is_active, use_custom_profiles, use_enhanced_profiles, audio_normalization } = req.body;
         const updates = {};
-        if (courseName !== undefined) updates.course_name = courseName;
-        if (description !== undefined) updates.description = description;
+        if (moduleLabel !== undefined) updates.module_label = normModuleLabel(moduleLabel);
+        if (courseCode !== undefined) {
+            const code = String(courseCode).trim();
+            if (!code || code.length > 15 || !/^[A-Za-z0-9 ]+$/.test(code)) {
+                return res.status(422).json({ error: 'Course code: letters, digits, and spaces, up to 15 characters' });
+            }
+            updates.course_code = code;
+        }
+        if (courseName !== undefined) {
+            const name = String(courseName).trim();
+            if (name.length > 300) return res.status(422).json({ error: 'Course name must be 300 characters or fewer' });
+            updates.course_name = name || null;
+        }
         if (is_active !== undefined) {
             updates.is_active = is_active === '1' || is_active === true || is_active === 1 ? 1 : 0;
         }
@@ -196,7 +334,7 @@ router.put('/admin/courses/:courseId', requireAuth, checkPermission('changeCours
 });
 
 // DELETE /api/admin/courses/:courseId — delete
-router.delete('/admin/courses/:courseId', requireAuth, checkPermission('deleteCourse'), requireMfaForScenario('course'), requireCourseAccess, async (req, res) => {
+router.delete('/admin/courses/:courseId', requireAuth, checkPermission('deleteCourse'), requireCourseAccess, async (req, res) => {
     try {
         await deleteCourse(req.params.courseId);
         res.status(204).end();
@@ -207,7 +345,7 @@ router.delete('/admin/courses/:courseId', requireAuth, checkPermission('deleteCo
 });
 
 // PUT /api/admin/courses/:courseId/transcoding-profiles — save course profiles
-router.put('/admin/courses/:courseId/transcoding-profiles', requireAuth, checkPermission('changeCourse'), requireMfaForScenario('course'), requireCourseAccess, async (req, res) => {
+router.put('/admin/courses/:courseId/transcoding-profiles', requireAuth, checkPermission('changeCourse'), requireCourseAccess, async (req, res) => {
     try {
         const course = await getCourseById(req.params.courseId);
         if (!course) return res.status(404).json({ error: 'Course not found' });
@@ -244,7 +382,7 @@ router.put('/admin/courses/:courseId/transcoding-profiles', requireAuth, checkPe
 });
 
 // DELETE /api/admin/courses/:courseId/transcoding-profiles — reset to global
-router.delete('/admin/courses/:courseId/transcoding-profiles', requireAuth, checkPermission('changeCourse'), requireMfaForScenario('course'), requireCourseAccess, async (req, res) => {
+router.delete('/admin/courses/:courseId/transcoding-profiles', requireAuth, checkPermission('changeCourse'), requireCourseAccess, async (req, res) => {
     try {
         await deleteCourseProfiles(req.params.courseId);
         res.status(204).end();
@@ -255,63 +393,24 @@ router.delete('/admin/courses/:courseId/transcoding-profiles', requireAuth, chec
 });
 
 // ==========================================================================
-//  VIDEOS (Video Management page)
-// ==========================================================================
-
-// GET /api/admin/videos/:courseId — paginated video list for a course
-router.get('/admin/videos/:courseId', requireAuth, checkAnyPermission('uploadVideo', 'changeVideo'), requireCourseAccess, async (req, res) => {
-    try {
-        const pool = getPool();
-        const courseId = parseInt(req.params.courseId);
-
-        // Verify course exists and is active
-        const courseCache = require('../../services/cache/courseCache');
-        const course = await courseCache.getCourseMeta(courseId);
-        if (!course || course.is_active !== 1) {
-            return res.status(404).json({ error: 'Course not found.' });
-        }
-
-        const page = parseInt(req.query.page) || 1;
-        const allowedLimits = [10, 20, 50];
-        const limit = allowedLimits.includes(parseInt(req.query.limit)) ? parseInt(req.query.limit) : 10;
-        const offset = (page - 1) * limit;
-
-        const [countRows] = await pool.execute(
-            'SELECT COUNT(*) as total FROM videos WHERE course_id = ?',
-            [courseId]
-        );
-        const total = countRows[0].total;
-
-        const [videos] = await pool.execute(
-            `SELECT * FROM videos WHERE course_id = ?
-             ORDER BY CAST(week AS UNSIGNED) DESC, week DESC, lecture_date DESC, created_at DESC, video_id DESC
-             LIMIT ${parseInt(limit)} OFFSET ${parseInt(offset)}`,
-            [courseId]
-        );
-        await require('../../services/cache/transcodeProgressCache').applyLiveOverlayToVideos(videos);
-
-        res.json({
-            course: { course_id: course.course_id, course_name: course.course_name },
-            videos: videos.map(sanitizeAdminVideo),
-            total,
-            page,
-            totalPages: Math.ceil(total / limit)
-        });
-    } catch (err) {
-        console.error('API admin videos error:', err);
-        res.status(500).json({ error: 'Failed to load videos.' });
-    }
-});
-
-// ==========================================================================
 //  USERS
 // ==========================================================================
 
-// GET /api/admin/users — paginated list
-router.get('/admin/users', requireAuth, checkPermission('manageUser'), requireMfaForScenario('user'), async (req, res) => {
+// GET /api/admin/users — paginated list. Fit-to-height paging + sort mirrors
+// the admin CoursePage: the client measures how many rows fit and asks for
+// exactly that many. `dir` is whitelisted to the literals 'ASC'/'DESC' BEFORE
+// it reaches the service, so the ORDER BY interpolation is injection-safe.
+// No requireStepup here: the users LIST is a read the redesigned client shows
+// without a page-guard, so a read-scoped step-up would deadlock it. The WRITE
+// user routes keep their 'user' step-up (a write-scoped policy leaves GETs open).
+router.get('/admin/users', requireAuth, checkPermission('manageUser'), async (req, res) => {
     try {
         const page = parseInt(req.query.page) || 1;
-        const result = await listUsers(res.locals.user.permission_level, page);
+        const limit = Math.min(60, Math.max(1, parseInt(req.query.limit) || 10));
+        const dir = req.query.dir === 'asc' ? 'ASC' : 'DESC';
+        const q = (req.query.q || '').toString().trim().slice(0, 100);
+        const La = res.locals.user.permission_level;
+        const result = await listUsers(La, page, limit, dir, q);
         res.json(result);
     } catch (err) {
         console.error('API admin users error:', err);
@@ -319,130 +418,25 @@ router.get('/admin/users', requireAuth, checkPermission('manageUser'), requireMf
     }
 });
 
-// GET /api/admin/users/new — form data for creating a user
-router.get('/admin/users/new', requireAuth, checkPermission('addUser'), requireMfaForScenario('user'), async (req, res) => {
+// GET /api/admin/users/:id/edit — the user page. Identity (display name,
+// email, password, MFA, enable/disable) is SSO-owned now: details render
+// view-only with a "manage at the account portal" link; only app-local
+// permission overrides and sessions remain editable here.
+router.get('/admin/users/:id/edit', requireAuth, checkPermission('changeUser'), requireStepup('user'), checkPermissionLevel, async (req, res) => {
     try {
-        const roles = await getAssignableRoles(res.locals.user.permission_level);
-        const defaultRoleId = await require('../../services/cache/settingsCache').getSetting('registration_default_role', '2');
-        res.json({ roles, defaultRoleId });
-    } catch (err) {
-        console.error('API new user form error:', err);
-        res.status(500).json({ error: 'Failed to load form.' });
-    }
-});
-
-// POST /api/admin/users — create
-router.post('/admin/users', requireAuth, checkPermission('addUser'), requireMfaForScenario('user'), async (req, res) => {
-    try {
-        const { username, displayName, email, password, roleId } = req.body;
-
-        if (!username || !password || !displayName) {
-            return res.status(400).json({ error: 'Username, display name, and password are required' });
-        }
-        if (/\s/.test(username)) return res.status(422).json({ error: 'Spaces are not allowed in username' });
-        if (/\s/.test(password)) return res.status(422).json({ error: 'Spaces are not allowed in password' });
-        if (email && /\s/.test(email)) return res.status(422).json({ error: 'Spaces are not allowed in email' });
-
-        // Username: 3-20 chars, letters/digits/dashes/underscores
-        const trimmedUsername = username.trim();
-        if (trimmedUsername.length < 3 || trimmedUsername.length > 20) {
-            return res.status(422).json({ error: 'Username must be between 3 and 20 characters' });
-        }
-        if (!/^[A-Za-z0-9_-]+$/.test(trimmedUsername)) {
-            return res.status(422).json({ error: 'Username can only contain letters, digits, dashes, and underscores' });
-        }
-
-        if (await usernameExists(trimmedUsername)) {
-            return res.status(409).json({ error: 'Username already exists' });
-        }
-
-        // Display name: 1-30 chars, letters/digits/spaces
-        const trimmedDisplayName = displayName.trim();
-        if (!trimmedDisplayName || trimmedDisplayName.length > 30) {
-            return res.status(422).json({ error: 'Display name must be between 1 and 30 characters' });
-        }
-        if (!/^[A-Za-z0-9 ]+$/.test(trimmedDisplayName)) {
-            return res.status(422).json({ error: 'Display name can only contain letters, digits, and spaces' });
-        }
-
-        // Email format and uniqueness
-        if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
-            return res.status(422).json({ error: 'Invalid email address format' });
-        }
-        if (email) {
-            const normalizedEmail = email.trim().toLowerCase();
-            if (await emailExists(normalizedEmail)) {
-                return res.status(409).json({ error: 'Email is already in use' });
-            }
-        }
-
-        // Verify the selected role is assignable by this user
-        const roles = await getAssignableRoles(res.locals.user.permission_level);
-        const selectedRole = parseInt(roleId) || 2;
-        const validRole = roles.find(r => r.role_id === selectedRole);
-        if (!validRole) {
-            return res.status(403).json({ error: 'Cannot assign that role' });
-        }
-
-        const userId = await createUser(trimmedUsername, trimmedDisplayName, password, selectedRole, email ? email.trim() : null);
-        res.status(201).json({ userId });
-    } catch (err) {
-        console.error('API create user error:', err);
-        res.status(500).json({ error: 'Failed to create user: ' + err.message });
-    }
-});
-
-// GET /api/admin/users/:id — single user + roles + overrides
-router.get('/admin/users/:id', requireAuth, checkPermission('changeUser'), requireMfaForScenario('user'), checkPermissionLevel, async (req, res) => {
-    try {
-        const targetUser = await getUserById(parseInt(req.params.id));
+        const targetUser = await getUserById(req.params.id);
         if (!targetUser) {
             return res.status(404).json({ error: 'User not found.' });
         }
-        delete targetUser.password_hash;
-
-        const roles = await getAssignableRoles(res.locals.user.permission_level);
         const overrides = await getUserOverrides(targetUser.user_id);
 
         res.json({
             targetUser,
-            roles,
             overrides,
             allPermissions: ALL_PERMISSIONS,
-            canChangePermissions: res.locals.user.permissions.changeUserPermission,
-            adminPermissions: res.locals.user.permissions
-        });
-    } catch (err) {
-        console.error('API get user error:', err);
-        res.status(500).json({ error: 'Failed to load user.' });
-    }
-});
-
-// GET /api/admin/users/:id/edit — alias for edit page
-router.get('/admin/users/:id/edit', requireAuth, checkPermission('changeUser'), requireMfaForScenario('user'), checkPermissionLevel, async (req, res) => {
-    try {
-        const targetUserId = parseInt(req.params.id);
-        const targetUser = await getUserById(targetUserId);
-        if (!targetUser) {
-            return res.status(404).json({ error: 'User not found.' });
-        }
-        delete targetUser.password_hash;
-        const roles = await getAssignableRoles(res.locals.user.permission_level);
-        const overrides = await getUserOverrides(targetUser.user_id);
-
-        // MFA state for the target user
-        const mfaEnabled = await mfaService.isUserMfaEnabled(targetUserId);
-        const mfaMethods = await mfaService.getUserMfaMethodTypes(targetUserId);
-
-        res.json({
-            targetUser,
-            roles,
-            overrides,
-            allPermissions: ALL_PERMISSIONS,
+            permissionPrereqs: PERMISSION_PREREQS,
             canChangePermissions: res.locals.user.permissions.changeUserPermission,
             adminPermissions: res.locals.user.permissions,
-            mfaEnabled,
-            mfaMethods
         });
     } catch (err) {
         console.error('API get user edit error:', err);
@@ -450,96 +444,48 @@ router.get('/admin/users/:id/edit', requireAuth, checkPermission('changeUser'), 
     }
 });
 
-// PUT /api/admin/users/:id — update
-router.put('/admin/users/:id', requireAuth, checkPermission('changeUser'), requireMfaForScenario('user'), checkPermissionLevel, async (req, res) => {
-    try {
-        if (blockSelfTarget(req, res)) return;
-        const { displayName, email, roleId, password, is_active } = req.body;
-        const targetUserId = parseInt(req.params.id);
-        const updates = {};
-
-        if (email !== undefined && email && /\s/.test(email)) return res.status(422).json({ error: 'Spaces are not allowed in email' });
-        if (password && /\s/.test(password)) return res.status(422).json({ error: 'Spaces are not allowed in password' });
-
-        // Display name: 1-30 chars, letters/digits/spaces
-        if (displayName) {
-            const trimmedDN = displayName.trim();
-            if (!trimmedDN || trimmedDN.length > 30) {
-                return res.status(422).json({ error: 'Display name must be between 1 and 30 characters' });
-            }
-            if (!/^[A-Za-z0-9 ]+$/.test(trimmedDN)) {
-                return res.status(422).json({ error: 'Display name can only contain letters, digits, and spaces' });
-            }
-            updates.display_name = trimmedDN;
-        }
-
-        // Email change
-        if (email !== undefined) {
-            const newEmail = email ? email.trim() : null;
-            if (newEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
-                return res.status(422).json({ error: 'Invalid email address format' });
-            }
-            // Check email uniqueness (users + pending_registrations)
-            if (newEmail) {
-                const normalizedEmail = newEmail.toLowerCase();
-                if (await emailExists(normalizedEmail, targetUserId)) {
-                    return res.status(409).json({ error: 'Email is already in use' });
-                }
-            }
-            // Block email change if target user has MFA enabled
-            const targetUser = await getUserById(targetUserId);
-            if (targetUser && targetUser.email !== newEmail) {
-                const targetMfaEnabled = await mfaService.isUserMfaEnabled(targetUserId);
-                if (targetMfaEnabled) {
-                    return res.status(422).json({ error: 'Cannot change email while user has MFA enabled. Reset their MFA first.' });
-                }
-            }
-            updates.email = newEmail;
-        }
-        if (is_active !== undefined) updates.is_active = is_active === '1' || is_active === true || is_active === 1 ? 1 : 0;
-        if (password) updates.password = password;
-
-        if (roleId !== undefined) {
-            const roles = await getAssignableRoles(res.locals.user.permission_level);
-            const selectedRole = parseInt(roleId);
-            if (roles.find(r => r.role_id === selectedRole)) {
-                updates.role_id = selectedRole;
-            }
-        }
-
-        await updateUser(targetUserId, updates);
-
-        // If password changed by admin, terminate ALL of the user's sessions
-        if (updates.password) {
-            await deleteUserSessions(targetUserId);
-        }
-
-        // If deactivated, destroy their sessions
-        if (updates.is_active === 0) {
-            await deleteUserSessions(targetUserId);
-        }
-
-        res.status(204).end();
-    } catch (err) {
-        console.error('API update user error:', err);
-        res.status(500).json({ error: 'Failed to update user' });
-    }
-});
-
 // PUT /api/admin/users/:id/permissions — update permission overrides
-router.put('/admin/users/:id/permissions', requireAuth, checkPermission('changeUserPermission'), requireMfaForScenario('user'), checkPermissionLevel, async (req, res) => {
+router.put('/admin/users/:id/permissions', requireAuth, checkPermission('changeUserPermission'), requireStepup('user'), checkPermissionLevel, async (req, res) => {
     try {
         if (blockSelfTarget(req, res)) return;
-        const userId = parseInt(req.params.id);
+        const userId = req.params.id;
         const { permissions } = req.body;
 
         if (permissions && typeof permissions === 'object') {
             const adminPerms = res.locals.user.permissions;
-            for (const [key, value] of Object.entries(permissions)) {
+            // Authorization: an admin can only touch keys they themselves hold.
+            for (const key of Object.keys(permissions)) {
                 if (!ALL_PERMISSIONS.includes(key)) continue;
                 if (!adminPerms[key]) {
-                    return res.status(403).json({ error: `Cannot modify '${key}' permission that you don't have` });
+                    return res.status(403).json({ error: `Cannot modify '${key}' permission that you don't have`, code: 'PERMISSION_DENIED' });
                 }
+            }
+            // Validate the OVERRIDE set ALONE — inherit is "unconfigured" and
+            // satisfies nothing. Because the role can change independently, an
+            // override GRANT must secure its prerequisites at the override level
+            // (an override-granted dependent needs its prereqs override-granted;
+            // an override-granted prereq can't be un-granted while depended on).
+            // Delta-aware: block only violations this change introduces.
+            const existing = await getUserOverrides(userId);
+            const grantsOnly = (ov) => {
+                const e = {};
+                for (const [k, v] of Object.entries(ov)) if (v === 1) e[k] = true;
+                return e;
+            };
+            const merged = { ...existing };
+            for (const [key, value] of Object.entries(permissions)) {
+                if (!ALL_PERMISSIONS.includes(key)) continue;
+                const v = parseInt(value);
+                if (v === 0) delete merged[key]; else merged[key] = v;
+            }
+            const before = new Set(validatePermissionSet(grantsOnly(existing)).map((v) => v.key));
+            const newViolations = validatePermissionSet(grantsOnly(merged)).filter((v) => !before.has(v.key));
+            if (newViolations.length) {
+                return res.status(422).json({ error: 'Some permissions are missing their prerequisites.', violations: newViolations });
+            }
+            // Apply.
+            for (const [key, value] of Object.entries(permissions)) {
+                if (!ALL_PERMISSIONS.includes(key)) continue;
                 await setUserOverride(userId, key, parseInt(value));
             }
         }
@@ -551,23 +497,10 @@ router.put('/admin/users/:id/permissions', requireAuth, checkPermission('changeU
     }
 });
 
-// DELETE /api/admin/users/:id — delete
-router.delete('/admin/users/:id', requireAuth, checkPermission('deleteUser'), requireMfaForScenario('user', { mandatory: true }), checkPermissionLevel, async (req, res) => {
-    try {
-        if (blockSelfTarget(req, res)) return;
-        await deleteUserSessions(parseInt(req.params.id));
-        await deleteUser(parseInt(req.params.id));
-        res.status(204).end();
-    } catch (err) {
-        console.error('API delete user error:', err);
-        res.status(500).json({ error: 'Failed to delete user' });
-    }
-});
-
 // GET /api/admin/users/:id/sessions
-router.get('/admin/users/:id/sessions', requireAuth, checkPermission('changeUser'), requireMfaForScenario('user'), checkPermissionLevel, async (req, res) => {
+router.get('/admin/users/:id/sessions', requireAuth, checkPermission('changeUser'), requireStepup('user'), checkPermissionLevel, async (req, res) => {
     try {
-        const sessions = await getUserSessions(parseInt(req.params.id));
+        const sessions = await getUserSessions(req.params.id);
         const sanitized = sessions.map(s => ({
             deviceName: formatUserAgent(s.user_agent),
             ip_address: s.ip_address,
@@ -583,10 +516,10 @@ router.get('/admin/users/:id/sessions', requireAuth, checkPermission('changeUser
 });
 
 // POST /api/admin/users/:id/sessions/terminate-all
-router.post('/admin/users/:id/sessions/terminate-all', requireAuth, checkPermission('changeUser'), requireMfaForScenario('user'), checkPermissionLevel, async (req, res) => {
+router.post('/admin/users/:id/sessions/terminate-all', requireAuth, checkPermission('changeUser'), requireStepup('user'), checkPermissionLevel, async (req, res) => {
     try {
         if (blockSelfTarget(req, res)) return;
-        await deleteUserSessions(parseInt(req.params.id));
+        await deleteUserSessions(req.params.id);
         res.status(204).end();
     } catch (err) {
         console.error('API terminate sessions error:', err);
@@ -594,53 +527,52 @@ router.post('/admin/users/:id/sessions/terminate-all', requireAuth, checkPermiss
     }
 });
 
-// POST /api/admin/users/:id/reset-mfa — reset a user's MFA
-router.post('/admin/users/:id/reset-mfa', requireAuth, checkPermission('changeUser'), requireMfaForScenario('user', { forceOneTime: true, mandatory: true }), checkPermissionLevel, async (req, res) => {
-    try {
-        if (blockSelfTarget(req, res)) return;
-        const targetUserId = parseInt(req.params.id);
-        await mfaService.resetUserMfa(targetUserId);
-        res.status(204).end();
-    } catch (err) {
-        console.error('API reset user MFA error:', err);
-        res.status(500).json({ error: 'Failed to reset MFA' });
-    }
-});
-
 // ==========================================================================
 //  ENROLLMENT
 // ==========================================================================
 
-// GET /api/admin/enrollment — query params: courseId, page, limit
-router.get('/admin/enrollment', requireAuth, checkPermission('manageEnrolment'), requireMfaForScenario('enrollment'), async (req, res) => {
+// GET /api/admin/enrollment — student-first, two shapes:
+//   • no query          → { students, courses } — the selector list + every
+//                          course (mapped thin, sorted course_code then id).
+//   • ?userId=<hex>      → { enrolledCourseIds } — the target's enrolled course
+//                          ids as an int array, after the authority guard.
+router.get('/admin/enrollment', requireAuth, checkPermission('manageEnrolment'), requireStepup('enrollment'), async (req, res) => {
     try {
-        const courseId = req.query.courseId;
-        const page = Math.max(1, parseInt(req.query.page) || 1);
-        const limit = [10, 20, 50].includes(parseInt(req.query.limit)) ? parseInt(req.query.limit) : 10;
-        const result = await listCourses(1, 999);
-        let enrollmentData = null;
-        let selectedCourse = null;
-        let pagination = null;
+        const actingLevel = res.locals.user.permission_level;
+        const userId = req.query.userId;
 
-        if (courseId) {
-            selectedCourse = await getCourseById(courseId);
-            if (selectedCourse) {
-                const allUsers = await getAllUsersWithEnrollment(courseId, res.locals.user.permission_level);
-                const total = allUsers.length;
-                const totalPages = Math.max(1, Math.ceil(total / limit));
-                const safePage = Math.min(page, totalPages);
-                enrollmentData = allUsers.slice((safePage - 1) * limit, safePage * limit);
-                pagination = { page: safePage, totalPages, total, limit };
+        if (userId) {
+            // Same target-authority guard as the mutation endpoints:
+            // 404 if the user has no role (i.e. doesn't exist); 403 if the
+            // acting admin isn't strictly higher authority (smaller level).
+            const targetBundle = await resolveAuthBundle(userId);
+            if (!targetBundle.role_id) {
+                return res.status(404).json({ error: 'User not found' });
             }
+            if (actingLevel >= targetBundle.permission_level) {
+                return res.status(403).json({ error: 'Cannot manage enrollment for users with equal or higher authority' });
+            }
+            const enrolledCourseIds = (await getUserEnrollments(userId)).map(c => c.course_id);
+            return res.json({ enrolledCourseIds });
         }
 
-        res.json({
-            courses: result.courses,
-            enrollmentData,
-            selectedCourse,
-            selectedCourseId: courseId || '',
-            pagination
-        });
+        // Selector payload: enrollable students + all courses (thin projection,
+        // sorted course_code ASC then course_id ASC).
+        const students = await getEnrollableStudents(actingLevel);
+        const { courses } = await listCourses(1, 999);
+        const thinCourses = courses
+            .map(c => ({
+                course_id: c.course_id,
+                course_code: c.course_code,
+                course_name: c.course_name,
+                is_active: c.is_active,
+            }))
+            .sort((a, b) => {
+                const byCode = String(a.course_code).localeCompare(String(b.course_code));
+                return byCode !== 0 ? byCode : a.course_id - b.course_id;
+            });
+
+        res.json({ students, courses: thinCourses });
     } catch (err) {
         console.error('API enrollment error:', err);
         res.status(500).json({ error: 'Failed to load enrollment data.' });
@@ -648,7 +580,7 @@ router.get('/admin/enrollment', requireAuth, checkPermission('manageEnrolment'),
 });
 
 // POST /api/admin/enrollment — add or remove
-router.post('/admin/enrollment', requireAuth, checkPermission('manageEnrolment'), requireMfaForScenario('enrollment'), async (req, res) => {
+router.post('/admin/enrollment', requireAuth, checkPermission('manageEnrolment'), requireStepup('enrollment'), async (req, res) => {
     try {
         const { action, userId, courseId } = req.body;
 
@@ -658,7 +590,7 @@ router.post('/admin/enrollment', requireAuth, checkPermission('manageEnrolment')
 
         // Check target user's permission level via the cached two-tier resolver
         // (user:perms → role:perms) — no DB JOIN per enrollment change.
-        const targetBundle = await require('../../services/permissionService').resolveAuthBundle(parseInt(userId));
+        const targetBundle = await require('../../services/permissionService').resolveAuthBundle(userId);
         if (!targetBundle.role_id) {
             return res.status(404).json({ error: 'User not found' });
         }
@@ -667,9 +599,9 @@ router.post('/admin/enrollment', requireAuth, checkPermission('manageEnrolment')
         }
 
         if (action === 'add') {
-            await addEnrollment(parseInt(userId), courseId);
+            await addEnrollment(userId, courseId);
         } else if (action === 'remove') {
-            await removeEnrollment(parseInt(userId), courseId);
+            await removeEnrollment(userId, courseId);
         }
 
         res.status(204).end();
@@ -679,12 +611,52 @@ router.post('/admin/enrollment', requireAuth, checkPermission('manageEnrolment')
     }
 });
 
+// POST /api/admin/enrollment/batch — commit staged adds/removes for one student
+// in a single atomic transaction. Body: { userId, adds: [courseId], removes:
+// [courseId] }. Guards the target the same way as the single endpoint (404 no
+// role, 403 acting level >= target level). Responds 200 with the fresh enrolled
+// course_id set so the client reconciles without a second GET.
+const MAX_BATCH_IDS = 1000; // sane upper bound (course counts are small); guards against pathological payloads
+router.post('/admin/enrollment/batch', requireAuth, checkPermission('manageEnrolment'), requireStepup('enrollment'), async (req, res) => {
+    try {
+        const { userId, adds, removes } = req.body;
+
+        if (!userId) {
+            return res.status(400).json({ error: 'User is required' });
+        }
+        if ((adds !== undefined && !Array.isArray(adds)) || (removes !== undefined && !Array.isArray(removes))) {
+            return res.status(400).json({ error: 'adds and removes must be arrays' });
+        }
+        const addsArr = Array.isArray(adds) ? adds : [];
+        const removesArr = Array.isArray(removes) ? removes : [];
+        if (addsArr.length > MAX_BATCH_IDS || removesArr.length > MAX_BATCH_IDS) {
+            return res.status(400).json({ error: 'Too many changes in one batch' });
+        }
+
+        // Target-authority guard (cached two-tier resolver): 404 no role, 403 if
+        // the acting admin isn't strictly higher authority (smaller level).
+        const targetBundle = await resolveAuthBundle(userId);
+        if (!targetBundle.role_id) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        if (res.locals.user.permission_level >= targetBundle.permission_level) {
+            return res.status(403).json({ error: 'Cannot manage enrollment for users with equal or higher authority' });
+        }
+
+        const enrolledCourseIds = await setEnrollmentBatch(userId, addsArr, removesArr);
+        res.status(200).json({ enrolledCourseIds });
+    } catch (err) {
+        console.error('API enrollment batch error:', err);
+        res.status(500).json({ error: 'Failed to update enrollment' });
+    }
+});
+
 // ==========================================================================
 //  ROLES
 // ==========================================================================
 
 // GET /api/admin/roles — with permissions
-router.get('/admin/roles', requireAuth, checkPermission('manageRoles'), requireMfaForScenario('roles'), async (req, res) => {
+router.get('/admin/roles', requireAuth, checkPermission('manageRoles'), requireStepup('roles'), async (req, res) => {
     try {
         const roles = await listRoles();
 
@@ -694,7 +666,20 @@ router.get('/admin/roles', requireAuth, checkPermission('manageRoles'), requireM
             rolePermissions[r.role_id] = await getRolePermissions(r.role_id);
         }
 
-        res.json({ roles, rolePermissions, allPermissions: ALL_PERMISSIONS, adminPermissions: res.locals.user.permissions });
+        // Per-role member counts + which role is the registration default (for
+        // the "N members" line + the "default" pill).
+        const [countRows] = await getPool().execute('SELECT role_id, COUNT(*) AS n FROM users GROUP BY role_id');
+        const memberCounts = {};
+        for (const row of countRows) memberCounts[row.role_id] = row.n;
+        const { getSetting } = require('../../services/cache/settingsCache');
+        const defRaw = parseInt(await getSetting('registration_default_role', ''), 10);
+
+        res.json({
+            roles, rolePermissions, memberCounts,
+            defaultRoleId: Number.isInteger(defRaw) ? defRaw : null,
+            allPermissions: ALL_PERMISSIONS, permissionPrereqs: PERMISSION_PREREQS,
+            adminPermissions: res.locals.user.permissions,
+        });
     } catch (err) {
         console.error('API roles error:', err);
         res.status(500).json({ error: 'Failed to load roles.' });
@@ -702,54 +687,67 @@ router.get('/admin/roles', requireAuth, checkPermission('manageRoles'), requireM
 });
 
 // POST /api/admin/roles — create
-router.post('/admin/roles', requireAuth, checkPermission('manageRoles'), requireMfaForScenario('roles'), async (req, res) => {
+router.post('/admin/roles', requireAuth, checkPermission('manageRoles'), requireStepup('roles'), async (req, res) => {
     try {
-        const { roleId, roleName, permissionLevel, description, permissions } = req.body;
-        const id = parseInt(roleId);
+        const { roleName, permissionLevel, description } = req.body;
         const level = parseInt(permissionLevel);
 
-        if (isNaN(id) || id < 0 || id > 99) {
-            return res.status(400).json({ error: 'Role ID must be 0-99' });
-        }
-        if (isNaN(level) || level < 0 || level > 99) {
-            return res.status(400).json({ error: 'Permission level must be 0-99' });
-        }
-        if (!roleName) {
+        if (!roleName || !String(roleName).trim()) {
             return res.status(400).json({ error: 'Role name is required' });
         }
-
-        // Only allow creating roles with higher permission level than own
+        if (isNaN(level) || level < 0 || level > 9999) {
+            return res.status(400).json({ error: 'Permission level must be between 0 and 9999' });
+        }
+        // A new role must be strictly LOWER privilege than the creator (higher
+        // number). Superadmin (level 0) can never be recreated this way.
         if (level <= res.locals.user.permission_level) {
             return res.status(403).json({ error: 'Cannot create a role with equal or higher authority' });
         }
-
-        if (await roleIdExists(id)) {
-            return res.status(409).json({ error: 'Role ID already exists' });
-        }
-        if (await roleNameExists(roleName)) {
+        const name = String(roleName).trim();
+        if (await roleNameExists(name)) {
             return res.status(409).json({ error: 'Role name already exists' });
         }
         if (await permissionLevelExists(level)) {
             return res.status(409).json({ error: 'Permission level already exists' });
         }
 
-        await createRole(id, roleName, level, description);
-
-        // Set permissions — admin can only grant permissions they have
-        if (permissions && typeof permissions === 'object') {
-            const adminPerms = res.locals.user.permissions;
-            const permMap = {};
-            for (const key of ALL_PERMISSIONS) {
-                const wants = permissions[key] === '1' || permissions[key] === true;
-                if (wants && !adminPerms[key]) {
-                    return res.status(403).json({ error: `Cannot grant '${key}' permission that you don't have` });
-                }
-                permMap[key] = adminPerms[key] ? wants : false;
+        // The backend assigns the id. getNextRoleId (MAX+1) isn't atomic with the
+        // INSERT, so two concurrent creates can pick the same id — the loser hits
+        // the PK and retries with a fresh id.
+        let id;
+        for (let attempt = 0; ; attempt++) {
+            id = await getNextRoleId();
+            try { await createRole(id, name, level, description ? String(description) : null); break; }
+            catch (e) {
+                if (attempt < 4 && (e.code === 'ER_DUP_ENTRY' || /duplicate/i.test(e.message || ''))) continue;
+                throw e;
             }
-            await setRolePermissions(id, permMap);
         }
 
-        res.status(204).end();
+        // Seed from the DEFAULT role's grants, filtered to keys the creator holds
+        // (drop any that then violate prereqs). If seeding fails, roll the role
+        // back so a same-name/level retry isn't blocked by an orphan.
+        try {
+            const adminPerms = res.locals.user.permissions;
+            const { getSetting } = require('../../services/cache/settingsCache');
+            const defaultId = parseInt(await getSetting('registration_default_role', ''), 10);
+            const preset = {};
+            for (const key of ALL_PERMISSIONS) preset[key] = false;
+            if (Number.isInteger(defaultId)) {
+                const defaultPerms = await getRolePermissions(defaultId);
+                for (const key of ALL_PERMISSIONS) preset[key] = !!(defaultPerms[key] && adminPerms[key]);
+            }
+            for (const v of validatePermissionSet(preset)) preset[v.key] = false;
+            await setRolePermissions(id, preset);
+        } catch (seedErr) {
+            try {
+                await getPool().execute('DELETE FROM roles WHERE role_id = ?', [id]);
+                require('../../services/ssoEvents').reportRoles().catch(() => {});
+            } catch { /* best-effort rollback */ }
+            throw seedErr;
+        }
+
+        res.status(201).json({ role_id: id });
     } catch (err) {
         console.error('API create role error:', err);
         res.status(500).json({ error: 'Failed to create role' });
@@ -757,10 +755,10 @@ router.post('/admin/roles', requireAuth, checkPermission('manageRoles'), require
 });
 
 // PUT /api/admin/roles/:id — update
-router.put('/admin/roles/:id', requireAuth, checkPermission('manageRoles'), requireMfaForScenario('roles'), async (req, res) => {
+router.put('/admin/roles/:id', requireAuth, checkPermission('manageRoles'), requireStepup('roles'), async (req, res) => {
     try {
         const roleId = parseInt(req.params.id);
-        const { newRoleId, roleName, permissionLevel, description, permissions } = req.body;
+        const { roleName, permissionLevel, description, permissions } = req.body;
 
         const role = await getRoleById(roleId);
         if (!role) {
@@ -774,20 +772,6 @@ router.put('/admin/roles/:id', requireAuth, checkPermission('manageRoles'), requ
 
         const updates = {};
 
-        // Handle role ID change
-        if (newRoleId !== undefined && newRoleId !== '') {
-            const parsedNewId = parseInt(newRoleId);
-            if (isNaN(parsedNewId) || parsedNewId < 0 || parsedNewId > 99) {
-                return res.status(400).json({ error: 'Role ID must be 0-99' });
-            }
-            if (parsedNewId !== roleId && await roleIdExists(parsedNewId)) {
-                return res.status(409).json({ error: 'Role ID already exists' });
-            }
-            if (parsedNewId !== roleId) {
-                updates.role_id = parsedNewId;
-            }
-        }
-
         if (roleName && roleName !== role.role_name) {
             if (await roleNameExists(roleName, roleId)) {
                 return res.status(409).json({ error: 'Role name already exists' });
@@ -796,8 +780,8 @@ router.put('/admin/roles/:id', requireAuth, checkPermission('manageRoles'), requ
         }
         if (permissionLevel !== undefined && permissionLevel !== '') {
             const level = parseInt(permissionLevel);
-            if (isNaN(level) || level < 0 || level > 99) {
-                return res.status(400).json({ error: 'Permission level must be 0-99' });
+            if (isNaN(level) || level < 0 || level > 9999) {
+                return res.status(400).json({ error: 'Permission level must be between 0 and 9999' });
             }
             if (level <= res.locals.user.permission_level) {
                 return res.status(403).json({ error: 'Cannot set permission level equal to or higher than your own' });
@@ -813,8 +797,7 @@ router.put('/admin/roles/:id', requireAuth, checkPermission('manageRoles'), requ
             await updateRole(roleId, updates);
         }
 
-        // Determine which role ID to use for permission updates
-        const effectiveRoleId = updates.role_id !== undefined ? updates.role_id : roleId;
+        const effectiveRoleId = roleId;
 
         // Update permissions — admin can only modify permissions they have; preserve others
         if (permissions && typeof permissions === 'object') {
@@ -832,6 +815,14 @@ router.put('/admin/roles/:id', requireAuth, checkPermission('manageRoles'), requ
                     permMap[key] = wants;
                 }
             }
+            // Block only NEW prerequisite violations. A pre-existing violation
+            // (e.g. on a key the admin can't edit) must not wedge every future
+            // edit — those are surfaced red in the UI and fixed deliberately.
+            const before = new Set(validatePermissionSet(currentPerms).map((v) => v.key));
+            const newViolations = validatePermissionSet(permMap).filter((v) => !before.has(v.key));
+            if (newViolations.length) {
+                return res.status(422).json({ error: 'Some permissions are missing their prerequisites.', violations: newViolations });
+            }
             await setRolePermissions(effectiveRoleId, permMap);
         }
 
@@ -842,8 +833,13 @@ router.put('/admin/roles/:id', requireAuth, checkPermission('manageRoles'), requ
     }
 });
 
-// DELETE /api/admin/roles/:id — delete
-router.delete('/admin/roles/:id', requireAuth, checkPermission('manageRoles'), requireMfaForScenario('roles'), async (req, res) => {
+// DELETE /api/admin/roles/:id — delete. Removing the role that is currently
+// the DEFAULT requires the caller to name its replacement: 409 default_role
+// prompts the client, which re-sends with { new_default: <role_id | null> }.
+// null/'' = blank default (No access — the SSO stores default_role_id NULL,
+// a first-class deny-safe state). The setting change rides the same
+// full-state roles.sync the deletion itself queues.
+router.delete('/admin/roles/:id', requireAuth, checkPermission('manageRoles'), requireStepup('roles'), async (req, res) => {
     try {
         const roleId = parseInt(req.params.id);
         const role = await getRoleById(roleId);
@@ -862,6 +858,28 @@ router.delete('/admin/roles/:id', requireAuth, checkPermission('manageRoles'), r
             return res.status(403).json({ error: 'Cannot remove a role with equal or higher authority' });
         }
 
+        const { getSetting } = require('../../services/cache/settingsCache');
+        const currentDefault = parseInt(await getSetting('registration_default_role', ''), 10);
+        if (currentDefault === roleId) {
+            const provided = req.body ? req.body.new_default : undefined;
+            if (provided === undefined) {
+                return res.status(409).json({ error: 'default_role', message: 'This role is the default role — pick a replacement (or blank for no access) first.' });
+            }
+            if (provided === null || provided === '') {
+                await setSetting('registration_default_role', '');
+            } else {
+                const newId = parseInt(provided, 10);
+                const newRole = Number.isInteger(newId) && newId !== roleId ? await getRoleById(newId) : null;
+                if (!newRole) {
+                    return res.status(422).json({ error: 'Invalid replacement default role' });
+                }
+                if (newRole.permission_level <= res.locals.user.permission_level) {
+                    return res.status(403).json({ error: 'Cannot set the default to a role with equal or higher privilege' });
+                }
+                await setSetting('registration_default_role', String(newId));
+            }
+        }
+
         await deleteRole(roleId);
         res.status(204).end();
     } catch (err) {
@@ -874,71 +892,77 @@ router.delete('/admin/roles/:id', requireAuth, checkPermission('manageRoles'), r
 //  SETTINGS
 // ==========================================================================
 
-// GET /api/admin/settings — all settings + worker keys + roles
-router.get('/admin/settings', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+// GET /api/admin/settings — site settings, sliced per pane. The SettingsPage
+// loads each pane lazily (?pane=general|transcoding|cloudflare|workers) so a
+// pane switch re-runs the step-up gate independently (blocking only the pane
+// you land on, without clobbering another pane's unsaved edits). No ?pane (or
+// an unknown one) returns the full blob for back-compat. The gate wraps the
+// whole route, so every slice honours the 'settings' scenario the same way.
+router.get('/admin/settings', requireAuth, checkPermission('manageSite'), requireStepup('settings'), async (req, res) => {
     try {
         const pool = getPool();
-        const [settings] = await pool.execute('SELECT * FROM site_settings ORDER BY setting_key');
-        const workerKeys = await listWorkerKeys();
-        const [roles] = await pool.execute('SELECT role_id, role_name, permission_level FROM roles ORDER BY permission_level ASC');
+        const pane = typeof req.query.pane === 'string' ? req.query.pane : null;
 
-        const settingsMap = {};
-        for (const s of settings) {
-            settingsMap[s.setting_key] = s.setting_value;
-        }
-        // Build the Cloudflare sub-object — everything CF-related lives
-        // under data.cloudflare so the settings blob stays focused on
-        // identity/site/session/registration concerns. The shape mixes
-        // existence flags (booleans), toggle states (parsed booleans), and
-        // configurable values (strings) — the client reads them directly,
-        // no `=== 'true'` dance required.
-        const cloudflare = {
-            video_hmac_enabled: settingsMap.video_hmac_enabled === 'true',
-            video_hmac_secret_configured: !!settingsMap.hmac_secret_key,
-            video_hmac_token_validity: settingsMap.video_hmac_token_validity || '600',
-            // R2 public domain ships down so the SettingsPage WAF rule
-            // builder can auto-fill the `(http.host eq "…")` clause instead
-            // of leaving a placeholder for the admin to edit. Sourced from
-            // env (not site_settings) — it's an infrastructure detail
-            // settled at deploy time, not a tenant-level toggle.
-            r2_public_domain: process.env.R2_PUBLIC_DOMAIN || '',
-            email_hmac_secret_configured: !!settingsMap.email_secret_key,
-            email_with_service_credentials: settingsMap.email_with_service_credentials === 'true',
-            email_access_secret_configured: !!settingsMap.cf_access_client_secret,
-            email_access_client_id: settingsMap.cf_access_client_id || null,
-            turnstile_worker_gate: settingsMap.cloudflare_turnstile_worker_gate === 'true',
+        // Site identity / session / registration fields + the role list the
+        // General pane needs for its default-role picker.
+        const buildGeneral = async () => {
+            const [settings] = await pool.execute('SELECT * FROM site_settings ORDER BY setting_key');
+            const [roles] = await pool.execute('SELECT role_id, role_name, permission_level FROM roles ORDER BY permission_level ASC');
+            const settingsMap = {};
+            for (const s of settings) settingsMap[s.setting_key] = s.setting_value;
+            // Strip secrets + anything owned by another pane / returned separately.
+            delete settingsMap.hmac_secret_key;
+            delete settingsMap.video_hmac_enabled;
+            delete settingsMap.video_hmac_token_validity;
+            for (const key of Object.keys(settingsMap)) {
+                if (key.startsWith('mfa_') || key.startsWith('audio_normalization_') || key === 'audio_bitrate_default') {
+                    delete settingsMap[key];
+                }
+            }
+            return { settings: settingsMap, roles };
         };
 
-        // Strip everything that's now in `cloudflare` (or that was always a
-        // secret) out of the settings blob.
-        delete settingsMap.hmac_secret_key;
-        delete settingsMap.video_hmac_enabled;
-        delete settingsMap.video_hmac_token_validity;
-        delete settingsMap.email_secret_key;
-        delete settingsMap.email_with_service_credentials;
-        delete settingsMap.cf_access_client_id;
-        delete settingsMap.cf_access_client_secret;
-        delete settingsMap.cloudflare_turnstile_worker_gate;
+        // The Cloudflare sub-object — existence flags, toggle state, and the
+        // token-validity/R2-domain values the WAF rule builder needs. r2_public_domain
+        // is an env-sourced infra detail, not a tenant toggle.
+        const buildCloudflare = async () => {
+            const [rows] = await pool.execute(
+                "SELECT setting_key, setting_value FROM site_settings WHERE setting_key IN ('video_hmac_enabled', 'hmac_secret_key', 'video_hmac_token_validity')");
+            const m = {};
+            for (const s of rows) m[s.setting_key] = s.setting_value;
+            return {
+                cloudflare: {
+                    video_hmac_enabled: m.video_hmac_enabled === 'true',
+                    video_hmac_secret_configured: !!m.hmac_secret_key,
+                    video_hmac_token_validity: m.video_hmac_token_validity || '600',
+                    r2_public_domain: process.env.R2_PUBLIC_DOMAIN || '',
+                },
+            };
+        };
 
-        // Strip keys managed by other pages / returned separately
-        for (const key of Object.keys(settingsMap)) {
-            if (key.startsWith('mfa_') || key.startsWith('audio_normalization_') || key === 'audio_bitrate_default') {
-                delete settingsMap[key];
-            }
-        }
+        const buildWorkers = async () => {
+            const workerKeys = await listWorkerKeys();
+            // Strip key_secret (only shown once at creation).
+            return { workerKeys: workerKeys.map(k => { const { key_secret, ...rest } = k; return rest; }) };
+        };
 
-        // Strip key_secret from worker keys list (only shown once at creation)
-        const sanitizedWorkerKeys = workerKeys.map(k => {
-            const { key_secret, ...rest } = k;
-            return rest;
+        const buildTranscoding = async () => ({
+            defaultProfiles: await getDefaultGlobalProfiles(),
+            enhancedProfiles: await getEnhancedGlobalProfiles(),
+            audioNormalization: await getAudioNormalizationSettings(),
+            audioBitrateKbps: await getAudioBitrateDefault(),
         });
 
-        const defaultProfiles = await getDefaultGlobalProfiles();
-        const enhancedProfiles = await getEnhancedGlobalProfiles();
-        const audioNormalization = await getAudioNormalizationSettings();
-        const audioBitrateKbps = await getAudioBitrateDefault();
-
-        res.json({ settings: settingsMap, cloudflare, workerKeys: sanitizedWorkerKeys, roles, defaultProfiles, enhancedProfiles, audioNormalization, audioBitrateKbps });
+        let payload;
+        if (pane === 'general') payload = await buildGeneral();
+        else if (pane === 'cloudflare') payload = await buildCloudflare();
+        else if (pane === 'workers') payload = await buildWorkers();
+        else if (pane === 'transcoding') payload = await buildTranscoding();
+        else {
+            const [g, cf, wk, tc] = await Promise.all([buildGeneral(), buildCloudflare(), buildWorkers(), buildTranscoding()]);
+            payload = { ...g, ...cf, ...wk, ...tc };
+        }
+        res.json(payload);
     } catch (err) {
         console.error('API settings error:', err);
         res.status(500).json({ error: 'Failed to load settings.' });
@@ -946,14 +970,13 @@ router.get('/admin/settings', requireAuth, checkPermission('manageSite'), requir
 });
 
 // PUT /api/admin/settings — save general settings (partial updates)
-router.put('/admin/settings', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+router.put('/admin/settings', requireAuth, checkPermission('manageSite'), requireStepup('settings'), async (req, res) => {
     try {
         const pool = getPool();
         const allowedKeys = [
             'site_name', 'site_protocol', 'site_hostname',
             'session_inactivity_days', 'session_max_days',
-            'emailed_link_validity_minutes', 'registration_default_role',
-            'enable_registration', 'require_invitation_code'
+            'registration_default_role',
         ];
 
         // Build updates from only the fields present in the request
@@ -961,12 +984,9 @@ router.put('/admin/settings', requireAuth, checkPermission('manageSite'), requir
         for (const key of allowedKeys) {
             if (req.body[key] === undefined) continue;
             if (key === 'site_hostname') {
-                updates.site_hostname = (req.body.site_hostname || '').trim().replace(/^https?:\/\//, '').split('/')[0];
+                updates.site_hostname = stripToHost(req.body.site_hostname);
             } else if (key === 'site_protocol') {
                 updates.site_protocol = req.body.site_protocol || 'https';
-            } else if (key === 'enable_registration' || key === 'require_invitation_code') {
-                const v = req.body[key];
-                updates[key] = (v === 'on' || v === true || v === 'true') ? 'true' : 'false';
             } else {
                 updates[key] = String(req.body[key]);
             }
@@ -988,8 +1008,8 @@ router.put('/admin/settings', requireAuth, checkPermission('manageSite'), requir
         if (updates.site_hostname !== undefined) {
             if (!updates.site_hostname.trim()) {
                 errors.site_hostname = 'Hostname is required';
-            } else if (/\s/.test(updates.site_hostname)) {
-                errors.site_hostname = 'Hostname cannot contain spaces';
+            } else if (!isValidHost(updates.site_hostname)) {
+                errors.site_hostname = 'Enter a valid hostname or IP address (no spaces, slashes, or path)';
             }
         }
 
@@ -1034,18 +1054,9 @@ router.put('/admin/settings', requireAuth, checkPermission('manageSite'), requir
             }
         }
 
-        if (updates.emailed_link_validity_minutes !== undefined) {
-            if (!updates.emailed_link_validity_minutes.trim()) {
-                errors.emailed_link_validity_minutes = 'This field is required';
-            } else {
-                const v = Number(updates.emailed_link_validity_minutes);
-                if (!Number.isInteger(v) || v < 5 || v > 10080) {
-                    errors.emailed_link_validity_minutes = 'Must be an integer between 5 and 10080';
-                }
-            }
-        }
-
-        if (updates.registration_default_role !== undefined) {
+        // Default role: blank = No access (a first-class state — the SSO stores
+        // default_role_id NULL and refuses sign-in for users who resolve to it).
+        if (updates.registration_default_role !== undefined && updates.registration_default_role.trim() !== '') {
             const roleId = Number(updates.registration_default_role);
             const [roleRows] = await pool.execute('SELECT permission_level FROM roles WHERE role_id = ?', [roleId]);
             if (!roleRows.length) {
@@ -1072,6 +1083,12 @@ router.put('/admin/settings', requireAuth, checkPermission('manageSite'), requir
             );
         }
         await require('../../services/cache/settingsCache').invalidate();
+
+        // The default role AND our display name ride the same full-state
+        // report the SSO mirrors — report on either change.
+        if (updates.registration_default_role !== undefined || updates.site_name !== undefined) {
+            require('../../services/ssoEvents').reportRoles().catch(() => {});
+        }
 
         res.status(204).end();
     } catch (err) {
@@ -1132,7 +1149,7 @@ async function parseAndGuardGlobalProfiles(profiles, enhanced) {
 // global set + (optionally) audio normalization + site-wide audio bitrate.
 // Audio settings ride on the default endpoint for back-compat; the enhanced
 // endpoint handles only its profile array.
-router.put('/admin/settings/transcoding-profiles/default', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+router.put('/admin/settings/transcoding-profiles/default', requireAuth, checkPermission('manageSite'), requireStepup('settings'), async (req, res) => {
     try {
         const { profiles, audioNormalization, audioBitrateKbps } = req.body;
         const result = await parseAndGuardGlobalProfiles(profiles, false);
@@ -1173,7 +1190,7 @@ router.put('/admin/settings/transcoding-profiles/default', requireAuth, checkPer
 
 // PUT /api/admin/settings/transcoding-profiles/enhanced — save enhanced-quality
 // global set. Profile array only; audio settings live on the /default endpoint.
-router.put('/admin/settings/transcoding-profiles/enhanced', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+router.put('/admin/settings/transcoding-profiles/enhanced', requireAuth, checkPermission('manageSite'), requireStepup('settings'), async (req, res) => {
     try {
         const { profiles } = req.body;
         const result = await parseAndGuardGlobalProfiles(profiles, true);
@@ -1187,7 +1204,7 @@ router.put('/admin/settings/transcoding-profiles/enhanced', requireAuth, checkPe
 });
 
 // POST /api/admin/settings/video-hmac/generate — generate new HMAC secret key
-router.post('/admin/settings/video-hmac/generate', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+router.post('/admin/settings/video-hmac/generate', requireAuth, checkPermission('manageSite'), requireStepup('settings'), async (req, res) => {
     try {
         const secret = await generateSecretKey();
         res.json({ success: true, secret });
@@ -1197,97 +1214,8 @@ router.post('/admin/settings/video-hmac/generate', requireAuth, checkPermission(
     }
 });
 
-// POST /api/admin/settings/email/generate — generate new email-sender secret.
-//
-// 64-char hex; stored encrypted (enc:v1:) in site_settings as
-// `email_secret_key` via setSecretSetting and surfaced once in the admin UI
-// for the admin to paste into the email-sender Worker via
-// `wrangler secret put EMAIL_HMAC_SECRET`. setSecretSetting purges the
-// site:settings cache so the next sendEmail call uses the new value.
-router.post('/admin/settings/email/generate', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
-    try {
-        const { setSecretSetting } = require('../../services/settingsEncryption');
-        const secret = crypto.randomBytes(32).toString('hex');
-        await setSecretSetting('email_secret_key', secret);
-        res.json({ success: true, secret });
-    } catch (err) {
-        console.error('API generate email secret error:', err);
-        res.status(500).json({ error: 'Failed to generate email secret key' });
-    }
-});
-
-// Strip a leading `CF-Access-Client-Id:` / `CF-Access-Client-Secret:` header
-// prefix (case-insensitive, whitespace around the colon allowed) and trim
-// surrounding whitespace. The Cloudflare dashboard ships the values copied
-// directly from a header-style display, so a paste like
-// `CF-Access-Client-Secret: abc123` should resolve to `abc123`. Client and
-// server both sanitize — client for the visible input, server as the
-// authoritative gate.
-function sanitizeCfAccessValue(raw) {
-    if (typeof raw !== 'string') return '';
-    return raw.replace(/^\s*cf-access-client-(?:id|secret)\s*:\s*/i, '').trim();
-}
-
-// PUT /api/admin/settings/email/service-credentials — set or rotate the
-// Cloudflare Access service-token credentials used to call the email-sender
-// Worker. Body: { clientId, secret, enable? }.
-//
-// - clientId is stored plaintext (it's an identifier, not a secret).
-// - secret is stored encrypted via setSecretSetting (enc:v1:).
-// - If `enable` is true/false, the email_with_service_credentials toggle is
-//   updated atomically. Omit `enable` to rotate without touching the toggle.
-//
-// Both fields are sanitized via sanitizeCfAccessValue() — strips any pasted
-// `CF-Access-Client-*:` header prefix + surrounding whitespace.
-//
-// MFA-gated so a stolen session can't rotate credentials silently.
-router.put('/admin/settings/email/service-credentials', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
-    try {
-        const clientId = sanitizeCfAccessValue(req.body && req.body.clientId);
-        const secret = sanitizeCfAccessValue(req.body && req.body.secret);
-        const enable = req.body && req.body.enable;
-        if (!clientId) {
-            return res.status(422).json({ error: 'clientId is required' });
-        }
-        if (!secret) {
-            return res.status(422).json({ error: 'secret is required' });
-        }
-        const { setSecretSetting } = require('../../services/settingsEncryption');
-        await setSetting('cf_access_client_id', clientId);
-        await setSecretSetting('cf_access_client_secret', secret);
-        if (enable === true || enable === false) {
-            await setSetting('email_with_service_credentials', enable ? 'true' : 'false');
-        }
-        res.status(204).end();
-    } catch (err) {
-        console.error('API set service credentials error:', err);
-        res.status(500).json({ error: 'Failed to save service credentials' });
-    }
-});
-
-// PUT /api/admin/settings/email/service-credentials/toggle — flip the
-// email_with_service_credentials switch without touching the stored
-// credentials. Refuses to enable if credentials aren't yet configured.
-router.put('/admin/settings/email/service-credentials/toggle', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
-    try {
-        const enabled = req.body && (req.body.enabled === true || req.body.enabled === 'true');
-        if (enabled) {
-            const { getSetting } = require('../../services/cache/settingsCache');
-            const clientId = await getSetting('cf_access_client_id');
-            if (!clientId) {
-                return res.status(422).json({ error: 'Configure service credentials before enabling' });
-            }
-        }
-        await setSetting('email_with_service_credentials', enabled ? 'true' : 'false');
-        res.status(204).end();
-    } catch (err) {
-        console.error('API toggle service credentials error:', err);
-        res.status(500).json({ error: 'Failed to toggle service credentials' });
-    }
-});
-
 // PUT /api/admin/settings/video-hmac/validity — update video-HMAC token validity hint
-router.put('/admin/settings/video-hmac/validity', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+router.put('/admin/settings/video-hmac/validity', requireAuth, checkPermission('manageSite'), requireStepup('settings'), async (req, res) => {
     try {
         const val = parseInt(req.body.video_hmac_token_validity, 10);
         if (!val || val < 600) {
@@ -1302,7 +1230,7 @@ router.put('/admin/settings/video-hmac/validity', requireAuth, checkPermission('
 });
 
 // PUT /api/admin/settings/video-hmac/toggle — enable/disable video-playback HMAC.
-router.put('/admin/settings/video-hmac/toggle', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+router.put('/admin/settings/video-hmac/toggle', requireAuth, checkPermission('manageSite'), requireStepup('settings'), async (req, res) => {
     try {
         const enabled = req.body.video_hmac_enabled === 'true' || req.body.video_hmac_enabled === true;
         if (enabled && !(await isHmacConfigured())) {
@@ -1316,29 +1244,10 @@ router.put('/admin/settings/video-hmac/toggle', requireAuth, checkPermission('ma
     }
 });
 
-// PUT /api/admin/settings/turnstile-gate/toggle — enable/disable
-// "Turnstile is verified at a Cloudflare Worker, skip origin verification."
-//
-// We accept the toggle even when origin doesn't have TURNSTILE_*_KEY set —
-// the per-request short-circuit in turnstileService.isWorkerGateActive
-// already treats the toggle as inert when Turnstile is unconfigured, so
-// flipping it has no effect until the env vars come in.
-router.put('/admin/settings/turnstile-gate/toggle', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
-    try {
-        const raw = req.body.enabled;
-        const enabled = raw === true || raw === 'true';
-        await setSetting('cloudflare_turnstile_worker_gate', enabled ? 'true' : 'false');
-        res.status(204).end();
-    } catch (err) {
-        console.error('API toggle turnstile gate error:', err);
-        res.status(500).json({ error: 'Failed to toggle Turnstile worker gate' });
-    }
-});
-
 // POST /api/admin/settings/worker-keys — create worker key.
 // Label is optional; the admin UI now collects it inside the post-click modal
 // (with a blank-allowed input) rather than inline, so an empty body is normal.
-router.post('/admin/settings/worker-keys', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+router.post('/admin/settings/worker-keys', requireAuth, checkPermission('manageSite'), requireStepup('settings'), async (req, res) => {
     try {
         const { label } = req.body || {};
         const { keyId, secret } = await generateWorkerKeyPair(label, res.locals.user.user_id);
@@ -1357,7 +1266,7 @@ router.post('/admin/settings/worker-keys', requireAuth, checkPermission('manageS
 // on a security-disabled key — the worker is still locked out by the auth-
 // time deactivated check, but the operator's mental model would diverge
 // from what the row actually says.
-router.post('/admin/settings/worker-keys/:keyId/pause', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+router.post('/admin/settings/worker-keys/:keyId/pause', requireAuth, checkPermission('manageSite'), requireStepup('settings'), async (req, res) => {
     try {
         const result = await pauseWorkerKey(req.params.keyId);
         if (!result.ok) {
@@ -1378,7 +1287,7 @@ router.post('/admin/settings/worker-keys/:keyId/pause', requireAuth, checkPermis
 // 'paused'. A 'deactivated' key would otherwise quietly skip the secret-
 // rotation that reactivate forces — that's a direct bypass of leak
 // detection, hence the 409 rather than a tolerant fallthrough.
-router.post('/admin/settings/worker-keys/:keyId/resume', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+router.post('/admin/settings/worker-keys/:keyId/resume', requireAuth, checkPermission('manageSite'), requireStepup('settings'), async (req, res) => {
     try {
         const result = await resumeWorkerKey(req.params.keyId);
         if (!result.ok) {
@@ -1404,7 +1313,7 @@ router.post('/admin/settings/worker-keys/:keyId/resume', requireAuth, checkPermi
 // a hijacked admin session could otherwise hit this on an 'active' key and
 // disrupt a healthy worker via the forced rotation. Returns 409 on a
 // preconditioned-failed status.
-router.post('/admin/settings/worker-keys/:keyId/reactivate', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+router.post('/admin/settings/worker-keys/:keyId/reactivate', requireAuth, checkPermission('manageSite'), requireStepup('settings'), async (req, res) => {
     try {
         const result = await reactivateWorkerKey(req.params.keyId);
         if (!result.ok) {
@@ -1425,7 +1334,7 @@ router.post('/admin/settings/worker-keys/:keyId/reactivate', requireAuth, checkP
 //
 // Rejects when the key is deactivated — spec is "Reactivate + Delete only"
 // in that column, and the UI hides Rename to match.
-router.post('/admin/settings/worker-keys/:keyId/rename', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+router.post('/admin/settings/worker-keys/:keyId/rename', requireAuth, checkPermission('manageSite'), requireStepup('settings'), async (req, res) => {
     try {
         const { label } = req.body || {};
         const result = await renameWorkerKey(req.params.keyId, typeof label === 'string' ? label.trim() : '');
@@ -1444,7 +1353,7 @@ router.post('/admin/settings/worker-keys/:keyId/rename', requireAuth, checkPermi
 // DELETE /api/admin/settings/worker-keys/:keyId — permanent delete. Replaces
 // the old Revoke→Delete two-step. Works in any status; the client shows a
 // confirmation warning before the call.
-router.delete('/admin/settings/worker-keys/:keyId', requireAuth, checkPermission('manageSite'), requireMfaForScenario('settings'), async (req, res) => {
+router.delete('/admin/settings/worker-keys/:keyId', requireAuth, checkPermission('manageSite'), requireStepup('settings'), async (req, res) => {
     try {
         const ok = await deleteWorkerKey(req.params.keyId);
         if (!ok) return res.status(404).json({ error: 'Key not found' });
@@ -1456,246 +1365,96 @@ router.delete('/admin/settings/worker-keys/:keyId', requireAuth, checkPermission
 });
 
 // ==========================================================================
-//  INVITATIONS
+//  PLAYBACK STATS  (distributed: per-course modal + per-user section)
 // ==========================================================================
+// The old global /admin/playback-stats drill-down page is gone. Stats now live
+// where the entity lives. Every read overlays live Redis pending data on the
+// flushed DB rows (see playbackStatsService).
 
-// GET /api/admin/invitations — query params: page, limit
-router.get('/admin/invitations', requireAuth, checkPermission('inviteUser'), requireMfaForScenario('invitation_codes'), async (req, res) => {
+// GET /api/admin/courses/:courseId/playback-stats
+//   base        → { overall:{videos,videoCount,totalDuration,viewerCount}, students }
+//   ?userId=HEX → { videos } for that student in this course
+// View gate: manageCourse + viewPlaybackStat + the admin's OWN course access
+// (allCourseAccess passes; otherwise must be enrolled) via requireCourseAccess.
+router.get('/admin/courses/:courseId/playback-stats',
+    requireAuth, checkPermission('manageCourse'), checkPermission('viewPlaybackStat'),
+    requireCourseAccess, async (req, res) => {
     try {
-        const page = Math.max(1, parseInt(req.query.page) || 1);
-        const limit = [10, 20, 50].includes(parseInt(req.query.limit)) ? parseInt(req.query.limit) : 10;
-        const allCodes = await listInvitationCodes(res.locals.user.permission_level);
-        const total = allCodes.length;
-        const totalPages = Math.max(1, Math.ceil(total / limit));
-        const safePage = Math.min(page, totalPages);
-        const codes = allCodes.slice((safePage - 1) * limit, safePage * limit);
-        res.json({ codes, pagination: { page: safePage, totalPages, total, limit } });
+        const courseId = parseInt(req.params.courseId, 10);
+        if (!Number.isInteger(courseId)) return res.status(400).json({ error: 'Invalid course id' });
+        if (req.query.userId) {
+            const videos = await playbackStats.getUserVideoStats(courseId, req.query.userId);
+            return res.json({ videos });
+        }
+        res.json(await playbackStats.getCourseStats(courseId));
     } catch (err) {
-        console.error('API invitation codes error:', err);
-        res.status(500).json({ error: 'Failed to load invitation codes.' });
-    }
-});
-
-// POST /api/admin/invitations — create new code
-router.post('/admin/invitations', requireAuth, checkPermission('inviteUser'), requireMfaForScenario('invitation_codes'), async (req, res) => {
-    try {
-        const validityHours = parseInt(req.body.validity_hours) || 72;
-        if (validityHours < 1) {
-            return res.status(400).json({ error: 'Validity must be at least 1 hour.' });
-        }
-
-        const result = await generateInvitationCode(res.locals.user.user_id, validityHours);
-        res.json({ code: result.code, expires_at: result.expiresAt });
-    } catch (err) {
-        console.error('API generate invitation code error:', err);
-        res.status(500).json({ error: 'Failed to generate invitation code.' });
-    }
-});
-
-// DELETE /api/admin/invitations/:code — remove invitation
-router.delete('/admin/invitations/:code', requireAuth, checkPermission('inviteUser'), requireMfaForScenario('invitation_codes'), async (req, res) => {
-    try {
-        const result = await removeInvitationCode(
-            req.params.code,
-            res.locals.user.user_id,
-            res.locals.user.permission_level
-        );
-
-        if (!result.success) {
-            const status = result.error.includes('permission') ? 403 : 404;
-            return res.status(status).json({ error: result.error });
-        }
-
-        res.status(204).end();
-    } catch (err) {
-        console.error('API remove invitation code error:', err);
-        res.status(500).json({ error: 'Failed to remove invitation code.' });
-    }
-});
-
-// ==========================================================================
-//  PLAYBACK STATS
-// ==========================================================================
-
-// GET /api/admin/playback-stats — query params: userId, courseId
-//
-// All three result sets (users, userCourses, courseVideos) are DB aggregates
-// overlaid with pending entries from progress:watch:* — so the page reflects
-// up-to-the-second activity, not 15-min-stale flushed data. The overlay also
-// surfaces courses/videos that have only Redis-pending data and no DB row yet.
-router.get('/admin/playback-stats', requireAuth, checkPermission('viewPlaybackStat'), requireMfaForScenario('playback_stats'), async (req, res) => {
-    try {
-        const pool = getPool();
-        const userIdParam = req.query.userId;
-        const courseIdParam = req.query.courseId;
-        const watchProgressCache = require('../../services/cache/watchProgressCache');
-        const videoCacheMod = require('../../services/cache/videoCache');
-        const courseCacheMod = require('../../services/cache/courseCache');
-
-        // Pull every pending watch entry once; we'll join against it three
-        // different ways below.
-        const pending = await watchProgressCache.getAllPending();
-        // Build per-user → {delta, max_updated_at} for the users table.
-        const pendingByUser = {};
-        // Build per-(user,video) → entry for the per-course / per-video tables.
-        for (const [memberId, data] of Object.entries(pending)) {
-            const [uidStr] = memberId.split(':');
-            const uid = parseInt(uidStr, 10);
-            if (!pendingByUser[uid]) pendingByUser[uid] = { delta: 0, max_updated_at: 0 };
-            pendingByUser[uid].delta += data.delta;
-            if (data.updated_at > pendingByUser[uid].max_updated_at) {
-                pendingByUser[uid].max_updated_at = data.updated_at;
-            }
-        }
-
-        // User list with total watch time
-        const [users] = await pool.execute(
-            `SELECT u.user_id, u.username, u.display_name,
-                    COALESCE(SUM(wp.watch_seconds), 0) as total_watch_seconds,
-                    MAX(wp.last_watch_at) as last_watch_at
-             FROM users u
-             LEFT JOIN watch_progress wp ON u.user_id = wp.user_id
-             GROUP BY u.user_id
-             ORDER BY total_watch_seconds DESC`
-        );
-
-        for (const u of users) {
-            const p = pendingByUser[u.user_id];
-            if (!p) continue;
-            u.total_watch_seconds = parseFloat(u.total_watch_seconds) + p.delta;
-            const lastWatchMs = u.last_watch_at ? new Date(u.last_watch_at).getTime() : 0;
-            if (p.max_updated_at > lastWatchMs) {
-                u.last_watch_at = new Date(p.max_updated_at);
-            }
-        }
-        users.sort((a, b) => parseFloat(b.total_watch_seconds) - parseFloat(a.total_watch_seconds));
-
-        let userCourses = null;
-        let courseVideos = null;
-        let selectedUser = null;
-        let selectedCourse = null;
-
-        if (userIdParam) {
-            const userId = parseInt(userIdParam);
-
-            // Get user info
-            const [userRows] = await pool.execute(
-                'SELECT user_id, username, display_name FROM users WHERE user_id = ?',
-                [userId]
-            );
-            selectedUser = userRows[0] || null;
-
-            if (selectedUser) {
-                // Group this user's pending entries by course_id (via videoCache).
-                const pendingByCourse = {};
-                for (const [memberId, data] of Object.entries(pending)) {
-                    const [uidStr, vidStr] = memberId.split(':');
-                    if (parseInt(uidStr) !== userId) continue;
-                    const vid = parseInt(vidStr);
-                    const meta = await videoCacheMod.getVideoMeta(vid);
-                    if (!meta) continue;
-                    const cid = meta.course_id;
-                    if (!pendingByCourse[cid]) pendingByCourse[cid] = { delta: 0, max_updated_at: 0 };
-                    pendingByCourse[cid].delta += data.delta;
-                    if (data.updated_at > pendingByCourse[cid].max_updated_at) {
-                        pendingByCourse[cid].max_updated_at = data.updated_at;
-                    }
-                }
-
-                // Get courses with watch stats for this user (DB aggregate).
-                const [courses] = await pool.execute(
-                    `SELECT c.course_id, c.course_name,
-                            COALESCE(SUM(wp.watch_seconds), 0) as total_watch_seconds,
-                            MAX(wp.last_watch_at) as last_watch_at
-                     FROM courses c
-                     JOIN videos v ON c.course_id = v.course_id
-                     LEFT JOIN watch_progress wp ON v.video_id = wp.video_id AND wp.user_id = ?
-                     GROUP BY c.course_id
-                     HAVING total_watch_seconds > 0
-                     ORDER BY last_watch_at DESC`,
-                    [userId]
-                );
-
-                const presentCourseIds = new Set(courses.map(c => c.course_id));
-                for (const c of courses) {
-                    const p = pendingByCourse[c.course_id];
-                    if (!p) continue;
-                    c.total_watch_seconds = parseFloat(c.total_watch_seconds) + p.delta;
-                    const lastWatchMs = c.last_watch_at ? new Date(c.last_watch_at).getTime() : 0;
-                    if (p.max_updated_at > lastWatchMs) {
-                        c.last_watch_at = new Date(p.max_updated_at);
-                    }
-                }
-                // Courses with only pending data (no DB row yet) need to be added.
-                for (const [cidStr, p] of Object.entries(pendingByCourse)) {
-                    const cid = parseInt(cidStr);
-                    if (presentCourseIds.has(cid)) continue;
-                    const courseMeta = await courseCacheMod.getCourseMeta(cid);
-                    if (!courseMeta) continue;
-                    courses.push({
-                        course_id: cid,
-                        course_name: courseMeta.course_name,
-                        total_watch_seconds: p.delta,
-                        last_watch_at: p.max_updated_at ? new Date(p.max_updated_at) : null,
-                    });
-                }
-                courses.sort((a, b) => {
-                    const ta = a.last_watch_at ? new Date(a.last_watch_at).getTime() : 0;
-                    const tb = b.last_watch_at ? new Date(b.last_watch_at).getTime() : 0;
-                    return tb - ta;
-                });
-                userCourses = courses;
-            }
-        }
-
-        if (userIdParam && courseIdParam) {
-            const userId = parseInt(userIdParam);
-            const courseId = parseInt(courseIdParam);
-
-            // Get per-video stats for this user + course
-            const [courseRows] = await pool.execute(
-                'SELECT course_id, course_name FROM courses WHERE course_id = ?',
-                [courseId]
-            );
-            selectedCourse = courseRows[0] || null;
-
-            const [videos] = await pool.execute(
-                `SELECT v.video_id, v.title, v.duration_seconds,
-                        COALESCE(wp.watch_seconds, 0) as watch_seconds,
-                        wp.last_position, wp.last_watch_at
-                 FROM videos v
-                 LEFT JOIN watch_progress wp ON v.video_id = wp.video_id AND wp.user_id = ?
-                 WHERE v.course_id = ?
-                 ORDER BY COALESCE(v.lecture_date, v.created_at) DESC`,
-                [userId, courseId]
-            );
-
-            for (const v of videos) {
-                const p = pending[`${userId}:${v.video_id}`];
-                if (!p) continue;
-                v.watch_seconds = parseFloat(v.watch_seconds) + p.delta;
-                v.last_position = p.last_position; // freshest
-                v.last_watch_at = new Date(p.updated_at);
-            }
-            courseVideos = videos;
-        }
-
-        res.json({
-            users,
-            userCourses,
-            courseVideos,
-            selectedUser,
-            selectedCourse,
-            canClear: res.locals.user.permissions.clearPlaybackStat
-        });
-    } catch (err) {
-        console.error('API playback stats error:', err);
+        console.error('API course playback stats error:', err);
         res.status(500).json({ error: 'Failed to load playback statistics.' });
     }
 });
 
-// DELETE /api/admin/playback-stats — clear all
-router.delete('/admin/playback-stats', requireAuth, checkPermission('clearPlaybackStat'), requireMfaForScenario('playback_stats'), async (req, res) => {
+// DELETE /api/admin/courses/:courseId/playback-stats — reset the WHOLE course
+// (all students). Gate: changeCourse + course access.
+router.delete('/admin/courses/:courseId/playback-stats',
+    requireAuth, checkPermission('changeCourse'),
+    requireCourseAccess, async (req, res) => {
+    try {
+        const courseId = parseInt(req.params.courseId, 10);
+        if (!Number.isInteger(courseId)) return res.status(400).json({ error: 'Invalid course id' });
+        await playbackStats.resetCourse(courseId);
+        res.status(204).end();
+    } catch (err) {
+        console.error('API reset course playback stats error:', err);
+        res.status(500).json({ error: 'Failed to reset statistics' });
+    }
+});
+
+// GET /api/admin/users/:id/playback-stats
+//   base         → { courses } this user has watched (feeds the course selector)
+//   ?courseId=N  → { videos } for this user in that course
+// Gate mirrors the other edit-user sub-routes: changeUser + strictly-below.
+router.get('/admin/users/:id/playback-stats',
+    requireAuth, checkPermission('changeUser'), requireStepup('user'),
+    checkPermissionLevel, async (req, res) => {
+    try {
+        if (req.query.courseId) {
+            const courseId = parseInt(req.query.courseId, 10);
+            if (!Number.isInteger(courseId)) return res.status(400).json({ error: 'Invalid course id' });
+            const videos = await playbackStats.getUserVideoStats(courseId, req.params.id);
+            return res.json({ videos });
+        }
+        res.json({ courses: await playbackStats.getUserWatchedCourses(req.params.id) });
+    } catch (err) {
+        console.error('API user playback stats error:', err);
+        res.status(500).json({ error: 'Failed to load playback statistics.' });
+    }
+});
+
+// DELETE /api/admin/users/:id/playback-stats — reset this student's stats.
+//   ?courseId=N → only that course; otherwise ALL courses.
+router.delete('/admin/users/:id/playback-stats',
+    requireAuth, checkPermission('changeUser'), requireStepup('user'),
+    checkPermissionLevel, async (req, res) => {
+    try {
+        if (req.query.courseId) {
+            const courseId = parseInt(req.query.courseId, 10);
+            if (!Number.isInteger(courseId)) return res.status(400).json({ error: 'Invalid course id' });
+            await playbackStats.resetUserCourse(req.params.id, courseId);
+        } else {
+            await playbackStats.resetUser(req.params.id);
+        }
+        res.status(204).end();
+    } catch (err) {
+        console.error('API reset user playback stats error:', err);
+        res.status(500).json({ error: 'Failed to reset statistics' });
+    }
+});
+
+// DELETE /api/admin/playback-stats — global kill switch (lives in Site Settings).
+// Was gated by the now-removed clearPlaybackStat; the site-wide reset is under
+// manageSite. Wipes EVERY student's watch history AND resume positions.
+router.delete('/admin/playback-stats',
+    requireAuth, checkPermission('manageSite'), requireStepup('settings'), async (req, res) => {
     try {
         const pool = getPool();
         await pool.execute('DELETE FROM watch_progress');
@@ -1712,7 +1471,7 @@ router.delete('/admin/playback-stats', requireAuth, checkPermission('clearPlayba
 // ==========================================================================
 
 // GET /api/admin/transcoding/jobs
-router.get('/admin/transcoding/jobs', requireAuth, checkPermission('manageSite'), requireMfaForScenario('transcoding'), async (req, res) => {
+router.get('/admin/transcoding/jobs', requireAuth, checkPermission('manageSite'), requireStepup('transcoding'), async (req, res) => {
     try {
         const pool = getPool();
 
@@ -1727,7 +1486,7 @@ router.get('/admin/transcoding/jobs', requireAuth, checkPermission('manageSite')
                     wak.label AS worker_label,
                     v.title AS video_title, v.video_id, v.status AS video_status,
                     v.processing_progress AS video_progress,
-                    c.course_name
+                    c.course_code AS course_name
              FROM processing_queue pq
              JOIN videos v ON pq.video_id = v.video_id
              JOIN courses c ON v.course_id = c.course_id
@@ -1795,7 +1554,7 @@ router.get('/admin/transcoding/jobs', requireAuth, checkPermission('manageSite')
 });
 
 // POST /api/admin/transcoding/clear-finished — soft-clear completed tasks
-router.post('/admin/transcoding/clear-finished', requireAuth, checkPermission('manageSite'), requireMfaForScenario('transcoding'), async (req, res) => {
+router.post('/admin/transcoding/clear-finished', requireAuth, checkPermission('manageSite'), requireStepup('transcoding'), async (req, res) => {
     try {
         const pool = getPool();
         await pool.execute(

@@ -176,6 +176,44 @@ async function clearForVideos(videoIds) {
     for (const vid of videoIds) await clearForVideo(vid);
 }
 
+// Scan + delete every cached entry for a given user (all videos). Used by the
+// admin per-user playback-stats reset. userId is the canonical lower-hex sub
+// (the exact form used in the key, since recordProgress keys on user.user_id).
+async function clearForUser(userId) {
+    const redis = getClient();
+    const pattern = `progress:watch:${userId}:*`;
+    let cursor = '0';
+    const toDelete = [];
+    do {
+        const [next, batch] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 500);
+        cursor = next;
+        toDelete.push(...batch);
+    } while (cursor !== '0');
+
+    if (toDelete.length === 0) return;
+    const dirtyMembers = toDelete.map(k => {
+        const parts = k.split(':');
+        return `${parts[2]}:${parts[3]}`;
+    });
+    const tx = redis.multi();
+    tx.del(...toDelete);
+    tx.srem(DIRTY, ...dirtyMembers);
+    await tx.exec();
+}
+
+// Delete this user's cached entries for a specific set of videos (the per-user,
+// per-course reset). Direct key hits — no scan needed.
+async function clearForUserVideos(userId, videoIds) {
+    if (!videoIds || videoIds.length === 0) return;
+    const redis = getClient();
+    const keys = videoIds.map(v => key(userId, v));
+    const members = videoIds.map(v => memberId(userId, v));
+    const tx = redis.multi();
+    tx.del(...keys);
+    tx.srem(DIRTY, ...members);
+    await tx.exec();
+}
+
 // Wipe everything. For admin "clear all playback stats".
 async function clearAll() {
     const redis = getClient();
@@ -199,5 +237,7 @@ module.exports = {
     removeDirty,
     clearForVideo,
     clearForVideos,
+    clearForUser,
+    clearForUserVideos,
     clearAll,
 };

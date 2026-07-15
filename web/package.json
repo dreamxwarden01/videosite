@@ -6,7 +6,11 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "check:schema": "node scripts/check-api-schema.js"
+    "check:schema": "node scripts/check-api-schema.js",
+    "check:db": "node scripts/check-db-baseline.js",
+    "db:bless": "node scripts/check-db-baseline.js --bless",
+    "test:db": "node scripts/db-baseline-test.js",
+    "test:install": "node scripts/install-e2e-test.mjs"
   },
   "keywords": [],
   "author": "",
@@ -15,6 +19,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.995.0",
     "@aws-sdk/s3-request-presigner": "^3.995.0",
+    "@peculiar/x509": "^2.0.0",
     "@simplewebauthn/server": "^13.3.0",
     "argon2": "^0.44.0",
     "cookie-parser": "^1.4.7",
@@ -22,10 +27,14 @@
     "express": "^5.2.1",
     "express-validator": "^7.3.1",
     "ioredis": "^5.10.1",
+    "jose": "^6.2.3",
     "morgan": "^1.10.1",
     "mysql2": "^3.17.4",
+    "node-forge": "^1.4.0",
     "otplib": "^13.4.0",
     "qrcode": "^1.5.4",
-    "ua-parser-js": "^2.0.9"
+    "reflect-metadata": "^0.2.2",
+    "ua-parser-js": "^2.0.9",
+    "undici": "^8.7.0"
   }
 }

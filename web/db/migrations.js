@@ -1,10 +1,20 @@
 const { getPool } = require('../config/database');
 
 /**
- * Run all pending migrations on startup.
- * Each migration checks if it needs to run before executing.
+ * Run all pending migrations.
+ *
+ * At BOOT this is deliberately lenient: a migration failure is logged and the
+ * running site carries on rather than crashing.
+ *
+ * The INSTALLER passes { strict: true } and needs the opposite: swallowing a failure
+ * would hand the operator a "success" page on top of a broken schema.
+ *
+ * TO ADD A MIGRATION: append it to the array below and touch NOTHING else. Do not
+ * add it to db/seed.sql and do not regenerate db/schema.sql — those two are a frozen
+ * baseline pair, and a fresh install runs everything after it exactly as an existing
+ * install does. `npm run check:db` enforces that. See lib/dbBaseline.js for why.
  */
-async function runMigrations() {
+async function runMigrations({ strict = false } = {}) {
     const pool = getPool();
 
     try {
@@ -219,11 +229,12 @@ async function runMigrations() {
                         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                     `);
 
-                    // Add MFA permissions to superadmin and admin
+                    // Add MFA permissions to superadmin and admin. (The former
+                    // manageSiteMFA row is dropped by a later migration — MFA
+                    // settings folded into manageSite.)
                     await pool.execute(`
                         INSERT IGNORE INTO role_permissions (role_id, permission_key, granted)
-                        VALUES (0, 'requireMFA', 1), (1, 'requireMFA', 1),
-                               (0, 'manageSiteMFA', 1)
+                        VALUES (0, 'requireMFA', 1), (1, 'requireMFA', 1)
                     `);
 
                     // Add MFA site settings defaults
@@ -1017,7 +1028,175 @@ async function runMigrations() {
                     }
                     console.log(`Migration 040: copied ${copied} poster(s), skipped ${skipped}`);
                 }
-            }
+            },
+            {
+                id: '041_sso_avatar',
+                up: async () => {
+                    // Profile picture file name mirrored from the SSO
+                    // ({sub}-{16hex}.webp); bytes are fetched S2S on demand.
+                    await pool.execute(`
+                        ALTER TABLE users
+                        ADD COLUMN sso_avatar VARCHAR(80) DEFAULT NULL AFTER display_name
+                    `);
+                }
+            },
+            {
+                id: '042_sso_identity_cleanup',
+                up: async () => {
+                    // Identity moved to the SSO: local registration, password
+                    // reset, invitation codes, email OTP (MFA level 0), and the
+                    // enable/disable flag are gone. Suspension is SSO-owned
+                    // (back-channel kills sessions; sign-in refused upstream).
+                    await pool.execute('ALTER TABLE users DROP COLUMN is_active');
+                    await pool.execute('DROP TABLE IF EXISTS pending_registrations');
+                    await pool.execute('DROP TABLE IF EXISTS registration_email_limits');
+                    await pool.execute('DROP TABLE IF EXISTS password_reset_tokens');
+                    await pool.execute('DROP TABLE IF EXISTS password_reset_email_limits');
+                    await pool.execute('DROP TABLE IF EXISTS invitation_codes');
+                    await pool.execute('DROP TABLE IF EXISTS mfa_otp_rate_limits');
+                    // Email was only ever an implicit MFA method (level 0) —
+                    // no enrolled rows should exist, but sweep defensively.
+                    await pool.execute(`DELETE FROM user_mfa_methods WHERE method_type = 'email'`);
+                    await pool.execute(`
+                        DELETE FROM site_settings WHERE setting_key IN (
+                            'enable_registration', 'require_invitation_code',
+                            'registration_token_validity_minutes', 'emailed_link_validity_minutes',
+                            'cloudflare_turnstile_worker_gate',
+                            'email_secret_key', 'email_with_service_credentials',
+                            'cf_access_client_id', 'cf_access_client_secret',
+                            'mfa_otp_timeout_seconds', 'mfa_level_0_timeout_seconds',
+                            'mfa_policy_login', 'mfa_policy_invitation_codes'
+                        )
+                    `);
+                    // Surviving scenario policies at the removed level 0 move
+                    // to level 1 (authenticator + passkey).
+                    const [policies] = await pool.execute(
+                        `SELECT setting_key, setting_value FROM site_settings WHERE setting_key LIKE 'mfa_policy_%'`
+                    );
+                    for (const row of policies) {
+                        try {
+                            const p = JSON.parse(row.setting_value);
+                            if (p && Number(p.level) === 0) {
+                                p.level = 1;
+                                await pool.execute(
+                                    'UPDATE site_settings SET setting_value = ? WHERE setting_key = ?',
+                                    [JSON.stringify(p), row.setting_key]
+                                );
+                            }
+                        } catch { /* unparseable policy — leave it */ }
+                    }
+                }
+            },
+            {
+                id: '043_course_code_name_rename',
+                up: async () => {
+                    // The old course_name is really a short code; the old
+                    // description is the real title. Rename to course_code +
+                    // course_name (sidebar shows the code, the header the
+                    // name, falling back to the code when name is null).
+                    await pool.execute('ALTER TABLE courses CHANGE COLUMN course_name course_code VARCHAR(15) NOT NULL');
+                    await pool.execute('ALTER TABLE courses CHANGE COLUMN description course_name VARCHAR(300) DEFAULT NULL');
+                    // Empty (never-set) descriptions become NULL so the
+                    // name-or-code fallback works everywhere.
+                    await pool.execute("UPDATE courses SET course_name = NULL WHERE course_name = ''");
+                }
+            },
+            {
+                id: '044_module_number_and_label',
+                up: async () => {
+                    // Generalize "week" into a course-configurable module number.
+                    // Each item keeps its number in a renamed column; the course
+                    // gets a label term (week/chapter/module/…) shown next to it.
+                    await pool.execute('ALTER TABLE videos CHANGE COLUMN week module_number VARCHAR(50) DEFAULT NULL');
+                    await pool.execute('ALTER TABLE upload_sessions CHANGE COLUMN week module_number VARCHAR(20) DEFAULT NULL');
+                    await pool.execute('ALTER TABLE course_materials CHANGE COLUMN week module_number VARCHAR(20) DEFAULT NULL');
+                    await pool.execute('ALTER TABLE courses ADD COLUMN module_label VARCHAR(20) DEFAULT NULL');
+                    // Every existing course keeps its current "Week N" labelling.
+                    await pool.execute("UPDATE courses SET module_label = 'week'");
+                }
+            },
+            {
+                id: '045_drop_course_mfa_policy',
+                up: async () => {
+                    // The /admin/courses* routes no longer call requireMfaForScenario:
+                    // step-up moves to SSO. The surviving policy row rendered a Course
+                    // card in admin MFA settings that gated nothing.
+                    await pool.execute(`DELETE FROM site_settings WHERE setting_key = 'mfa_policy_course'`);
+                }
+            },
+            {
+                id: '046_drop_clear_playback_stat_perm',
+                up: async () => {
+                    // Playback stats were distributed into the course modal +
+                    // edit-user section; the site-wide reset now lives in Site
+                    // Settings under manageSite. The old clearPlaybackStat key is
+                    // gone from ALL_PERMISSIONS — drop its granted rows + any
+                    // per-user overrides so nothing dangles. (permissionCache
+                    // already filters unknown keys, so this is pure hygiene.)
+                    await pool.execute(`DELETE FROM role_permissions WHERE permission_key = 'clearPlaybackStat'`);
+                    await pool.execute(`DELETE FROM user_permission_overrides WHERE permission_key = 'clearPlaybackStat'`);
+                }
+            },
+            {
+                id: '047_drop_manage_site_mfa_perm',
+                up: async () => {
+                    // MFA settings were folded into the unified /admin/settings
+                    // surface, gated by manageSite alone. The manageSiteMFA key
+                    // is gone from ALL_PERMISSIONS — drop its granted rows + any
+                    // per-user overrides so nothing dangles. (permissionCache
+                    // already filters unknown keys, so this is pure hygiene.)
+                    await pool.execute(`DELETE FROM role_permissions WHERE permission_key = 'manageSiteMFA'`);
+                    await pool.execute(`DELETE FROM user_permission_overrides WHERE permission_key = 'manageSiteMFA'`);
+                }
+            },
+            {
+                id: '048_session_stepup',
+                up: async () => {
+                    // SSO step-up (sudo) window for videosite. The /auth/stepup
+                    // ceremony stamps the fresh factor + time on the session row;
+                    // the gate + status endpoint read it. Column-guarded so a
+                    // re-run (or a hand-applied column) is a no-op — MySQL 8 has no
+                    // ADD COLUMN IF NOT EXISTS.
+                    const [cols] = await pool.execute(
+                        `SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sessions'
+                            AND COLUMN_NAME IN ('stepup_at','stepup_method')`
+                    );
+                    const have = new Set(cols.map(c => c.COLUMN_NAME));
+                    if (!have.has('stepup_at')) {
+                        await pool.execute(`ALTER TABLE sessions ADD COLUMN stepup_at DATETIME NULL`);
+                    }
+                    if (!have.has('stepup_method')) {
+                        await pool.execute(`ALTER TABLE sessions ADD COLUMN stepup_method VARCHAR(16) NULL`);
+                    }
+                }
+            },
+            {
+                id: '049_drop_password_columns',
+                up: async () => {
+                    // videosite authenticates nobody — sign-in is the SSO, users are
+                    // JIT-created from the id_token, and the installer no longer makes
+                    // an account. password_hash was write-only dead weight: the old
+                    // installer wrote an argon2 hash that nothing ever read.
+                    //
+                    // It was also an active bug: the column is NOT NULL with no default,
+                    // and findOrCreateBySub INSERTs without it — so JIT-creating a brand
+                    // new SSO identity would fail outright under MySQL strict mode.
+                    // Column-guarded (MySQL 8 has no DROP COLUMN IF EXISTS).
+                    const [cols] = await pool.execute(
+                        `SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users'
+                            AND COLUMN_NAME IN ('password_hash','password_changed_at')`
+                    );
+                    const have = new Set(cols.map(c => c.COLUMN_NAME));
+                    if (have.has('password_hash')) {
+                        await pool.execute('ALTER TABLE users DROP COLUMN password_hash');
+                    }
+                    if (have.has('password_changed_at')) {
+                        await pool.execute('ALTER TABLE users DROP COLUMN password_changed_at');
+                    }
+                }
+            },
         ];
 
         for (const migration of migrations) {
@@ -1037,7 +1216,9 @@ async function runMigrations() {
         }
     } catch (err) {
         console.error('Migration error:', err.message);
-        // Don't crash the app – log and continue
+        // Boot: log and carry on rather than take a running site down.
+        // Installer (strict): the operator must not be told the install worked.
+        if (strict) throw err;
     }
 }
 

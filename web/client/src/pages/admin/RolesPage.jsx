@@ -1,13 +1,21 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useSite } from '../../context/SiteContext';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
 import { useConfirm } from '../../components/ConfirmModal';
-import useMfaPageGuard from '../../hooks/useMfaPageGuard';
-import useMfaChallenge from '../../hooks/useMfaChallenge';
-import MfaPageGuard, { MfaSetupRequiredModal } from '../../components/MfaPageGuard';
-import MfaChallengeUI from '../../components/MfaChallengeUI';
-import LoadingSpinner from '../../components/LoadingSpinner';
+import useStepupGuard from '../../hooks/useStepupGuard';
+import StepUpBlock, { CardLoading } from '../../components/StepUpBlock';
+import { apiPost, apiPut, apiDelete } from '../../api';
+import { loadDraft, clearDraft } from '../../stepupDraft';
+import VsSaveBar from '../../components/VsSaveBar';
+import PermSelector from '../../components/PermSelector';
+import { permissionLabel, permissionGroups, prereqReason } from '../../utils/permissionLabels';
+import { prereqViolations, lockedPrereqs } from '../../utils/permissionPrereqs';
+
+const GD_OPTIONS = [
+  { value: true, label: 'Grant', tone: 'grant' },
+  { value: false, label: 'Deny', tone: 'deny' },
+];
 
 export default function RolesPage() {
   const { siteName } = useSite();
@@ -15,369 +23,349 @@ export default function RolesPage() {
   const { showToast } = useToast();
   const confirm = useConfirm();
 
-  const { mfaBlock, mfaSetupBlock, autoShowModal, mfaPageFetch, handlePageMfaSuccess, handlePageMfaCancel, retryVerification, mfaVerifiedKey } = useMfaPageGuard();
-  const { mfaFetch, mfaState, mfaSetupState, onMfaSuccess, onMfaCancel, dismissMfaSetup } = useMfaChallenge();
+  // Read-gated pages block on a GET 403 step_up_required (the modal also opens from
+  // the same 403 via StepUpProvider); mutations 403 reactively within a lapsed
+  // window. A fresh window (post-verify reload) lets everything through.
+  const { blocked, guardFetch, verify, guardAction } = useStepupGuard('roles');
+  const CREATE_DRAFT = 'roles:create';
 
-  const [roles, setRoles] = useState([]);
-  const [rolePermissions, setRolePermissions] = useState({});
-  const [allPermissions, setAllPermissions] = useState([]);
-  const [adminPermissions, setAdminPermissions] = useState({});
   const [loading, setLoading] = useState(true);
+  const [roles, setRoles] = useState([]);
+  const [rolePerms, setRolePerms] = useState({});
+  const [allPerms, setAllPerms] = useState([]);
+  const [prereqs, setPrereqs] = useState({});
+  const [adminPerms, setAdminPerms] = useState({});
+  const [memberCounts, setMemberCounts] = useState({});
+  const [defaultRoleId, setDefaultRoleId] = useState(null);
 
-  // Expanded edit rows
-  const [expandedRoleId, setExpandedRoleId] = useState(null);
+  const [selectedId, setSelectedId] = useState(null);
+  const [staged, setStaged] = useState({});     // { key: bool } grants for the selected role
+  const original = useRef({});                   // pristine grants for the selected role
+  const detailRef = useRef(null);                // detail scroll column — reset to top on role switch
+  const [savingPerms, setSavingPerms] = useState(false);
 
-  // Edit form state
-  const [editRoleId, setEditRoleId] = useState('');
-  const [editRoleName, setEditRoleName] = useState('');
-  const [editLevel, setEditLevel] = useState('');
-  const [editDescription, setEditDescription] = useState('');
-  const [editPerms, setEditPerms] = useState({});
-  const [editSaving, setEditSaving] = useState(false);
+  // Metadata edit (name / level / description) — a plain inline Save.
+  const [mName, setMName] = useState('');
+  const [mLevel, setMLevel] = useState('');
+  const [mDesc, setMDesc] = useState('');
+  const metaOrig = useRef({});
+  const [savingMeta, setSavingMeta] = useState(false);
 
-  // Create form state
-  const [newRoleId, setNewRoleId] = useState('');
-  const [newLevel, setNewLevel] = useState('');
-  const [newName, setNewName] = useState('');
-  const [newDescription, setNewDescription] = useState('');
-  const [newPerms, setNewPerms] = useState({});
-  const [createSaving, setCreateSaving] = useState(false);
+  // Create modal.
+  const [showCreate, setShowCreate] = useState(false);
+  const [cName, setCName] = useState('');
+  const [cLevel, setCLevel] = useState('');
+  const [cDesc, setCDesc] = useState('');
+  const [creating, setCreating] = useState(false);
 
-  useEffect(() => {
-    if (!siteName) return;
-    document.title = `Role Management - ${siteName}`;
-  }, [siteName]);
+  // Delete → replacement-default flow (409 default_role).
+  const [replaceFor, setReplaceFor] = useState(null);
+  const [replaceWith, setReplaceWith] = useState('');
+  const [deleting, setDeleting] = useState(false);
 
-  const fetchRoles = useCallback(async () => {
+  const myLevel = user?.permission_level ?? 0;
+
+  useEffect(() => { if (siteName) document.title = `Roles - ${siteName}`; }, [siteName]);
+
+  const load = useCallback(async () => {
     try {
-      const { data, ok } = await mfaPageFetch('/api/admin/roles');
+      const { data, ok } = await guardFetch('/api/admin/roles');
       if (ok && data) {
         setRoles(data.roles || []);
-        setRolePermissions(data.rolePermissions || {});
-        setAllPermissions(data.allPermissions || []);
-        setAdminPermissions(data.adminPermissions || {});
+        setRolePerms(data.rolePermissions || {});
+        setAllPerms(data.allPermissions || []);
+        setPrereqs(data.permissionPrereqs || {});
+        setAdminPerms(data.adminPermissions || {});
+        setMemberCounts(data.memberCounts || {});
+        setDefaultRoleId(data.defaultRoleId ?? null);
+        return data;
       }
-    } catch {
-      // ignore
-    } finally {
-      setLoading(false);
-    }
-  }, [mfaPageFetch]);
+    } catch { showToast('Failed to load roles.'); }
+    finally { setLoading(false); }
+    return null;
+  }, [guardFetch]);
 
+  useEffect(() => { load(); }, [load]);
+
+  // Restore an in-progress "New role" modal after returning from a step-up redirect
+  // (the draft is only present if the user hit Continue, not Cancel).
   useEffect(() => {
-    fetchRoles();
-  }, [fetchRoles, mfaVerifiedKey]);
+    const d = loadDraft(CREATE_DRAFT);
+    if (!d) return;
+    setCName(d.cName || ''); setCLevel(d.cLevel || ''); setCDesc(d.cDesc || ''); setShowCreate(true);
+    // Keep the draft on an ERROR return so the error card's "Try again" (a fresh
+    // redirect that doesn't re-save) still restores on the eventual success.
+    const o = new URLSearchParams(window.location.search).get('stepup');
+    if (o !== 'account' && o !== 'failed' && o !== 'error') clearDraft(CREATE_DRAFT);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Reset the detail column's scroll to the top whenever a different role is selected.
+  useEffect(() => { if (detailRef.current) detailRef.current.scrollTop = 0; }, [selectedId]);
+
+  const selectRole = (role, srcPerms = rolePerms, srcAll = allPerms) => {
+    setSelectedId(role.role_id);
+    const perms = srcPerms[role.role_id] || {};
+    const g = {};
+    for (const k of srcAll) g[k] = !!perms[k];
+    setStaged(g);
+    original.current = g;
+    setMName(role.role_name || '');
+    setMLevel(String(role.permission_level ?? ''));
+    setMDesc(role.description || '');
+    metaOrig.current = { name: role.role_name || '', level: String(role.permission_level ?? ''), desc: role.description || '' };
+  };
 
   if (!user?.permissions?.manageRoles) {
-    return <p className="text-muted">Permission denied.</p>;
+    return <div className="vs-cv-empty">Permission denied.</div>;
   }
 
-  if (loading) return <LoadingSpinner />;
+  const selected = roles.find((r) => r.role_id === selectedId) || null;
+  const editable = !!selected && selected.permission_level > myLevel; // strictly-lower only
 
-  const toggleExpand = (role) => {
-    if (expandedRoleId === role.role_id) {
-      setExpandedRoleId(null);
-      return;
-    }
-    setExpandedRoleId(role.role_id);
-    setEditRoleId(String(role.role_id));
-    setEditRoleName(role.role_name);
-    setEditLevel(String(role.permission_level));
-    setEditDescription(role.description || '');
-    // Load current permissions
-    const perms = rolePermissions[role.role_id] || {};
-    setEditPerms({ ...perms });
+  // Prerequisite state for the selected role's staged grants.
+  const violations = prereqViolations(staged, prereqs);
+  const locked = lockedPrereqs(staged, prereqs);
+  const originalViolations = prereqViolations(original.current, prereqs);
+  const hasNewViolations = Object.keys(violations).some((k) => !originalViolations[k]);
+  const permsDirty = allPerms.some((k) => adminPerms[k] && !!staged[k] !== !!original.current[k]);
+  const metaDirty = mName !== metaOrig.current.name || mLevel !== metaOrig.current.level || mDesc !== metaOrig.current.desc;
+  const metaLvl = parseInt(mLevel, 10);
+  const metaValid = !!mName.trim() && Number.isInteger(metaLvl) && metaLvl > myLevel && metaLvl <= 9999;
+  // Staged permission chips for the save bar (Grant → green +, Deny → red −).
+  const permItems = allPerms
+    .filter((k) => adminPerms[k] && !!staged[k] !== !!original.current[k])
+    .map((k) => ({ label: k, tone: staged[k] ? 'add' : 'remove' }));
+
+  const toggle = (key, val) => setStaged((prev) => ({ ...prev, [key]: val }));
+
+  const savePerms = async () => {
+    if (!permsDirty || hasNewViolations) return;
+    setSavingPerms(true);
+    try {
+      const permissions = {};
+      for (const k of allPerms) permissions[k] = staged[k] ? '1' : '0';
+      const { ok, data } = await apiPut(`/api/admin/roles/${selectedId}`, { permissions });
+      if (ok) { showToast('Permissions saved.', 'success'); original.current = { ...staged }; setRolePerms((p) => ({ ...p, [selectedId]: { ...staged } })); }
+      else showToast(data?.error || 'Failed to save permissions.');
+    } catch (err) { showToast(err.message); }
+    finally { setSavingPerms(false); }
   };
 
-  const handleEditSave = async (originalRoleId) => {
-    // Client-side duplicate checks
-    const parsedEditId = parseInt(editRoleId);
-    if (parsedEditId !== originalRoleId && roles.some(r => r.role_id === parsedEditId)) {
-      showToast('Role ID already exists.');
-      return;
-    }
-    if (editRoleName && editRoleName !== roles.find(r => r.role_id === originalRoleId)?.role_name
-        && roles.some(r => r.role_name.toLowerCase() === editRoleName.toLowerCase() && r.role_id !== originalRoleId)) {
-      showToast('Role name already exists.');
-      return;
-    }
-    setEditSaving(true);
+  const saveMeta = async () => {
+    if (!metaDirty) return;
+    const lvl = parseInt(mLevel, 10);
+    if (!mName.trim()) { showToast('Role name is required.'); return; }
+    if (!Number.isInteger(lvl) || lvl < 0 || lvl > 9999) { showToast('Level must be between 0 and 9999.'); return; }
+    if (lvl <= myLevel) { showToast(`Level must be greater than yours (${myLevel}).`); return; }
+    setSavingMeta(true);
     try {
-      const permissionsBody = {};
-      for (const perm of allPermissions) {
-        if (!adminPermissions[perm]) {
-          // Preserve existing value for keys admin doesn't have
-          permissionsBody[perm] = (rolePermissions[originalRoleId]?.[perm]) ? '1' : '0';
-        } else {
-          permissionsBody[perm] = editPerms[perm] ? '1' : '0';
-        }
-      }
-
-      const { ok, data } = await mfaFetch(`/api/admin/roles/${originalRoleId}`, {
-        method: 'PUT', body: {
-          newRoleId: editRoleId,
-          roleName: editRoleName,
-          permissionLevel: editLevel,
-          description: editDescription,
-          permissions: permissionsBody
-        }
-      });
-      if (ok) {
-        showToast('Role updated.', 'success');
-        setExpandedRoleId(null);
-        fetchRoles();
-      } else {
-        showToast(data?.error || 'Failed to update role.');
-      }
-    } catch (err) {
-      showToast(err.message);
-    } finally {
-      setEditSaving(false);
-    }
+      const { ok, data } = await apiPut(`/api/admin/roles/${selectedId}`, { roleName: mName.trim(), permissionLevel: mLevel, description: mDesc });
+      if (ok) { showToast('Role updated.', 'success'); await load(); metaOrig.current = { name: mName.trim(), level: mLevel, desc: mDesc }; }
+      else showToast(data?.error || 'Failed to update role.');
+    } catch (err) { showToast(err.message); }
+    finally { setSavingMeta(false); }
   };
 
-  const handleDelete = async (roleId, roleName) => {
-    if (!await confirm(`Remove role '${roleName}'? Users with this role will be reassigned to 'user'.`)) return;
+  const createRole = async () => {
+    const lvl = parseInt(cLevel, 10);
+    if (!cName.trim()) { showToast('Role name is required.'); return; }
+    if (!Number.isInteger(lvl) || lvl < 0 || lvl > 9999) { showToast('Level must be between 0 and 9999.'); return; }
+    if (lvl <= myLevel) { showToast('New role must be lower privilege than you (a higher level number).'); return; }
+    setCreating(true);
     try {
-      const { ok, data } = await mfaFetch(`/api/admin/roles/${roleId}`, { method: 'DELETE' });
-      if (ok) {
-        showToast('Role removed.', 'success');
-        fetchRoles();
-      } else {
-        showToast(data?.error || 'Failed to remove role.');
-      }
-    } catch (err) {
-      showToast(err.message);
-    }
-  };
-
-  const handleCreate = async (e) => {
-    e.preventDefault();
-    // Client-side duplicate checks
-    const parsedNewId = parseInt(newRoleId);
-    if (roles.some(r => r.role_id === parsedNewId)) {
-      showToast('Role ID already exists.');
-      return;
-    }
-    if (newName && roles.some(r => r.role_name.toLowerCase() === newName.toLowerCase())) {
-      showToast('Role name already exists.');
-      return;
-    }
-    setCreateSaving(true);
-    try {
-      const permissionsBody = {};
-      for (const perm of allPermissions) {
-        if (!adminPermissions[perm]) {
-          permissionsBody[perm] = '0'; // default false for keys admin doesn't have
-        } else {
-          permissionsBody[perm] = newPerms[perm] ? '1' : '0';
-        }
-      }
-
-      const { ok, data } = await mfaFetch('/api/admin/roles', {
-        method: 'POST', body: {
-          roleId: newRoleId,
-          roleName: newName,
-          permissionLevel: newLevel,
-          description: newDescription,
-          permissions: permissionsBody
-        }
-      });
+      const { ok, data } = await apiPost('/api/admin/roles', { roleName: cName.trim(), permissionLevel: cLevel, description: cDesc });
       if (ok) {
         showToast('Role created.', 'success');
-        setNewRoleId('');
-        setNewLevel('');
-        setNewName('');
-        setNewDescription('');
-        setNewPerms({});
-        fetchRoles();
+        setShowCreate(false); setCName(''); setCLevel(''); setCDesc('');
+        // Initialize the new selection from the FRESH data — a bare setSelectedId
+        // would leave staged/original/meta on the previously-selected role.
+        const fresh = await load();
+        const created = fresh?.roles?.find((r) => r.role_id === data.role_id);
+        if (created) selectRole(created, fresh.rolePermissions || {}, fresh.allPermissions || []);
+      } else showToast(data?.error || 'Failed to create role.');
+    } catch (err) { showToast(err.message); }
+    finally { setCreating(false); }
+  };
+
+  const doDelete = async (role, newDefault) => {
+    setDeleting(true);
+    try {
+      const body = newDefault !== undefined ? { new_default: newDefault } : undefined;
+      const { ok, data, status } = await apiDelete(`/api/admin/roles/${role.role_id}`, body || undefined);
+      if (ok) {
+        showToast('Role deleted.', 'success');
+        setReplaceFor(null); setReplaceWith('');
+        if (selectedId === role.role_id) setSelectedId(null);
+        await load();
+      } else if (status === 409 && data?.error === 'default_role') {
+        setReplaceFor(role); setReplaceWith('');
       } else {
-        showToast(data?.error || 'Failed to create role.');
+        showToast(data?.error || 'Failed to delete role.');
       }
-    } catch (err) {
-      showToast(err.message);
-    } finally {
-      setCreateSaving(false);
-    }
+    } catch (err) { showToast(err.message); }
+    finally { setDeleting(false); }
+  };
+
+  const handleDelete = async (role) => {
+    if (!await confirm({ title: 'Delete role?', message: `The role “${role.role_name}” will be deleted. Members are reassigned by the SSO.`, confirmLabel: 'Delete', danger: true })) return;
+    doDelete(role);
   };
 
   return (
-    <MfaPageGuard mfaBlock={mfaBlock} mfaSetupBlock={mfaSetupBlock} autoShowModal={autoShowModal}
-      onSuccess={handlePageMfaSuccess} onCancel={handlePageMfaCancel} onRetry={retryVerification}>
-    <div>
-      <h1 className="mb-3">Role Management</h1>
-
-      <div className="card">
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Name</th>
-                <th>Level</th>
-                <th>System</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {roles.map(r => {
-                const canEdit = r.permission_level > user.permission_level;
-                return [
-                  <tr key={r.role_id}>
-                    <td>{r.role_id}</td>
-                    <td>{r.role_name}</td>
-                    <td>{r.permission_level}</td>
-                    <td>{r.is_system ? 'Yes' : 'No'}</td>
-                    <td>
-                      {canEdit ? (
-                        <>
-                          <button
-                            className="btn btn-secondary btn-sm"
-                            onClick={() => toggleExpand(r)}
-                          >
-                            {expandedRoleId === r.role_id ? 'Close' : 'Edit'}
-                          </button>
-                          {!r.is_system && (
-                            <button
-                              className="btn btn-danger btn-sm"
-                              onClick={() => handleDelete(r.role_id, r.role_name)}
-                            >
-                              Remove
-                            </button>
-                          )}
-                        </>
-                      ) : (
-                        <span className="text-muted text-sm">Higher authority</span>
-                      )}
-                    </td>
-                  </tr>,
-                  expandedRoleId === r.role_id && canEdit && (
-                    <tr key={`edit-${r.role_id}`}>
-                      <td colSpan="5" style={{ padding: '16px 12px', background: '#f8f9fa' }}>
-                        <div style={{ maxWidth: '700px' }}>
-                          <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
-                            <div className="form-group" style={{ flex: 1, minWidth: '120px' }}>
-                              <label>Role ID (0-99)</label>
-                              <input type="number" className="form-control"
-                                value={editRoleId} onChange={e => setEditRoleId(e.target.value)}
-                                min="0" max="99" required />
-                            </div>
-                            <div className="form-group" style={{ flex: 2, minWidth: '180px' }}>
-                              <label>Role Name</label>
-                              <input type="text" className="form-control"
-                                value={editRoleName} onChange={e => setEditRoleName(e.target.value)} required />
-                            </div>
-                            <div className="form-group" style={{ flex: 1, minWidth: '120px' }}>
-                              <label>Level (0-99)</label>
-                              <input type="number" className="form-control"
-                                value={editLevel} onChange={e => setEditLevel(e.target.value)}
-                                min="0" max="99" required />
-                            </div>
-                          </div>
-                          <div className="form-group">
-                            <label>Description</label>
-                            <input type="text" className="form-control"
-                              value={editDescription} onChange={e => setEditDescription(e.target.value)} />
-                          </div>
-                          <div className="form-group">
-                            <label style={{ marginBottom: '8px' }}>Permissions</label>
-                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '4px 16px' }}>
-                              {allPermissions.map(perm => {
-                                const canEditPerm = !!adminPermissions[perm];
-                                return (
-                                  <label key={perm} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 400, fontSize: '13px', padding: '3px 0', cursor: canEditPerm ? 'pointer' : 'not-allowed', opacity: canEditPerm ? 1 : 0.4 }}>
-                                    <input
-                                      type="checkbox"
-                                      checked={!!editPerms[perm]}
-                                      onChange={e => setEditPerms(prev => ({ ...prev, [perm]: e.target.checked }))}
-                                      disabled={!canEditPerm}
-                                    />
-                                    {perm}
-                                  </label>
-                                );
-                              })}
-                            </div>
-                          </div>
-                          <div className="flex gap-2">
-                            <button className="btn btn-primary btn-sm" onClick={() => handleEditSave(r.role_id)} disabled={editSaving}>
-                              {editSaving ? 'Saving...' : 'Save Changes'}
-                            </button>
-                            <button className="btn btn-secondary btn-sm" onClick={() => setExpandedRoleId(null)}>Cancel</button>
-                          </div>
-                        </div>
-                      </td>
-                    </tr>
-                  )
-                ];
-              })}
-            </tbody>
-          </table>
+    <div className="vs-roles-page">
+      <div className="vs-cv-head" style={{ alignItems: 'flex-end' }}>
+        <div style={{ minWidth: 0 }}>
+          <h1 className="vs-cv-title">Roles</h1>
+          <p className="vs-cv-sub">Smaller level = higher privilege. You can edit only roles below your own.</p>
         </div>
+        <button className="vs-btn vs-btn-primary" onClick={() => guardAction(() => { setCName(''); setCLevel(''); setCDesc(''); setShowCreate(true); })}>New role</button>
       </div>
+        {/* The content's own white card, mounted always — Loading… / the verify
+            reminder / the data all fill the same card. */}
+        <div className={'vs-roles' + (!loading && !blocked && selected ? ' has-sel' : '')}>
+          {blocked ? <StepUpBlock onVerify={verify} /> : loading ? <CardLoading /> : (<>
+            <div className="vs-roles-side">
+              {roles.map((r) => {
+                  const ed = r.permission_level > myLevel;
+                  return (
+                    <button key={r.role_id} type="button"
+                      className={'vs-roles-row' + (r.role_id === selectedId ? ' on' : '')}
+                      onClick={() => selectRole(r)}>
+                      <div className="vs-roles-mn">
+                        <div className="vs-roles-name">{r.role_name}</div>
+                        <div className="vs-roles-lvl">level {r.permission_level} · {memberCounts[r.role_id] || 0} {(memberCounts[r.role_id] || 0) === 1 ? 'member' : 'members'}</div>
+                      </div>
+                      <div className="vs-roles-pills">
+                        {r.is_system && <span className="vs-roles-pill sys">system</span>}
+                        {r.role_id === defaultRoleId && <span className="vs-roles-pill def">default</span>}
+                        {!ed && <span className="vs-roles-pill">view only</span>}
+                      </div>
+                    </button>
+                  );
+                })}
+            </div>
 
-      {/* Add New Role */}
-      <div className="card mt-3">
-        <div className="card-header">
-          <h2>Add New Role</h2>
+            <div className="vs-roles-detail" ref={detailRef}>
+              {!selected ? (
+                <div className="vs-cv-empty" style={{ padding: '56px 16px' }}>Select a role to view or edit it.</div>
+              ) : (
+                <>
+                  <button type="button" className="vs-roles-back" onClick={() => setSelectedId(null)}>‹ Roles</button>
+                  <div className="vs-pane-h vs-roles-detail-h">
+                    <span>{selected.role_name}</span>
+                    {!editable && <span className="vs-roles-pill">View only</span>}
+                  </div>
+                  <p className="vs-pane-sub">
+                    {editable ? 'Edit this role’s details and permissions.' : 'This role is at or above your privilege — read-only.'}
+                  </p>
+
+                  {/* Settings */}
+                  <div className="vs-field"><div className="vs-label">Name</div>
+                      <input className="vs-input" style={{ maxWidth: 360 }} value={mName} disabled={!editable} onChange={(e) => setMName(e.target.value)} /></div>
+                    <div className="vs-field"><div className="vs-label">Level</div>
+                      <input className="vs-input" type="text" inputMode="numeric" value={mLevel} disabled={!editable}
+                        onChange={(e) => setMLevel(e.target.value.replace(/\D/g, ''))} style={{ maxWidth: 120 }} />
+                      <div className="vs-hint">Smaller = higher privilege; must stay below your own ({myLevel}).</div></div>
+                    <div className="vs-field"><div className="vs-label">Description</div>
+                      <input className="vs-input" style={{ maxWidth: 440 }} value={mDesc} disabled={!editable} onChange={(e) => setMDesc(e.target.value)} /></div>
+                    {editable && (
+                      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                        <button className="vs-btn vs-btn-primary" disabled={!metaDirty || !metaValid || savingMeta} onClick={() => guardAction(saveMeta)}>
+                          {savingMeta ? 'Saving…' : 'Save details'}
+                        </button>
+                        {!selected.is_system
+                          ? <button className="vs-btn vs-btn-danger" onClick={() => guardAction(() => handleDelete(selected))}>Delete role</button>
+                          : <span className="vs-hint" style={{ marginTop: 0 }}>System role — can’t be deleted.</span>}
+                      </div>
+                    )}
+
+                  <hr className="vs-roles-div" />
+                  <div className="vs-roles-permh">Permissions</div>
+                    {permissionGroups(allPerms).map(({ group, keys }) => (
+                      <div className="vs-perm-group" key={group}>
+                        <div className="vs-perm-grp">{group}</div>
+                        {keys.map((key) => {
+                          const canEdit = editable && !!adminPerms[key];
+                          const val = !!staged[key];
+                          const changed = canEdit && val !== !!original.current[key];
+                          const bad = !!violations[key];
+                          const lockedVals = new Set();
+                          if (locked.has(key)) lockedVals.add(false); // can't Deny a needed prereq
+                          return (
+                            <div className={'vs-perm-row' + (canEdit ? '' : ' locked') + (changed ? ' changed' : '') + (bad ? ' bad' : '')} key={key}>
+                              <div className="vs-perm-mn">
+                                <div className="vs-perm-name">{permissionLabel(key)}</div>
+                                <div className="vs-perm-key">{key}</div>
+                                {bad && <div className="vs-perm-note">{prereqReason(violations[key])}</div>}
+                              </div>
+                              <PermSelector value={val} options={GD_OPTIONS} disabled={!canEdit}
+                                lockedValues={lockedVals} invalid={bad} onChange={(v) => toggle(key, v)} />
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ))}
+                  {editable && (
+                    <VsSaveBar visible={permsDirty} busy={savingPerms} saveLabel="Save permissions" invalid={hasNewViolations} items={permItems}
+                      onSave={() => guardAction(savePerms)} onDiscard={() => setStaged({ ...original.current })} />
+                  )}
+                </>
+              )}
+            </div>
+          </>)}
         </div>
-        <form onSubmit={handleCreate} style={{ maxWidth: '600px' }}>
-          <div className="flex gap-2">
-            <div className="form-group" style={{ flex: 1 }}>
-              <label htmlFor="newRoleId">Role ID (0-99)</label>
-              <input type="number" id="newRoleId" className="form-control"
-                value={newRoleId} onChange={e => setNewRoleId(e.target.value)}
-                min="0" max="99" required />
+
+      {/* Create role modal */}
+      {showCreate && (
+        <div className="vs-scrim" onMouseDown={() => !creating && setShowCreate(false)}>
+          <div className="vs-modal" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="vs-modal-head"><div className="vs-modal-title">New role</div>
+              <button className="vs-modal-x" aria-label="Close" onClick={() => setShowCreate(false)}>✕</button></div>
+            <div className="vs-modal-body">
+              <div className="vs-field"><div className="vs-label">Name</div>
+                <input className="vs-input" value={cName} autoFocus onChange={(e) => setCName(e.target.value)} placeholder="Teaching assistant" /></div>
+              <div className="vs-field"><div className="vs-label">Level</div>
+                <input className="vs-input" type="text" inputMode="numeric" value={cLevel}
+                  onChange={(e) => setCLevel(e.target.value.replace(/\D/g, ''))} placeholder={`> ${myLevel}`} style={{ maxWidth: 140 }} />
+                <div className="vs-hint">Smaller = higher privilege. Must be greater than {myLevel} (below you).</div></div>
+              <div className="vs-field"><div className="vs-label">Description <span style={{ color: '#9ca3af' }}>(optional)</span></div>
+                <input className="vs-input" value={cDesc} onChange={(e) => setCDesc(e.target.value)} /></div>
+              <p className="vs-modal-note">Starts with the default role’s permissions — tune them after.</p>
             </div>
-            <div className="form-group" style={{ flex: 1 }}>
-              <label htmlFor="newLevel">Permission Level (0-99)</label>
-              <input type="number" id="newLevel" className="form-control"
-                value={newLevel} onChange={e => setNewLevel(e.target.value)}
-                min="0" max="99" required />
-            </div>
-          </div>
-          <div className="form-group">
-            <label htmlFor="newName">Role Name</label>
-            <input type="text" id="newName" className="form-control"
-              value={newName} onChange={e => setNewName(e.target.value)} required />
-          </div>
-          <div className="form-group">
-            <label htmlFor="newDesc">Description</label>
-            <input type="text" id="newDesc" className="form-control"
-              value={newDescription} onChange={e => setNewDescription(e.target.value)} />
-          </div>
-          <div className="form-group">
-            <label style={{ marginBottom: '8px' }}>Permissions</label>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '4px 16px' }}>
-              {allPermissions.map(perm => {
-                const canEditPerm = !!adminPermissions[perm];
-                return (
-                  <label key={perm} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 400, fontSize: '13px', padding: '3px 0', cursor: canEditPerm ? 'pointer' : 'not-allowed', opacity: canEditPerm ? 1 : 0.4 }}>
-                    <input
-                      type="checkbox"
-                      checked={!!newPerms[perm]}
-                      onChange={e => setNewPerms(prev => ({ ...prev, [perm]: e.target.checked }))}
-                      disabled={!canEditPerm}
-                    />
-                    {perm}
-                  </label>
-                );
-              })}
+            <div className="vs-modal-foot">
+              <button className="vs-btn" onClick={() => setShowCreate(false)} disabled={creating}>Cancel</button>
+              <button className="vs-btn vs-btn-primary" onClick={() => guardAction(createRole, { draftKey: CREATE_DRAFT, draft: { cName, cLevel, cDesc } })} disabled={creating}>{creating ? 'Creating…' : 'Create role'}</button>
             </div>
           </div>
-          <button type="submit" className="btn btn-primary" disabled={createSaving}>
-            {createSaving ? 'Creating...' : 'Create Role'}
-          </button>
-        </form>
-      </div>
+        </div>
+      )}
+
+      {/* Delete → pick a replacement default */}
+      {replaceFor && (
+        <div className="vs-scrim" onMouseDown={() => !deleting && setReplaceFor(null)}>
+          <div className="vs-modal" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="vs-modal-head"><div className="vs-modal-title">Replace default role</div></div>
+            <div className="vs-modal-body">
+              <p className="vs-pane-sub">“{replaceFor.role_name}” is the current default role. Choose what new users get instead.</p>
+              <div className="vs-field"><div className="vs-label">New default</div>
+                <select className="vs-input" value={replaceWith} onChange={(e) => setReplaceWith(e.target.value)}>
+                  <option value="">No access</option>
+                  {roles.filter((r) => r.role_id !== replaceFor.role_id && r.permission_level > myLevel).map((r) => (
+                    <option key={r.role_id} value={r.role_id}>{r.role_name} (level {r.permission_level})</option>
+                  ))}
+                </select></div>
+            </div>
+            <div className="vs-modal-foot">
+              <button className="vs-btn" onClick={() => setReplaceFor(null)} disabled={deleting}>Cancel</button>
+              <button className="vs-btn vs-btn-danger" disabled={deleting}
+                onClick={() => guardAction(() => doDelete(replaceFor, replaceWith === '' ? null : parseInt(replaceWith, 10)))}>
+                {deleting ? 'Deleting…' : 'Delete role'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
-
-    {mfaState && (
-      <MfaChallengeUI isModal={true}
-        challengeId={mfaState.challengeId} allowedMethods={mfaState.allowedMethods}
-        maskedEmail={mfaState.maskedEmail} apiBase="/api/mfa/challenge"
-        onSuccess={onMfaSuccess} onCancel={onMfaCancel} title="Verify to continue" />
-    )}
-    <MfaSetupRequiredModal mfaSetupState={mfaSetupState} onDismiss={dismissMfaSetup} />
-    </MfaPageGuard>
   );
 }

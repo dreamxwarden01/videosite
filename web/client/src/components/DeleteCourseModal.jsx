@@ -1,20 +1,23 @@
 import { useState } from 'react';
+import { apiDelete } from '../api';
 import { useToast } from '../context/ToastContext';
 
-export default function DeleteCourseModal({ isOpen, courseName, courseId, onClose, onDeleted, mfaFetch }) {
+const CloseIcon = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+);
+
+export default function DeleteCourseModal({ courseId, courseCode, onClose, onDeleted }) {
   const { showToast } = useToast();
   const [confirmName, setConfirmName] = useState('');
   const [deleting, setDeleting] = useState(false);
 
-  if (!isOpen) return null;
-
-  const nameMatches = confirmName === courseName;
+  const nameMatches = confirmName === courseCode;
 
   const handleDelete = async () => {
     if (!nameMatches) return;
     setDeleting(true);
     try {
-      const { ok, data } = await mfaFetch(`/api/admin/courses/${courseId}`, { method: 'DELETE' });
+      const { ok, data } = await apiDelete(`/api/admin/courses/${courseId}`);
       if (ok) {
         showToast('Course deleted.', 'success');
         onDeleted();
@@ -29,35 +32,35 @@ export default function DeleteCourseModal({ isOpen, courseName, courseId, onClos
   };
 
   return (
-    <div className="modal-overlay active" onClick={() => {}}>
-      <div className="upload-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '440px' }}>
-        <div className="modal-header">
-          <h3>Delete Course</h3>
-          <button className="modal-close" onClick={onClose}>&times;</button>
+    <div className="vs-scrim vs-scrim-nested">
+      <div className="vs-modal">
+        <div className="vs-modal-head">
+          <h3 className="vs-modal-title">Delete Course</h3>
+          <button type="button" className="vs-modal-x" onClick={onClose} disabled={deleting}><CloseIcon /></button>
         </div>
-        <div className="modal-body">
-          <p style={{ marginBottom: '16px', color: '#991b1b' }}>
-            This will permanently delete <strong>{courseName}</strong> and all its videos. This cannot be undone.
+        <div className="vs-modal-body">
+          <p className="vs-hint err" style={{ marginBottom: '14px' }}>
+            Deleting <strong>{courseCode}</strong> removes every video, file, enrolment and watch record tied to it. This cannot be undone.
           </p>
-          <div className="form-group">
-            <label htmlFor="confirm_action">Type the course name to confirm:</label>
+          <div className="vs-field">
+            <label className="vs-label" htmlFor="confirm_action">Type the course code to confirm</label>
             <input
-              type="text" id="confirm_action" className="form-control"
+              type="text" id="confirm_action" className="vs-input"
               value={confirmName} onChange={e => setConfirmName(e.target.value)}
-              placeholder={courseName} autoFocus autoComplete="off"
+              placeholder={courseCode} autoFocus autoComplete="off"
               readOnly onFocus={e => e.target.removeAttribute('readOnly')}
             />
           </div>
-          <div className="flex gap-2" style={{ justifyContent: 'flex-end' }}>
-            <button type="button" className="btn btn-secondary" onClick={onClose}>Cancel</button>
-            <button
-              type="button" className="btn btn-danger"
-              disabled={!nameMatches || deleting}
-              onClick={handleDelete}
-            >
-              {deleting ? 'Deleting...' : 'Delete Course'}
-            </button>
-          </div>
+        </div>
+        <div className="vs-modal-foot">
+          <button type="button" className="vs-btn" onClick={onClose} disabled={deleting}>Cancel</button>
+          <button
+            type="button" className="vs-btn vs-btn-danger"
+            disabled={!nameMatches || deleting}
+            onClick={handleDelete}
+          >
+            {deleting ? 'Deleting...' : 'Delete Course'}
+          </button>
         </div>
       </div>
     </div>

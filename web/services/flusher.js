@@ -12,7 +12,7 @@
 // ip / ua (display-only).
 
 const { getClient } = require('./redis');
-const { getPool } = require('../config/database');
+const { getPool, idBuf } = require('../config/database');
 const watchCache = require('./cache/watchProgressCache');
 const transcodeCache = require('./cache/transcodeProgressCache');
 const uploadHeartbeatCache = require('./cache/uploadHeartbeatCache');
@@ -136,7 +136,7 @@ async function flushDirtyWatch() {
                         watch_seconds = watch_seconds + VALUES(watch_seconds),
                         last_position = VALUES(last_position),
                         last_watch_at = VALUES(last_watch_at)`,
-                    [uid, vid, data.delta, data.last_position, lastWatchAt]
+                    [idBuf(uid), vid, data.delta, data.last_position, lastWatchAt]
                 );
 
                 // Clear the hash + dirty marker. Subsequent /watch-progress starts

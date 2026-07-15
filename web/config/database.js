@@ -12,7 +12,20 @@ function getPool() {
             database: process.env.DB_NAME,
             waitForConnections: true,
             connectionLimit: 10,
-            queueLimit: 0
+            queueLimit: 0,
+            // After the user_id INT -> BINARY(16) (UUIDv7 = OIDC `sub`) rewrite, hand
+            // every UUID column back as a 32-char hex string instead of a raw Buffer,
+            // so the app keeps treating ids as strings (Redis keys, JSON, equality).
+            // mysql2 reports CHAR/BINARY as type 'STRING'; the only fixed-16 columns
+            // are the binary(16) UUIDs (verified — no char(16) text columns exist),
+            // and this applies to both query() and execute() in mysql2 >= 3.22.
+            typeCast(field, next) {
+                if (field.type === 'STRING' && field.length === 16) {
+                    const buf = field.buffer();
+                    return buf === null ? null : buf.toString('hex');
+                }
+                return next();
+            }
         });
     }
     return pool;
@@ -39,4 +52,12 @@ function resetPool() {
     }
 }
 
-module.exports = { getPool, createInstallPool, resetPool };
+// Convert the canonical 32-char hex user id back to BINARY(16) for query params
+// (WHERE / INSERT). Pass-through for null/undefined and already-Buffer values so
+// callers can wrap defensively without double-converting.
+function idBuf(hexId) {
+    if (hexId == null || Buffer.isBuffer(hexId)) return hexId;
+    return Buffer.from(String(hexId), 'hex');
+}
+
+module.exports = { getPool, createInstallPool, resetPool, idBuf };

@@ -1,46 +1,83 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
+import { useParams, useNavigate, Navigate } from 'react-router-dom';
 import { useSite } from '../../context/SiteContext';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
+import SsoSettings from '../../components/SsoSettings';
 import { useConfirm } from '../../components/ConfirmModal';
-import useMfaPageGuard from '../../hooks/useMfaPageGuard';
-import useMfaChallenge from '../../hooks/useMfaChallenge';
-import MfaPageGuard, { MfaSetupRequiredModal } from '../../components/MfaPageGuard';
-import MfaChallengeUI from '../../components/MfaChallengeUI';
-import LoadingSpinner from '../../components/LoadingSpinner';
+import useStepupGuard from '../../hooks/useStepupGuard';
+import StepUpBlock, { CardLoading } from '../../components/StepUpBlock';
+import { apiPut, apiPost, apiDelete } from '../../api';
 import ProfileEditModal from '../../components/ProfileEditModal';
+import VsSaveBar from '../../components/VsSaveBar';
+import MfaSettingsSections from './MfaSettingsSections';
+import { stripToHost, isValidHost } from '../../utils/hostname';
+
+const CloseIcon = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+);
+const TrashIcon = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
+);
+
+// The Site-domain sections. The Security-domain (MFA) sections live in the
+// lazily-mounted MfaSettingsSections child so their step-up guard stays
+// independent. Rail groups are visual only — the whole surface gates on
+// manageSite (the former manageSiteMFA permission was dropped).
+// One flat rail (no Site/Security group headers). The MFA sections (windows +
+// policy) are folded into a single "MFA" tab.
+const SECTIONS = [
+  ['general', 'General'],
+  ['transcoding', 'Transcoding'],
+  ['cloudflare', 'Cloudflare'],
+  ['workers', 'Worker keys'],
+  ['sso', 'SSO'],
+  ['playback', 'Playback data'],
+  ['mfa', 'MFA'],
+];
+const MFA_KEYS = new Set(['mfa']);
+const PANE_KEYS = new Set(SECTIONS.map(([k]) => k));
+// Panes backed by a lazy /api/admin/settings?pane=<key> slice GET. The SSO + MFA
+// panes fetch (and step-up-guard) themselves; Playback has no read to protect.
+const SLICE_PANES = new Set(['general', 'transcoding', 'cloudflare', 'workers']);
 
 export default function SettingsPage() {
-  // turnstileSiteKey is pulled in to drive the disabled state of the
-  // Turnstile-at-Worker toggle: when origin Turnstile isn't configured at
-  // all (env vars missing → /api/settings/public returns null), the toggle
-  // is moot and we grey it out with an inline note.
-  const { siteName, turnstileSiteKey } = useSite();
+  const { siteName } = useSite();
   const { user } = useAuth();
   const { showToast } = useToast();
   const confirm = useConfirm();
+  const navigate = useNavigate();
 
-  const { mfaBlock, mfaSetupBlock, autoShowModal, mfaPageFetch, handlePageMfaSuccess, handlePageMfaCancel, retryVerification, mfaVerifiedKey } = useMfaPageGuard();
-  const { mfaFetch, mfaState, mfaSetupState, onMfaSuccess, onMfaCancel, dismissMfaSetup } = useMfaChallenge();
+  // The site panes (general/transcoding/cloudflare/workers) share one 'settings'
+  // step-up guard: their slice GETs route through guardFetch (a 403 blocks the pane
+  // and the modal opens reactively); their writes pre-check via guardAction. The SSO
+  // + MFA panes own their own guard. verify re-prompts from the in-pane block.
+  const { blocked, guardFetch, verify, guardAction } = useStepupGuard('settings');
 
-  const [loading, setLoading] = useState(true);
+  // The active pane comes from the URL (/admin/settings/:pane) so a step-up
+  // returnTo lands back on the exact pane.
+  const { pane } = useParams();
+  const active = PANE_KEYS.has(pane) ? pane : 'general';
+
+  const [mfaDirty, setMfaDirty] = useState({ mfa: false });
+  const [mfaLocked, setMfaLocked] = useState(false); // MFA child has a save in flight
+  const paneRef = useRef(null);
+  useEffect(() => { if (paneRef.current) paneRef.current.scrollTop = 0; }, [active]);
+
+  // Panes whose slice has loaded at least once — a first visit shows CardLoading,
+  // a revisit keeps the (parent-held) content and just re-runs the gate.
+  const [loaded, setLoaded] = useState(() => new Set());
   const [saving, setSaving] = useState(false);
+  const [clearingStats, setClearingStats] = useState(false);
 
-  // General settings
+  // General
   const [siteName_, setSiteName] = useState('');
   const [siteProtocol, setSiteProtocol] = useState('https');
   const [siteHostname, setSiteHostname] = useState('');
   const [sessionInactivityDays, setSessionInactivityDays] = useState('3');
   const [sessionMaxDays, setSessionMaxDays] = useState('15');
-
-  // Registration
-  const [enableRegistration, setEnableRegistration] = useState(false);
-  const [requireInvitationCode, setRequireInvitationCode] = useState(true);
-  const [registrationTokenValidity, setRegistrationTokenValidity] = useState('30');
-  const [registrationDefaultRole, setRegistrationDefaultRole] = useState('2');
+  const [registrationDefaultRole, setRegistrationDefaultRole] = useState('');
   const [roles, setRoles] = useState([]);
-
-  // R2 public domain (read-only, from env, used by HMAC WAF rule)
 
   // HMAC
   const [hmacEnabled, setHmacEnabled] = useState(false);
@@ -49,69 +86,30 @@ export default function SettingsPage() {
   const [hmacSaving, setHmacSaving] = useState(false);
   const [generatedHmacKey, setGeneratedHmacKey] = useState(null);
   const [hmacKeyCopyLabel, setHmacKeyCopyLabel] = useState('Copy');
-  // Separate copy-button labels for each rule — the modal renders two
-  // WAF rules now (playback prefix scope + poster file scope), and each
-  // copy button transitions independently.
   const [playbackRuleCopyLabel, setPlaybackRuleCopyLabel] = useState('click to copy');
   const [posterRuleCopyLabel, setPosterRuleCopyLabel] = useState('click to copy');
   const [hmacInitMode, setHmacInitMode] = useState(false);
-  // R2 public domain from env (server-side, deploy-time setting). Used to
-  // auto-fill the host clause in the WAF rules so the admin doesn't have
-  // to edit a placeholder.
   const [r2PublicDomain, setR2PublicDomain] = useState('');
-
-  // Email Sending (sister section under the same Cloudflare card). The
-  // email-sender Worker holds the matching secret in EMAIL_HMAC_SECRET.
-  const [emailHmacSecretConfigured, setEmailHmacSecretConfigured] = useState(false);
-  const [generatedEmailKey, setGeneratedEmailKey] = useState(null);
-  const [emailKeyCopyLabel, setEmailKeyCopyLabel] = useState('Copy');
-
-  // CF Access service credentials for email-sender. The toggle attaches
-  // Cf-Access-Client-Id / -Client-Secret headers to outbound sends so the
-  // worker route bypasses Super Bot Fight Mode via cf.access.authenticated.
-  const [emailServiceCredentialsEnabled, setEmailServiceCredentialsEnabled] = useState(false);
-  const [emailServiceClientId, setEmailServiceClientId] = useState(null);
-  const [emailAccessSecretConfigured, setEmailAccessSecretConfigured] = useState(false);
-  // null | 'initial' (first enable, asks for id+secret) | 'rotate'.
-  // Both modals use content-overlay (z-index 900) so a mid-submit MFA
-  // challenge (mfa-challenge-overlay z-index 1100) stacks on top.
-  const [emailServiceModal, setEmailServiceModal] = useState(null);
-  const [emailServiceClientIdInput, setEmailServiceClientIdInput] = useState('');
-  const [emailServiceSecretInput, setEmailServiceSecretInput] = useState('');
-  const [emailServiceSaving, setEmailServiceSaving] = useState(false);
-
-  // Turnstile-at-Worker (sister section under the same Cloudflare card)
-  const [workerTurnstileEnabled, setWorkerTurnstileEnabled] = useState(false);
 
   // Worker Keys
   const [workerKeys, setWorkerKeys] = useState([]);
   const [generatingKey, setGeneratingKey] = useState(false);
-  // Generate modal: opens after the user clicks "Generate New Key" so they
-  // can type an optional label before submitting (replaces the old inline form).
   const [generateModalOpen, setGenerateModalOpen] = useState(false);
   const [generateLabel, setGenerateLabel] = useState('');
-  // Rename modal: pre-fills the current label; Continue button greys out if
-  // the value hasn't changed (label can be cleared by submitting an empty
-  // string).
-  const [renameModalState, setRenameModalState] = useState(null); // { keyId, originalLabel } | null
+  const [renameModalState, setRenameModalState] = useState(null);
   const [renameLabel, setRenameLabel] = useState('');
   const [renameSaving, setRenameSaving] = useState(false);
-  // Reactivate modal: warns about secret rotation; on Continue, calls the
-  // reactivate endpoint and pipes the rotated secret through the existing
-  // newWorkerKey display modal.
-  const [reactivateModalState, setReactivateModalState] = useState(null); // { keyId } | null
+  const [reactivateModalState, setReactivateModalState] = useState(null);
   const [reactivateSaving, setReactivateSaving] = useState(false);
+  const [newWorkerKey, setNewWorkerKey] = useState(null);
+  const [wkKeyIdCopyLabel, setWkKeyIdCopyLabel] = useState('Copy');
+  const [wkSecretCopyLabel, setWkSecretCopyLabel] = useState('Copy');
 
   // Validation & dirty tracking
   const [errors, setErrors] = useState({});
   const originalValues = useRef({});
 
-  // Worker key modal
-  const [newWorkerKey, setNewWorkerKey] = useState(null);
-  const [wkKeyIdCopyLabel, setWkKeyIdCopyLabel] = useState('Copy');
-  const [wkSecretCopyLabel, setWkSecretCopyLabel] = useState('Copy');
-
-  // Transcoding profiles — two global sets, default and enhanced.
+  // Transcoding profiles
   const [defaultProfiles, setDefaultProfiles] = useState([]);
   const [enhancedProfiles, setEnhancedProfiles] = useState([]);
   const [audioBitrateKbps, setAudioBitrateKbps] = useState('192');
@@ -121,7 +119,6 @@ export default function SettingsPage() {
   const [savingDefault, setSavingDefault] = useState(false);
   const [savingEnhanced, setSavingEnhanced] = useState(false);
   const [showProfileModal, setShowProfileModal] = useState(false);
-  // editingProfileTarget = { set: 'default' | 'enhanced', idx } or null
   const [editingProfileTarget, setEditingProfileTarget] = useState(null);
   const originalTranscoding = useRef({});
   const [transcodingErrors, setTranscodingErrors] = useState({});
@@ -129,91 +126,99 @@ export default function SettingsPage() {
 
   useEffect(() => {
     if (!siteName) return;
-    document.title = `Site Settings - ${siteName}`;
+    document.title = `Settings - ${siteName}`;
   }, [siteName]);
 
-  const fetchSettings = useCallback(async () => {
-    try {
-      const { data, ok } = await mfaPageFetch('/api/admin/settings');
-      if (ok && data) {
-        const s = data.settings || {};
-        setSiteName(s.site_name || 'VideoSite');
-        setSiteProtocol(s.site_protocol || 'https');
-        setSiteHostname(s.site_hostname || '');
-        setSessionInactivityDays(s.session_inactivity_days || '3');
-        setSessionMaxDays(s.session_max_days || '15');
-        setEnableRegistration(s.enable_registration === 'true');
-        setRequireInvitationCode(s.require_invitation_code !== 'false');
-        setRegistrationTokenValidity(s.emailed_link_validity_minutes || '30');
-        setRegistrationDefaultRole(s.registration_default_role || '2');
-        // Everything Cloudflare-related now lives under data.cloudflare —
-        // the server parses booleans + strips raw row keys before sending,
-        // so the client reads them directly without `=== 'true'` checks.
-        const cf = data.cloudflare || {};
-        setHmacHasKey(cf.video_hmac_secret_configured || false);
-        setEmailHmacSecretConfigured(cf.email_hmac_secret_configured || false);
-        setEmailAccessSecretConfigured(cf.email_access_secret_configured || false);
-        setEmailServiceCredentialsEnabled(!!cf.email_with_service_credentials);
-        setEmailServiceClientId(cf.email_access_client_id || null);
-        setHmacEnabled(!!cf.video_hmac_enabled);
-        setHmacTokenValidity(cf.video_hmac_token_validity || '600');
-        setR2PublicDomain(cf.r2_public_domain || '');
-        setWorkerTurnstileEnabled(!!cf.turnstile_worker_gate);
-        setWorkerKeys(data.workerKeys || []);
-        setRoles(data.roles || []);
-        originalValues.current = {
-          site_name: s.site_name || 'VideoSite',
-          site_protocol: s.site_protocol || 'https',
-          site_hostname: s.site_hostname || '',
-          session_inactivity_days: s.session_inactivity_days || '3',
-          session_max_days: s.session_max_days || '15',
-          enable_registration: s.enable_registration === 'true',
-          require_invitation_code: s.require_invitation_code !== 'false',
-          emailed_link_validity_minutes: s.emailed_link_validity_minutes || '30',
-          registration_default_role: s.registration_default_role || '2',
-        };
-        setErrors({});
+  // Per-pane appliers — each writes only its own slice's state so re-fetching one
+  // pane never clobbers another pane's unsaved edits.
+  const applyGeneral = (data) => {
+    const s = data.settings || {};
+    setSiteName(s.site_name || 'VideoSite');
+    setSiteProtocol(s.site_protocol || 'https');
+    setSiteHostname(s.site_hostname || '');
+    setSessionInactivityDays(s.session_inactivity_days || '3');
+    setSessionMaxDays(s.session_max_days || '15');
+    setRegistrationDefaultRole(s.registration_default_role ?? '');
+    setRoles(data.roles || []);
+    originalValues.current = {
+      site_name: s.site_name || 'VideoSite',
+      site_protocol: s.site_protocol || 'https',
+      site_hostname: s.site_hostname || '',
+      session_inactivity_days: s.session_inactivity_days || '3',
+      session_max_days: s.session_max_days || '15',
+      registration_default_role: s.registration_default_role ?? '',
+    };
+    setErrors({});
+  };
+  const applyCloudflare = (data) => {
+    const cf = data.cloudflare || {};
+    setHmacHasKey(cf.video_hmac_secret_configured || false);
+    setHmacEnabled(!!cf.video_hmac_enabled);
+    setHmacTokenValidity(cf.video_hmac_token_validity || '600');
+    setR2PublicDomain(cf.r2_public_domain || '');
+  };
+  const applyWorkers = (data) => setWorkerKeys(data.workerKeys || []);
+  const applyTranscoding = (data) => {
+    setDefaultProfiles(data.defaultProfiles || []);
+    setEnhancedProfiles(data.enhancedProfiles || []);
+    const an = data.audioNormalization || {};
+    setAudioNormTarget(an.target || '-20');
+    setAudioNormPeak(an.peak || '-2');
+    setAudioNormMaxGain(an.maxGain || '20');
+    const abk = String(data.audioBitrateKbps ?? '192');
+    setAudioBitrateKbps(abk);
+    originalTranscoding.current = {
+      defaultProfiles: JSON.stringify(data.defaultProfiles || []),
+      enhancedProfiles: JSON.stringify(data.enhancedProfiles || []),
+      target: an.target || '-20', peak: an.peak || '-2', maxGain: an.maxGain || '20', audioBitrateKbps: abk,
+    };
+    setTranscodingErrors({}); setTranscodingTouched({});
+  };
+  const APPLIERS = { general: applyGeneral, cloudflare: applyCloudflare, workers: applyWorkers, transcoding: applyTranscoding };
 
-        // Transcoding profiles — load both global sets
-        setDefaultProfiles(data.defaultProfiles || []);
-        setEnhancedProfiles(data.enhancedProfiles || []);
-        const an = data.audioNormalization || {};
-        setAudioNormTarget(an.target || '-20');
-        setAudioNormPeak(an.peak || '-2');
-        setAudioNormMaxGain(an.maxGain || '20');
-        const abk = String(data.audioBitrateKbps ?? '192');
-        setAudioBitrateKbps(abk);
-        originalTranscoding.current = {
-          defaultProfiles: JSON.stringify(data.defaultProfiles || []),
-          enhancedProfiles: JSON.stringify(data.enhancedProfiles || []),
-          target: an.target || '-20',
-          peak: an.peak || '-2',
-          maxGain: an.maxGain || '20',
-          audioBitrateKbps: abk
-        };
-        setTranscodingErrors({});
-        setTranscodingTouched({});
-      }
-    } catch {
-      showToast('Failed to load settings.');
-    } finally {
-      setLoading(false);
-    }
-  }, [mfaPageFetch]);
-
+  // Lazy per-pane load. First visit applies data (and marks the pane loaded, so
+  // CardLoading yields to content); a revisit only re-runs guardFetch so a lapsed
+  // window re-blocks — it keeps the parent-held state (no clobber, no flash). The
+  // verify redirect is a full reload, so a fresh window re-loads everything anyway.
   useEffect(() => {
-    fetchSettings();
-  }, [fetchSettings, mfaVerifiedKey]);
+    if (!SLICE_PANES.has(active)) return undefined;
+    let cancelled = false;
+    const firstLoad = !loaded.has(active);
+    (async () => {
+      try {
+        const { data, ok } = await guardFetch('/api/admin/settings?pane=' + active);
+        if (cancelled) return;
+        if (ok && data) {
+          if (firstLoad) {
+            APPLIERS[active](data);
+            setLoaded((prev) => { const n = new Set(prev); n.add(active); return n; });
+          }
+        } else if (data?.code !== 'step_up_required') {
+          // A step-up 403 becomes the block card; any other failure (e.g. 500)
+          // would otherwise leave the pane silently stuck on "Loading…".
+          showToast('Failed to load settings.');
+        }
+      } catch {
+        if (!cancelled) showToast('Failed to load settings.');
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, guardFetch]);
+
+  // Refresh the worker-key list after a mutation (create/pause/rename/…). Routed
+  // through guardFetch so the gate/blocked state stays in sync.
+  const reloadWorkers = async () => {
+    const { data, ok } = await guardFetch('/api/admin/settings?pane=workers');
+    if (ok && data) applyWorkers(data);
+  };
 
   // --- Client-side validation effects ---
   useEffect(() => {
     setErrors(prev => {
       const next = { ...prev };
-      if (!siteName_.trim()) {
-        next.site_name = 'Site name is required';
-      } else {
-        delete next.site_name;
-      }
+      if (!siteName_.trim()) next.site_name = 'Site name is required';
+      else delete next.site_name;
       return next;
     });
   }, [siteName_]);
@@ -221,14 +226,9 @@ export default function SettingsPage() {
   useEffect(() => {
     setErrors(prev => {
       const next = { ...prev };
-      const trimmed = siteHostname.trim().replace(/^https?:\/\//, '').split('/')[0];
-      if (!siteHostname.trim()) {
-        next.site_hostname = 'Hostname is required';
-      } else if (/\s/.test(trimmed)) {
-        next.site_hostname = 'Hostname cannot contain spaces';
-      } else {
-        delete next.site_hostname;
-      }
+      if (!siteHostname.trim()) next.site_hostname = 'Hostname is required';
+      else if (!isValidHost(siteHostname)) next.site_hostname = 'Enter a valid hostname or IP address (no spaces, slashes, or path)';
+      else delete next.site_hostname;
       return next;
     });
   }, [siteHostname]);
@@ -236,71 +236,39 @@ export default function SettingsPage() {
   useEffect(() => {
     setErrors(prev => {
       const next = { ...prev };
-      // Session inactivity days
-      if (sessionInactivityDays === '') {
-        next.session_inactivity_days = 'This field is required';
-      } else {
+      if (sessionInactivityDays === '') next.session_inactivity_days = 'This field is required';
+      else {
         const v = Number(sessionInactivityDays);
-        if (!Number.isInteger(v) || v < 1 || v > 365) {
-          next.session_inactivity_days = 'Must be between 1 and 365';
-        } else {
-          delete next.session_inactivity_days;
-        }
+        if (!Number.isInteger(v) || v < 1 || v > 365) next.session_inactivity_days = 'Must be between 1 and 365';
+        else delete next.session_inactivity_days;
       }
-      // Session max days
-      if (sessionMaxDays === '') {
-        next.session_max_days = 'This field is required';
-      } else {
+      if (sessionMaxDays === '') next.session_max_days = 'This field is required';
+      else {
         const v = Number(sessionMaxDays);
-        if (!Number.isInteger(v) || v < 1 || v > 365) {
-          next.session_max_days = 'Must be between 1 and 365';
-        } else {
-          delete next.session_max_days;
-        }
+        if (!Number.isInteger(v) || v < 1 || v > 365) next.session_max_days = 'Must be between 1 and 365';
+        else delete next.session_max_days;
       }
-      // Cross-field: inactivity <= max
       if (!next.session_inactivity_days && !next.session_max_days && sessionInactivityDays !== '' && sessionMaxDays !== '') {
-        if (Number(sessionInactivityDays) > Number(sessionMaxDays)) {
-          next.session_inactivity_days = 'Inactivity timeout cannot exceed max lifetime';
-        }
+        if (Number(sessionInactivityDays) > Number(sessionMaxDays)) next.session_inactivity_days = 'Inactivity timeout cannot exceed max lifetime';
       }
       return next;
     });
   }, [sessionInactivityDays, sessionMaxDays]);
 
-  useEffect(() => {
-    setErrors(prev => {
-      const next = { ...prev };
-      if (registrationTokenValidity === '') {
-        next.emailed_link_validity_minutes = 'This field is required';
-      } else {
-        const v = Number(registrationTokenValidity);
-        if (!Number.isInteger(v) || v < 5 || v > 10080) {
-          next.emailed_link_validity_minutes = 'Must be between 5 and 10080';
-        } else {
-          delete next.emailed_link_validity_minutes;
-        }
-      }
-      return next;
-    });
-  }, [registrationTokenValidity]);
-
-  // --- Role dropdown filtering (must be before early returns) ---
   const filteredRoles = useMemo(() => {
     const userLevel = user?.permission_level ?? 0;
     const origRoleId = originalValues.current.registration_default_role;
-    return roles.filter(r =>
-      r.permission_level > userLevel || String(r.role_id) === String(origRoleId)
-    );
+    return roles.filter(r => r.permission_level > userLevel || String(r.role_id) === String(origRoleId));
   }, [roles, user?.permission_level]);
 
   if (!user?.permissions?.manageSite) {
     return <p className="text-muted">Permission denied.</p>;
   }
+  // Unknown pane in the URL → normalize to the first pane.
+  if (!PANE_KEYS.has(pane)) {
+    return <Navigate to="/admin/settings/general" replace />;
+  }
 
-  if (loading) return <LoadingSpinner />;
-
-  // --- Digit-only input handler ---
   const handleDigitOnly = (e) => {
     if (e.ctrlKey || e.metaKey || ['Backspace', 'Delete', 'Tab', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
     if (!/^\d$/.test(e.key)) e.preventDefault();
@@ -312,22 +280,26 @@ export default function SettingsPage() {
     if (digits) setter(digits);
   };
 
-  // --- Dirty tracking ---
   const orig = originalValues.current;
-  const isDirty = siteName_ !== orig.site_name
-    || siteProtocol !== orig.site_protocol
-    || siteHostname !== orig.site_hostname
-    || sessionInactivityDays !== orig.session_inactivity_days
-    || sessionMaxDays !== orig.session_max_days
-    || enableRegistration !== orig.enable_registration
-    || requireInvitationCode !== orig.require_invitation_code
-    || registrationTokenValidity !== orig.emailed_link_validity_minutes
+  const isDirty = siteName_ !== orig.site_name || siteProtocol !== orig.site_protocol || siteHostname !== orig.site_hostname
+    || sessionInactivityDays !== orig.session_inactivity_days || sessionMaxDays !== orig.session_max_days
     || registrationDefaultRole !== orig.registration_default_role;
   const hasErrors = Object.values(errors).some(Boolean);
 
-  // --- Save general settings (partial PUT) ---
-  const handleSaveGeneral = async (e) => {
-    e.preventDefault();
+  const generalItems = [];
+  if (siteName_ !== orig.site_name) generalItems.push({ label: 'Site name' });
+  if (siteProtocol !== orig.site_protocol || siteHostname !== orig.site_hostname) generalItems.push({ label: 'Hostname' });
+  if (sessionInactivityDays !== orig.session_inactivity_days) generalItems.push({ label: 'Inactivity timeout' });
+  if (sessionMaxDays !== orig.session_max_days) generalItems.push({ label: 'Max lifetime' });
+  if (registrationDefaultRole !== orig.registration_default_role) generalItems.push({ label: 'Default role' });
+
+  const transcodingDirty = defaultProfiles && (
+    JSON.stringify(defaultProfiles) !== originalTranscoding.current.defaultProfiles
+    || JSON.stringify(enhancedProfiles) !== originalTranscoding.current.enhancedProfiles
+    || audioNormTarget !== originalTranscoding.current.target || audioNormPeak !== originalTranscoding.current.peak
+    || audioNormMaxGain !== originalTranscoding.current.maxGain || audioBitrateKbps !== originalTranscoding.current.audioBitrateKbps);
+
+  const handleSaveGeneral = async () => {
     if (hasErrors) return;
     setSaving(true);
     try {
@@ -337,270 +309,78 @@ export default function SettingsPage() {
       if (siteHostname !== orig.site_hostname) body.site_hostname = siteHostname;
       if (sessionInactivityDays !== orig.session_inactivity_days) body.session_inactivity_days = sessionInactivityDays;
       if (sessionMaxDays !== orig.session_max_days) body.session_max_days = sessionMaxDays;
-      if (enableRegistration !== orig.enable_registration) body.enable_registration = enableRegistration;
-      if (requireInvitationCode !== orig.require_invitation_code) body.require_invitation_code = requireInvitationCode;
-      if (registrationTokenValidity !== orig.emailed_link_validity_minutes) body.emailed_link_validity_minutes = registrationTokenValidity;
       if (registrationDefaultRole !== orig.registration_default_role) body.registration_default_role = registrationDefaultRole;
-
       if (Object.keys(body).length === 0) return;
 
-      const { ok, data, status } = await mfaFetch('/api/admin/settings', { method: 'PUT', body });
+      const { ok, data, status } = await apiPut('/api/admin/settings', body);
       if (ok) {
         showToast('Settings saved.', 'success');
-        // Update original values to match saved state
         originalValues.current = {
-          site_name: siteName_,
-          site_protocol: siteProtocol,
-          site_hostname: siteHostname,
-          session_inactivity_days: sessionInactivityDays,
-          session_max_days: sessionMaxDays,
-          enable_registration: enableRegistration,
-          require_invitation_code: requireInvitationCode,
-          emailed_link_validity_minutes: registrationTokenValidity,
+          site_name: siteName_, site_protocol: siteProtocol, site_hostname: siteHostname,
+          session_inactivity_days: sessionInactivityDays, session_max_days: sessionMaxDays,
           registration_default_role: registrationDefaultRole,
         };
         setErrors({});
       } else if (status === 422 && data?.errors) {
-        setErrors(data.errors);
-        showToast('Please fix the errors below.');
-      } else {
+        setErrors(data.errors); showToast('Please fix the errors below.');
+      } else if (data?.code !== 'step_up_required') {
+        // a lapsed-window 403 opens the challenge modal reactively — don't also toast
         showToast(data?.error || 'Failed to save settings.');
       }
-    } catch (err) {
-      showToast(err.message);
-    } finally {
-      setSaving(false);
-    }
+    } catch (err) { showToast(err.message); }
+    finally { setSaving(false); }
+  };
+  const discardGeneral = () => {
+    setSiteName(orig.site_name); setSiteProtocol(orig.site_protocol); setSiteHostname(orig.site_hostname);
+    setSessionInactivityDays(orig.session_inactivity_days); setSessionMaxDays(orig.session_max_days);
+    setRegistrationDefaultRole(orig.registration_default_role); setErrors({});
   };
 
-  // HMAC toggle
+  // HMAC ---------------------------------------------------------------
   const handleToggleHmac = async () => {
     const newEnabled = !hmacEnabled;
     if (newEnabled) {
-      if (!await confirm('You must have an active Cloudflare Pro, Business, or Enterprise plan on your domain to use HMAC validation with custom WAF rules. Continue?')) return;
-      if (!hmacHasKey) {
-        // No key yet — generate one first, modal OK will enable
-        await doGenerateHmac(true);
-        return;
-      }
+      if (!await confirm({ title: 'Enable HMAC validation?', message: 'You need an active Cloudflare Pro, Business, or Enterprise plan on your domain to use HMAC validation with custom WAF rules.', confirmLabel: 'Continue', danger: false })) return;
+      if (!hmacHasKey) { await doGenerateHmac(true); return; }
     } else {
-      if (!await confirm('You must disable the related HMAC validation rule from your Cloudflare WAF rules before turning this off, otherwise all videos will be inaccessible. Continue?')) return;
+      if (!await confirm({ title: 'Disable HMAC validation?', message: 'Disable the related HMAC validation rule in your Cloudflare WAF first — otherwise all videos become inaccessible.', confirmLabel: 'Disable', danger: true })) return;
     }
     try {
-      const { ok, data } = await mfaFetch('/api/admin/settings/video-hmac/toggle', { method: 'PUT', body: { video_hmac_enabled: newEnabled } });
-      if (ok) {
-        setHmacEnabled(newEnabled);
-      } else {
-        showToast(data?.error || 'Failed to toggle HMAC validation.');
-      }
-    } catch (err) {
-      showToast(err.message);
-    }
+      const { ok, data } = await apiPut('/api/admin/settings/video-hmac/toggle', { video_hmac_enabled: newEnabled });
+      if (ok) setHmacEnabled(newEnabled);
+      else if (data?.code !== 'step_up_required') showToast(data?.error || 'Failed to toggle HMAC validation.');
+    } catch (err) { showToast(err.message); }
   };
-
-  // HMAC generate — isInit=true means first-time setup (auto-enable on modal close)
   const doGenerateHmac = async (isInit = false) => {
     if (!isInit && hmacHasKey) {
-      if (!await confirm('Generate a new HMAC secret key? This will invalidate all existing playback tokens.')) return;
+      if (!await confirm({ title: 'Generate a new HMAC key?', message: 'This invalidates all existing playback tokens.', confirmLabel: 'Generate new key', danger: true })) return;
     }
     try {
-      const { ok, data } = await mfaFetch('/api/admin/settings/video-hmac/generate', { method: 'POST' });
+      const { ok, data } = await apiPost('/api/admin/settings/video-hmac/generate');
       if (ok && data?.secret) {
         setGeneratedHmacKey(data.secret);
-        setHmacKeyCopyLabel('Copy');
-        setPlaybackRuleCopyLabel('click to copy');
-        setPosterRuleCopyLabel('click to copy');
-        setHmacHasKey(true);
-        setHmacInitMode(isInit);
-      } else {
-        showToast(data?.error || 'Failed to generate HMAC key.');
-      }
-    } catch (err) {
-      showToast(err.message);
-    }
+        setHmacKeyCopyLabel('Copy'); setPlaybackRuleCopyLabel('click to copy'); setPosterRuleCopyLabel('click to copy');
+        setHmacHasKey(true); setHmacInitMode(isInit);
+      } else if (data?.code !== 'step_up_required') showToast(data?.error || 'Failed to generate HMAC key.');
+    } catch (err) { showToast(err.message); }
   };
-
   const handleGenerateHmac = () => doGenerateHmac(false);
-
   const handleCloseHmacModal = async () => {
     if (hmacInitMode) {
-      // Auto-enable after first initialization
       try {
-        const { ok, data } = await mfaFetch('/api/admin/settings/video-hmac/toggle', { method: 'PUT', body: { video_hmac_enabled: true } });
-        if (ok) {
-          setHmacEnabled(true);
-        } else {
-          showToast(data?.error || 'Failed to enable HMAC validation.');
-        }
-      } catch (err) {
-        showToast(err.message);
-      }
+        const { ok, data } = await apiPut('/api/admin/settings/video-hmac/toggle', { video_hmac_enabled: true });
+        if (ok) setHmacEnabled(true);
+        else if (data?.code !== 'step_up_required') showToast(data?.error || 'Failed to enable HMAC validation.');
+      } catch (err) { showToast(err.message); }
     }
-    setGeneratedHmacKey(null);
-    setHmacInitMode(false);
+    setGeneratedHmacKey(null); setHmacInitMode(false);
   };
-
   const handleCopyHmacKey = () => {
     if (!generatedHmacKey) return;
     navigator.clipboard.writeText(generatedHmacKey).then(() => {
-      setHmacKeyCopyLabel('Copied!');
-      setTimeout(() => setHmacKeyCopyLabel('Copy'), 1500);
+      setHmacKeyCopyLabel('Copied!'); setTimeout(() => setHmacKeyCopyLabel('Copy'), 1500);
     }).catch(() => {});
   };
-
-  // Email-sender secret generate. Mirrors the HMAC flow but simpler — no
-  // auto-enable step (presence of the secret is the only enable signal)
-  // and no WAF rule to display.
-  const doGenerateEmail = async () => {
-    if (emailHmacSecretConfigured) {
-      if (!await confirm('Generate a new email-sender secret? The email-sender Worker must be updated with the new secret (wrangler secret put EMAIL_HMAC_SECRET) before outbound email will work again.')) return;
-    }
-    try {
-      const { ok, data } = await mfaFetch('/api/admin/settings/email/generate', { method: 'POST' });
-      if (ok && data?.secret) {
-        setGeneratedEmailKey(data.secret);
-        setEmailKeyCopyLabel('Copy');
-        setEmailKeyConfigured(true);
-      } else {
-        showToast(data?.error || 'Failed to generate email secret.');
-      }
-    } catch (err) {
-      showToast(err.message);
-    }
-  };
-
-  const handleCloseEmailModal = () => {
-    setGeneratedEmailKey(null);
-  };
-
-  const handleCopyEmailKey = () => {
-    if (!generatedEmailKey) return;
-    navigator.clipboard.writeText(generatedEmailKey).then(() => {
-      setEmailKeyCopyLabel('Copied!');
-      setTimeout(() => setEmailKeyCopyLabel('Copy'), 1500);
-    }).catch(() => {});
-  };
-
-  // Strip a leading `CF-Access-Client-Id:` / `CF-Access-Client-Secret:` header
-  // prefix (case-insensitive, any whitespace around the colon) and trim
-  // surrounding whitespace. Cloudflare's dashboard displays the values as
-  // header lines and "copy" puts the whole line on the clipboard, so a paste
-  // of `CF-Access-Client-Secret: abc...` should become `abc...`. Server
-  // applies the same sanitizer as the authoritative gate.
-  const sanitizeCfAccessValue = (raw) =>
-    (typeof raw === 'string' ? raw : '')
-      .replace(/^\s*cf-access-client-(?:id|secret)\s*:\s*/i, '')
-      .trim();
-
-  // Service-credentials handlers. Toggle flow:
-  //  - Off → On with no clientId stored → open 'initial' prompt (id + secret).
-  //  - Off → On with clientId stored     → toggle endpoint, no prompt.
-  //  - On → Off                          → confirm dialog, then toggle endpoint.
-  // Rotate is independent of the toggle — opens 'rotate' modal with clientId
-  // pre-filled, secret blank, and rotates without touching the toggle state.
-  const handleToggleEmailService = async (newValue) => {
-    if (emailServiceSaving) return;
-    if (newValue && !emailServiceClientId) {
-      // First-time enable — collect credentials.
-      setEmailServiceClientIdInput('');
-      setEmailServiceSecretInput('');
-      setEmailServiceModal('initial');
-      return;
-    }
-    if (!newValue) {
-      const ok = await confirm('Disable Cloudflare Access service credentials? Outbound email will no longer attach the Cf-Access-Client-* headers, and the worker route may start failing if it requires Access authentication.');
-      if (!ok) return;
-    }
-    setEmailServiceSaving(true);
-    try {
-      const { ok, data } = await mfaFetch('/api/admin/settings/email/service-credentials/toggle', {
-        method: 'PUT', body: { enabled: newValue },
-      });
-      if (ok) {
-        setEmailServiceCredentialsEnabled(newValue);
-      } else {
-        showToast(data?.error || 'Failed to update service credentials toggle.');
-      }
-    } catch (err) {
-      showToast(err.message);
-    } finally {
-      setEmailServiceSaving(false);
-    }
-  };
-
-  const openRotateServiceCredentials = () => {
-    setEmailServiceClientIdInput(emailServiceClientId || '');
-    setEmailServiceSecretInput('');
-    setEmailServiceModal('rotate');
-  };
-
-  const closeEmailServiceModal = () => {
-    if (emailServiceSaving) return; // don't close while a request is in flight
-    setEmailServiceModal(null);
-    setEmailServiceClientIdInput('');
-    setEmailServiceSecretInput('');
-  };
-
-  const submitEmailServiceCredentials = async () => {
-    if (emailServiceSaving) return;
-    const clientId = emailServiceClientIdInput.trim();
-    const secret = emailServiceSecretInput.trim();
-    if (!clientId) { showToast('Client ID is required.'); return; }
-    if (!secret) { showToast('Client Secret is required.'); return; }
-
-    setEmailServiceSaving(true);
-    try {
-      const isInitial = emailServiceModal === 'initial';
-      const body = isInitial
-        ? { clientId, secret, enable: true }
-        : { clientId, secret };
-      const { ok, data } = await mfaFetch('/api/admin/settings/email/service-credentials', {
-        method: 'PUT', body,
-      });
-      if (ok) {
-        setEmailServiceClientId(clientId);
-        if (isInitial) setEmailServiceCredentialsEnabled(true);
-        showToast(isInitial ? 'Service credentials saved and enabled.' : 'Service credentials rotated.', 'success');
-        setEmailServiceModal(null);
-        setEmailServiceClientIdInput('');
-        setEmailServiceSecretInput('');
-      } else {
-        showToast(data?.error || 'Failed to save service credentials.');
-      }
-    } catch (err) {
-      showToast(err.message);
-    } finally {
-      setEmailServiceSaving(false);
-    }
-  };
-
-  // Build the two Cloudflare WAF rules. They share one secret + one
-  // validity but use different `is_timed_hmac_valid_v0` invocations:
-  //
-  //  - PLAYBACK (prefix scope): manifest + every segment under
-  //    /{64-char hash}/{12-char job}/. Uses `concat(substring(path,0,79),
-  //    "?", substring(query,7,200))` so a single token covers every file
-  //    under the job prefix. Excludes the /posters/ subtree so the
-  //    poster rule has sole jurisdiction over those files.
-  //
-  //  - POSTER (file scope): just /posters/{course_id}/{video_id}.jpg.
-  //    Uses `concat(http.request.uri.path, "?", substring(query, 7, 200))`
-  //    — the full path (no substring) so the message MACed is the entire
-  //    file path. One concat per rule, well within Cloudflare's limit.
-  //
-  // Both rules pass the literal string "s" as the 6th argument. This
-  // tells the function to expect URL-safe base64 MACs (43 chars, no
-  // padding, alphabet [A-Za-z0-9_-]) instead of standard base64 (44
-  // chars, alphabet [A-Za-z0-9+/=]). Standard base64 contains chars that
-  // require URL-encoding when embedded in a query string, and the encoded
-  // form depends on the browser — that ambiguity is what was causing the
-  // intermittent 403s. URL-safe base64 has zero chars that need
-  // encoding, so the wire format is unambiguous and the function's regex
-  // matches deterministically. The server's tokenService._sign uses
-  // Node's `digest('base64url')` to match.
-  //
-  // Both rules block (action set in Cloudflare dashboard) when no valid
-  // token is present. Mutually exclusive on path via the starts_with check.
   const buildWafRule = (secret) => {
     const host = r2PublicDomain || 'your-cdn-domain.com';
     const validity = hmacTokenValidity || '600';
@@ -608,581 +388,438 @@ export default function SettingsPage() {
     const poster = `(http.host eq "${host}") and starts_with(http.request.uri.path, "/posters/") and not (\n    starts_with(http.request.uri.query, "verify=") and\n    is_timed_hmac_valid_v0(\n        "${secret}",\n        concat(\n            http.request.uri.path,\n            "?",\n            substring(http.request.uri.query, 7, 200)\n        ),\n        ${validity},\n        http.request.timestamp.sec,\n        1,\n        "s"\n    )\n)`;
     return { playback, poster };
   };
-
   const handleCopyPlaybackRule = () => {
     if (!generatedHmacKey) return;
     navigator.clipboard.writeText(buildWafRule(generatedHmacKey).playback).then(() => {
-      setPlaybackRuleCopyLabel('copied!');
-      setTimeout(() => setPlaybackRuleCopyLabel('click to copy'), 1500);
+      setPlaybackRuleCopyLabel('copied!'); setTimeout(() => setPlaybackRuleCopyLabel('click to copy'), 1500);
     }).catch(() => {});
   };
-
   const handleCopyPosterRule = () => {
     if (!generatedHmacKey) return;
     navigator.clipboard.writeText(buildWafRule(generatedHmacKey).poster).then(() => {
-      setPosterRuleCopyLabel('copied!');
-      setTimeout(() => setPosterRuleCopyLabel('click to copy'), 1500);
+      setPosterRuleCopyLabel('copied!'); setTimeout(() => setPosterRuleCopyLabel('click to copy'), 1500);
     }).catch(() => {});
   };
-
   const handleSaveHmacValidity = async () => {
     setHmacSaving(true);
     try {
-      const { ok, data } = await mfaFetch('/api/admin/settings/video-hmac/validity', { method: 'PUT', body: { video_hmac_token_validity: hmacTokenValidity } });
-      if (ok) {
-        showToast('Token validity updated.', 'success');
-      } else {
-        showToast(data?.error || 'Failed to save token validity.');
-      }
-    } catch (err) {
-      showToast(err.message);
-    } finally {
-      setHmacSaving(false);
-    }
+      const { ok, data } = await apiPut('/api/admin/settings/video-hmac/validity', { video_hmac_token_validity: hmacTokenValidity });
+      if (ok) showToast('Token validity updated.', 'success');
+      else if (data?.code !== 'step_up_required') showToast(data?.error || 'Failed to save token validity.');
+    } catch (err) { showToast(err.message); }
+    finally { setHmacSaving(false); }
   };
 
-  // Turnstile-at-Worker toggle. Coordination rule for both directions:
-  // never end up in (toggle off + Worker deployed) — the Worker strips the
-  // token, the origin still expects to see one, so every gated request
-  // 403s. So the safe order is:
-  //   - Enabling : toggle ON first, then deploy the Worker.
-  //   - Disabling: undeploy the Worker first, then toggle OFF.
-  // The intermediate state (toggle on + Worker not yet in front) is fine
-  // functionally — it just means Turnstile isn't actually checked during
-  // that brief window.
-  const handleToggleWorkerTurnstile = async () => {
-    const newEnabled = !workerTurnstileEnabled;
-    if (newEnabled) {
-      if (!await confirm('Order: enable this first, then deploy the cloudflare/workers/turnstile-gate Worker (with TURNSTILE_SECRET_KEY set on the Cloudflare dashboard). Origin will skip Turnstile verification on the five sign-in/registration endpoints. Continue?')) return;
-    } else {
-      if (!await confirm('Order: undeploy the cloudflare/workers/turnstile-gate Worker (or remove its routes) first, then disable this. Disabling while the Worker is still in front will break every gated request because the Worker strips the token, but origin will start expecting one again. Continue?')) return;
-    }
-    try {
-      const { ok, data } = await mfaFetch('/api/admin/settings/turnstile-gate/toggle', { method: 'PUT', body: { enabled: newEnabled } });
-      if (ok) {
-        setWorkerTurnstileEnabled(newEnabled);
-      } else {
-        showToast(data?.error || 'Failed to toggle Turnstile worker gate.');
-      }
-    } catch (err) {
-      showToast(err.message);
-    }
-  };
-
-  // Worker keys
-
-  // Open the generate modal. Label entry now happens inside the modal so the
-  // panel header can stay clean with just one button.
-  const handleOpenGenerateModal = () => {
-    setGenerateLabel('');
-    setGenerateModalOpen(true);
-  };
-
+  // Worker keys --------------------------------------------------------
+  const handleOpenGenerateModal = () => { setGenerateLabel(''); setGenerateModalOpen(true); };
   const handleConfirmGenerate = async () => {
     setGeneratingKey(true);
     try {
-      const { ok, data } = await mfaFetch('/api/admin/settings/worker-keys', {
-        method: 'POST',
-        body: { label: generateLabel.trim() || null },
-      });
-      if (!ok) throw new Error(data?.error || 'Failed to generate worker key');
-
+      const { ok, data } = await apiPost('/api/admin/settings/worker-keys', { label: generateLabel.trim() || null });
+      if (!ok) { if (data?.code !== 'step_up_required') showToast(data?.error || 'Failed to generate worker key'); return; }
       setGenerateModalOpen(false);
       setNewWorkerKey({ keyId: data.keyId, secret: data.secret });
-      setWkKeyIdCopyLabel('Copy');
-      setWkSecretCopyLabel('Copy');
-    } catch (err) {
-      showToast(err.message);
-    } finally {
-      setGeneratingKey(false);
-    }
+      setWkKeyIdCopyLabel('Copy'); setWkSecretCopyLabel('Copy');
+    } catch (err) { showToast(err.message); }
+    finally { setGeneratingKey(false); }
   };
-
-  const handleCloseWorkerKeyModal = () => {
-    setNewWorkerKey(null);
-    fetchSettings();
-  };
-
+  const handleCloseWorkerKeyModal = () => { setNewWorkerKey(null); reloadWorkers(); };
   const handlePauseWorkerKey = async (keyId) => {
     try {
-      const { ok, data } = await mfaFetch(`/api/admin/settings/worker-keys/${keyId}/pause`, { method: 'POST' });
-      if (ok) { showToast('Worker key paused.', 'success'); fetchSettings(); }
-      else showToast(data?.error || 'Failed to pause worker key.');
+      const { ok, data } = await apiPost(`/api/admin/settings/worker-keys/${keyId}/pause`);
+      if (ok) { showToast('Worker key paused.', 'success'); reloadWorkers(); }
+      else if (data?.code !== 'step_up_required') showToast(data?.error || 'Failed to pause worker key.');
     } catch (err) { showToast(err.message); }
   };
-
   const handleResumeWorkerKey = async (keyId) => {
     try {
-      const { ok, data } = await mfaFetch(`/api/admin/settings/worker-keys/${keyId}/resume`, { method: 'POST' });
-      if (ok) { showToast('Worker key resumed.', 'success'); fetchSettings(); }
-      else showToast(data?.error || 'Failed to resume worker key.');
+      const { ok, data } = await apiPost(`/api/admin/settings/worker-keys/${keyId}/resume`);
+      if (ok) { showToast('Worker key resumed.', 'success'); reloadWorkers(); }
+      else if (data?.code !== 'step_up_required') showToast(data?.error || 'Failed to resume worker key.');
     } catch (err) { showToast(err.message); }
   };
-
-  const handleOpenRenameModal = (wk) => {
-    setRenameModalState({ keyId: wk.key_id, originalLabel: wk.label || '' });
-    setRenameLabel(wk.label || '');
-  };
-
+  const handleOpenRenameModal = (wk) => { setRenameModalState({ keyId: wk.key_id, originalLabel: wk.label || '' }); setRenameLabel(wk.label || ''); };
   const handleConfirmRename = async () => {
     if (!renameModalState) return;
     setRenameSaving(true);
     try {
-      const { ok, data } = await mfaFetch(`/api/admin/settings/worker-keys/${renameModalState.keyId}/rename`, {
-        method: 'POST',
-        body: { label: renameLabel.trim() },
-      });
-      if (ok) {
-        showToast('Worker key renamed.', 'success');
-        setRenameModalState(null);
-        fetchSettings();
-      } else {
-        showToast(data?.error || 'Failed to rename worker key.');
-      }
-    } catch (err) {
-      showToast(err.message);
-    } finally {
-      setRenameSaving(false);
-    }
+      const { ok, data } = await apiPost(`/api/admin/settings/worker-keys/${renameModalState.keyId}/rename`, { label: renameLabel.trim() });
+      if (ok) { showToast('Worker key renamed.', 'success'); setRenameModalState(null); reloadWorkers(); }
+      else if (data?.code !== 'step_up_required') showToast(data?.error || 'Failed to rename worker key.');
+    } catch (err) { showToast(err.message); }
+    finally { setRenameSaving(false); }
   };
-
-  const handleOpenReactivateModal = (keyId) => {
-    setReactivateModalState({ keyId });
-  };
-
+  const handleOpenReactivateModal = (keyId) => setReactivateModalState({ keyId });
   const handleConfirmReactivate = async () => {
     if (!reactivateModalState) return;
     setReactivateSaving(true);
     try {
-      const { ok, data } = await mfaFetch(`/api/admin/settings/worker-keys/${reactivateModalState.keyId}/reactivate`, { method: 'POST' });
-      if (!ok) throw new Error(data?.error || 'Failed to reactivate worker key');
+      const { ok, data } = await apiPost(`/api/admin/settings/worker-keys/${reactivateModalState.keyId}/reactivate`);
+      if (!ok) { if (data?.code !== 'step_up_required') showToast(data?.error || 'Failed to reactivate worker key'); return; }
       setReactivateModalState(null);
-      // Pipe the rotated secret through the same one-time-display modal used
-      // for initial generation. Same shape: { keyId, secret }.
       setNewWorkerKey({ keyId: data.keyId, secret: data.secret });
-      setWkKeyIdCopyLabel('Copy');
-      setWkSecretCopyLabel('Copy');
-    } catch (err) {
-      showToast(err.message);
-    } finally {
-      setReactivateSaving(false);
-    }
+      setWkKeyIdCopyLabel('Copy'); setWkSecretCopyLabel('Copy');
+    } catch (err) { showToast(err.message); }
+    finally { setReactivateSaving(false); }
   };
-
   const handleDeleteWorkerKey = async (keyId) => {
-    if (!await confirm('Permanently delete this worker key? This action cannot be undone — any worker still running with this key will lose its session and be unable to reauth.')) return;
+    if (!await confirm({ title: 'Delete worker key?', message: 'This can\'t be undone — any worker still running with this key loses its session and can\'t reauth.', confirmLabel: 'Delete', danger: true })) return;
     try {
-      const { ok, data } = await mfaFetch(`/api/admin/settings/worker-keys/${keyId}`, { method: 'DELETE' });
-      if (ok) {
-        showToast('Worker key deleted.', 'success');
-        fetchSettings();
-      } else {
-        showToast(data?.error || 'Failed to delete worker key.');
-      }
-    } catch (err) {
-      showToast(err.message);
-    }
+      const { ok, data } = await apiDelete(`/api/admin/settings/worker-keys/${keyId}`);
+      if (ok) { showToast('Worker key deleted.', 'success'); reloadWorkers(); }
+      else if (data?.code !== 'step_up_required') showToast(data?.error || 'Failed to delete worker key.');
+    } catch (err) { showToast(err.message); }
+  };
+  const copyField = (value, setLabel) => {
+    navigator.clipboard.writeText(value).then(() => { setLabel('Copied!'); setTimeout(() => setLabel('Copy'), 1500); }).catch(() => {});
   };
 
-  const copyField = (value, setLabel) => {
-    navigator.clipboard.writeText(value).then(() => {
-      setLabel('Copied!');
-      setTimeout(() => setLabel('Copy'), 1500);
-    }).catch(() => {});
+  const handleClearPlaybackStats = async () => {
+    if (!await confirm({ title: 'Reset all playback statistics?', message: 'This permanently deletes every user\'s watch history and resume positions across every course — every student loses their "continue watching" progress. This can\'t be undone.', confirmLabel: 'Reset all', danger: true })) return;
+    setClearingStats(true);
+    try {
+      const { ok, data } = await apiDelete('/api/admin/playback-stats');
+      if (ok) showToast('All playback statistics cleared.', 'success');
+      else if (data?.code !== 'step_up_required') showToast(data?.error || 'Failed to clear statistics.');
+    } catch (err) { showToast(err.message); }
+    finally { setClearingStats(false); }
+  };
+
+  const saveTranscodingSet = async (which) => {
+    const isDefault = which === 'default';
+    const profiles = isDefault ? defaultProfiles : enhancedProfiles;
+    if (profiles.length === 0) { showToast('At least one profile is required.'); return; }
+    const setSaving = isDefault ? setSavingDefault : setSavingEnhanced;
+    setSaving(true);
+    try {
+      const { ok, data } = await apiPut(`/api/admin/settings/transcoding-profiles/${which}`, { profiles });
+      if (ok) {
+        showToast(`${isDefault ? 'Default' : 'Enhanced'} profiles saved.`, 'success');
+        originalTranscoding.current = { ...originalTranscoding.current, [isDefault ? 'defaultProfiles' : 'enhancedProfiles']: JSON.stringify(profiles) };
+      } else if (data?.code !== 'step_up_required') showToast(data?.error || 'Failed to save profiles.');
+    } catch (err) { showToast(err.message); }
+    finally { setSaving(false); }
+  };
+  const saveAudioSettings = async () => {
+    const abkInt = parseInt(audioBitrateKbps, 10);
+    if (!Number.isInteger(abkInt) || abkInt < 128 || abkInt > 320) {
+      setTranscodingTouched(t => ({ ...t, audioBitrateKbps: true }));
+      setTranscodingErrors(e => ({ ...e, audioBitrateKbps: 'Must be an integer between 128 and 320' }));
+      showToast('Please fix the errors below.'); return;
+    }
+    setSavingDefault(true);
+    try {
+      const { ok, data } = await apiPut('/api/admin/settings/transcoding-profiles/default', {
+        profiles: defaultProfiles, audioNormalization: { target: audioNormTarget, peak: audioNormPeak, maxGain: audioNormMaxGain }, audioBitrateKbps: abkInt,
+      });
+      if (ok) {
+        showToast('Audio settings saved.', 'success');
+        originalTranscoding.current = {
+          ...originalTranscoding.current, defaultProfiles: JSON.stringify(defaultProfiles),
+          target: audioNormTarget, peak: audioNormPeak, maxGain: audioNormMaxGain, audioBitrateKbps,
+        };
+      } else if (data?.code !== 'step_up_required') showToast(data?.error || 'Failed to save.');
+    } catch (err) { showToast(err.message); }
+    finally { setSavingDefault(false); }
+  };
+
+  // --- Section navigation ---
+  // Each pane is a URL (/admin/settings/:pane) so navigating is a router push. Block
+  // it only while the MFA child has a save in flight (switching away would unmount
+  // it mid-request). The step-up challenge modal now lives in the global provider,
+  // so unmounting a pane can no longer strand it.
+  const goSection = (key) => { if (mfaLocked || key === active) return; navigate('/admin/settings/' + key); };
+  const dotFor = (key) => {
+    if (MFA_KEYS.has(key)) return !!mfaDirty[key];
+    if (!loaded.has(key)) return false; // originals aren't populated until the slice loads
+    if (key === 'general') return isDirty;
+    if (key === 'transcoding') return !!transcodingDirty;
+    return false;
+  };
+  const activeIsMfa = MFA_KEYS.has(active);
+  const activeIsSso = active === 'sso';
+
+  const railItem = ([key, label]) => (
+    <button key={key} type="button" className={'vs-set-nav' + (active === key ? ' on' : '')} onClick={() => goSection(key)}>
+      <span>{label}</span>
+      {dotFor(key) && <span className="vs-set-dot" title="Unsaved changes" />}
+    </button>
+  );
+
+  // --- Site section renderers ---
+  const renderGeneral = () => (
+    <>
+      <h3 className="vs-set-h">General</h3>
+      <p className="vs-set-sub">Core identity and session lifetime for the site.</p>
+      <div className="vs-field" style={{ maxWidth: 320 }}>
+        <label className="vs-label">Site name</label>
+        <input type="text" className={'vs-input' + (errors.site_name ? ' err' : '')} value={siteName_} onChange={e => setSiteName(e.target.value)} />
+        {errors.site_name && <p className="vs-hint err">{errors.site_name}</p>}
+      </div>
+      <div className="vs-field" style={{ maxWidth: 420 }}>
+        <label className="vs-label">Site hostname</label>
+        <div style={{ display: 'flex' }}>
+          <select className="vs-select" style={{ width: 104, borderRadius: '8px 0 0 8px', flexShrink: 0 }} value={siteProtocol} onChange={e => setSiteProtocol(e.target.value)}>
+            <option value="https">https://</option>
+            <option value="http">http://</option>
+          </select>
+          <input type="text" className={'vs-input' + (errors.site_hostname ? ' err' : '')} style={{ borderRadius: '0 8px 8px 0', borderLeft: 'none' }}
+            value={siteHostname} onChange={e => setSiteHostname(stripToHost(e.target.value))} placeholder="stream.yourdomain.com" />
+        </div>
+        {errors.site_hostname && <p className="vs-hint err">{errors.site_hostname}</p>}
+      </div>
+      <div className="vs-field-row" style={{ maxWidth: 420 }}>
+        <div className="vs-field">
+          <label className="vs-label">Session inactivity timeout (days)</label>
+          <input type="text" inputMode="numeric" className={'vs-input' + (errors.session_inactivity_days ? ' err' : '')}
+            value={sessionInactivityDays} onChange={e => setSessionInactivityDays(e.target.value)} onKeyDown={handleDigitOnly} onPaste={handleDigitPaste(setSessionInactivityDays)} />
+          {errors.session_inactivity_days && <p className="vs-hint err">{errors.session_inactivity_days}</p>}
+        </div>
+        <div className="vs-field">
+          <label className="vs-label">Session max lifetime (days)</label>
+          <input type="text" inputMode="numeric" className={'vs-input' + (errors.session_max_days ? ' err' : '')}
+            value={sessionMaxDays} onChange={e => setSessionMaxDays(e.target.value)} onKeyDown={handleDigitOnly} onPaste={handleDigitPaste(setSessionMaxDays)} />
+          {errors.session_max_days && <p className="vs-hint err">{errors.session_max_days}</p>}
+        </div>
+      </div>
+      <div className="vs-field" style={{ maxWidth: 320 }}>
+        <label className="vs-label">Default role</label>
+        <select className={'vs-select' + (errors.registration_default_role ? ' err' : '')} value={registrationDefaultRole}
+          onChange={e => { setRegistrationDefaultRole(e.target.value); setErrors(prev => { if (!prev.registration_default_role) return prev; const n = { ...prev }; delete n.registration_default_role; return n; }); }}>
+          <option value="">No access</option>
+          {filteredRoles.map(r => {
+            const isProtected = r.permission_level <= (user?.permission_level ?? 0);
+            return <option key={r.role_id} value={r.role_id}>{r.role_name}{isProtected ? ' (current)' : ''}</option>;
+          })}
+        </select>
+        <p className="vs-hint">Fallback role reported to the SSO — used for new users and when a user’s role is removed. “No access” means such users cannot sign in.</p>
+      </div>
+      <VsSaveBar visible={isDirty} busy={saving} items={generalItems} invalid={hasErrors}
+        invalidNote="Fix the highlighted fields to save." onSave={() => guardAction(handleSaveGeneral)} onDiscard={discardGeneral} saveLabel="Save" />
+    </>
+  );
+
+  const profileTable = (profiles, setName, setter) => (
+    <div className="vs-st-tbl">
+      <div className="vs-st-th">
+        <span style={{ flex: '1.2', minWidth: 0 }}>Name</span>
+        <span style={{ flex: 1 }}>Resolution</span>
+        <span style={{ flex: 1 }}>Bitrate</span>
+        <span style={{ flex: '0 0 60px' }}>Max FPS</span>
+        <span style={{ flex: '0 0 54px' }}>GOP</span>
+        <span style={{ flex: '0 0 64px' }} />
+      </div>
+      {profiles.map((p, idx) => (
+        <div className="vs-st-tr" key={p.profile_id || `${setName}-${idx}`}>
+          <span style={{ flex: '1.2', minWidth: 0, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</span>
+          <span style={{ flex: 1, color: '#6b7280' }}>{p.width}×{p.height}</span>
+          <span style={{ flex: 1, color: '#6b7280' }}>{p.video_bitrate_kbps} kbps</span>
+          <span style={{ flex: '0 0 60px', color: '#6b7280' }}>{p.fps_limit} fps</span>
+          <span style={{ flex: '0 0 54px', color: '#6b7280' }}>{p.gop_seconds}</span>
+          <span style={{ flex: '0 0 64px', display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+            <button className="vs-ico-btn" title="Edit" onClick={() => { setEditingProfileTarget({ set: setName, idx }); setShowProfileModal(true); }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" /></svg>
+            </button>
+            {!p.is_system_profile && (
+              <button className="vs-ico-btn dg" title="Delete" onClick={async () => {
+                if (!await confirm({ title: 'Delete profile?', message: 'This removes the transcoding profile from this set.', confirmLabel: 'Delete', danger: true })) return;
+                setter(prev => prev.filter((_, i) => i !== idx));
+              }}><TrashIcon /></button>
+            )}
+          </span>
+        </div>
+      ))}
+      {profiles.length === 0 && <div className="vs-st-empty">No profiles configured</div>}
+    </div>
+  );
+
+  const renderTranscoding = () => (
+    <>
+      <h3 className="vs-set-h">Transcoding</h3>
+      <p className="vs-set-sub">Site-wide encoding profiles. Courses choose between the default and enhanced sets via a per-course toggle, or override entirely with custom profiles.</p>
+
+      <label className="vs-label" style={{ marginBottom: 8 }}>Default quality profiles</label>
+      {profileTable(defaultProfiles, 'default', setDefaultProfiles)}
+      <div style={{ display: 'flex', gap: 8, marginTop: 12, marginBottom: 24 }}>
+        <button className="vs-btn" onClick={() => { setEditingProfileTarget({ set: 'default', idx: null }); setShowProfileModal(true); }}>Add profile</button>
+        <button className="vs-btn vs-btn-primary" disabled={savingDefault || JSON.stringify(defaultProfiles) === originalTranscoding.current.defaultProfiles} onClick={() => guardAction(() => saveTranscodingSet('default'))}>
+          {savingDefault ? 'Saving…' : 'Save default profiles'}
+        </button>
+      </div>
+
+      <label className="vs-label" style={{ marginBottom: 4 }}>Enhanced quality profiles</label>
+      <p className="vs-set-sub" style={{ marginBottom: 8 }}>Higher-bitrate set (1440p / 1080p / 720p). Courses opt in via the per-course toggle.</p>
+      {profileTable(enhancedProfiles, 'enhanced', setEnhancedProfiles)}
+      <div style={{ display: 'flex', gap: 8, marginTop: 12, marginBottom: 24 }}>
+        <button className="vs-btn" onClick={() => { setEditingProfileTarget({ set: 'enhanced', idx: null }); setShowProfileModal(true); }}>Add profile</button>
+        <button className="vs-btn vs-btn-primary" disabled={savingEnhanced || JSON.stringify(enhancedProfiles) === originalTranscoding.current.enhancedProfiles} onClick={() => guardAction(() => saveTranscodingSet('enhanced'))}>
+          {savingEnhanced ? 'Saving…' : 'Save enhanced profiles'}
+        </button>
+      </div>
+
+      <label className="vs-label" style={{ marginBottom: 4 }}>Audio settings</label>
+      <div className="vs-field" style={{ maxWidth: 280, marginTop: 8 }}>
+        <label className="vs-label">Audio bitrate (kbps)</label>
+        <input type="text" inputMode="numeric" className={'vs-input' + (transcodingTouched.audioBitrateKbps && transcodingErrors.audioBitrateKbps ? ' err' : '')}
+          value={audioBitrateKbps} onChange={e => setAudioBitrateKbps(e.target.value.replace(/\D/g, ''))} onKeyDown={handleDigitOnly} onPaste={handleDigitPaste(setAudioBitrateKbps)}
+          onBlur={() => {
+            setTranscodingTouched(t => ({ ...t, audioBitrateKbps: true }));
+            const v = parseInt(audioBitrateKbps, 10);
+            setTranscodingErrors(e => { const n = { ...e }; if (!Number.isInteger(v) || v < 128 || v > 320) n.audioBitrateKbps = 'Must be an integer between 128 and 320'; else delete n.audioBitrateKbps; return n; });
+          }} />
+        <p className={'vs-hint' + (transcodingTouched.audioBitrateKbps && transcodingErrors.audioBitrateKbps ? ' err' : '')}>
+          {transcodingTouched.audioBitrateKbps && transcodingErrors.audioBitrateKbps ? transcodingErrors.audioBitrateKbps : 'Site-wide AAC-LC bitrate for all transcoded videos. Range 128–320.'}
+        </p>
+      </div>
+      <p className="vs-set-sub" style={{ margin: '10px 0 8px' }}>Audio normalization is enabled by default for new courses. Individual courses can disable it.</p>
+      <div className="vs-field-row" style={{ maxWidth: 480 }}>
+        <div className="vs-field">
+          <label className="vs-label">Target loudness (LUFS)</label>
+          <input type="text" inputMode="numeric" className={'vs-input' + (transcodingTouched.target && transcodingErrors.target ? ' err' : '')}
+            value={audioNormTarget} onChange={e => setAudioNormTarget(e.target.value.replace(/[^0-9.-]/g, ''))}
+            onBlur={() => { setTranscodingTouched(t => ({ ...t, target: true })); const v = parseFloat(audioNormTarget); setTranscodingErrors(e => { const n = { ...e }; if (isNaN(v) || v < -50 || v > 0) n.target = 'Must be -50 to 0'; else delete n.target; return n; }); }} />
+          {transcodingTouched.target && transcodingErrors.target && <p className="vs-hint err">{transcodingErrors.target}</p>}
+        </div>
+        <div className="vs-field">
+          <label className="vs-label">True peak ceiling (dBFS)</label>
+          <input type="text" inputMode="numeric" className={'vs-input' + (transcodingTouched.peak && transcodingErrors.peak ? ' err' : '')}
+            value={audioNormPeak} onChange={e => setAudioNormPeak(e.target.value.replace(/[^0-9.-]/g, ''))}
+            onBlur={() => { setTranscodingTouched(t => ({ ...t, peak: true })); const v = parseFloat(audioNormPeak); setTranscodingErrors(e => { const n = { ...e }; if (isNaN(v) || v < -20 || v > 0) n.peak = 'Must be -20 to 0'; else delete n.peak; return n; }); }} />
+          {transcodingTouched.peak && transcodingErrors.peak && <p className="vs-hint err">{transcodingErrors.peak}</p>}
+        </div>
+        <div className="vs-field">
+          <label className="vs-label">Max upward gain (dB)</label>
+          <input type="text" inputMode="numeric" className={'vs-input' + (transcodingTouched.maxGain && transcodingErrors.maxGain ? ' err' : '')}
+            value={audioNormMaxGain} onChange={e => setAudioNormMaxGain(e.target.value.replace(/[^0-9.-]/g, ''))}
+            onBlur={() => { setTranscodingTouched(t => ({ ...t, maxGain: true })); const v = parseFloat(audioNormMaxGain); setTranscodingErrors(e => { const n = { ...e }; if (isNaN(v) || v < 0 || v > 40) n.maxGain = 'Must be 0 to 40'; else delete n.maxGain; return n; }); }} />
+          {transcodingTouched.maxGain && transcodingErrors.maxGain && <p className="vs-hint err">{transcodingErrors.maxGain}</p>}
+        </div>
+      </div>
+      <button className="vs-btn vs-btn-primary" style={{ marginTop: 4 }}
+        disabled={savingDefault || Object.keys(transcodingErrors).length > 0 || (
+          audioNormTarget === originalTranscoding.current.target && audioNormPeak === originalTranscoding.current.peak
+          && audioNormMaxGain === originalTranscoding.current.maxGain && audioBitrateKbps === originalTranscoding.current.audioBitrateKbps)}
+        onClick={() => guardAction(saveAudioSettings)}>
+        {savingDefault ? 'Saving…' : 'Save audio settings'}
+      </button>
+    </>
+  );
+
+  const renderCloudflare = () => (
+    <>
+      <h3 className="vs-set-h">Cloudflare</h3>
+      <p className="vs-set-sub">Signs playback URLs with HMAC-SHA256 for Cloudflare WAF token authentication.</p>
+      <div className="vs-toggle" style={{ maxWidth: 480, marginBottom: 18 }}>
+        <div className="vs-toggle-lbl">
+          <label className="vs-label">HMAC validation</label>
+          <p className="vs-hint" style={{ marginTop: 0 }}>{hmacEnabled ? 'Enabled' : 'Disabled'}</p>
+        </div>
+        <label className="vs-switch">
+          <input type="checkbox" checked={hmacEnabled} onChange={() => guardAction(handleToggleHmac)} />
+          <span className="vs-switch-slider" />
+        </label>
+      </div>
+      <div className="vs-field" style={{ maxWidth: 480 }}>
+        <label className="vs-label">HMAC secret key</label>
+        <div><button type="button" className="vs-btn vs-btn-primary" onClick={() => guardAction(handleGenerateHmac)} disabled={!hmacEnabled}>{hmacHasKey ? 'Generate new key' : 'Initialize key'}</button></div>
+        <p className="vs-hint">{hmacHasKey ? 'Generates a new key and shows it once. Changing the key immediately invalidates all active playback sessions.' : 'Generate a secret key to get started with HMAC validation.'}</p>
+      </div>
+      <div className="vs-field" style={{ maxWidth: 480 }}>
+        <label className="vs-label">Token validity for client (seconds)</label>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <input type="number" className="vs-input" value={hmacTokenValidity} onChange={e => setHmacTokenValidity(e.target.value)} min="600" step="1" style={{ maxWidth: 200 }} disabled={!hmacEnabled} />
+          <button type="button" className="vs-btn vs-btn-primary" onClick={() => guardAction(handleSaveHmacValidity)} disabled={hmacSaving || !hmacEnabled}>{hmacSaving ? 'Saving…' : 'Save'}</button>
+        </div>
+        <p className="vs-hint">Tells the player when to proactively refresh the token (refreshes at half this value). Must be ≤ the lifetime configured in your Cloudflare WAF rule. Default: 600 seconds.</p>
+      </div>
+    </>
+  );
+
+  const wkStatus = (status) => {
+    const s = status || 'active';
+    const label = s.charAt(0).toUpperCase() + s.slice(1);
+    const tone = s === 'active' ? 'g' : s === 'paused' ? 'y' : 'r';
+    return <span className={'vs-st-pill ' + tone}>{label}</span>;
+  };
+  const renderWorkers = () => (
+    <>
+      <h3 className="vs-set-h">Worker access keys</h3>
+      <p className="vs-set-sub">Credentials transcoding workers use to authenticate. Generated once, shown once.</p>
+      <div style={{ marginBottom: 12 }}><button type="button" className="vs-btn vs-btn-primary" onClick={() => guardAction(handleOpenGenerateModal)}>Generate new key</button></div>
+      <div className="vs-st-tbl">
+        <div className="vs-st-th">
+          <span style={{ flex: '1.2', minWidth: 0 }}>Key ID</span>
+          <span style={{ flex: 1 }}>Label</span>
+          <span style={{ flex: '0 0 84px' }}>Status</span>
+          <span style={{ flex: 1 }}>Last used</span>
+          <span style={{ flex: '0 0 200px' }} />
+        </div>
+        {workerKeys.map(wk => {
+          const status = wk.status || 'active';
+          return (
+            <div className="vs-st-tr" key={wk.key_id}>
+              <span style={{ flex: '1.2', minWidth: 0, fontFamily: 'monospace', fontSize: 12, color: '#6b7280', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{wk.key_id}</span>
+              <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{wk.label || '—'}</span>
+              <span style={{ flex: '0 0 84px' }}>{wkStatus(status)}</span>
+              <span style={{ flex: 1, color: '#6b7280' }}>{wk.last_used_at ? new Date(wk.last_used_at).toLocaleString() : 'Never'}</span>
+              <span style={{ flex: '0 0 200px', display: 'flex', gap: 6, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+                {status === 'active' && <button className="vs-btn vs-btn-sm" onClick={() => guardAction(() => handlePauseWorkerKey(wk.key_id))}>Pause</button>}
+                {status === 'paused' && <button className="vs-btn vs-btn-sm" onClick={() => guardAction(() => handleResumeWorkerKey(wk.key_id))}>Resume</button>}
+                {status === 'deactivated' && <button className="vs-btn vs-btn-sm" onClick={() => guardAction(() => handleOpenReactivateModal(wk.key_id))}>Reactivate</button>}
+                {status !== 'deactivated' && <button className="vs-btn vs-btn-sm" onClick={() => guardAction(() => handleOpenRenameModal(wk))}>Rename</button>}
+                <button className="vs-ico-btn dg" title="Delete" onClick={() => guardAction(() => handleDeleteWorkerKey(wk.key_id))}><TrashIcon /></button>
+              </span>
+            </div>
+          );
+        })}
+        {workerKeys.length === 0 && <div className="vs-st-empty">No worker keys</div>}
+      </div>
+    </>
+  );
+
+  const renderPlayback = () => (
+    <>
+      <h3 className="vs-set-h">Playback data</h3>
+      <p className="vs-set-sub">Per-course and per-student playback stats now live on each course page and on each user’s edit page. This is the site-wide reset.</p>
+      <button type="button" className="vs-btn vs-btn-danger" onClick={() => guardAction(handleClearPlaybackStats)} disabled={clearingStats}>{clearingStats ? 'Clearing…' : 'Reset all playback stats'}</button>
+      <p className="vs-set-sub" style={{ marginTop: 10 }}>Permanently deletes every user’s watch history <strong>and</strong> resume positions across all courses. This can’t be undone.</p>
+    </>
+  );
+
+  const renderSite = () => {
+    // A slice pane still loading its first fetch shows the plain "Loading…" card.
+    if (SLICE_PANES.has(active) && !loaded.has(active)) return <CardLoading />;
+    switch (active) {
+      case 'transcoding': return renderTranscoding();
+      case 'cloudflare': return renderCloudflare();
+      case 'workers': return renderWorkers();
+      case 'playback': return renderPlayback();
+      default: return renderGeneral();
+    }
   };
 
   return (
-    <MfaPageGuard mfaBlock={mfaBlock} mfaSetupBlock={mfaSetupBlock} autoShowModal={autoShowModal}
-      onSuccess={handlePageMfaSuccess} onCancel={handlePageMfaCancel} onRetry={retryVerification}>
-    <div>
-      <h1 className="mb-3">Site Settings</h1>
-
-      {/* General + Registration + R2 */}
-      <div className="card">
-        <div className="card-header">
-          <h2>General</h2>
-        </div>
-        <form onSubmit={handleSaveGeneral}>
-            <div style={{ maxWidth: '600px' }}>
-              <div className="form-group">
-                <label htmlFor="site_name">Site Name</label>
-                <input type="text" id="site_name" className={`form-control${errors.site_name ? ' input-error' : ''}`}
-                  value={siteName_} onChange={e => setSiteName(e.target.value)}
-                  style={{ maxWidth: '300px' }} />
-                {errors.site_name && <span className="field-error">{errors.site_name}</span>}
-              </div>
-              <div className="form-group">
-                <label htmlFor="site_hostname">Site Hostname</label>
-                <div style={{ display: 'flex', gap: 0, maxWidth: '400px' }}>
-                  <select id="site_protocol" className="form-control"
-                    style={{ width: '100px', borderRadius: '6px 0 0 6px', flexShrink: 0 }}
-                    value={siteProtocol} onChange={e => setSiteProtocol(e.target.value)}>
-                    <option value="https">https://</option>
-                    <option value="http">http://</option>
-                  </select>
-                  <input type="text" id="site_hostname" className={`form-control${errors.site_hostname ? ' input-error' : ''}`}
-                    style={{ borderRadius: '0 6px 6px 0', borderLeft: 'none' }}
-                    value={siteHostname}
-                    onChange={e => setSiteHostname(e.target.value)}
-                    onBlur={e => setSiteHostname(e.target.value.trim().replace(/^https?:\/\//, '').split('/')[0])}
-                    placeholder="stream.yourdomain.com" />
-                </div>
-                {errors.site_hostname && <span className="field-error">{errors.site_hostname}</span>}
-              </div>
-              <div className="form-group">
-                <label htmlFor="session_inactivity_days">Session Inactivity Timeout (days)</label>
-                <input type="text" inputMode="numeric" id="session_inactivity_days"
-                  className={`form-control${errors.session_inactivity_days ? ' input-error' : ''}`}
-                  value={sessionInactivityDays} onChange={e => setSessionInactivityDays(e.target.value)}
-                  onKeyDown={handleDigitOnly} onPaste={handleDigitPaste(setSessionInactivityDays)}
-                  style={{ maxWidth: '200px' }} />
-                {errors.session_inactivity_days && <span className="field-error">{errors.session_inactivity_days}</span>}
-              </div>
-              <div className="form-group">
-                <label htmlFor="session_max_days">Session Max Lifetime (days)</label>
-                <input type="text" inputMode="numeric" id="session_max_days"
-                  className={`form-control${errors.session_max_days ? ' input-error' : ''}`}
-                  value={sessionMaxDays} onChange={e => setSessionMaxDays(e.target.value)}
-                  onKeyDown={handleDigitOnly} onPaste={handleDigitPaste(setSessionMaxDays)}
-                  style={{ maxWidth: '200px' }} />
-                {errors.session_max_days && <span className="field-error">{errors.session_max_days}</span>}
-              </div>
-              <div className="form-group">
-                <label htmlFor="emailed_link_validity_minutes">Emailed Link Validity (minutes)</label>
-                <input type="text" inputMode="numeric" id="emailed_link_validity_minutes"
-                  className={`form-control${errors.emailed_link_validity_minutes ? ' input-error' : ''}`}
-                  value={registrationTokenValidity} onChange={e => setRegistrationTokenValidity(e.target.value)}
-                  onKeyDown={handleDigitOnly} onPaste={handleDigitPaste(setRegistrationTokenValidity)}
-                  style={{ maxWidth: '200px' }} />
-                {errors.emailed_link_validity_minutes && <span className="field-error">{errors.emailed_link_validity_minutes}</span>}
-              </div>
-              <small className="text-muted" style={{ display: 'block', marginTop: '-8px', marginBottom: '12px' }}>Applies to registration and password reset links</small>
-
-              <h3 style={{ margin: '20px 0 12px' }}>Registration</h3>
-              <div className="form-group">
-                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
-                  <input type="checkbox" checked={enableRegistration}
-                    onChange={e => setEnableRegistration(e.target.checked)} />
-                  Enable Registration
-                </label>
-              </div>
-              <div className="form-group">
-                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
-                  <input type="checkbox" checked={requireInvitationCode}
-                    onChange={e => setRequireInvitationCode(e.target.checked)} />
-                  Require Invitation Code
-                </label>
-              </div>
-              <div className="form-group">
-                <label htmlFor="registration_default_role">Default Role for New Users</label>
-                <select id="registration_default_role" className={`form-control${errors.registration_default_role ? ' input-error' : ''}`}
-                  style={{ maxWidth: '200px' }}
-                  value={registrationDefaultRole} onChange={e => setRegistrationDefaultRole(e.target.value)}>
-                  {filteredRoles.map(r => {
-                    const isProtected = r.permission_level <= (user?.permission_level ?? 0);
-                    return (
-                      <option key={r.role_id} value={r.role_id}>
-                        {r.role_name}{isProtected ? ' (current)' : ''}
-                      </option>
-                    );
-                  })}
-                </select>
-                {errors.registration_default_role && <span className="field-error">{errors.registration_default_role}</span>}
-              </div>
-            </div>
-
-          <button type="submit" className="btn btn-primary" disabled={saving || !isDirty || hasErrors}
-            style={{ marginTop: '8px', opacity: (!isDirty || hasErrors) && !saving ? 0.5 : 1 }}>
-            {saving ? 'Saving...' : 'Save Settings'}
-          </button>
-        </form>
+    <div className="vs-set-page">
+      <div className="vs-set-head">
+        <h1 className="vs-set-title">Settings</h1>
+        <p className="vs-set-psub">Site configuration, integrations, and multi-factor policy.</p>
       </div>
 
-      {/* Transcoding Profiles */}
-      <div className="card mt-3">
-        <div className="card-header">
-          <h2>Transcoding Profiles</h2>
-        </div>
-        <div>
-          <p className="text-muted" style={{ marginBottom: '16px' }}>
-            Default site-wide encoding profiles. Courses choose between the default and enhanced sets via a per-course toggle, or can override entirely with custom profiles.
-          </p>
-
-          {/* Default Quality */}
-          <h3 style={{ marginBottom: '8px' }}>Default Quality Profiles</h3>
-          <div className="table-wrap" style={{ marginBottom: '12px' }}>
-            <table>
-              <thead>
-                <tr>
-                  <th>Name</th>
-                  <th>Resolution</th>
-                  <th>Video Bitrate</th>
-                  <th>Max FPS</th>
-                  <th>GOP (s)</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {defaultProfiles.map((p, idx) => (
-                  <tr key={p.profile_id || `d-${idx}`}>
-                    <td>{p.name}</td>
-                    <td>{p.width}x{p.height}</td>
-                    <td>{p.video_bitrate_kbps} kbps</td>
-                    <td>{p.fps_limit} fps</td>
-                    <td>{p.gop_seconds}</td>
-                    <td>
-                      <button className="btn btn-secondary btn-sm" onClick={() => { setEditingProfileTarget({ set: 'default', idx }); setShowProfileModal(true); }}>Edit</button>
-                      {!p.is_system_profile && (
-                        <button className="btn btn-danger btn-sm" style={{ marginLeft: '4px' }} onClick={async () => {
-                          if (!await confirm('Delete this profile?')) return;
-                          setDefaultProfiles(prev => prev.filter((_, i) => i !== idx));
-                        }}>Delete</button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-                {defaultProfiles.length === 0 && (
-                  <tr><td colSpan="6" className="text-muted" style={{ textAlign: 'center', padding: '16px' }}>No profiles configured</td></tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-
-          <button className="btn btn-secondary btn-sm" style={{ marginBottom: '20px' }}
-            onClick={() => { setEditingProfileTarget({ set: 'default', idx: null }); setShowProfileModal(true); }}>
-            Add Default Profile
-          </button>
-
-          <button className="btn btn-primary btn-sm" style={{ marginLeft: '8px', marginBottom: '20px' }}
-            disabled={savingDefault || JSON.stringify(defaultProfiles) === originalTranscoding.current.defaultProfiles}
-            onClick={async () => {
-              if (defaultProfiles.length === 0) { showToast('At least one profile is required.'); return; }
-              setSavingDefault(true);
-              try {
-                const { ok, data } = await mfaFetch('/api/admin/settings/transcoding-profiles/default', {
-                  method: 'PUT', body: { profiles: defaultProfiles }
-                });
-                if (ok) {
-                  showToast('Default profiles saved.', 'success');
-                  originalTranscoding.current = { ...originalTranscoding.current, defaultProfiles: JSON.stringify(defaultProfiles) };
-                } else {
-                  showToast(data?.error || 'Failed to save default profiles.');
-                }
-              } catch (err) { showToast(err.message); }
-              finally { setSavingDefault(false); }
-            }}>
-            {savingDefault ? 'Saving...' : 'Save Default Profiles'}
-          </button>
-
-          {/* Enhanced Quality */}
-          <h3 style={{ marginBottom: '8px' }}>Enhanced Quality Profiles</h3>
-          <p className="text-muted text-sm" style={{ marginBottom: '8px' }}>
-            Higher-bitrate set (1440p / 1080p / 720p). Courses opt in via the per-course toggle.
-          </p>
-          <div className="table-wrap" style={{ marginBottom: '12px' }}>
-            <table>
-              <thead>
-                <tr>
-                  <th>Name</th>
-                  <th>Resolution</th>
-                  <th>Video Bitrate</th>
-                  <th>Max FPS</th>
-                  <th>GOP (s)</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {enhancedProfiles.map((p, idx) => (
-                  <tr key={p.profile_id || `e-${idx}`}>
-                    <td>{p.name}</td>
-                    <td>{p.width}x{p.height}</td>
-                    <td>{p.video_bitrate_kbps} kbps</td>
-                    <td>{p.fps_limit} fps</td>
-                    <td>{p.gop_seconds}</td>
-                    <td>
-                      <button className="btn btn-secondary btn-sm" onClick={() => { setEditingProfileTarget({ set: 'enhanced', idx }); setShowProfileModal(true); }}>Edit</button>
-                      {!p.is_system_profile && (
-                        <button className="btn btn-danger btn-sm" style={{ marginLeft: '4px' }} onClick={async () => {
-                          if (!await confirm('Delete this profile?')) return;
-                          setEnhancedProfiles(prev => prev.filter((_, i) => i !== idx));
-                        }}>Delete</button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-                {enhancedProfiles.length === 0 && (
-                  <tr><td colSpan="6" className="text-muted" style={{ textAlign: 'center', padding: '16px' }}>No profiles configured</td></tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-
-          <button className="btn btn-secondary btn-sm" style={{ marginBottom: '20px' }}
-            onClick={() => { setEditingProfileTarget({ set: 'enhanced', idx: null }); setShowProfileModal(true); }}>
-            Add Enhanced Profile
-          </button>
-
-          <button className="btn btn-primary btn-sm" style={{ marginLeft: '8px', marginBottom: '20px' }}
-            disabled={savingEnhanced || JSON.stringify(enhancedProfiles) === originalTranscoding.current.enhancedProfiles}
-            onClick={async () => {
-              if (enhancedProfiles.length === 0) { showToast('At least one profile is required.'); return; }
-              setSavingEnhanced(true);
-              try {
-                const { ok, data } = await mfaFetch('/api/admin/settings/transcoding-profiles/enhanced', {
-                  method: 'PUT', body: { profiles: enhancedProfiles }
-                });
-                if (ok) {
-                  showToast('Enhanced profiles saved.', 'success');
-                  originalTranscoding.current = { ...originalTranscoding.current, enhancedProfiles: JSON.stringify(enhancedProfiles) };
-                } else {
-                  showToast(data?.error || 'Failed to save enhanced profiles.');
-                }
-              } catch (err) { showToast(err.message); }
-              finally { setSavingEnhanced(false); }
-            }}>
-            {savingEnhanced ? 'Saving...' : 'Save Enhanced Profiles'}
-          </button>
-
-          <h3 style={{ marginTop: '24px', marginBottom: '12px' }}>Audio Settings</h3>
-
-          <div className="form-group" style={{ maxWidth: '400px' }}>
-            <label htmlFor="audioBitrateKbps">Audio Bitrate (kbps)</label>
-            <input
-              id="audioBitrateKbps"
-              type="text"
-              inputMode="numeric"
-              className={`form-control${transcodingTouched.audioBitrateKbps && transcodingErrors.audioBitrateKbps ? ' input-error' : ''}`}
-              value={audioBitrateKbps}
-              onChange={e => setAudioBitrateKbps(e.target.value.replace(/\D/g, ''))}
-              onKeyDown={handleDigitOnly}
-              onPaste={handleDigitPaste(setAudioBitrateKbps)}
-              onBlur={() => {
-                setTranscodingTouched(t => ({ ...t, audioBitrateKbps: true }));
-                const v = parseInt(audioBitrateKbps, 10);
-                setTranscodingErrors(e => {
-                  const n = { ...e };
-                  if (!Number.isInteger(v) || v < 128 || v > 320) n.audioBitrateKbps = 'Must be an integer between 128 and 320';
-                  else delete n.audioBitrateKbps;
-                  return n;
-                });
-              }}
-              style={{ maxWidth: '200px' }}
-            />
-            {transcodingTouched.audioBitrateKbps && transcodingErrors.audioBitrateKbps && (
-              <span className="field-error">{transcodingErrors.audioBitrateKbps}</span>
-            )}
-            <small className="text-muted" style={{ display: 'block', marginTop: '4px' }}>
-              Site-wide AAC-LC bitrate used for all transcoded videos. Range 128–320.
-            </small>
-          </div>
-
-          <h4 style={{ marginBottom: '12px' }}>Audio Normalization Defaults</h4>
-          <p className="text-muted text-sm" style={{ marginBottom: '12px' }}>
-            Audio normalization is enabled by default for new courses. Individual courses can disable it.
-          </p>
-
-          <div style={{ maxWidth: '400px' }}>
-            <div className="form-group">
-              <label>Target Loudness (LUFS)</label>
-              <input type="text" inputMode="numeric" className={`form-control${transcodingTouched.target && transcodingErrors.target ? ' input-error' : ''}`}
-                value={audioNormTarget}
-                onChange={e => { setAudioNormTarget(e.target.value.replace(/[^0-9.-]/g, '')); }}
-                onBlur={() => {
-                  setTranscodingTouched(t => ({ ...t, target: true }));
-                  const v = parseFloat(audioNormTarget);
-                  setTranscodingErrors(e => {
-                    const n = { ...e };
-                    if (isNaN(v) || v < -50 || v > 0) n.target = 'Must be -50 to 0';
-                    else delete n.target;
-                    return n;
-                  });
-                }}
-              />
-              {transcodingTouched.target && transcodingErrors.target && <span className="field-error">{transcodingErrors.target}</span>}
-            </div>
-            <div className="form-group">
-              <label>True Peak Ceiling (dBFS)</label>
-              <input type="text" inputMode="numeric" className={`form-control${transcodingTouched.peak && transcodingErrors.peak ? ' input-error' : ''}`}
-                value={audioNormPeak}
-                onChange={e => { setAudioNormPeak(e.target.value.replace(/[^0-9.-]/g, '')); }}
-                onBlur={() => {
-                  setTranscodingTouched(t => ({ ...t, peak: true }));
-                  const v = parseFloat(audioNormPeak);
-                  setTranscodingErrors(e => {
-                    const n = { ...e };
-                    if (isNaN(v) || v < -20 || v > 0) n.peak = 'Must be -20 to 0';
-                    else delete n.peak;
-                    return n;
-                  });
-                }}
-              />
-              {transcodingTouched.peak && transcodingErrors.peak && <span className="field-error">{transcodingErrors.peak}</span>}
-            </div>
-            <div className="form-group">
-              <label>Max Upward Gain (dB)</label>
-              <input type="text" inputMode="numeric" className={`form-control${transcodingTouched.maxGain && transcodingErrors.maxGain ? ' input-error' : ''}`}
-                value={audioNormMaxGain}
-                onChange={e => { setAudioNormMaxGain(e.target.value.replace(/[^0-9.-]/g, '')); }}
-                onBlur={() => {
-                  setTranscodingTouched(t => ({ ...t, maxGain: true }));
-                  const v = parseFloat(audioNormMaxGain);
-                  setTranscodingErrors(e => {
-                    const n = { ...e };
-                    if (isNaN(v) || v < 0 || v > 40) n.maxGain = 'Must be 0 to 40';
-                    else delete n.maxGain;
-                    return n;
-                  });
-                }}
-              />
-              {transcodingTouched.maxGain && transcodingErrors.maxGain && <span className="field-error">{transcodingErrors.maxGain}</span>}
-            </div>
-          </div>
-
-          <button className="btn btn-primary" style={{ marginTop: '8px' }}
-            disabled={savingDefault || Object.keys(transcodingErrors).length > 0 || (
-              audioNormTarget === originalTranscoding.current.target
-              && audioNormPeak === originalTranscoding.current.peak
-              && audioNormMaxGain === originalTranscoding.current.maxGain
-              && audioBitrateKbps === originalTranscoding.current.audioBitrateKbps
-            )}
-            onClick={async () => {
-              const abkInt = parseInt(audioBitrateKbps, 10);
-              if (!Number.isInteger(abkInt) || abkInt < 128 || abkInt > 320) {
-                setTranscodingTouched(t => ({ ...t, audioBitrateKbps: true }));
-                setTranscodingErrors(e => ({ ...e, audioBitrateKbps: 'Must be an integer between 128 and 320' }));
-                showToast('Please fix the errors below.');
-                return;
-              }
-              setSavingDefault(true);
-              try {
-                // Audio settings ride on the default-profiles PUT — we send
-                // only the audio fields here, leaving the default profile
-                // array intact server-side.
-                const { ok, data } = await mfaFetch('/api/admin/settings/transcoding-profiles/default', {
-                  method: 'PUT',
-                  body: {
-                    profiles: defaultProfiles,
-                    audioNormalization: { target: audioNormTarget, peak: audioNormPeak, maxGain: audioNormMaxGain },
-                    audioBitrateKbps: abkInt
-                  }
-                });
-                if (ok) {
-                  showToast('Audio settings saved.', 'success');
-                  originalTranscoding.current = {
-                    ...originalTranscoding.current,
-                    defaultProfiles: JSON.stringify(defaultProfiles),
-                    target: audioNormTarget, peak: audioNormPeak, maxGain: audioNormMaxGain,
-                    audioBitrateKbps: audioBitrateKbps
-                  };
-                } else {
-                  showToast(data?.error || 'Failed to save.');
-                }
-              } catch (err) { showToast(err.message); }
-              finally { setSavingDefault(false); }
-            }}
-          >
-            {savingDefault ? 'Saving...' : 'Save Audio Settings'}
-          </button>
+      <div className="vs-set">
+        <nav className="vs-set-rail">
+          {SECTIONS.map(railItem)}
+        </nav>
+        {/* The MFA + SSO panes own their step-up guard; the site panes share this
+            page's guard — a lapsed window turns the pane area into the "verify to
+            continue" reminder, right of the rail, across all of them. */}
+        <div className="vs-set-pane" ref={paneRef}>
+          {activeIsMfa
+            ? <MfaSettingsSections onDirty={setMfaDirty} onLock={setMfaLocked} />
+            : activeIsSso
+              ? <SsoSettings />
+              : (blocked && SLICE_PANES.has(active))
+                ? <StepUpBlock onVerify={verify} />
+                : renderSite()}
         </div>
       </div>
 
@@ -1197,564 +834,127 @@ export default function SettingsPage() {
         onSave={(profile) => {
           if (!editingProfileTarget) return;
           const setter = editingProfileTarget.set === 'enhanced' ? setEnhancedProfiles : setDefaultProfiles;
-          // Stamp is_enhanced_profile for new rows so the server save lands
-          // them in the right set even before the user hits Save.
-          const stamped = {
-            ...profile,
-            is_enhanced_profile: editingProfileTarget.set === 'enhanced' ? 1 : 0
-          };
-          if (editingProfileTarget.idx !== null) {
-            setter(prev => prev.map((p, i) => i === editingProfileTarget.idx ? stamped : p));
-          } else {
-            setter(prev => [...prev, stamped]);
-          }
-          setShowProfileModal(false);
-          setEditingProfileTarget(null);
+          const stamped = { ...profile, is_enhanced_profile: editingProfileTarget.set === 'enhanced' ? 1 : 0 };
+          if (editingProfileTarget.idx !== null) setter(prev => prev.map((p, i) => i === editingProfileTarget.idx ? stamped : p));
+          else setter(prev => [...prev, stamped]);
+          setShowProfileModal(false); setEditingProfileTarget(null);
         }}
       />
 
-      {/* Cloudflare — HMAC playback signing + Turnstile-at-Worker gate */}
-      <div className="card mt-3">
-        <div className="card-header">
-          <h2>Cloudflare</h2>
-        </div>
-        <div style={{ maxWidth: '600px' }}>
-          {/* ── HMAC Validation ─────────────────────────────────────── */}
-          <h3 style={{ fontSize: '14px', textTransform: 'uppercase', letterSpacing: '0.05em', color: '#6b7280', marginTop: 0, marginBottom: '12px' }}>
-            HMAC Validation
-          </h3>
-          <p className="text-muted" style={{ marginBottom: '12px' }}>
-            Signs playback URLs with HMAC-SHA256 for Cloudflare WAF token authentication.
-          </p>
-
-          <div className="form-group">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-              <span style={{ fontSize: '14px', fontWeight: 500 }}>
-                {hmacEnabled ? 'Enabled' : 'Disabled'}
-              </span>
-              <div
-                role="switch"
-                aria-checked={hmacEnabled}
-                tabIndex={0}
-                onClick={handleToggleHmac}
-                onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleToggleHmac(); } }}
-                style={{
-                  width: '44px', height: '24px', borderRadius: '12px',
-                  backgroundColor: hmacEnabled ? '#16a34a' : '#d1d5db',
-                  position: 'relative', transition: 'background-color 0.2s', cursor: 'pointer',
-                }}
-              >
-                <div style={{
-                  width: '18px', height: '18px', borderRadius: '50%', backgroundColor: '#fff',
-                  position: 'absolute', top: '3px', left: hmacEnabled ? '23px' : '3px',
-                  transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
-                }} />
-              </div>
-            </label>
-          </div>
-
-          <div className="form-group" style={{ marginTop: '16px' }}>
-            <label>HMAC Secret Key</label>
-            <div>
-              <button type="button" className="btn btn-primary btn-sm"
-                onClick={handleGenerateHmac} disabled={!hmacEnabled}>
-                {hmacHasKey ? 'Generate New Key' : 'Initialize Key'}
-              </button>
-            </div>
-            <small className="text-muted">
-              {hmacHasKey
-                ? 'Generates a new key and shows it once. Changing the key immediately invalidates all active playback sessions.'
-                : 'Generate a secret key to get started with HMAC validation.'}
-            </small>
-          </div>
-
-          <div className="form-group" style={{ marginTop: '16px' }}>
-            <label htmlFor="hmacTokenValidity">Token Validity for Client (seconds)</label>
-            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-              <input type="number" id="hmacTokenValidity" className="form-control"
-                value={hmacTokenValidity} onChange={e => setHmacTokenValidity(e.target.value)}
-                min="600" step="1" style={{ flex: 1, maxWidth: '200px' }}
-                disabled={!hmacEnabled} />
-              <button type="button" className="btn btn-primary btn-sm"
-                onClick={handleSaveHmacValidity} disabled={hmacSaving || !hmacEnabled}>
-                {hmacSaving ? 'Saving...' : 'Save'}
-              </button>
-            </div>
-            <small className="text-muted">
-              Tells the player when to proactively refresh the token (refreshes at half this value).
-              Must be &le; the lifetime configured in your Cloudflare WAF rule. Default: 600 seconds.
-            </small>
-          </div>
-
-          <hr style={{ margin: '24px 0', border: 'none', borderTop: '1px solid #e5e7eb' }} />
-
-          {/* ── Turnstile Verification at Worker ────────────────────── */}
-          <h3 style={{ fontSize: '14px', textTransform: 'uppercase', letterSpacing: '0.05em', color: '#6b7280', marginTop: 0, marginBottom: '12px' }}>
-            Turnstile Verification at Worker
-          </h3>
-          <p className="text-muted" style={{ marginBottom: '12px' }}>
-            Lets a Cloudflare Worker validate Turnstile tokens at the edge instead of the origin.
-            The five sign-in/registration endpoints will skip their own siteverify call and trust
-            that the Worker has already verified the token.
-          </p>
-
-          <div className="form-group">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-              <span style={{ fontSize: '14px', fontWeight: 500 }}>
-                {workerTurnstileEnabled ? 'Enabled' : 'Disabled'}
-              </span>
-              <div
-                role="switch"
-                aria-checked={workerTurnstileEnabled}
-                aria-disabled={!turnstileSiteKey}
-                tabIndex={turnstileSiteKey ? 0 : -1}
-                onClick={() => { if (turnstileSiteKey) handleToggleWorkerTurnstile(); }}
-                onKeyDown={e => { if (turnstileSiteKey && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); handleToggleWorkerTurnstile(); } }}
-                style={{
-                  width: '44px', height: '24px', borderRadius: '12px',
-                  backgroundColor: workerTurnstileEnabled ? '#16a34a' : '#d1d5db',
-                  position: 'relative', transition: 'background-color 0.2s',
-                  cursor: turnstileSiteKey ? 'pointer' : 'not-allowed',
-                  opacity: turnstileSiteKey ? 1 : 0.5,
-                }}
-              >
-                <div style={{
-                  width: '18px', height: '18px', borderRadius: '50%', backgroundColor: '#fff',
-                  position: 'absolute', top: '3px', left: workerTurnstileEnabled ? '23px' : '3px',
-                  transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
-                }} />
-              </div>
-            </label>
-          </div>
-
-          <small className="text-muted" style={{ display: 'block', marginTop: '8px' }}>
-            Set <code>TURNSTILE_SECRET_KEY</code> on the Cloudflare dashboard for the
-            <code> turnstile-gate</code> Worker before deploying. Coordination order: turn this
-            <strong> on</strong> <em>before</em> deploying the Worker, and <strong>off</strong>
-            <em> after</em> undeploying. (Off + Worker still in front breaks every gated request — the
-            Worker strips the token while the origin expects to see one.)
-          </small>
-          {!turnstileSiteKey && (
-            <small className="text-muted" style={{ display: 'block', marginTop: '8px', color: '#b45309' }}>
-              Configure <code>TURNSTILE_SITE_KEY</code> and <code>TURNSTILE_SECRET_KEY</code> at the
-              origin first — this toggle has no effect while site-wide Turnstile is unconfigured.
-            </small>
-          )}
-
-          <hr style={{ margin: '24px 0', border: 'none', borderTop: '1px solid #e5e7eb' }} />
-
-          {/* ── Email Sending ───────────────────────────────────────── */}
-          <h3 style={{ fontSize: '14px', textTransform: 'uppercase', letterSpacing: '0.05em', color: '#6b7280', marginTop: 0, marginBottom: '12px' }}>
-            Email Sending
-          </h3>
-          <p className="text-muted" style={{ marginBottom: '12px', fontSize: '13px' }}>
-            Transactional email is sent via the <code>email-sender</code> Worker. Configure the
-            sender address on the worker (<code>EMAIL_FROM_ADDRESS</code> in <code>wrangler.jsonc</code>).
-            The display name is pulled from the site name above.
-          </p>
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '12px' }}>
-            <span style={{ fontSize: '13px', color: '#6b7280' }}>Status:</span>
-            {emailHmacSecretConfigured ? (
-              <span style={{
-                display: 'inline-block', padding: '3px 10px', borderRadius: '10px',
-                fontSize: '12px', fontWeight: 600, color: '#065f46', backgroundColor: '#d1fae5',
-              }}>Configured</span>
-            ) : (
-              <span style={{
-                display: 'inline-block', padding: '3px 10px', borderRadius: '10px',
-                fontSize: '12px', fontWeight: 600, color: '#92400e', backgroundColor: '#fef3c7',
-              }}>Not configured</span>
-            )}
-          </div>
-
-          <button type="button" className="btn btn-primary btn-sm" onClick={doGenerateEmail}>
-            {emailHmacSecretConfigured ? 'Generate New Key' : 'Initialize Key'}
-          </button>
-
-          <div style={{ marginTop: '20px', paddingTop: '16px', borderTop: '1px solid #e5e7eb' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px' }}>
-              <span style={{ fontSize: '14px', fontWeight: 500 }}>
-                Send email with service credentials
-              </span>
-              <div
-                role="switch"
-                aria-checked={emailServiceCredentialsEnabled}
-                tabIndex={0}
-                onClick={() => handleToggleEmailService(!emailServiceCredentialsEnabled)}
-                onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleToggleEmailService(!emailServiceCredentialsEnabled); } }}
-                style={{
-                  width: '44px', height: '24px', borderRadius: '12px',
-                  backgroundColor: emailServiceCredentialsEnabled ? '#16a34a' : '#d1d5db',
-                  position: 'relative', transition: 'background-color 0.2s',
-                  cursor: emailServiceSaving ? 'not-allowed' : 'pointer',
-                  opacity: emailServiceSaving ? 0.5 : 1,
-                }}
-              >
-                <div style={{
-                  width: '18px', height: '18px', borderRadius: '50%', backgroundColor: '#fff',
-                  position: 'absolute', top: '3px', left: emailServiceCredentialsEnabled ? '23px' : '3px',
-                  transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
-                }} />
-              </div>
-            </label>
-            <p className="text-muted text-sm" style={{ marginBottom: '12px' }}>
-              Attach <code>Cf-Access-Client-Id</code> / <code>Cf-Access-Client-Secret</code> headers
-              to outbound sends. Configure a Cloudflare Access service token and a policy on
-              <code> stream.dreamxwarden.ca/email-sending</code>, then a WAF rule on
-              <code> cf.access.authenticated</code> to bypass Super Bot Fight Mode.
-            </p>
-            {emailServiceClientId && (
-              <button type="button" className="btn btn-secondary btn-sm" onClick={openRotateServiceCredentials} disabled={emailServiceSaving}>
-                Rotate Service Credentials
-              </button>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* Worker Keys */}
-      <div className="card mt-3">
-        <div className="card-header">
-          <h2>Worker Access Keys</h2>
-        </div>
-
-        <div className="mb-3">
-          <button type="button" className="btn btn-primary btn-sm" onClick={handleOpenGenerateModal}>
-            Generate New Key
-          </button>
-        </div>
-
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Key ID</th>
-                <th>Label</th>
-                <th>Status</th>
-                <th>Last Used</th>
-                <th>Created</th>
-                <th>Action</th>
-              </tr>
-            </thead>
-            <tbody>
-              {workerKeys.map(wk => {
-                const status = wk.status || 'active';
-                const isActive = status === 'active';
-                const isPaused = status === 'paused';
-                const isDeactivated = status === 'deactivated';
-                const statusLabel = status.charAt(0).toUpperCase() + status.slice(1);
-                // Three classes mapped to existing palette: green / yellow / red.
-                // status-paused and status-deactivated alias status-queued and
-                // status-error respectively (see style.css "Status Badges").
-                const statusClass = isActive ? 'status-finished'
-                  : isPaused ? 'status-paused'
-                  : 'status-deactivated';
-                return (
-                  <tr key={wk.key_id}>
-                    <td><code>{wk.key_id}</code></td>
-                    <td>{wk.label || '-'}</td>
-                    <td><span className={`status ${statusClass}`}>{statusLabel}</span></td>
-                    <td>{wk.last_used_at ? new Date(wk.last_used_at).toLocaleString() : 'Never'}</td>
-                    <td>{new Date(wk.created_at).toLocaleDateString()}</td>
-                    <td style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
-                      {isActive && (
-                        <button className="btn btn-sm" onClick={() => handlePauseWorkerKey(wk.key_id)}>Pause</button>
-                      )}
-                      {isPaused && (
-                        <button className="btn btn-sm" onClick={() => handleResumeWorkerKey(wk.key_id)}>Resume</button>
-                      )}
-                      {isDeactivated && (
-                        <button className="btn btn-sm" onClick={() => handleOpenReactivateModal(wk.key_id)}>Reactivate</button>
-                      )}
-                      {!isDeactivated && (
-                        <button className="btn btn-sm" onClick={() => handleOpenRenameModal(wk)}>Rename</button>
-                      )}
-                      <button className="btn btn-danger btn-sm" onClick={() => handleDeleteWorkerKey(wk.key_id)}>Delete</button>
-                    </td>
-                  </tr>
-                );
-              })}
-              {workerKeys.length === 0 && (
-                <tr>
-                  <td colSpan="6" className="text-muted" style={{ textAlign: 'center' }}>No worker keys</td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* Service Credentials Modal — initial setup + enable, or rotate.
-          Uses content-overlay (z-index 900) so a mid-submit MFA challenge
-          (mfa-challenge-overlay z-index 1100) stacks on top. */}
-      {emailServiceModal && (
-        <div className="content-overlay active" onClick={closeEmailServiceModal}>
-          <div className="wk-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '520px' }}>
-            <div className="wk-modal-header">
-              <h3>{emailServiceModal === 'initial' ? 'Configure Service Credentials' : 'Rotate Service Credentials'}</h3>
-            </div>
-            <div className="wk-modal-body">
-              <p className="text-muted text-sm" style={{ marginTop: 0, marginBottom: '16px' }}>
-                Paste the Client ID and Client Secret from your Cloudflare Access service token
-                (Zero Trust → Access → Service Tokens).
-                {emailServiceModal === 'rotate' && ' The current Client ID is pre-filled; you can change it if the token was rotated.'}
-              </p>
-              <div className="form-group">
-                <label htmlFor="cfAccessClientIdInput">Client ID</label>
-                <input id="cfAccessClientIdInput" type="text" className="form-control"
-                  value={emailServiceClientIdInput}
-                  onChange={e => setEmailServiceClientIdInput(sanitizeCfAccessValue(e.target.value))}
-                  placeholder="abc123...access"
-                  autoComplete="off"
-                  disabled={emailServiceSaving}
-                />
-              </div>
-              <div className="form-group">
-                <label htmlFor="cfAccessClientSecretInput">Client Secret</label>
-                <input id="cfAccessClientSecretInput" type="password" className="form-control"
-                  value={emailServiceSecretInput}
-                  onChange={e => setEmailServiceSecretInput(sanitizeCfAccessValue(e.target.value))}
-                  placeholder={emailServiceModal === 'rotate' ? 'Enter the new secret' : 'Paste the secret'}
-                  autoComplete="off"
-                  autoFocus={emailServiceModal === 'rotate'}
-                  disabled={emailServiceSaving}
-                />
-                {emailServiceModal === 'rotate' && (
-                  <small className="text-muted" style={{ display: 'block', marginTop: '4px' }}>
-                    The previously stored secret is not shown — paste the new one to rotate.
-                  </small>
-                )}
-              </div>
-            </div>
-            <div className="wk-modal-footer" style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
-              <button type="button" className="btn btn-secondary btn-sm" onClick={closeEmailServiceModal} disabled={emailServiceSaving}>
-                Cancel
-              </button>
-              <button type="button" className="btn btn-primary btn-sm" onClick={submitEmailServiceCredentials}
-                disabled={emailServiceSaving || !emailServiceClientIdInput.trim() || !emailServiceSecretInput.trim()}>
-                {emailServiceSaving ? 'Saving…' : (emailServiceModal === 'initial' ? 'Save & Enable' : 'Rotate')}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Email Sender Secret Generated Modal */}
-      {generatedEmailKey && (
-        <div className="content-overlay active" onClick={handleCloseEmailModal}>
-          <div className="wk-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '620px' }}>
-            <div className="wk-modal-header"><h3>Email Worker Secret Generated</h3></div>
-            <div className="wk-modal-body">
-              <div className="wk-field">
-                <label>Email Worker Secret</label>
-                <div className="wk-field-row">
-                  <input type="text" readOnly value={generatedEmailKey}
-                    onClick={e => e.target.select()} style={{ cursor: 'text' }} />
-                  <button type="button" className="btn btn-sm" onClick={handleCopyEmailKey}>{emailKeyCopyLabel}</button>
-                </div>
-              </div>
-              <p className="wk-warning">Save this key now — it won't be shown again.</p>
-              <p className="text-muted" style={{ fontSize: '13px', marginTop: '8px' }}>
-                Add this secret to the <code>email-sender</code> Worker:
-                <br />
-                <code>npx wrangler secret put EMAIL_HMAC_SECRET</code>
-                <br />
-                …or via the Cloudflare dashboard (Workers &amp; Pages → email-sender →
-                Settings → Variables and Secrets). Email sending will fail until the
-                Worker's secret matches this value.
-              </p>
-            </div>
-            <div className="wk-modal-footer">
-              <button type="button" className="btn btn-primary btn-sm" onClick={handleCloseEmailModal}>OK</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* HMAC Key Generated Modal */}
+      {/* HMAC Key Generated */}
       {generatedHmacKey && (
-        <div className="content-overlay active" onClick={handleCloseHmacModal}>
-          <div className="wk-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '620px' }}>
-            <div className="wk-modal-header"><h3>HMAC Secret Key Generated</h3></div>
-            <div className="wk-modal-body">
-              <div className="wk-field">
-                <label>HMAC Secret Key</label>
-                <div className="wk-field-row">
-                  <input type="text" readOnly value={generatedHmacKey}
-                    onClick={e => e.target.select()} style={{ cursor: 'text' }} />
-                  <button type="button" className="btn btn-sm" onClick={handleCopyHmacKey}>{hmacKeyCopyLabel}</button>
+        <div className="vs-scrim" onClick={handleCloseHmacModal}>
+          <div className="vs-modal vs-modal-wide" onClick={e => e.stopPropagation()}>
+            <div className="vs-modal-head"><h3 className="vs-modal-title">HMAC secret key generated</h3></div>
+            <div className="vs-modal-body">
+              <div className="vs-field">
+                <label className="vs-label">HMAC secret key</label>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input type="text" className="vs-input" readOnly value={generatedHmacKey} onClick={e => e.target.select()} style={{ fontFamily: 'monospace', fontSize: 12 }} />
+                  <button type="button" className="vs-btn" onClick={handleCopyHmacKey}>{hmacKeyCopyLabel}</button>
                 </div>
               </div>
-              <p className="wk-warning">Save this key now — it won't be shown again.</p>
-
-              <div className="wk-field" style={{ marginTop: '16px' }}>
-                <label>Cloudflare WAF Rule — Playback (manifest + segments)</label>
-                <textarea readOnly value={buildWafRule(generatedHmacKey).playback}
-                  onClick={e => e.target.select()}
-                  style={{ width: '100%', minHeight: '160px', fontFamily: 'monospace', fontSize: '12px', padding: '10px', border: '1px solid #d1d5db', borderRadius: '6px', resize: 'vertical', cursor: 'text', background: '#f9fafb', boxSizing: 'border-box' }} />
-                <div style={{ textAlign: 'right', marginTop: '4px' }}>
-                  <span onClick={handleCopyPlaybackRule}
-                    style={{ color: '#9ca3af', fontSize: '13px', cursor: 'pointer' }}>
-                    {playbackRuleCopyLabel}
-                  </span>
-                </div>
+              <p className="vs-modal-warn">Save this key now — it won’t be shown again.</p>
+              <div className="vs-field" style={{ marginTop: 14 }}>
+                <label className="vs-label">Cloudflare WAF rule — playback (manifest + segments)</label>
+                <textarea className="vs-textarea vs-mono-area" readOnly value={buildWafRule(generatedHmacKey).playback} onClick={e => e.target.select()} style={{ minHeight: 150 }} />
+                <div style={{ textAlign: 'right', marginTop: 4 }}><span onClick={handleCopyPlaybackRule} className="vs-copylink">{playbackRuleCopyLabel}</span></div>
               </div>
-              <div className="wk-field" style={{ marginTop: '12px' }}>
-                <label>Cloudflare WAF Rule — Poster (per-file)</label>
-                <textarea readOnly value={buildWafRule(generatedHmacKey).poster}
-                  onClick={e => e.target.select()}
-                  style={{ width: '100%', minHeight: '120px', fontFamily: 'monospace', fontSize: '12px', padding: '10px', border: '1px solid #d1d5db', borderRadius: '6px', resize: 'vertical', cursor: 'text', background: '#f9fafb', boxSizing: 'border-box' }} />
-                <div style={{ textAlign: 'right', marginTop: '4px' }}>
-                  <span onClick={handleCopyPosterRule}
-                    style={{ color: '#9ca3af', fontSize: '13px', cursor: 'pointer' }}>
-                    {posterRuleCopyLabel}
-                  </span>
-                </div>
+              <div className="vs-field">
+                <label className="vs-label">Cloudflare WAF rule — poster (per-file)</label>
+                <textarea className="vs-textarea vs-mono-area" readOnly value={buildWafRule(generatedHmacKey).poster} onClick={e => e.target.select()} style={{ minHeight: 120 }} />
+                <div style={{ textAlign: 'right', marginTop: 4 }}><span onClick={handleCopyPosterRule} className="vs-copylink">{posterRuleCopyLabel}</span></div>
               </div>
-              <p className="text-muted" style={{ fontSize: '13px', marginTop: '8px' }}>
-                Paste each as a <strong>separate</strong> Cloudflare WAF custom rule. Set the action to <strong>Block</strong> with a 403 response for both.
-              </p>
+              <p className="vs-hint">Paste each as a <strong>separate</strong> Cloudflare WAF custom rule. Set the action to <strong>Block</strong> with a 403 response for both.</p>
             </div>
-            <div className="wk-modal-footer">
-              <button type="button" className="btn btn-primary btn-sm" onClick={handleCloseHmacModal}>OK</button>
-            </div>
+            <div className="vs-modal-foot"><button type="button" className="vs-btn vs-btn-primary" onClick={handleCloseHmacModal}>OK</button></div>
           </div>
         </div>
       )}
 
-      {/* Generate Worker Key Modal — label entry happens here so the panel
-          can stay clean with just one button. Empty label is allowed. */}
+      {/* Generate Worker Key */}
       {generateModalOpen && (
-        <div className="content-overlay active" onClick={() => !generatingKey && setGenerateModalOpen(false)}>
-          <div className="wk-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '420px' }}>
-            <div className="wk-modal-header"><h3>Generate Worker Key</h3></div>
-            <div className="wk-modal-body">
-              <div className="form-group">
-                <label htmlFor="generateLabel">Label (optional)</label>
-                <input id="generateLabel" type="text" className="form-control"
-                  value={generateLabel}
-                  onChange={e => setGenerateLabel(e.target.value)}
-                  placeholder="e.g. Transcoding Server 1"
-                  disabled={generatingKey}
-                  autoFocus
-                />
+        <div className="vs-scrim" onClick={() => !generatingKey && setGenerateModalOpen(false)}>
+          <div className="vs-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 420 }}>
+            <div className="vs-modal-head"><h3 className="vs-modal-title">Generate worker key</h3><button type="button" className="vs-modal-x" onClick={() => !generatingKey && setGenerateModalOpen(false)}><CloseIcon /></button></div>
+            <div className="vs-modal-body">
+              <div className="vs-field">
+                <label className="vs-label">Label (optional)</label>
+                <input className="vs-input" value={generateLabel} onChange={e => setGenerateLabel(e.target.value)} placeholder="Transcoding Server 1" disabled={generatingKey} autoFocus />
               </div>
             </div>
-            <div className="wk-modal-footer" style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
-              <button type="button" className="btn btn-secondary btn-sm"
-                onClick={() => setGenerateModalOpen(false)} disabled={generatingKey}>Cancel</button>
-              <button type="button" className="btn btn-primary btn-sm"
-                onClick={handleConfirmGenerate} disabled={generatingKey}>
-                {generatingKey ? 'Generating…' : 'Continue'}
-              </button>
+            <div className="vs-modal-foot">
+              <button type="button" className="vs-btn" onClick={() => setGenerateModalOpen(false)} disabled={generatingKey}>Cancel</button>
+              <button type="button" className="vs-btn vs-btn-primary" onClick={handleConfirmGenerate} disabled={generatingKey}>{generatingKey ? 'Generating…' : 'Continue'}</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Rename Worker Key Modal — Continue greyed if the value hasn't
-          changed. Empty label clears the label. */}
+      {/* Rename Worker Key */}
       {renameModalState && (
-        <div className="content-overlay active" onClick={() => !renameSaving && setRenameModalState(null)}>
-          <div className="wk-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '420px' }}>
-            <div className="wk-modal-header"><h3>Rename Worker Key</h3></div>
-            <div className="wk-modal-body">
-              <div className="form-group">
-                <label htmlFor="renameLabel">Label</label>
-                <input id="renameLabel" type="text" className="form-control"
-                  value={renameLabel}
-                  onChange={e => setRenameLabel(e.target.value)}
-                  placeholder="(leave blank to clear)"
-                  disabled={renameSaving}
-                  autoFocus
-                />
+        <div className="vs-scrim" onClick={() => !renameSaving && setRenameModalState(null)}>
+          <div className="vs-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 420 }}>
+            <div className="vs-modal-head"><h3 className="vs-modal-title">Rename worker key</h3><button type="button" className="vs-modal-x" onClick={() => !renameSaving && setRenameModalState(null)}><CloseIcon /></button></div>
+            <div className="vs-modal-body">
+              <div className="vs-field">
+                <label className="vs-label">Label</label>
+                <input className="vs-input" value={renameLabel} onChange={e => setRenameLabel(e.target.value)} placeholder="(leave blank to clear)" disabled={renameSaving} autoFocus />
               </div>
             </div>
-            <div className="wk-modal-footer" style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
-              <button type="button" className="btn btn-secondary btn-sm"
-                onClick={() => setRenameModalState(null)} disabled={renameSaving}>Cancel</button>
-              <button type="button" className="btn btn-primary btn-sm"
-                onClick={handleConfirmRename}
-                disabled={renameSaving || renameLabel.trim() === (renameModalState.originalLabel || '').trim()}>
-                {renameSaving ? 'Saving…' : 'Continue'}
-              </button>
+            <div className="vs-modal-foot">
+              <button type="button" className="vs-btn" onClick={() => setRenameModalState(null)} disabled={renameSaving}>Cancel</button>
+              <button type="button" className="vs-btn vs-btn-primary" onClick={handleConfirmRename} disabled={renameSaving || renameLabel.trim() === (renameModalState.originalLabel || '').trim()}>{renameSaving ? 'Saving…' : 'Continue'}</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Reactivate Worker Key Modal — warns that the secret will rotate,
-          since deactivation is usually a leak-detection event and the old
-          secret must be considered compromised. On Continue, the rotated
-          secret is shown via the same one-time-display modal as initial
-          generation. */}
+      {/* Reactivate Worker Key */}
       {reactivateModalState && (
-        <div className="content-overlay active" onClick={() => !reactivateSaving && setReactivateModalState(null)}>
-          <div className="wk-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '480px' }}>
-            <div className="wk-modal-header"><h3>Reactivate Worker Key</h3></div>
-            <div className="wk-modal-body">
-              <p>
-                Reactivating will <strong>rotate the worker key secret</strong>. The previous
-                secret will no longer authenticate — any worker still using it must
-                be updated with the new secret.
-              </p>
-              <p className="text-muted text-sm" style={{ marginTop: '12px' }}>
-                The new secret will be displayed once after you click Continue.
-                Make sure to copy it before closing the next dialog.
-              </p>
+        <div className="vs-scrim" onClick={() => !reactivateSaving && setReactivateModalState(null)}>
+          <div className="vs-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 480 }}>
+            <div className="vs-modal-head"><h3 className="vs-modal-title">Reactivate worker key</h3><button type="button" className="vs-modal-x" onClick={() => !reactivateSaving && setReactivateModalState(null)}><CloseIcon /></button></div>
+            <div className="vs-modal-body">
+              <p style={{ margin: 0 }}>Reactivating will <strong>rotate the worker key secret</strong>. The previous secret will no longer authenticate — any worker still using it must be updated with the new secret.</p>
+              <p className="vs-hint" style={{ marginTop: 12 }}>The new secret will be displayed once after you click Continue. Make sure to copy it before closing the next dialog.</p>
             </div>
-            <div className="wk-modal-footer" style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
-              <button type="button" className="btn btn-secondary btn-sm"
-                onClick={() => setReactivateModalState(null)} disabled={reactivateSaving}>Cancel</button>
-              <button type="button" className="btn btn-primary btn-sm"
-                onClick={handleConfirmReactivate} disabled={reactivateSaving}>
-                {reactivateSaving ? 'Rotating…' : 'Continue'}
-              </button>
+            <div className="vs-modal-foot">
+              <button type="button" className="vs-btn" onClick={() => setReactivateModalState(null)} disabled={reactivateSaving}>Cancel</button>
+              <button type="button" className="vs-btn vs-btn-primary" onClick={handleConfirmReactivate} disabled={reactivateSaving}>{reactivateSaving ? 'Rotating…' : 'Continue'}</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Worker Key Created Modal */}
+      {/* Worker Key Created */}
       {newWorkerKey && (
-        <div className="content-overlay active" onClick={handleCloseWorkerKeyModal}>
-          <div className="wk-modal" onClick={e => e.stopPropagation()}>
-            <div className="wk-modal-header"><h3>Worker Key Created</h3></div>
-            <div className="wk-modal-body">
-              <div className="wk-field">
-                <label>Key ID</label>
-                <div className="wk-field-row">
-                  <input type="text" readOnly value={newWorkerKey.keyId} />
-                  <button type="button" className="btn btn-sm"
-                    onClick={() => copyField(newWorkerKey.keyId, setWkKeyIdCopyLabel)}>{wkKeyIdCopyLabel}</button>
+        <div className="vs-scrim" onClick={handleCloseWorkerKeyModal}>
+          <div className="vs-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 480 }}>
+            <div className="vs-modal-head"><h3 className="vs-modal-title">Worker key created</h3></div>
+            <div className="vs-modal-body">
+              <div className="vs-field">
+                <label className="vs-label">Key ID</label>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input type="text" className="vs-input" readOnly value={newWorkerKey.keyId} style={{ fontFamily: 'monospace', fontSize: 12 }} />
+                  <button type="button" className="vs-btn" onClick={() => copyField(newWorkerKey.keyId, setWkKeyIdCopyLabel)}>{wkKeyIdCopyLabel}</button>
                 </div>
               </div>
-              <div className="wk-field">
-                <label>Secret</label>
-                <div className="wk-field-row">
-                  <input type="text" readOnly value={newWorkerKey.secret} />
-                  <button type="button" className="btn btn-sm"
-                    onClick={() => copyField(newWorkerKey.secret, setWkSecretCopyLabel)}>{wkSecretCopyLabel}</button>
+              <div className="vs-field">
+                <label className="vs-label">Secret</label>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input type="text" className="vs-input" readOnly value={newWorkerKey.secret} style={{ fontFamily: 'monospace', fontSize: 12 }} />
+                  <button type="button" className="vs-btn" onClick={() => copyField(newWorkerKey.secret, setWkSecretCopyLabel)}>{wkSecretCopyLabel}</button>
                 </div>
               </div>
-              <p className="wk-warning">Save this secret now — it won't be shown again.</p>
+              <p className="vs-modal-warn">Save this secret now — it won’t be shown again.</p>
             </div>
-            <div className="wk-modal-footer">
-              <button type="button" className="btn btn-primary btn-sm" onClick={handleCloseWorkerKeyModal}>OK</button>
-            </div>
+            <div className="vs-modal-foot"><button type="button" className="vs-btn vs-btn-primary" onClick={handleCloseWorkerKeyModal}>OK</button></div>
           </div>
         </div>
       )}
+      {/* The step-up challenge modal + error cards are rendered globally by the
+          StepUpProvider — no per-page challenge UI here anymore. */}
     </div>
-
-    {mfaState && (
-      <MfaChallengeUI isModal={true}
-        challengeId={mfaState.challengeId} allowedMethods={mfaState.allowedMethods}
-        maskedEmail={mfaState.maskedEmail} apiBase="/api/mfa/challenge"
-        onSuccess={onMfaSuccess} onCancel={onMfaCancel} title="Verify to continue" />
-    )}
-    <MfaSetupRequiredModal mfaSetupState={mfaSetupState} onDismiss={dismissMfaSetup} />
-    </MfaPageGuard>
   );
 }

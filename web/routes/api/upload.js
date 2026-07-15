@@ -3,7 +3,7 @@ const router = express.Router();
 const path = require('path');
 const { requireAuth } = require('../../middleware/auth');
 const { checkPermission } = require('../../middleware/permissions');
-const { getPool } = require('../../config/database');
+const { getPool, idBuf } = require('../../config/database');
 const { createVideo } = require('../../services/videoService');
 const deletionService = require('../../services/deletionService');
 const { getCourseById } = require('../../services/courseService');
@@ -63,7 +63,7 @@ function validateUploadInputs(filename, fileSize) {
 // POST /api/upload/create — create new upload session (new video)
 router.post('/upload/create', requireAuth, checkPermission('uploadVideo'), async (req, res) => {
     try {
-        const { courseId, filename, fileSize, contentType, title, week, lectureDate, description } = req.body;
+        const { courseId, filename, fileSize, contentType, title, module_number, lectureDate, description } = req.body;
 
         if (!courseId || !filename || !fileSize || !title?.trim()) {
             return res.status(400).json({ error: 'courseId, filename, fileSize, and title are required' });
@@ -94,7 +94,7 @@ router.post('/upload/create', requireAuth, checkPermission('uploadVideo'), async
             const pool = getPool();
             const [enrollment] = await pool.execute(
                 'SELECT 1 FROM enrollments WHERE user_id = ? AND course_id = ?',
-                [user.user_id, courseId]
+                [idBuf(user.user_id), courseId]
             );
             if (enrollment.length === 0) {
                 return res.status(403).json({ error: 'Not enrolled in this course' });
@@ -102,7 +102,7 @@ router.post('/upload/create', requireAuth, checkPermission('uploadVideo'), async
         }
 
         // Check metadata conflict
-        const conflict = await checkMetadataConflict(courseId, title.trim(), week || null, lectureDate || null);
+        const conflict = await checkMetadataConflict(courseId, title.trim(), module_number || null, lectureDate || null);
         if (conflict) {
             return res.status(409).json({ conflict: true, ...conflict });
         }
@@ -123,7 +123,7 @@ router.post('/upload/create', requireAuth, checkPermission('uploadVideo'), async
             videoId: null,
             courseId,
             title: title.trim(),
-            week: week || null,
+            module_number: module_number || null,
             lectureDate: lectureDate || null,
             description: description?.trim() || null,
             r2UploadId,
@@ -166,6 +166,20 @@ router.post('/upload/replace', requireAuth, checkPermission('uploadVideo'), asyn
         }
 
         const video = rows[0];
+
+        // Course access: a course-scoped admin (uploadVideo without allCourseAccess)
+        // may only replace content in a course they are enrolled in — same gate the
+        // create/update/delete/retry handlers apply against the target's course_id.
+        const user = res.locals.user;
+        if (!user.permissions.allCourseAccess) {
+            const [enrollment] = await pool.execute(
+                'SELECT 1 FROM enrollments WHERE user_id = ? AND course_id = ?',
+                [idBuf(user.user_id), video.course_id]
+            );
+            if (enrollment.length === 0) {
+                return res.status(403).json({ error: 'Not enrolled in this course' });
+            }
+        }
 
         // Check replace conflict
         const conflict = await checkReplaceConflict(videoId);
@@ -276,7 +290,7 @@ router.post('/upload/:uploadId/complete', requireAuth, checkPermission('uploadVi
             const user = res.locals.user;
             const result = await createVideo(session.course_id, session.title, {
                 description: session.description,
-                week: session.week,
+                module_number: session.module_number,
                 lecture_date: session.lecture_date,
                 original_filename: session.original_filename,
                 file_size_bytes: session.file_size_bytes,

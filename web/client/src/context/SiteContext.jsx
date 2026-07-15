@@ -26,27 +26,16 @@ function writeCachedSiteName(name) {
 }
 
 export function SiteProvider({ children }) {
-  // turnstileSiteKey: null means "Turnstile is off site-wide" — no widget,
-  // no token required by submits. A real string means "render the widget."
-  // The server returns null (not '') from /api/settings/public when either
-  // the site key or secret key env var is missing.
-  //
   // siteName: lazy-init from localStorage so returning visitors get the
   // correct header + tab title on first paint. First-time visitors start
   // with '' and pages skip setting document.title until the response
   // populates it (see usePageTitle).
   const [site, setSite] = useState(() => ({
     siteName: readCachedSiteName(),
-    turnstileSiteKey: null,
-    registrationEnabled: false,
-    invitationRequired: true,
   }));
   const [loading, setLoading] = useState(true);
 
-  // Re-fetch /api/settings/public. Form pages call this when the server
-  // rejects a submit with errors.turnstile while the local site key was
-  // null — i.e., admin enabled Turnstile after the page loaded. The page
-  // then re-renders with the widget visible so the user can try again.
+  // Re-fetch /api/settings/public.
   const refreshSiteSettings = useCallback(async () => {
     try {
       const { data, ok } = await apiGet('/api/settings/public');
@@ -54,9 +43,6 @@ export function SiteProvider({ children }) {
         const siteName = data.siteName || '';
         setSite({
           siteName,
-          turnstileSiteKey: data.turnstileSiteKey || null,
-          registrationEnabled: data.registrationEnabled || false,
-          invitationRequired: data.invitationRequired !== false,
         });
         // Refresh the cache on every successful response so an admin
         // rename propagates to returning visitors after one round-trip.

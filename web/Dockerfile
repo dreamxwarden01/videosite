@@ -42,6 +42,7 @@ COPY package.json ./
 COPY server.js ./
 COPY api-schema.json ./
 COPY config/ ./config/
+COPY lib/ ./lib/
 COPY db/ ./db/
 COPY middleware/ ./middleware/
 COPY routes/ ./routes/

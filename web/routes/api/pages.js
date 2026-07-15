@@ -1,13 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const { requireAuth } = require('../../middleware/auth');
-const { getPool } = require('../../config/database');
-const { getUserById, verifyPassword, updateUser } = require('../../services/userService');
+const { getPool, idBuf } = require('../../config/database');
+const { getUserById } = require('../../services/userService');
 const { getUserSessions, deleteUserSessions } = require('../../config/session');
 const { generateToken, generateFileToken, getTokenValiditySeconds } = require('../../services/tokenService');
-const mfaService = require('../../services/mfaService');
-const { mapEmailErrorHttp } = require('../../services/emailService');
-const { getUserMfaMethods, isUserMfaEnabled, maskEmail, validateChallenge, consumeChallenge } = mfaService;
+const { getUserMfaMethods, isUserMfaEnabled, maskEmail } = require('../../services/mfaService');
 const UAParser = require('ua-parser-js');
 
 function formatUserAgent(ua) {
@@ -23,37 +21,37 @@ function formatUserAgent(ua) {
 // GET /api/courses — course list for home page
 router.get('/courses', requireAuth, async (req, res) => {
     try {
-        const pool = getPool();
-        const user = res.locals.user;
-        let courses;
+        const courseListCache = require('../../services/cache/courseListCache');
+        const enrollmentCache = require('../../services/cache/enrollmentCache');
 
+        const user = res.locals.user;
+
+        // The cached base holds one row per course — active AND inactive — with
+        // NO per-user data. We compose the caller's visible list in-app on every
+        // request: filter to active, then scope by the CALLER's own permissions
+        // / enrollment. The composed result is NEVER cached, so one user's course
+        // set can't leak to another.
+        const base = (await courseListCache.getBase()).filter(c => c.is_active === 1);
+
+        let visible;
         if (user.permissions.allCourseAccess) {
-            const [rows] = await pool.execute(
-                `SELECT c.*,
-                    (SELECT COUNT(*) FROM videos v WHERE v.course_id = c.course_id) as video_count,
-                    (SELECT MAX(COALESCE(v.updated_at, v.created_at)) FROM videos v WHERE v.course_id = c.course_id) as last_video_at
-                 FROM courses c WHERE c.is_active = 1 ORDER BY c.course_name ASC`
-            );
-            courses = rows;
+            visible = base;
         } else {
-            const [rows] = await pool.execute(
-                `SELECT c.*,
-                    (SELECT COUNT(*) FROM videos v WHERE v.course_id = c.course_id) as video_count,
-                    (SELECT MAX(COALESCE(v.updated_at, v.created_at)) FROM videos v WHERE v.course_id = c.course_id) as last_video_at
-                 FROM courses c
-                 JOIN enrollments e ON c.course_id = e.course_id
-                 WHERE e.user_id = ? AND c.is_active = 1
-                 ORDER BY c.course_name ASC`,
-                [user.user_id]
+            // getUserEnrollments returns an array of int course_ids. Normalise to
+            // Number on both sides so a Set membership test can't silently miss
+            // on a type drift — a mismatch would show an enrolled user ZERO courses.
+            const enrolled = new Set(
+                (await enrollmentCache.getUserEnrollments(user.user_id)).map(Number)
             );
-            courses = rows;
+            visible = base.filter(c => enrolled.has(Number(c.course_id)));
         }
 
         res.json({
-            courses: courses.map(c => ({
+            courses: visible.map(c => ({
                 course_id: c.course_id,
+                course_code: c.course_code,
                 course_name: c.course_name,
-                description: c.description,
+                module_label: c.module_label,
                 video_count: c.video_count,
                 last_video_at: c.last_video_at || null,
             }))
@@ -71,24 +69,24 @@ router.get('/courses/:courseId', requireAuth, async (req, res) => {
         const user = res.locals.user;
         const courseId = parseInt(req.params.courseId);
         const page = parseInt(req.query.page) || 1;
-        const ALLOWED_LIMITS = [10, 20, 50];
-        const rawLimit = parseInt(req.query.limit);
-        const limit = ALLOWED_LIMITS.includes(rawLimit) ? rawLimit : 10;
-        const offset = (page - 1) * limit;
+        // Fit-to-height paging (like the account portal): the client measures
+        // how many rows fit and asks for exactly that many. Clamp to a sane
+        // range instead of the old fixed [10,20,50] set.
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 10, 1), 60);
 
         const courseCache = require('../../services/cache/courseCache');
         const enrollmentCache = require('../../services/cache/enrollmentCache');
 
         const course = await courseCache.getCourseMeta(courseId);
         if (!course || course.is_active !== 1) {
-            return res.status(404).json({ error: 'Course not found.' });
+            return res.status(404).json({ error: 'Course not found.', code: 'COURSE_NOT_FOUND' });
         }
 
         // Check course access
         if (!user.permissions.allCourseAccess) {
             const enrolled = await enrollmentCache.isEnrolledInCourse(user.user_id, courseId);
             if (!enrolled) {
-                return res.status(403).json({ error: 'You are not enrolled in this course.' });
+                return res.status(403).json({ error: 'You are not enrolled in this course.', code: 'COURSE_FORBIDDEN' });
             }
         }
 
@@ -97,19 +95,35 @@ router.get('/courses/:courseId', requireAuth, async (req, res) => {
             [courseId]
         );
 
-        const lim = parseInt(limit);
-        const off = parseInt(offset);
+        const total = countRows[0].total;
+        const lim = limit;
+        const totalPages = Math.max(1, Math.ceil(total / lim));
+        // Clamp an out-of-range page to the LAST page: a stale/oversized page
+        // number (e.g. the client's remembered page after its measured page size
+        // grew and reduced the page count) returns the last page's rows instead
+        // of an empty set.
+        const effPage = Math.min(Math.max(page, 1), totalPages);
+        const off = (effPage - 1) * lim;
+        // Sort — whitelisted so the fragments are safe to interpolate. A NULL
+        // module_number / lecture_date always sinks to the bottom regardless of order.
+        //   default: module_number → lecture date → id
+        //   date:    lecture date → module_number → id      (date promoted to front)
+        //   name:    title → module_number → lecture date → id   (name promoted to front)
+        const dir = req.query.dir === 'desc' ? 'DESC' : 'ASC';
+        const sort = ['default', 'date', 'name'].includes(req.query.sort) ? req.query.sort : 'default';
+        const orderBy =
+            sort === 'name'
+                ? `title ${dir}, (module_number IS NULL) ASC, CAST(module_number AS UNSIGNED) ${dir}, (lecture_date IS NULL) ASC, lecture_date ${dir}, video_id ${dir}`
+                : sort === 'date'
+                    ? `(lecture_date IS NULL) ASC, lecture_date ${dir}, (module_number IS NULL) ASC, CAST(module_number AS UNSIGNED) ${dir}, video_id ${dir}`
+                    : `(module_number IS NULL) ASC, CAST(module_number AS UNSIGNED) ${dir}, (lecture_date IS NULL) ASC, lecture_date ${dir}, video_id ${dir}`;
         const [videos] = await pool.execute(
             `SELECT * FROM videos WHERE course_id = ?
-             ORDER BY (week IS NULL) ASC, CAST(week AS UNSIGNED) ASC,
-                      (lecture_date IS NULL) ASC, lecture_date ASC,
-                      created_at ASC
+             ORDER BY ${orderBy}
              LIMIT ${lim} OFFSET ${off}`,
             [courseId]
         );
         await require('../../services/cache/transcodeProgressCache').applyLiveOverlayToVideos(videos);
-
-        const total = countRows[0].total;
 
         // Per-video poster signing. The course list page swaps the
         // play-icon for a thumbnail when a video has has_poster=1, but the
@@ -134,7 +148,7 @@ router.get('/courses/:courseId', requireAuth, async (req, res) => {
                 course_id: v.course_id,
                 title: v.title,
                 description: v.description,
-                week: v.week,
+                module_number: v.module_number,
                 lecture_date: v.lecture_date,
                 duration_seconds: v.duration_seconds,
                 status: v.status,
@@ -151,15 +165,16 @@ router.get('/courses/:courseId', requireAuth, async (req, res) => {
         res.json({
             course: {
                 course_id: course.course_id,
+                course_code: course.course_code,
                 course_name: course.course_name,
-                description: course.description,
+                module_label: course.module_label,
                 is_active: course.is_active,
             },
             videos: posterVideos,
             r2PublicDomain: publicDomain,
             pagination: {
-                page,
-                totalPages: Math.ceil(total / limit) || 1,
+                page: effPage,
+                totalPages,
                 total,
                 limit
             }
@@ -237,7 +252,7 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
             if (pos === null) {
                 const [watchRows] = await pool.execute(
                     'SELECT last_position FROM watch_progress WHERE user_id = ? AND video_id = ?',
-                    [user.user_id, videoId]
+                    [idBuf(user.user_id),videoId]
                 );
                 if (watchRows.length > 0) pos = watchRows[0].last_position;
             }
@@ -254,11 +269,13 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
                 video_id: video.video_id,
                 title: video.title,
                 description: video.description,
-                week: video.week,
+                module_number: video.module_number,
                 lecture_date: video.lecture_date,
                 duration_seconds: video.duration_seconds,
                 course_id: video.course_id,
+                course_code: course ? course.course_code : null,
                 course_name: course ? course.course_name : null,
+                module_label: course ? course.module_label : null,
             },
             // Client constructs the manifest URL itself: pick master.m3u8 or
             // manifest.mpd based on videoType + UA, then prepend
@@ -300,212 +317,17 @@ router.get('/profile', requireAuth, async (req, res) => {
                 user_id: profile.user_id,
                 username: profile.username,
                 display_name: profile.display_name,
+                avatar: profile.sso_avatar || null,
                 maskedEmail: profile.email ? maskEmail(profile.email) : null,
                 hasEmail: !!profile.email,
                 role_name: profile.role_name || 'user',
                 created_at: profile.created_at,
             },
             sessions: sanitizedSessions,
-            canChangePassword: user.permissions.changeOwnPassword,
         });
     } catch (err) {
         console.error('API profile error:', err);
         res.status(500).json({ error: 'Failed to load profile.' });
-    }
-});
-
-// PUT /api/profile/display-name — change display name (no verification needed)
-router.put('/profile/display-name', requireAuth, async (req, res) => {
-    try {
-        const user = res.locals.user;
-        const { displayName } = req.body;
-
-        if (!displayName || typeof displayName !== 'string' || !displayName.trim()) {
-            return res.status(422).json({ error: 'Display name is required' });
-        }
-        const trimmed = displayName.trim();
-        if (trimmed.length > 30) {
-            return res.status(422).json({ error: 'Display name must be 30 characters or fewer' });
-        }
-        if (!/^[A-Za-z0-9 ]+$/.test(trimmed)) {
-            return res.status(422).json({ error: 'Display name can only contain letters, digits, and spaces' });
-        }
-
-        await updateUser(user.user_id, { display_name: trimmed });
-        res.status(204).end();
-    } catch (err) {
-        console.error('API display name change error:', err);
-        res.status(500).json({ error: 'Failed to update display name' });
-    }
-});
-
-// POST /api/profile/password/preflight — check what identity verification is
-// needed to change own password. Mirrors /api/profile/email/preflight.
-router.post('/profile/password/preflight', requireAuth, async (req, res) => {
-    try {
-        const user = res.locals.user;
-        if (!user.permissions.changeOwnPassword) {
-            return res.status(403).json({ error: 'Permission denied' });
-        }
-
-        const pool = getPool();
-        const [[userRow]] = await pool.execute(
-            'SELECT email, mfa_enabled FROM users WHERE user_id = ?',
-            [user.user_id]
-        );
-        const hasExistingEmail = !!(userRow && userRow.email);
-        const mfaEnabled = !!(userRow && userRow.mfa_enabled);
-
-        if (mfaEnabled) {
-            const bmfaToken = await mfaService.ensureBmfa(req, res);
-
-            // Check for existing verified, unconsumed, one-time challenge for
-            // this same operation. Lets the user retry the password submit
-            // without re-verifying if their previous attempt failed late.
-            const [[existing]] = await pool.execute(
-                `SELECT id FROM mfa_challenges
-                 WHERE user_id = ? AND context_type = 'bmfa' AND context_id = ?
-                   AND status = 'verified' AND can_reuse = 0 AND mfa_level >= 0
-                   AND message_type = 'mfa_change' AND message_operation = 'password_change_identity'
-                   AND expires_at > NOW()
-                 LIMIT 1`,
-                [user.user_id, bmfaToken]
-            );
-
-            if (existing) {
-                return res.json({ needsChallenge: false, existingChallengeId: existing.id });
-            }
-
-            // Confirm user has at least one usable level-0 method
-            const userMethods = await mfaService.getUserMfaMethodTypes(user.user_id);
-            const allowedMethods = mfaService.getAllowedMethodsForLevel(0);
-            const overlap = userMethods.filter(m => allowedMethods.includes(m));
-            if (overlap.length === 0) {
-                return res.status(422).json({ error: 'No MFA methods available. Please set up MFA first.' });
-            }
-
-            const challenge = await mfaService.createChallenge({
-                userId: user.user_id,
-                contextType: 'bmfa',
-                contextId: bmfaToken,
-                mfaLevel: 0,
-                messageType: 'mfa_change',
-                messageOperation: 'password_change_identity',
-                canReuse: false,
-            });
-
-            const filteredMethods = challenge.allowedMethods.filter(m => {
-                if (m === 'email') return hasExistingEmail;
-                return userMethods.includes(m);
-            });
-
-            const maskedEmailValue = hasExistingEmail ? maskEmail(userRow.email) : null;
-
-            return res.json({
-                needsChallenge: true,
-                challengeId: challenge.id,
-                allowedMethods: filteredMethods,
-                maskedEmail: maskedEmailValue,
-                pendingTtlSeconds: challenge.pendingTtlSeconds,
-            });
-        }
-
-        // No MFA — caller must re-enter current password to authenticate
-        return res.json({ needsChallenge: false, needsPassword: true });
-    } catch (err) {
-        console.error('API profile/password/preflight error:', err);
-        res.status(500).json({ error: 'Failed to check password change requirements' });
-    }
-});
-
-// POST /api/profile/password — change own password
-//
-// Identity verification:
-//   - If MFA is enabled: a verified, one-time MFA challenge ID
-//     (message_operation = 'password_change_identity') must be supplied in the
-//     body as `mfaChallengeId`. The challenge is consumed on success.
-//   - If MFA is not enabled: `currentPassword` must be supplied and verified.
-//
-// signOutOthers (default true): when true, terminates every other session
-// belonging to this user. When false, keeps other sessions alive.
-router.post('/profile/password', requireAuth, async (req, res) => {
-    try {
-        const user = res.locals.user;
-        if (!user.permissions.changeOwnPassword) {
-            return res.status(403).json({ error: 'Permission denied' });
-        }
-
-        const { currentPassword, newPassword, confirmPassword, mfaChallengeId, signOutOthers } = req.body;
-
-        if (!newPassword || !confirmPassword) {
-            return res.status(422).json({ error: 'New password is required' });
-        }
-        if (/\s/.test(newPassword) || /\s/.test(confirmPassword)) {
-            return res.status(422).json({ error: 'Spaces are not allowed in passwords' });
-        }
-        if (newPassword !== confirmPassword) {
-            return res.status(422).json({ error: 'New passwords do not match' });
-        }
-        if (newPassword.length < 8) {
-            return res.status(422).json({ error: 'Password must be at least 8 characters' });
-        }
-
-        const pool = getPool();
-        const [[userRow]] = await pool.execute(
-            'SELECT mfa_enabled FROM users WHERE user_id = ?',
-            [user.user_id]
-        );
-        const mfaEnabled = !!(userRow && userRow.mfa_enabled);
-
-        // Identity verification — branches on user's current MFA state.
-        if (mfaEnabled) {
-            if (!mfaChallengeId) {
-                return res.status(403).json({ error: 'MFA verification required' });
-            }
-            const bmfaToken = await mfaService.ensureBmfa(req, res);
-            const validation = await validateChallenge(mfaChallengeId, user.user_id, bmfaToken, 0);
-            if (!validation.valid) {
-                return res.status(403).json({ error: validation.reason || 'Invalid MFA challenge' });
-            }
-            // Defensive: make sure this challenge was minted for the password
-            // flow specifically — validateChallenge is generic and would
-            // otherwise accept a same-level challenge from a different op
-            // (e.g. an unconsumed email-change identity challenge).
-            if (validation.challenge.message_operation !== 'password_change_identity') {
-                return res.status(403).json({ error: 'Wrong challenge type' });
-            }
-        } else {
-            if (!currentPassword) {
-                return res.status(422).json({ error: 'Current password is required' });
-            }
-            const fullUser = await getUserById(user.user_id);
-            const valid = await verifyPassword(fullUser.password_hash, currentPassword);
-            if (!valid) {
-                return res.status(422).json({ error: 'Current password is incorrect' });
-            }
-        }
-
-        await updateUser(user.user_id, { password: newPassword });
-        // Track password change timestamp
-        await pool.execute('UPDATE users SET password_changed_at = NOW() WHERE user_id = ?', [user.user_id]);
-
-        // Consume the one-time MFA challenge after the password has changed,
-        // so a transient error during update doesn't burn the verification.
-        if (mfaEnabled && mfaChallengeId) {
-            await consumeChallenge(mfaChallengeId);
-            const bmfaToken = await mfaService.ensureBmfa(req, res);
-            await mfaService.rotateBmfaIfNeeded(req, res, bmfaToken);
-        }
-
-        // signOutOthers defaults to true when omitted (matches legacy
-        // behaviour). Only false when client explicitly opts out.
-        if (signOutOthers !== false) {
-            await deleteUserSessions(user.user_id, user.session_id);
-        }
-        res.json({ success: true, message: 'Password changed successfully' });
-    } catch (err) {
-        console.error('API password change error:', err);
-        res.status(500).json({ error: 'Failed to change password' });
     }
 });
 
@@ -531,8 +353,8 @@ router.get('/profile/security', requireAuth, async (req, res) => {
         const methods = await getUserMfaMethods(user.user_id);
 
         const [[userRow]] = await pool.execute(
-            'SELECT email, password_changed_at FROM users WHERE user_id = ?',
-            [user.user_id]
+            'SELECT email FROM users WHERE user_id = ?',
+            [idBuf(user.user_id)]
         );
 
         const hasEmail = !!(userRow && userRow.email);
@@ -545,312 +367,12 @@ router.get('/profile/security', requireAuth, async (req, res) => {
                 label: m.label,
                 created_at: m.created_at,
             })),
-            requireMFA: !!user.permissions.requireMFA,
-            toggleOwnMfa: !!user.permissions.toggleOwnMfa,
             hasEmail,
             maskedEmail: hasEmail ? maskEmail(userRow.email) : null,
-            passwordChangedAt: userRow ? userRow.password_changed_at : null,
         });
     } catch (err) {
         console.error('API profile/security error:', err);
         res.status(500).json({ error: 'Failed to load security info' });
-    }
-});
-
-// POST /api/profile/email/preflight — check what identity verification is needed
-router.post('/profile/email/preflight', requireAuth, async (req, res) => {
-    try {
-        const user = res.locals.user;
-        const pool = getPool();
-
-        const [[userRow]] = await pool.execute(
-            'SELECT email, mfa_enabled FROM users WHERE user_id = ?',
-            [user.user_id]
-        );
-        const hasExistingEmail = !!(userRow && userRow.email);
-        const mfaEnabled = !!(userRow && userRow.mfa_enabled);
-
-        if (mfaEnabled) {
-            const bmfaToken = await mfaService.ensureBmfa(req, res);
-
-            // Check for existing verified, unconsumed, one-time challenge
-            const [[existing]] = await pool.execute(
-                `SELECT id FROM mfa_challenges
-                 WHERE user_id = ? AND context_type = 'bmfa' AND context_id = ?
-                   AND status = 'verified' AND can_reuse = 0 AND mfa_level >= 0
-                   AND message_type = 'email_verification' AND message_operation = 'email_change_identity'
-                   AND expires_at > NOW()
-                 LIMIT 1`,
-                [user.user_id, bmfaToken]
-            );
-
-            if (existing) {
-                return res.json({ needsChallenge: false, existingChallengeId: existing.id });
-            }
-
-            // Check user has usable MFA methods
-            const userMethods = await mfaService.getUserMfaMethodTypes(user.user_id);
-            const allowedMethods = mfaService.getAllowedMethodsForLevel(0);
-            const overlap = userMethods.filter(m => allowedMethods.includes(m));
-            if (overlap.length === 0) {
-                return res.status(422).json({ error: 'No MFA methods available. Please set up MFA first.' });
-            }
-
-            // Create new pending challenge
-            const challenge = await mfaService.createChallenge({
-                userId: user.user_id,
-                contextType: 'bmfa',
-                contextId: bmfaToken,
-                mfaLevel: 0,
-                messageType: 'email_verification',
-                messageOperation: 'email_change_identity',
-                canReuse: false,
-            });
-
-            // Filter methods to what user actually has
-            const filteredMethods = challenge.allowedMethods.filter(m => {
-                if (m === 'email') return hasExistingEmail;
-                return userMethods.includes(m);
-            });
-
-            const maskedEmailValue = hasExistingEmail ? maskEmail(userRow.email) : null;
-
-            return res.json({
-                needsChallenge: true,
-                challengeId: challenge.id,
-                allowedMethods: filteredMethods,
-                maskedEmail: maskedEmailValue,
-                pendingTtlSeconds: challenge.pendingTtlSeconds,
-            });
-        }
-
-        // No MFA
-        if (hasExistingEmail) {
-            return res.json({ needsChallenge: false, needsPassword: true });
-        }
-        return res.json({ needsChallenge: false, needsPassword: false });
-    } catch (err) {
-        console.error('API profile/email/preflight error:', err);
-        res.status(500).json({ error: 'Failed to check email change requirements' });
-    }
-});
-
-// POST /api/profile/email/start — begin email change flow
-router.post('/profile/email/start', requireAuth, async (req, res) => {
-    try {
-        const user = res.locals.user;
-        const pool = getPool();
-        const { email, currentPassword } = req.body;
-
-        // Validate email format
-        if (!email || typeof email !== 'string') {
-            return res.status(422).json({ error: 'Email is required' });
-        }
-        if (/\s/.test(email)) {
-            return res.status(422).json({ error: 'Spaces are not allowed in email' });
-        }
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(email)) {
-            return res.status(422).json({ error: 'Invalid email format' });
-        }
-
-        const normalizedEmail = email.toLowerCase();
-
-        // Check email not already used by another user
-        const [[existing]] = await pool.execute(
-            'SELECT user_id FROM users WHERE email = ? AND user_id != ?',
-            [normalizedEmail, user.user_id]
-        );
-        if (existing) {
-            return res.status(422).json({ error: 'Email is already in use' });
-        }
-
-        // Check email not in a pending registration (within link validity)
-        const [[pendingReg]] = await pool.execute(
-            `SELECT email FROM pending_registrations WHERE email = ?
-             AND created_at >= DATE_SUB(NOW(), INTERVAL CAST(COALESCE(
-                 (SELECT setting_value FROM site_settings WHERE setting_key = 'emailed_link_validity_minutes'), '30'
-             ) AS UNSIGNED) MINUTE)`,
-            [normalizedEmail]
-        );
-        if (pendingReg) {
-            return res.status(422).json({ error: 'Email is already in use' });
-        }
-
-        // Get current user state
-        const [[userRow]] = await pool.execute(
-            'SELECT email, mfa_enabled FROM users WHERE user_id = ?',
-            [user.user_id]
-        );
-        const hasExistingEmail = !!(userRow && userRow.email);
-        const mfaEnabled = !!(userRow && userRow.mfa_enabled);
-
-        if (hasExistingEmail && mfaEnabled) {
-            // Require MFA challenge via X-MFA-Challenge header
-            const challengeId = req.headers['x-mfa-challenge'];
-            if (!challengeId) {
-                return res.status(403).json({ error: 'MFA verification required' });
-            }
-            const bmfaTokenForValidation = await mfaService.ensureBmfa(req, res);
-            const validation = await validateChallenge(challengeId, user.user_id, bmfaTokenForValidation, 0);
-            if (!validation.valid) {
-                return res.status(403).json({ error: validation.reason || 'Invalid MFA challenge' });
-            }
-            // Challenge validated but NOT consumed — deferred to /confirm
-        } else if (hasExistingEmail) {
-            // Require current password
-            if (!currentPassword) {
-                return res.status(422).json({ error: 'Current password is required' });
-            }
-            const fullUser = await getUserById(user.user_id);
-            const valid = await verifyPassword(fullUser.password_hash, currentPassword);
-            if (!valid) {
-                return res.status(422).json({ error: 'Current password is incorrect' });
-            }
-        }
-        // If no existing email, no verification needed
-
-        // Create email verification challenge
-        const bmfaToken = await mfaService.ensureBmfa(req, res);
-        const challenge = await mfaService.createChallenge({
-            userId: user.user_id,
-            contextType: 'bmfa',
-            contextId: bmfaToken,
-            mfaLevel: 0,
-            messageType: 'email_verification',
-            messageOperation: normalizedEmail,
-            canReuse: false,
-        });
-
-        // Send OTP to the NEW email
-        const sendResult = await mfaService.sendOtpToEmail(challenge.id, user.user_id, normalizedEmail);
-        if (!sendResult.success) {
-            const httpErr = mapEmailErrorHttp(sendResult);
-            if (httpErr) return res.status(httpErr.status).json(httpErr.body);
-            if (sendResult.retryAfter || sendResult.message === 'Daily limit reached') {
-                return res.status(429).json({ error: sendResult.message, retryAfter: sendResult.retryAfter || null });
-            }
-            return res.status(503).json({ error: sendResult.message || 'Failed to send verification email' });
-        }
-
-        // Mask email for response
-        const atIdx = normalizedEmail.indexOf('@');
-        const local = normalizedEmail.substring(0, atIdx);
-        const domain = normalizedEmail.substring(atIdx);
-        const maskedNewEmail = local.length < 3
-            ? local.charAt(0) + '*'.repeat(Math.max(0, local.length - 1)) + domain
-            : local.substring(0, 2) + '*'.repeat(local.length - 2) + domain;
-
-        res.json({ success: true, challengeId: challenge.id, maskedNewEmail });
-    } catch (err) {
-        console.error('API profile/email/start error:', err);
-        res.status(500).json({ error: 'Failed to start email change' });
-    }
-});
-
-// POST /api/profile/email/confirm — confirm email change with OTP
-router.post('/profile/email/confirm', requireAuth, async (req, res) => {
-    try {
-        const user = res.locals.user;
-        const pool = getPool();
-        const { challengeId, code, mfaChallengeId } = req.body;
-
-        if (!challengeId || !code) {
-            return res.status(422).json({ error: 'Challenge ID and code are required' });
-        }
-
-        // If user has MFA enabled, require the MFA identity challenge
-        const [[mfaCheck]] = await pool.execute(
-            'SELECT mfa_enabled, email FROM users WHERE user_id = ?',
-            [user.user_id]
-        );
-        if (mfaCheck?.mfa_enabled && mfaCheck?.email) {
-            if (!mfaChallengeId) {
-                return res.status(403).json({ error: 'MFA verification required' });
-            }
-            const bmfaToken = await mfaService.ensureBmfa(req, res);
-            const validation = await validateChallenge(mfaChallengeId, user.user_id, bmfaToken, 0);
-            if (!validation.valid) {
-                return res.status(403).json({ error: validation.reason || 'Invalid MFA challenge' });
-            }
-        }
-
-        const result = await mfaService.verifyOtp(challengeId, code);
-        if (!result.valid) {
-            const errorResponse = { error: result.reason || 'Invalid code' };
-            if (result.mustResend !== undefined) errorResponse.mustResend = result.mustResend;
-            if (result.attemptsRemaining !== undefined) errorResponse.attemptsRemaining = result.attemptsRemaining;
-            return res.status(422).json(errorResponse);
-        }
-
-        // Read the challenge to get message_operation (the new email)
-        const challenge = await mfaService.getChallenge(challengeId);
-        if (!challenge || challenge.user_id !== user.user_id) {
-            return res.status(403).json({ error: 'Invalid challenge' });
-        }
-
-        const newEmail = challenge.message_operation;
-        if (!newEmail) {
-            return res.status(400).json({ error: 'No email found in challenge' });
-        }
-
-        // Update user email
-        await pool.execute(
-            'UPDATE users SET email = ? WHERE user_id = ?',
-            [newEmail, user.user_id]
-        );
-        await require('../../services/cache/userCache').invalidate(user.user_id);
-
-        // Consume OTP challenge
-        await mfaService.consumeChallenge(challengeId);
-
-        // Consume the MFA identity challenge if one was used
-        if (mfaChallengeId) {
-            await consumeChallenge(mfaChallengeId);
-            const bmfaToken = await mfaService.ensureBmfa(req, res);
-            await mfaService.rotateBmfaIfNeeded(req, res, bmfaToken);
-        }
-
-        res.json({ success: true });
-    } catch (err) {
-        console.error('API profile/email/confirm error:', err);
-        res.status(500).json({ error: 'Failed to confirm email change' });
-    }
-});
-
-// POST /api/profile/email/resend — resend email verification OTP
-router.post('/profile/email/resend', requireAuth, async (req, res) => {
-    try {
-        const user = res.locals.user;
-        const { challengeId } = req.body;
-
-        if (!challengeId) {
-            return res.status(422).json({ error: 'Challenge ID is required' });
-        }
-
-        // Get challenge and verify it belongs to user
-        const challenge = await mfaService.getChallenge(challengeId);
-        if (!challenge || challenge.user_id !== user.user_id) {
-            return res.status(403).json({ error: 'Invalid challenge' });
-        }
-
-        const result = await mfaService.sendOtpToEmail(challengeId, user.user_id, challenge.message_operation);
-        if (!result.success) {
-            const httpErr = mapEmailErrorHttp(result);
-            if (httpErr) return res.status(httpErr.status).json(httpErr.body);
-            if (result.retryAfter || result.message === 'Daily limit reached') {
-                return res.status(429).json({
-                    error: result.message,
-                    retryAfter: result.retryAfter || null,
-                });
-            }
-            return res.status(503).json({ error: result.message || 'Failed to send code' });
-        }
-
-        res.json({ success: true });
-    } catch (err) {
-        console.error('API profile/email/resend error:', err);
-        res.status(500).json({ error: 'Failed to resend verification email' });
     }
 });
 

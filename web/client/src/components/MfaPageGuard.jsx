@@ -1,5 +1,9 @@
-import { Link, useNavigate } from 'react-router-dom';
 import MfaChallengeUI from './MfaChallengeUI';
+import { useAuth } from '../context/AuthContext';
+
+// MFA is managed in the account portal now (this videosite is an SSO RP); the
+// local step-up flow is slated for the SSO step-up ceremony. Until then, the
+// "set up MFA" prompts send the user to the portal rather than a local page.
 
 const METHOD_LABELS = {
   authenticator: 'Authenticator App',
@@ -20,6 +24,7 @@ export default function MfaPageGuard({
   onRetry,
   children,
 }) {
+  const { user } = useAuth();
   if (mfaSetupBlock) {
     const methods = mfaSetupBlock.requiredMethods || [];
     const methodNames = formatMethods(methods);
@@ -37,7 +42,7 @@ export default function MfaPageGuard({
             Your account must have at least one of the following methods enabled: {methodNames.join(', ')}.
           </p>
         )}
-        <Link to="/profile" className="btn btn-primary">Go to MFA Settings</Link>
+        <a href={user?.account_portal || '/'} target="_blank" rel="noreferrer" className="btn btn-primary">Go to MFA Settings</a>
       </div>
     );
   }
@@ -77,7 +82,7 @@ export default function MfaPageGuard({
  * Two scenarios: user has no MFA at all, or has MFA but missing required methods.
  */
 export function MfaSetupRequiredModal({ mfaSetupState, onDismiss }) {
-  const navigate = useNavigate();
+  const { user } = useAuth();
 
   if (!mfaSetupState) return null;
 
@@ -107,7 +112,7 @@ export function MfaSetupRequiredModal({ mfaSetupState, onDismiss }) {
           )}
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '12px', padding: '0 20px 20px' }}>
-          <button className="btn btn-primary" style={{ fontSize: '13px', padding: '4px 16px' }} onClick={() => { onDismiss(); navigate('/profile'); }}>
+          <button className="btn btn-primary" style={{ fontSize: '13px', padding: '4px 16px' }} onClick={() => { onDismiss(); if (user?.account_portal) window.open(user.account_portal, '_blank', 'noopener'); }}>
             Go to MFA Settings
           </button>
           <button className="btn btn-secondary" style={{ width: '100%', justifyContent: 'center' }} onClick={onDismiss}>OK</button>

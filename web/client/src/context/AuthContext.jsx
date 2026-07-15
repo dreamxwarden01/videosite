@@ -3,6 +3,29 @@ import { apiGet, apiPost, setAuthFailureHandler, markSigningOut } from '../api';
 
 const AuthContext = createContext(null);
 
+// A 403-driven /api/me refetch (e.g. after a course-access denial) usually
+// returns the SAME user. Compare shallow over every scalar field plus a
+// set-equality on the granted permissions, so a functional setUser can bail out
+// (return prev) and avoid re-rendering the whole tree when nothing changed.
+// `permissions` is the rehydrated { key: true } map by the time this runs — a
+// denied permission is absent, never `false`, so the granted keys ARE the set.
+function sameUser(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  const ak = Object.keys(a);
+  if (ak.length !== Object.keys(b).length) return false;
+  for (const k of ak) {
+    if (k === 'permissions') continue;
+    if (a[k] !== b[k]) return false;
+  }
+  const ap = a.permissions || {};
+  const bp = b.permissions || {};
+  const apk = Object.keys(ap).filter(k => ap[k]);
+  if (apk.length !== Object.keys(bp).filter(k => bp[k]).length) return false;
+  for (const k of apk) if (!bp[k]) return false;
+  return true;
+}
+
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -28,7 +51,10 @@ export function AuthProvider({ children }) {
             data.user.permissions.map(k => [k, true])
           );
         }
-        setUser(data.user);
+        // Merge-not-replace: only swap state when something actually changed, so
+        // an unchanged refetch is a no-op re-render. Functional update reads
+        // current state without adding `user` as a dep.
+        setUser(prev => sameUser(prev, data.user) ? prev : data.user);
       } else {
         setUser(null);
       }
@@ -47,19 +73,21 @@ export function AuthProvider({ children }) {
   }, [refresh, clearUser]);
 
   const logout = useCallback(async () => {
+    let logoutUrl = '/auth/login';
     try {
-      await apiPost('/api/auth/logout');
+      // Backend kills the local session and returns the SSO end_session URL
+      // (RP-initiated logout) so the IdP clears its own session too.
+      const { data } = await apiPost('/auth/logout');
+      if (data && data.logoutUrl) logoutUrl = data.logoutUrl;
     } catch {
-      // ignore
+      // ignore — fall back to re-login
     }
     // Mark first so WatchPage's pagehide handler skips its sendBeacon — the
-    // session is dead, the server would 401 the report anyway. Set AFTER the
-    // logout call so a network failure on logout (cookie still alive) doesn't
-    // permanently latch the flag and silence future watch reports on retry.
+    // session is dead, the server would 401 the report anyway.
     markSigningOut();
-    // Full reload to /login — don't setUser(null) first, that would trigger
-    // ProtectedRoute's redirect with returnTo before the reload completes (flash)
-    window.location.href = '/login';
+    // Full navigation to the SSO end_session endpoint (clears the IdP session,
+    // then redirects back to our post-logout URL).
+    window.location.href = logoutUrl;
   }, []);
 
   return (

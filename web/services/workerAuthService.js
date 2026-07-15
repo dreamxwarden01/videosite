@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const argon2 = require('argon2');
-const { getPool } = require('../config/database');
+const { getPool, idBuf } = require('../config/database');
 const { getClient } = require('./redis');
 const { normalizeIP } = require('./ipHelpers');
 
@@ -30,7 +30,7 @@ async function generateWorkerKeyPair(label, createdBy) {
     await pool.execute(
         `INSERT INTO worker_access_keys (key_id, key_secret, label, created_by)
          VALUES (?, ?, ?, ?)`,
-        [keyId, secretHash, label || null, createdBy]
+        [keyId, secretHash, label || null, idBuf(createdBy)]
     );
 
     // Return the plain secret (shown once to the admin)

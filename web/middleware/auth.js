@@ -48,12 +48,9 @@ async function loadUser(req, res, next) {
             return next();
         }
 
-        // Account deactivated → cascade-clear all sessions / caches for this user.
-        if (!userMeta.is_active) {
-            await deleteUserSessions(session.user_id);
-            res.clearCookie(SESSION_COOKIE);
-            return next();
-        }
+        // (Account enable/disable is SSO-owned now: a suspended user's sessions
+        // are killed via the back-channel and future sign-ins are refused at
+        // the SSO — no local is_active gate.)
 
         // Update last_seen + ip + ua in Redis. The periodic flusher drains
         // these to DB every 15 min — the per-request DB write is gone.
@@ -66,6 +63,8 @@ async function loadUser(req, res, next) {
             user_id: session.user_id,
             username: userMeta.username,
             display_name: userMeta.display_name,
+            sso_avatar: userMeta.sso_avatar || null,
+            email: userMeta.email || null,
             role_id: userMeta.role_id,
             permissions,
             permission_level,
@@ -87,7 +86,7 @@ function requireAuth(req, res, next) {
             return res.status(401).json({ error: 'Authentication required' });
         }
         const returnTo = req.originalUrl === '/' ? '' : '?returnTo=' + encodeURIComponent(req.originalUrl);
-        return res.redirect('/login' + returnTo);
+        return res.redirect('/auth/login' + returnTo);
     }
     next();
 }

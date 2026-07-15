@@ -1,13 +1,9 @@
 // User metadata cache. Stores the bits of the users row that the auth
-// middleware needs on every request (username, display_name, email, role_id,
-// is_active) so we can drop the session→users JOIN.
-//
-// is_active lives here because it gates auth in the same place permissions do,
-// but semantically it's user state, not a permission — so it sits in this
-// cache rather than user:perms.
+// middleware needs on every request (username, display_name, email, role_id)
+// so we can drop the session→users JOIN.
 
 const { getClient } = require('../redis');
-const { getPool } = require('../../config/database');
+const { getPool, idBuf } = require('../../config/database');
 
 const TTL = 30 * 60;
 const key = (userId) => `user:meta:${userId}`;
@@ -15,8 +11,8 @@ const key = (userId) => `user:meta:${userId}`;
 async function loadFromDb(userId) {
     const pool = getPool();
     const [rows] = await pool.execute(
-        'SELECT user_id, username, display_name, email, role_id, is_active FROM users WHERE user_id = ?',
-        [userId]
+        'SELECT user_id, username, display_name, sso_avatar, email, role_id FROM users WHERE user_id = ?',
+        [idBuf(userId)]
     );
     return rows[0] || null;
 }

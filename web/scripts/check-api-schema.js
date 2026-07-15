@@ -12,15 +12,18 @@
  *   - operations without operationId, or duplicate operationIds
  *   - path templates whose parameters aren't declared
  *   - schema size over 5 MB (free plan ceiling)
+ *   - DRIFT from the actual Express routes (routeCrossCheck): a real /api route
+ *     with no schema entry (API Shield would flag it "unknown"), or a schema entry
+ *     with no route (a phantom — how this file rotted into listing removed identity
+ *     routes for weeks). The schema and the code must describe the same surface.
  *
  * Does NOT enforce request bodies on POST/PUT — many endpoints (toggles,
- * key generators, terminate-all) are legitimately bodyless. Does NOT
- * cross-check the schema against actual Express routers; drift between
- * schema and code is caught by updating both in the same commit.
+ * key generators, terminate-all) are legitimately bodyless.
  */
 
 const fs = require('fs');
 const path = require('path');
+const { crossCheck } = require('./lib/routeCrossCheck');
 
 const SCHEMA_PATH = path.join(__dirname, '..', 'api-schema.json');
 const MAX_SIZE_BYTES = 5 * 1024 * 1024;
@@ -116,10 +119,25 @@ if (opCount === 0) {
     fail('No operations found — schema appears empty.');
 }
 
+// Drift check: the schema must describe exactly the in-scope (/api/* + installer)
+// routes the code defines — no missing entries, no phantoms.
+let xc = { ok: true, checked: 0 };
+try {
+    xc = crossCheck(schema);
+    for (const r of xc.missingInSchema) {
+        fail(`route not in schema: ${r} — a real route with no schema entry (CF API Shield would flag it "unknown"). Add it, or (if intentionally out of scope) exclude its prefix in scripts/lib/routeCrossCheck.js.`);
+    }
+    for (const r of xc.missingInCode) {
+        fail(`phantom in schema: ${r} — a schema entry with no matching route. Remove it (this is how the schema drifted stale before).`);
+    }
+} catch (err) {
+    fail(`route cross-check failed to run: ${err.message}`);
+}
+
 if (errors.length > 0) {
     console.error(`api-schema.json: ${errors.length} issue${errors.length === 1 ? '' : 's'}\n`);
     for (const e of errors) console.error(`  - ${e}`);
     process.exit(1);
 }
 
-console.log(`api-schema.json OK — ${opCount} operations, ${Buffer.byteLength(raw)} bytes`);
+console.log(`api-schema.json OK — ${opCount} operations, ${Buffer.byteLength(raw)} bytes; ${xc.checked} routes cross-checked against code, no drift`);

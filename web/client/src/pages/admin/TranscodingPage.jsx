@@ -3,41 +3,41 @@ import { useSite } from '../../context/SiteContext';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
 import { useConfirm } from '../../components/ConfirmModal';
-import useMfaPageGuard from '../../hooks/useMfaPageGuard';
-import useMfaChallenge from '../../hooks/useMfaChallenge';
-import MfaPageGuard, { MfaSetupRequiredModal } from '../../components/MfaPageGuard';
-import MfaChallengeUI from '../../components/MfaChallengeUI';
+import useStepupGuard from '../../hooks/useStepupGuard';
+import StepUpBlock from '../../components/StepUpBlock';
+import { apiPost } from '../../api';
+import TimeAgo from '../../components/TimeAgo';
 
-function escapeHtml(str) {
-  if (!str) return '';
-  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
+const CheckIcon = () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9" /><path d="m8.5 12 2.4 2.4 4.6-5" /></svg>;
+const LoaderIcon = () => <svg className="vs-tc-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M12 3a9 9 0 1 0 9 9" /></svg>;
+const ClockIcon = () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9" /><path d="M12 7.5V12l3 1.8" /></svg>;
+const AlertIcon = () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9" /><path d="M12 8v4.5" /><path d="M12 16h.01" /></svg>;
+const BanIcon = () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9" /><path d="m6.5 6.5 11 11" /></svg>;
+const ICONS = { check: CheckIcon, loader: LoaderIcon, clock: ClockIcon, alert: AlertIcon, ban: BanIcon };
 
-function formatTime(dateStr) {
-  if (!dateStr) return '-';
-  return new Date(dateStr).toLocaleString();
+// Raw job → display state. Mirrors the old getStatusLabel/getStatusClass: the
+// worker sub-states (downloading/uploading) refine an otherwise generic
+// "processing"; all live states share the spinner glyph (accent), the pill
+// carries the phase.
+function jobState(job) {
+  const s = job.status, vs = job.videoStatus;
+  if (s === 'error') return { label: 'Failed', role: 'danger', icon: 'alert' };
+  if (s === 'completed') return { label: 'Finished', role: 'success', icon: 'check' };
+  if (s === 'aborted') return { label: 'Aborted', role: 'neutral', icon: 'ban' };
+  if (s === 'queued' || s === 'pending') return { label: 'Queued', role: 'neutral', icon: 'clock' };
+  if (s === 'leased' || vs === 'worker_downloading') return { label: 'Downloading', role: 'accent', icon: 'loader' };
+  if (s === 'processing' && vs === 'worker_uploading') return { label: 'Uploading', role: 'accent', icon: 'loader' };
+  return { label: 'Processing', role: 'accent', icon: 'loader' };
 }
+const isActiveStatus = (s) => !['completed', 'error', 'aborted', 'queued', 'pending'].includes(s);
+const isPending = (s) => s === 'queued' || s === 'pending';
 
-function getStatusLabel(job) {
-  if (job.status === 'leased' || job.videoStatus === 'worker_downloading') return 'downloading';
-  if (job.status === 'processing' && job.videoStatus === 'worker_uploading') return 'uploading';
-  return job.videoStatus || job.status;
-}
-
-function getCardClass(job) {
-  if (job.status === 'error') return 'job-error';
-  if (job.status === 'completed') return 'job-finished';
-  if (job.status === 'aborted') return 'job-aborted';
-  return 'job-active';
-}
-
-function getStatusClass(job) {
-  if (job.status === 'error') return 'status-error';
-  if (job.status === 'completed') return 'status-completed';
-  if (job.status === 'aborted') return 'status-aborted';
-  if (job.status === 'queued' || job.status === 'pending') return 'status-queued';
-  return 'status-processing';
-}
+const FILTERS = [
+  { k: 'all', label: 'All', test: () => true },
+  { k: 'active', label: 'Active', test: (j) => isActiveStatus(j.status) || isPending(j.status) },
+  { k: 'finished', label: 'Finished', test: (j) => j.status === 'completed' },
+  { k: 'failed', label: 'Failed', test: (j) => j.status === 'error' || j.status === 'aborted' },
+];
 
 export default function TranscodingPage() {
   const { siteName } = useSite();
@@ -45,151 +45,130 @@ export default function TranscodingPage() {
   const { showToast } = useToast();
   const confirm = useConfirm();
 
-  const { mfaBlock, mfaSetupBlock, autoShowModal, mfaPageFetch, handlePageMfaSuccess, handlePageMfaCancel, retryVerification, mfaVerifiedKey } = useMfaPageGuard();
-  const { mfaFetch, mfaState, mfaSetupState, onMfaSuccess, onMfaCancel, dismissMfaSetup } = useMfaChallenge();
+  const { blocked, guardFetch, verify, guardAction } = useStepupGuard('transcoding');
 
   const [jobs, setJobs] = useState([]);
   const [hasActive, setHasActive] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [filter, setFilter] = useState('all');
   const pollRef = useRef(null);
 
   useEffect(() => {
     if (!siteName) return;
-    document.title = `Transcoding Status - ${siteName}`;
+    document.title = `Transcoding - ${siteName}`;
   }, [siteName]);
-
-  if (!user?.permissions?.manageSite) {
-    return <p className="text-muted">Permission denied.</p>;
-  }
 
   const fetchJobs = async () => {
     try {
-      const { data, ok } = await mfaPageFetch('/api/admin/transcoding/jobs');
+      const { data, ok } = await guardFetch('/api/admin/transcoding/jobs');
       if (ok && data) {
         setJobs(data.jobs || []);
         setHasActive(data.hasActive || false);
         setLoaded(true);
       }
-    } catch {}
+    } catch { /* keep the last good list on a transient error */ }
   };
 
   useEffect(() => {
     fetchJobs();
     pollRef.current = setInterval(fetchJobs, 5000);
-
     const visHandler = () => {
       if (document.hidden) {
         clearInterval(pollRef.current);
       } else {
         fetchJobs();
-        pollRef.current = setInterval(fetchJobs, 5000);
+        pollRef.current = setInterval(fetchJobs, hasActive ? 1000 : 5000);
       }
     };
     document.addEventListener('visibilitychange', visHandler);
-
     return () => {
       clearInterval(pollRef.current);
       document.removeEventListener('visibilitychange', visHandler);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Adjust polling speed based on active jobs
+  // Poll faster while any job is active.
   useEffect(() => {
     clearInterval(pollRef.current);
-    const interval = hasActive ? 1000 : 5000;
-    pollRef.current = setInterval(fetchJobs, interval);
+    pollRef.current = setInterval(fetchJobs, hasActive ? 1000 : 5000);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasActive]);
 
+  if (!user?.permissions?.manageSite) {
+    return <div className="vs-cv-empty">Permission denied.</div>;
+  }
+
   const handleClearFinished = async () => {
-    if (!await confirm('Clear all finished jobs from the list?')) return;
-    const { ok } = await mfaFetch('/api/admin/transcoding/clear-finished', { method: 'POST' });
-    if (ok) {
-      showToast('Finished jobs cleared.', 'success');
-      fetchJobs();
-    } else {
-      showToast('Failed to clear finished jobs.');
-    }
+    if (!await confirm({ title: 'Clear finished jobs?', message: 'This only removes them from this view — it doesn\'t touch the videos.', confirmLabel: 'Clear', danger: false })) return;
+    const { ok } = await apiPost('/api/admin/transcoding/clear-finished');
+    if (ok) { showToast('Finished jobs cleared.', 'success'); fetchJobs(); }
+    else showToast('Failed to clear finished jobs.');
   };
 
   const hasFinished = jobs.some(j => j.status === 'completed');
+  const activeCount = jobs.filter(FILTERS[1].test).length;
+  const filtered = jobs.filter(FILTERS.find(f => f.k === filter).test);
 
   return (
-    <MfaPageGuard mfaBlock={mfaBlock} mfaSetupBlock={mfaSetupBlock} autoShowModal={autoShowModal}
-      onSuccess={handlePageMfaSuccess} onCancel={handlePageMfaCancel} onRetry={retryVerification}>
-    <div>
-      <div className="flex-between mb-3">
-        <h1>Transcoding Status</h1>
-        {hasFinished && (
-          <button className="btn btn-sm" onClick={handleClearFinished}>Clear Finished</button>
-        )}
-      </div>
-
-      {!loaded ? (
-        <p className="text-muted">Loading...</p>
-      ) : jobs.length === 0 ? (
-        <div style={{ textAlign: 'center', padding: '40px', color: '#999' }}>No transcoding jobs</div>
-      ) : (
-        jobs.map(job => {
-          const showProgress = !['completed', 'error', 'aborted', 'queued'].includes(job.status);
-          return (
-            <div key={job.taskId || job.jobId} className={`job-card ${getCardClass(job)}`}>
-              <div className="job-header">
-                <span className="job-title">{job.videoTitle}</span>
-                <span className={`job-status ${getStatusClass(job)}`}>{getStatusLabel(job)}</span>
-              </div>
-              <div className="job-meta">
-                {job.courseName}
-                {job.jobId && <> &middot; Job: {job.jobId}</>}
-                {/* Worker label (or last 6 of the key id when the operator
-                    didn't set a label). Skipped entirely for queued/unleased
-                    rows — no worker has touched them yet. */}
-                {job.workerKeyId && (
-                  <> &middot; Worker: {job.workerLabel || job.workerKeyId.slice(-6)}</>
-                )}
-                {' '}&middot; Uploaded: {formatTime(job.uploadTime)}
-              </div>
-              {showProgress && (
-                <>
-                  <div className="progress-bar-wrap">
-                    <div className="progress-bar-fill" style={{ width: `${job.progress}%` }} />
-                  </div>
-                  <div className="job-meta" style={{ marginTop: '4px' }}>{job.progress}%</div>
-                </>
-              )}
-              {job.errorMessage && <div className="job-error-msg">{job.errorMessage}</div>}
+    <div className="vs-tc">
+      <div className="vs-tc-head">
+          <div className="vs-tc-headrow">
+            <div style={{ minWidth: 0 }}>
+              <h1 className="vs-cv-title">Transcoding</h1>
+              <p className="vs-cv-sub">
+                {loaded
+                  ? `${jobs.length} ${jobs.length === 1 ? 'job' : 'jobs'}${activeCount ? ` · ${activeCount} active` : ''}`
+                  : <span className="vs-cv-skel vs-cv-sub-skel" />}
+              </p>
             </div>
-          );
-        })
-      )}
-
-      <style>{`
-        .job-card { border: 1px solid #e0e0e0; border-radius: 6px; padding: 14px 18px; margin-bottom: 10px; background: #fff; }
-        .job-card.job-error { background: #fff9e6; border-color: #f0d060; }
-        .job-card.job-active { background: #f0f7ff; border-color: #b0d0f0; }
-        .job-card.job-finished { background: #f0faf0; border-color: #b0e0b0; }
-        .job-card.job-aborted { background: #f5f5f5; border-color: #ccc; }
-        .job-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-        .job-title { font-weight: 600; font-size: 14px; }
-        .job-meta { font-size: 12px; color: #666; }
-        .job-status { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
-        .status-queued, .status-pending { background: #e0e0e0; color: #555; }
-        .status-leased, .status-processing { background: #d0e8ff; color: #2060a0; }
-        .status-completed { background: #d0f0d0; color: #208020; }
-        .status-error { background: #ffe0a0; color: #806000; }
-        .status-aborted { background: #e0e0e0; color: #888; }
-        .progress-bar-wrap { height: 6px; background: #e0e0e0; border-radius: 3px; margin-top: 8px; overflow: hidden; }
-        .progress-bar-fill { height: 100%; background: #4a90d9; border-radius: 3px; transition: width 0.3s ease; }
-        .job-error-msg { color: #a06000; font-size: 12px; margin-top: 6px; word-break: break-word; }
-      `}</style>
-    </div>
-
-    {mfaState && (
-      <MfaChallengeUI isModal={true}
-        challengeId={mfaState.challengeId} allowedMethods={mfaState.allowedMethods}
-        maskedEmail={mfaState.maskedEmail} apiBase="/api/mfa/challenge"
-        onSuccess={onMfaSuccess} onCancel={onMfaCancel} title="Verify to continue" />
-    )}
-    <MfaSetupRequiredModal mfaSetupState={mfaSetupState} onDismiss={dismissMfaSetup} />
-    </MfaPageGuard>
+            {hasFinished && <button className="vs-btn" onClick={() => guardAction(handleClearFinished)}>Clear finished</button>}
+          </div>
+          <div className="vs-tc-filters">
+            {FILTERS.map(f => (
+              <button key={f.k} type="button" className={'vs-tc-fbtn' + (filter === f.k ? ' on' : '')} onClick={() => setFilter(f.k)}>
+                {f.label} <span className="n">{jobs.filter(f.test).length}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="vs-tc-card">
+          {blocked ? (
+            <StepUpBlock onVerify={verify} />
+          ) : !loaded ? (
+            <div className="vs-tc-empty">Loading…</div>
+          ) : filtered.length === 0 ? (
+            <div className="vs-tc-empty">{jobs.length === 0 ? 'No transcoding jobs.' : 'No jobs in this view.'}</div>
+          ) : (
+            filtered.map(job => {
+              const st = jobState(job);
+              const Icon = ICONS[st.icon];
+              const active = isActiveStatus(job.status);
+              const worker = job.workerKeyId ? (job.workerLabel || job.workerKeyId.slice(-6)) : null;
+              return (
+                <div key={job.taskId || job.jobId} className="vs-tc-row">
+                  <div className={`vs-tc-ic vs-tc-${st.role}`}><Icon /></div>
+                  <div className="vs-tc-mn">
+                    <div className="vs-tc-toprow">
+                      <div className="vs-tc-title" title={job.videoTitle}>{job.videoTitle}</div>
+                      <span className={`vs-tc-pill vs-tc-${st.role}`}>{st.label}{active ? ` ${job.progress}%` : ''}</span>
+                    </div>
+                    <div className="vs-tc-meta">
+                      {job.courseName}
+                      {worker && <> · {worker}</>}
+                      {job.uploadTime && <> · uploaded <TimeAgo iso={job.uploadTime} /></>}
+                      {job.jobId && <> · <span className="vs-tc-jid">{job.jobId}</span></>}
+                    </div>
+                    {active && (
+                      <div className="vs-tc-pbar"><div className="vs-tc-pfill" style={{ width: `${job.progress || 0}%` }} /></div>
+                    )}
+                    {job.errorMessage && <div className="vs-tc-err">{job.errorMessage}</div>}
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
   );
 }

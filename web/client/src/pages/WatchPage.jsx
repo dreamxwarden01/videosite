@@ -5,6 +5,7 @@ import { useAuth } from '../context/AuthContext';
 import { useToast } from '../context/ToastContext';
 import { apiGet, apiPost, triggerAuthFailure, isSigningOut } from '../api';
 import LoadingSpinner from '../components/LoadingSpinner';
+import { moduleTerm } from '../utils/moduleLabel';
 
 // isAppleDevice returns true for clients whose video stack prefers HLS over
 // DASH: iOS/iPadOS Safari (all browsers on iOS share WebKit), macOS Safari,
@@ -57,6 +58,69 @@ function isManifestOrInitUrl(url) {
   if (!url) return false;
   const path = url.split('?')[0].toLowerCase();
   return path.endsWith('.m3u8') || path.endsWith('.mpd') || path.endsWith('.mp4');
+}
+
+// Duration formatter shared with the course view: h:mm:ss when there are
+// hours, otherwise m:ss.
+function formatDuration(s) {
+  if (!s) return '';
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+  const ss = String(sec).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
+}
+
+// --- Theater toggle, rendered inside Shaka's control bar --------------------
+// The theater button lives in Shaka's UI (created imperatively, outside the
+// React tree), so it communicates with the page purely through DOM events:
+// clicking dispatches `vs-theater-toggle` for WatchPage's React state to pick
+// up, and it re-reads the `body.theater-mode` class (signalled by the
+// `vs-theater-changed` event) to keep its icon in sync. React remains the
+// single source of truth for theater state — this is chrome only and touches
+// none of the playback / token / progress / media-session logic.
+//
+// Icon: a bordered rectangle enclosing a solid rectangle — a large inner rect
+// when inactive, a smaller one when active.
+const THEATER_ICON_INACTIVE =
+  '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">'
+  + '<rect x="3" y="5" width="18" height="14" rx="2" stroke="currentColor" stroke-width="1.6"/>'
+  + '<rect x="6" y="8.5" width="12" height="7" rx="1" fill="currentColor"/></svg>';
+const THEATER_ICON_ACTIVE =
+  '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">'
+  + '<rect x="3" y="5" width="18" height="14" rx="2" stroke="currentColor" stroke-width="1.6"/>'
+  + '<rect x="8" y="9.5" width="8" height="5" rx="1" fill="currentColor"/></svg>';
+
+// Registered once with Shaka's control factory (guarded so remounts / repeated
+// loads don't re-register). Each button auto-cleans its listeners when the UI
+// is destroyed because it uses this.eventManager.
+let theaterElementRegistered = false;
+function registerTheaterElement(shaka) {
+  if (theaterElementRegistered || !shaka?.ui?.Controls || !shaka?.ui?.Element) return;
+
+  class TheaterButton extends shaka.ui.Element {
+    constructor(parent, controls) {
+      super(parent, controls);
+      this.button_ = document.createElement('button');
+      // 'shaka-tooltip' opts the button into Shaka's own hover tooltip, which
+      // renders the aria-label on hover — same as the fullscreen / mute buttons.
+      this.button_.classList.add('shaka-theater-button', 'shaka-tooltip');
+      this.parent.appendChild(this.button_);
+      this.syncIcon_();
+      this.eventManager.listen(this.button_, 'click', () => {
+        window.dispatchEvent(new CustomEvent('vs-theater-toggle'));
+      });
+      this.eventManager.listen(window, 'vs-theater-changed', () => this.syncIcon_());
+    }
+    syncIcon_() {
+      const active = document.body.classList.contains('theater-mode');
+      this.button_.innerHTML = active ? THEATER_ICON_ACTIVE : THEATER_ICON_INACTIVE;
+      this.button_.setAttribute('aria-label', active ? 'Exit Theater Mode' : 'Theater Mode');
+    }
+  }
+  TheaterButton.Factory = class {
+    create(rootElement, controls) { return new TheaterButton(rootElement, controls); }
+  };
+  shaka.ui.Controls.registerElement('theater', new TheaterButton.Factory());
+  theaterElementRegistered = true;
 }
 
 export default function WatchPage() {
@@ -182,12 +246,30 @@ export default function WatchPage() {
       if (cancelled) return;
       ui = new shaka.ui.Overlay(player, containerRef.current, videoEl);
       const isTouchDevice = navigator.maxTouchPoints > 0;
+
+      // Add the theater toggle to the control bar. We take Shaka's own default
+      // control-panel layout (platform-filtered — cast/remote only where
+      // supported) and splice 'theater' in right before 'fullscreen' rather
+      // than hard-coding the set, so we never drift from it. The fallback
+      // mirrors Shaka 5.2.1's default and is only used if the read is empty.
+      registerTheaterElement(shaka);
+      let controlPanelElements = ui.getConfiguration().controlPanelElements;
+      controlPanelElements = Array.isArray(controlPanelElements) && controlPanelElements.length
+        ? controlPanelElements.slice()
+        : ['play_pause', 'skip_previous', 'skip_next', 'mute', 'volume', 'time_and_duration', 'spacer', 'overflow_menu', 'fullscreen'];
+      if (!controlPanelElements.includes('theater')) {
+        const fsIdx = controlPanelElements.indexOf('fullscreen');
+        controlPanelElements.splice(fsIdx === -1 ? controlPanelElements.length : fsIdx, 0, 'theater');
+      }
+
       ui.configure({
         playbackRates: [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5],
         enableKeyboardPlaybackControls: false,
         singleClickForPlayAndPause: !isTouchDevice,
         seekOnTaps: isTouchDevice,
         doubleClickForFullscreen: !isTouchDevice,
+        enableTooltips: true,
+        controlPanelElements,
       });
 
       // Adopt the loaded video's actual aspect ratio. The container starts at
@@ -560,11 +642,21 @@ export default function WatchPage() {
     };
   }, [data]);
 
-  // Theater mode body class
+  // Theater mode body class. Also broadcasts so the Shaka control-bar button
+  // (created imperatively, outside React) can re-sync its active/inactive icon.
   useEffect(() => {
     document.body.classList.toggle('theater-mode', theaterActive);
+    window.dispatchEvent(new CustomEvent('vs-theater-changed'));
     return () => document.body.classList.remove('theater-mode');
   }, [theaterActive]);
+
+  // The theater toggle also lives in the Shaka control bar; it lies outside
+  // React's tree, so it drives this state through a DOM event.
+  useEffect(() => {
+    const onToggle = () => setTheaterActive((v) => !v);
+    window.addEventListener('vs-theater-toggle', onToggle);
+    return () => window.removeEventListener('vs-theater-toggle', onToggle);
+  }, []);
 
   // Media Session metadata — drives iOS Control Center / Dynamic Island,
   // Android notification shade, and any connected Bluetooth display. Shaka
@@ -596,8 +688,8 @@ export default function WatchPage() {
     try {
       navigator.mediaSession.metadata = new window.MediaMetadata({
         title: video.title || '',
-        artist: video.course_name || '',
-        album: video.week ? `Week ${video.week}` : '',
+        artist: video.course_name || video.course_code || "",
+        album: video.module_number ? `${moduleTerm(video.module_label)} ${video.module_number}` : '',
         artwork,
       });
     } catch {
@@ -733,33 +825,19 @@ export default function WatchPage() {
   const backUrl = `/course/${video.course_id}`;
 
   return (
-    <div className="player-container">
-      <div className="player-nav-bar">
-        <Link
-          to={backUrl}
-          className="player-back-link"
-          onClick={() => { flushWatchRef.current?.(); }}
-        >
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-            <path d="M10 12L6 8l4-4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
-          </svg>
-          {video.course_name}
-        </Link>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 }}>
-          <span className="player-nav-title">{video.title}</span>
-          <button
-            className="theater-toggle-btn"
-            title={theaterActive ? 'Exit theater mode (t)' : 'Theater mode (t)'}
-            onClick={() => setTheaterActive(v => !v)}
-          >
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-              <rect x="1" y="3" width="14" height="10" rx="1.5" stroke="currentColor" strokeWidth="1.4" fill="none"/>
-              <rect x="3" y="5" width="10" height="6" rx="0.5" stroke="currentColor" strokeWidth="1" fill="none" strokeDasharray="2 1"/>
-            </svg>
-          </button>
-        </div>
-      </div>
-      <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+    <div className="vs-wp">
+      <Link
+        to={backUrl}
+        className="vs-wp-back"
+        onClick={() => { flushWatchRef.current?.(); }}
+      >
+        <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <path d="M10 12L6 8l4-4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+        </svg>
+        {video.course_name || video.course_code}
+      </Link>
+
+      <div className="vs-wp-stage">
         <div className="video-player" ref={containerRef} data-shaka-player-container>
           {/* `playsInline` is the iOS Safari kill switch for background
               audio: without it, locking the screen or app-switching
@@ -771,22 +849,16 @@ export default function WatchPage() {
           <video ref={videoRef} id="video-element" autoPlay playsInline />
         </div>
       </div>
-      <div className="player-scroll">
-        <div className="card mt-2">
-          <h2>{video.title}</h2>
-          <p className="text-muted text-sm mt-1">
-            {video.week && <>Week {video.week} &middot; </>}
-            {video.lecture_date && <>{video.lecture_date.slice(0, 10)} &middot; </>}
-            {video.duration_seconds > 0 && (
-              <>{Math.floor(video.duration_seconds / 3600)}h {Math.floor((video.duration_seconds % 3600) / 60)}m</>
-            )}
-          </p>
-          {video.description && (
-            <p className="mt-2" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
-              {video.description}
-            </p>
-          )}
-        </div>
+
+      <div className="vs-wp-info">
+        <h2 className="vs-wp-title">{video.title}</h2>
+        <p className="vs-wp-meta">
+          {video.module_number != null && <span className="vs-wk">{moduleTerm(video.module_label)} {video.module_number}</span>}
+          {video.lecture_date && <span>{video.lecture_date.slice(0, 10)}</span>}
+          {video.lecture_date && video.duration_seconds > 0 && <span className="vs-cv-dot">·</span>}
+          {video.duration_seconds > 0 && <span>{formatDuration(video.duration_seconds)}</span>}
+        </p>
+        {video.description && <p className="vs-wp-desc">{video.description}</p>}
       </div>
     </div>
   );

@@ -1,11 +1,11 @@
-const { getPool } = require('../config/database');
+const { getPool, idBuf } = require('../config/database');
 
 // Check if user has one or more permissions
 function checkPermission(...requiredPermissions) {
     return (req, res, next) => {
         const user = res.locals.user;
         if (!user) {
-            if (req.path.startsWith('/api/') || req.xhr) {
+            if (req.originalUrl.startsWith('/api/') || req.xhr) {
                 return res.status(401).json({ error: 'Authentication required' });
             }
             return res.redirect('/login?returnTo=' + encodeURIComponent(req.originalUrl));
@@ -13,8 +13,8 @@ function checkPermission(...requiredPermissions) {
 
         for (const perm of requiredPermissions) {
             if (!user.permissions[perm]) {
-                if (req.path.startsWith('/api/') || req.xhr) {
-                    return res.status(403).json({ error: 'Permission denied' });
+                if (req.originalUrl.startsWith('/api/') || req.xhr) {
+                    return res.status(403).json({ error: 'Permission denied', code: 'PERMISSION_DENIED' });
                 }
                 return res.status(403).render('error', {
                     title: 'Access Denied',
@@ -29,7 +29,7 @@ function checkPermission(...requiredPermissions) {
 // Check that the acting user has a lower permission_level than the target user
 // The target user ID comes from req.params.id
 function checkPermissionLevel(req, res, next) {
-    const targetUserId = parseInt(req.params.id);
+    const targetUserId = req.params.id;   // UUID hex now, not INT
     const actingUser = res.locals.user;
 
     if (!actingUser) {
@@ -42,13 +42,13 @@ function checkPermissionLevel(req, res, next) {
     }
 
     const pool = getPool();
-    const isApi = req.path.startsWith('/api/') || req.xhr;
+    const isApi = req.originalUrl.startsWith('/api/') || req.xhr;
 
     pool.execute(
         `SELECT u.role_id, r.permission_level
          FROM users u JOIN roles r ON u.role_id = r.role_id
          WHERE u.user_id = ?`,
-        [targetUserId]
+        [idBuf(targetUserId)]
     ).then(([rows]) => {
         if (rows.length === 0) {
             if (isApi) {
@@ -92,15 +92,15 @@ function checkAnyPermission(...permissions) {
     return (req, res, next) => {
         const user = res.locals.user;
         if (!user) {
-            if (req.path.startsWith('/api/') || req.xhr) {
+            if (req.originalUrl.startsWith('/api/') || req.xhr) {
                 return res.status(401).json({ error: 'Authentication required' });
             }
             return res.redirect('/login?returnTo=' + encodeURIComponent(req.originalUrl));
         }
 
         if (!permissions.some(p => user.permissions[p])) {
-            if (req.path.startsWith('/api/') || req.xhr) {
-                return res.status(403).json({ error: 'Permission denied' });
+            if (req.originalUrl.startsWith('/api/') || req.xhr) {
+                return res.status(403).json({ error: 'Permission denied', code: 'PERMISSION_DENIED' });
             }
             return res.status(403).render('error', {
                 title: 'Access Denied',

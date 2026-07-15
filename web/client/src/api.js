@@ -11,6 +11,12 @@ let onAuthFailure = null;
 export function setAuthFailureHandler(fn) { onAuthFailure = fn; }
 export function triggerAuthFailure() { if (onAuthFailure) onAuthFailure(); }
 
+// Module-level step-up callback — registered by StepUpProvider. Any 403 whose body
+// carries code:'step_up_required' opens the challenge modal (the redirect ceremony).
+// Mirrors the 401 hook above; the modal takes over from there.
+let onStepUp = null;
+export function setStepUpHandler(fn) { onStepUp = fn; }
+
 // Module-level sign-out latch. Set right before AuthContext.logout flips
 // window.location, read by WatchPage's pagehide flush so a logged-out user's
 // final beacon doesn't fire (cookie's already gone, server would 401 anyway).
@@ -46,6 +52,12 @@ export async function apiFetch(url, options = {}) {
   // Signal session expired — ProtectedRoute handles the redirect
   if (resp.status === 401 && onAuthFailure) {
     onAuthFailure();
+  }
+
+  // Signal step-up required — StepUpProvider opens the challenge modal. The caller
+  // still receives the 403 normally (it just shouldn't act on it — the modal owns it).
+  if (resp.status === 403 && data && data.code === 'step_up_required' && onStepUp) {
+    onStepUp(data);
   }
 
   return { data, status: resp.status, ok: resp.ok };

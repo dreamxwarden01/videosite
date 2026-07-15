@@ -2,7 +2,8 @@ const crypto = require('crypto');
 const { PutObjectCommand, GetObjectCommand, CopyObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { getR2Client, getR2BucketName } = require('../config/r2');
-const { getPool } = require('../config/database');
+const { getPool, idBuf } = require('../config/database');
+const courseListCache = require('./cache/courseListCache');
 
 // --- Base62 ID generation (same pattern as uploadSessionService.js) ---
 const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
@@ -74,22 +75,24 @@ async function applyHeaders(objectKey, contentType) {
  * Insert a row for a confirmed attachment. Called from the /complete
  * handler after the PUT has landed and headers have been re-stamped.
  */
-async function createMaterialRecord(courseId, objectKey, filename, fileSize, contentType, week, uploadedBy) {
+async function createMaterialRecord(courseId, objectKey, filename, fileSize, contentType, module_number, uploadedBy) {
     const pool = getPool();
     const [result] = await pool.execute(
-        `INSERT INTO course_materials (course_id, object_key, filename, file_size, content_type, week, uploaded_by)
+        `INSERT INTO course_materials (course_id, object_key, filename, file_size, content_type, module_number, uploaded_by)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [courseId, objectKey, filename, fileSize, contentType || 'application/octet-stream', week || null, uploadedBy]
+        [courseId, objectKey, filename, fileSize, contentType || 'application/octet-stream', module_number || null, idBuf(uploadedBy)]
     );
+    // Course list base caches material_count / last_material_at per course.
+    await courseListCache.invalidate();
     return result.insertId;
 }
 
 async function getMaterialsByCourse(courseId) {
     const pool = getPool();
     const [rows] = await pool.execute(
-        `SELECT material_id, course_id, filename, file_size, content_type, week, uploaded_by, created_at, updated_at
+        `SELECT material_id, course_id, filename, file_size, content_type, module_number, uploaded_by, created_at, updated_at
          FROM course_materials WHERE course_id = ?
-         ORDER BY CAST(week AS UNSIGNED) DESC, created_at DESC, filename ASC`,
+         ORDER BY CAST(module_number AS UNSIGNED) DESC, created_at DESC, filename ASC`,
         [courseId]
     );
     return rows;
@@ -104,13 +107,13 @@ async function getMaterialById(materialId) {
     return rows[0] || null;
 }
 
-async function updateMaterial(materialId, { filename, week }) {
+async function updateMaterial(materialId, { filename, module_number }) {
     const pool = getPool();
     const fields = [];
     const values = [];
 
     if (filename !== undefined) { fields.push('filename = ?'); values.push(filename); }
-    if (week !== undefined) { fields.push('week = ?'); values.push(week || null); }
+    if (module_number !== undefined) { fields.push('module_number = ?'); values.push(module_number || null); }
 
     if (fields.length === 0) return;
     values.push(materialId);
@@ -131,6 +134,7 @@ async function deleteMaterial(materialId) {
     if (rows.length === 0) return null;
 
     await pool.execute('DELETE FROM course_materials WHERE material_id = ?', [materialId]);
+    await courseListCache.invalidate();
     return rows[0].object_key;
 }
 
@@ -139,24 +143,24 @@ async function getCoursesWithMaterialCount(userId, hasAllCourseAccess) {
 
     if (hasAllCourseAccess) {
         const [rows] = await pool.execute(
-            `SELECT c.course_id, c.course_name,
+            `SELECT c.course_id, c.course_code, c.course_name,
                 (SELECT COUNT(*) FROM course_materials m WHERE m.course_id = c.course_id) as material_count,
                 (SELECT MAX(m.created_at) FROM course_materials m WHERE m.course_id = c.course_id) as last_material_at
              FROM courses c WHERE c.is_active = 1
-             ORDER BY c.course_name ASC`
+             ORDER BY c.course_code ASC`
         );
         return rows;
     }
 
     const [rows] = await pool.execute(
-        `SELECT c.course_id, c.course_name,
+        `SELECT c.course_id, c.course_code, c.course_name,
             (SELECT COUNT(*) FROM course_materials m WHERE m.course_id = c.course_id) as material_count,
             (SELECT MAX(m.created_at) FROM course_materials m WHERE m.course_id = c.course_id) as last_material_at
          FROM courses c
          JOIN enrollments e ON c.course_id = e.course_id
          WHERE e.user_id = ? AND c.is_active = 1
-         ORDER BY c.course_name ASC`,
-        [userId]
+         ORDER BY c.course_code ASC`,
+        [idBuf(userId)]
     );
     return rows;
 }

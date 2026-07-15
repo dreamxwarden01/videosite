@@ -25,6 +25,17 @@ app.use(cookieParser());
 app.use('/assets', express.static(path.join(__dirname, 'client', 'dist', 'assets')));
 app.use('/favicon.ico', express.static(path.join(__dirname, 'client', 'dist', 'favicon.ico')));
 
+// Client public keys for the SSO (private_key_jwt) — before the install gate:
+// the install flow registers this URL at the SSO while the app is live.
+app.get('/.well-known/jwks.json', (req, res) => {
+  try {
+    res.set('Cache-Control', 'public, max-age=300');
+    res.json(require('./lib/oidc').publicJwks());
+  } catch (e) {
+    res.status(500).json({ error: 'keys_unavailable' });
+  }
+});
+
 // Installation check middleware
 const { checkInstalled } = require('./middleware/installer');
 app.use(checkInstalled);
@@ -38,20 +49,19 @@ app.use(loadUser);
 
 // Routes
 const installRoutes = require('./routes/install');
-const authRoutes = require('./routes/auth');
-const registerRoutes = require('./routes/register');
+const authRoutes = require('./routes/auth'); // now the OIDC RP flow (login/callback/error/logout)
+const backchannelRoutes = require('./routes/backchannel'); // SSO event receiver (logout, role-sync requests, ...)
 const apiAppRoutes = require('./routes/api/app');
 const apiPagesRoutes = require('./routes/api/pages');
 const apiAdminRoutes = require('./routes/api/admin');
 const apiUploadRoutes = require('./routes/api/upload');
 const apiVideoRoutes = require('./routes/api/videos');
 const apiWorkerRoutes = require('./routes/api/worker');
-const mfaAuthRoutes = require('./routes/mfa-auth');
-const passkeyLoginRoutes = require('./routes/passkey-login');
-const apiMfaAdminRoutes = require('./routes/api/mfa-admin');
-const apiMfaRoutes = require('./routes/api/mfa');
-const passwordResetRoutes = require('./routes/password-reset');
+const apiMfaAdminRoutes = require('./routes/api/mfa-admin'); // site MFA POLICY admin (kept)
 const apiMaterialRoutes = require('./routes/api/materials');
+const apiSsoRoutes = require('./routes/api/sso'); // DreamSSO connection + mTLS admin
+// Identity (registration, password reset, login MFA, self-service password/
+// email) lives at the SSO now — the local flows were removed outright.
 
 // Belt-and-suspenders: disabling app-level etag stops 304s, but a browser
 // that previously cached an /api response (e.g. with a stale Cache-Control
@@ -62,9 +72,7 @@ const apiMaterialRoutes = require('./routes/api/materials');
 // runs in declaration order, and the routers below register their own
 // /api/* paths (some via app.use(routes) without a prefix, some via
 // app.use('/api', routes)). Originally this lived between the two groups,
-// which meant /api/login, /api/auth/logout, /api/register/*, /api/mfa/*,
-// /api/auth/passkey/*, /api/password-reset/*, and /api/install all
-// bypassed it. Moving it up plugs that hole.
+// which let some of those paths bypass it. Moving it up plugs that hole.
 app.use('/api', (req, res, next) => {
     res.set('Cache-Control', 'no-store');
     next();
@@ -72,11 +80,8 @@ app.use('/api', (req, res, next) => {
 
 app.use(installRoutes);
 app.use(authRoutes);
-app.use(mfaAuthRoutes);
-app.use(passkeyLoginRoutes);
-app.use(registerRoutes);
-app.use(passwordResetRoutes);
 
+app.use(backchannelRoutes); // /backchannel/events (envelope-authed, no session; unified path)
 app.use('/api', apiAppRoutes);
 app.use('/api', apiPagesRoutes);
 app.use('/api', apiAdminRoutes);
@@ -84,8 +89,8 @@ app.use('/api', apiUploadRoutes);
 app.use('/api', apiVideoRoutes);
 app.use('/api', apiWorkerRoutes);
 app.use('/api', apiMfaAdminRoutes);
-app.use('/api', apiMfaRoutes);
 app.use('/api', apiMaterialRoutes);
+app.use('/api', apiSsoRoutes);
 
 // SPA route allowlist — every client path that should serve index.html must
 // appear here. Anything not in the list (and not handled by an earlier
@@ -100,36 +105,27 @@ app.use('/api', apiMaterialRoutes);
 // by express.static earlier in the middleware chain, so they don't need
 // listing here. The /install client path is owned by routes/install.js.
 const spaPaths = [
-    // Public — no shell
+    // '/' stays so an authenticated landing renders; login itself is the
+    // backend /auth/* routes (not SPA paths), and unauth users get
+    // full-page-redirected there by ProtectedRoute.
     '/',
-    '/login',
-    '/register',
-    '/register/continue',
-    '/reset-password',
-    '/reset-password/confirm',
 
     // Authenticated user pages
-    '/profile',
-    '/profile/security/mfa',  // legacy redirect target
     '/course/:courseId',
+    '/course/:courseId/materials',  // materials tab of the course view
     '/watch/:videoId',
-    '/materials',             // course materials — gated by accessAttachments, not admin-only
-    '/materials/:courseId',
 
     // Admin
     '/admin/courses',
-    '/admin/courses/:courseId/edit',
-    '/admin/videos',
-    '/admin/videos/:courseId',
+    '/admin/courses/:courseId',
     '/admin/users',
     '/admin/users/:id/edit',
     '/admin/enrollment',
     '/admin/roles',
-    '/admin/invitations',
-    '/admin/settings',
+    '/admin/settings',          // redirects (client-side) to /admin/settings/general
+    '/admin/settings/:pane',    // per-pane deep links + the step-up returnTo target
     '/admin/transcoding',
-    '/admin/playback-stats',
-    '/admin/mfa-settings',
+    '/admin/mfa-settings',      // legacy → redirects (client-side) to /admin/settings/mfa
 ];
 
 const spaIndexPath = path.join(__dirname, 'client', 'dist', 'index.html');
@@ -196,6 +192,23 @@ const PORT = parseInt(process.env.PORT || '3000');
 const server = app.listen(PORT, async () => {
     console.log(`VideoSite running on http://localhost:${PORT}`);
 
+    // Resolve the install latch ONCE, here — every later request reads it from
+    // RAM. Not installed => the gate answers everything with a neutral 503 and
+    // only the token-locked installer responds.
+    const { resolveInstallState } = require('./middleware/installer');
+    const { ensureInstallToken, clearInstallToken, TOKEN_FILE } = require('./lib/installToken');
+    const alreadyInstalled = await resolveInstallState();
+    if (!alreadyInstalled) {
+        const token = ensureInstallToken();
+        console.log('VideoSite — FIRST-RUN INSTALL');
+        console.log(`  open:  /install?token=${token}`);
+        console.log(`  token: ${TOKEN_FILE}`);
+        return; // no migrations, no Redis, no pumps — there's nothing configured yet
+    }
+    // Installed: no installer, so no lock. Drops a token left behind by a run
+    // that was interrupted before finish.
+    clearInstallToken();
+
     // Run database migrations if the app is installed
     if (process.env.DB_HOST && process.env.DB_NAME) {
         try {
@@ -235,11 +248,23 @@ const server = app.listen(PORT, async () => {
                 console.error('Settings cache flush failed:', err.message);
             }
 
+            // Overlay the SSO connection config from site_settings (env fallback),
+            // so admin edits in the SSO card take effect for the live OIDC flow.
+            try {
+                await require('./lib/oidc').loadConfig();
+            } catch (err) {
+                console.error('SSO config load failed:', err.message);
+            }
+
             // Start the periodic write-coalescing flusher (drains dirty:session:user
             // every 15 min into DB). Phase 5 will plug watch + transcode into the
             // same module.
             const flusher = require('./services/flusher');
             flusher.start();
+
+            // SSO event pump: boot-time full role report (self-healing) +
+            // the 60s retry sweep for the outbound event queue.
+            require('./services/ssoEvents').start();
         } catch (err) {
             console.error(`Redis is required and unreachable at ${process.env.REDIS_HOST}:${process.env.REDIS_PORT || 6379}: ${err.message}`);
             process.exit(1);
@@ -249,24 +274,14 @@ const server = app.listen(PORT, async () => {
     // Clean expired sessions every hour
     setInterval(cleanExpiredSessions, 60 * 60 * 1000);
 
-    // Clean expired registrations, invitation codes, and rate limit records every hour
-    const { cleanupExpiredRegistrations } = require('./services/registrationService');
-    setInterval(cleanupExpiredRegistrations, 60 * 60 * 1000);
-
-    // Clean expired MFA challenges, bmfa tokens, and OTP rate limits every hour
-    const { cleanupExpiredChallenges, cleanupExpiredOtpRateLimits, cleanupExpiredBmfa, cleanupExpiredTotpRateLimits } = require('./services/mfaService');
+    // Clean expired MFA challenges, bmfa tokens, and TOTP rate limits every hour
+    // (registration/password-reset/email-OTP cleanups left with their features —
+    // identity lives at the SSO now)
+    const { cleanupExpiredChallenges, cleanupExpiredBmfa, cleanupExpiredTotpRateLimits } = require('./services/mfaService');
     setInterval(() => {
         cleanupExpiredChallenges();
-        cleanupExpiredOtpRateLimits();
         cleanupExpiredBmfa();
         cleanupExpiredTotpRateLimits();
-    }, 60 * 60 * 1000);
-
-    // Clean expired password reset tokens and rate limits every hour
-    const { cleanupExpiredResetTokens, cleanupExpiredResetRateLimits } = require('./services/passwordResetService');
-    setInterval(() => {
-        cleanupExpiredResetTokens();
-        cleanupExpiredResetRateLimits();
     }, 60 * 60 * 1000);
 
     // Periodic R2 deletion reaper. Drains pending_deletes rows whose

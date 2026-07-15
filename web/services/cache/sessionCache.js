@@ -33,17 +33,20 @@ function toEpochMs(value) {
 function parseHash(hash) {
     if (!hash || Object.keys(hash).length === 0) return null;
     return {
-        user_id: hash.user_id ? parseInt(hash.user_id, 10) : null,
+        user_id: hash.user_id || null,   // UUID hex string post-rewrite (was INT)
         last_sign_in: hash.last_sign_in ? parseInt(hash.last_sign_in, 10) : null,
         last_seen: hash.last_seen ? parseInt(hash.last_seen, 10) : null,
         ip_address: hash.ip_address || null,
         user_agent: hash.user_agent || null,
+        sso_expires_at: hash.sso_expires_at ? parseInt(hash.sso_expires_at, 10) : null,
     };
 }
 
 // Create a Redis-side session record. Caller is responsible for the DB INSERT
 // (which already happens in createSession). ttlSeconds = idle timeout.
-async function createSession(sid, { userId, lastSignIn, lastSeen, ipAddress, userAgent }, ttlSeconds) {
+// ssoExpiresAt = the SSO session's absolute expiry (the app session must never
+// outlive it — checked in isSessionValid).
+async function createSession(sid, { userId, lastSignIn, lastSeen, ipAddress, userAgent, ssoExpiresAt }, ttlSeconds) {
     const redis = getClient();
     const fields = {
         user_id: String(userId),
@@ -51,6 +54,7 @@ async function createSession(sid, { userId, lastSignIn, lastSeen, ipAddress, use
         last_seen: toEpochMs(lastSeen),
         ip_address: ipAddress || '',
         user_agent: userAgent || '',
+        sso_expires_at: toEpochMs(ssoExpiresAt),
     };
     await redis.multi()
         .hset(sessionKey(sid), fields)

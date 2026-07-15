@@ -1,17 +1,20 @@
-const { getPool } = require('../config/database');
+const { getPool, idBuf } = require('../config/database');
 const videoCache = require('./cache/videoCache');
 const courseCache = require('./cache/courseCache');
+const courseListCache = require('./cache/courseListCache');
 
-async function createCourse(courseName, description, createdBy) {
+async function createCourse(courseCode, courseName, moduleLabel, createdBy) {
     const pool = getPool();
 
     // use_enhanced_profiles defaults to 0 (default-quality global set). New
-    // courses opt into enhanced via the toggle on the edit page.
+    // courses opt into enhanced via the toggle on the edit page. module_label
+    // is the term ('week'/'chapter'/…) shown next to each item's number.
     const [result] = await pool.execute(
-        `INSERT INTO courses (course_name, description, created_by) VALUES (?, ?, ?)`,
-        [courseName, description || null, createdBy]
+        `INSERT INTO courses (course_code, course_name, module_label, created_by) VALUES (?, ?, ?, ?)`,
+        [courseCode, courseName || null, moduleLabel || null, idBuf(createdBy)]
     );
 
+    await courseListCache.invalidate();
     return { courseId: result.insertId };
 }
 
@@ -29,8 +32,9 @@ async function updateCourse(courseId, updates) {
     const fields = [];
     const values = [];
 
+    if (updates.course_code !== undefined) { fields.push('course_code = ?'); values.push(updates.course_code); }
     if (updates.course_name !== undefined) { fields.push('course_name = ?'); values.push(updates.course_name); }
-    if (updates.description !== undefined) { fields.push('description = ?'); values.push(updates.description); }
+    if (updates.module_label !== undefined) { fields.push('module_label = ?'); values.push(updates.module_label); }
     if (updates.is_active !== undefined) { fields.push('is_active = ?'); values.push(updates.is_active); }
     if (updates.use_custom_profiles !== undefined) { fields.push('use_custom_profiles = ?'); values.push(updates.use_custom_profiles); }
     if (updates.use_enhanced_profiles !== undefined) { fields.push('use_enhanced_profiles = ?'); values.push(updates.use_enhanced_profiles); }
@@ -45,6 +49,7 @@ async function updateCourse(courseId, updates) {
     );
 
     await courseCache.invalidate(courseId);
+    await courseListCache.invalidate();
 }
 
 /**
@@ -133,6 +138,7 @@ async function deleteCourse(courseId) {
     const videoIds = videos.map(v => v.video_id);
     await videoCache.invalidateMany(videoIds);
     await courseCache.invalidate(courseId);
+    await courseListCache.invalidate();
     await require('./cache/watchProgressCache').clearForVideos(videoIds);
 
     // 6. Enqueue R2 cleanup. All durable — reaper retries on transient
@@ -190,6 +196,41 @@ async function listCourses(page = 1, limit = 10) {
     };
 }
 
+// Admin course list — every course the caller may administer, in one array
+// (the admin CoursesPage fit-height-paginates client-side, so no LIMIT/OFFSET).
+// Enrollment-scoped EXACTLY like GET /api/courses (routes/api/pages.js): with
+// allCourseAccess → all courses; otherwise JOIN enrollments on the caller's
+// user_id (same binary-UUID binding). Unlike the student surface there is NO
+// is_active filter — an admin must still see (and reopen) courses they've
+// flipped Inactive. Video + material counts ride along as correlated
+// subqueries. Ordered by course code then course_id for a stable list.
+async function listCoursesForAdmin(userId, hasAllCourseAccess) {
+    const pool = getPool();
+
+    if (hasAllCourseAccess) {
+        const [rows] = await pool.execute(
+            `SELECT c.*,
+                (SELECT COUNT(*) FROM videos v WHERE v.course_id = c.course_id) AS video_count,
+                (SELECT COUNT(*) FROM course_materials m WHERE m.course_id = c.course_id) AS material_count
+             FROM courses c
+             ORDER BY c.course_code ASC, c.course_id ASC`
+        );
+        return rows;
+    }
+
+    const [rows] = await pool.execute(
+        `SELECT c.*,
+            (SELECT COUNT(*) FROM videos v WHERE v.course_id = c.course_id) AS video_count,
+            (SELECT COUNT(*) FROM course_materials m WHERE m.course_id = c.course_id) AS material_count
+         FROM courses c
+         JOIN enrollments e ON c.course_id = e.course_id
+         WHERE e.user_id = ?
+         ORDER BY c.course_code ASC, c.course_id ASC`,
+        [idBuf(userId)]
+    );
+    return rows;
+}
+
 // List courses the user has access to (for admin views that require course enrollment)
 async function listUserCourses(userId, hasAllCourseAccess) {
     const pool = getPool();
@@ -205,7 +246,7 @@ async function listUserCourses(userId, hasAllCourseAccess) {
          JOIN enrollments e ON c.course_id = e.course_id
          WHERE e.user_id = ?
          ORDER BY c.created_at DESC`,
-        [userId]
+        [idBuf(userId)]
     );
     return rows;
 }
@@ -216,5 +257,6 @@ module.exports = {
     updateCourse,
     deleteCourse,
     listCourses,
+    listCoursesForAdmin,
     listUserCourses
 };

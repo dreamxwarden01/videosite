@@ -25,6 +25,8 @@ async function createRole(roleId, roleName, permissionLevel, description = null)
          VALUES (?, ?, ?, ?)`,
         [roleId, roleName, permissionLevel, description]
     );
+    // Catalog changed -> queue a full-state roles.sync to the SSO (coalesced).
+    require('./ssoEvents').reportRoles().catch(() => {});
 }
 
 async function updateRole(roleId, updates) {
@@ -111,6 +113,8 @@ async function updateRole(roleId, updates) {
         const userCache = require('./cache/userCache');
         for (const uid of affectedUserIds) await userCache.invalidate(uid);
     }
+    // Catalog changed -> queue a full-state roles.sync to the SSO (coalesced).
+    require('./ssoEvents').reportRoles().catch(() => {});
 }
 
 async function deleteRole(roleId) {
@@ -130,8 +134,29 @@ async function deleteRole(roleId) {
     );
     const affectedUserIds = affectedRows.map(r => r.user_id);
 
-    // Reassign any users with this role to the default "user" role (id=2)
-    await pool.execute('UPDATE users SET role_id = 2 WHERE role_id = ?', [roleId]);
+    // Local reassignment is a transitional placeholder to satisfy the role_id
+    // FK: the current default role when it's a real (other) role, else the
+    // least-privileged remaining role. The SSO's removed-role reconciliation
+    // is authoritative — it pushes account.roles_change per affected user
+    // right after our roles.sync lands (moving them to the new default, or to
+    // No access, which kills their sessions).
+    const { getSetting } = require('./cache/settingsCache');
+    const def = parseInt(await getSetting('registration_default_role', ''), 10);
+    let target;
+    if (Number.isInteger(def) && def !== roleId) {
+        const [defRows] = await pool.execute('SELECT role_id FROM roles WHERE role_id = ?', [def]);
+        target = defRows[0]?.role_id;
+    }
+    if (target === undefined) {
+        const [lowRows] = await pool.execute(
+            'SELECT role_id FROM roles WHERE role_id <> ? ORDER BY permission_level DESC LIMIT 1',
+            [roleId]
+        );
+        target = lowRows[0]?.role_id;
+    }
+    if (target !== undefined) {
+        await pool.execute('UPDATE users SET role_id = ? WHERE role_id = ?', [target, roleId]);
+    }
 
     await pool.execute('DELETE FROM roles WHERE role_id = ?', [roleId]);
 
@@ -139,6 +164,16 @@ async function deleteRole(roleId) {
     // perm cache (their cached role_id is now stale).
     await permCache.invalidateRole(roleId);
     await permCache.invalidateUsers(affectedUserIds);
+    // Catalog changed -> queue a full-state roles.sync to the SSO (coalesced).
+    require('./ssoEvents').reportRoles().catch(() => {});
+}
+
+// Next free numeric role_id (the PK has no AUTO_INCREMENT — roles were
+// historically user-numbered; creation now assigns the id server-side).
+async function getNextRoleId() {
+    const pool = getPool();
+    const [rows] = await pool.execute('SELECT COALESCE(MAX(role_id), -1) + 1 AS nextId FROM roles');
+    return rows[0].nextId;
 }
 
 async function roleIdExists(roleId) {
@@ -198,6 +233,7 @@ module.exports = {
     createRole,
     updateRole,
     deleteRole,
+    getNextRoleId,
     roleIdExists,
     roleNameExists,
     permissionLevelExists,

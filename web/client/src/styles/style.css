@@ -78,11 +78,23 @@ a:hover {
     text-decoration: none;
 }
 
-/* === Header Buttons (mobile only) === */
+/* === Header Buttons (right side: profile link + dropdown, hamburger on mobile) === */
 .header-buttons {
-    display: none;
+    display: flex;
     align-items: center;
     gap: 6px;
+}
+.vs-header-link {
+    color: rgba(255,255,255,0.9);
+    font-size: 14px;
+    text-decoration: none;
+    padding: 4px 10px;
+    border-radius: 6px;
+}
+.vs-header-link:hover {
+    background: rgba(255,255,255,0.15);
+    color: #fff;
+    text-decoration: none;
 }
 .header-icon-btn {
     display: flex;
@@ -100,7 +112,31 @@ a:hover {
     background: rgba(255,255,255,0.15);
     color: #fff;
 }
-/* Sidebar hamburger — hidden by default, shown via JS when sidebar exists */
+/* === Profile dropdown (header right) — white panel on the blue header === */
+.vs-pmenu { position: relative; }
+.vs-pmenu-trigger { display: flex; align-items: center; gap: 8px; background: none; border: none; cursor: pointer; padding: 4px 6px; border-radius: 8px; color: #1f2937; font-family: inherit; }
+.vs-pmenu-trigger:hover { background: #f1f3f4; }
+.vs-pmenu-uname { font-size: 13px; color: #5f6368; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vs-pmenu-av-sm { width: 28px; height: 28px; border-radius: 50%; background: #e8f0fe; color: #1a73e8; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; flex-shrink: 0; }
+img.vs-pmenu-av-sm { object-fit: cover; display: block; }
+.vs-pmenu-panel { position: absolute; top: calc(100% + 10px); right: 0; width: 320px; background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18); z-index: 300; overflow: hidden; color: #1f2937; }
+.vs-pmenu-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 16px; border-bottom: 1px solid #e5e7eb; }
+.vs-pmenu-org { font-size: 13px; font-weight: 600; color: #374151; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vs-pmenu-signout { border: none; background: none; color: #6b7280; font-size: 13px; cursor: pointer; padding: 4px 6px; border-radius: 6px; flex-shrink: 0; font-family: inherit; }
+.vs-pmenu-signout:hover { background: #f1f3f4; color: #1f2937; }
+.vs-pmenu-body { display: flex; gap: 14px; padding: 16px; align-items: flex-start; }
+.vs-pmenu-av { width: 72px; height: 72px; border-radius: 50%; background: #e8f0fe; color: #1a73e8; display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: 600; flex-shrink: 0; }
+img.vs-pmenu-av { object-fit: cover; display: block; }
+.vs-pmenu-info { min-width: 0; }
+.vs-pmenu-name { margin: 2px 0 2px; font-size: 16px; font-weight: 600; color: #1f2937; overflow-wrap: anywhere; }
+.vs-pmenu-email { margin: 0 0 6px; font-size: 13px; color: #6b7280; overflow-wrap: anywhere; }
+.vs-pmenu-link { display: inline-block; font-size: 13px; font-weight: 600; color: #1a73e8; text-decoration: none; }
+.vs-pmenu-link:hover { text-decoration: underline; }
+@media (max-width: 480px) {
+  .vs-pmenu-panel { width: min(320px, calc(100vw - 24px)); }
+}
+
+/* Sidebar hamburger — mobile only (desktop shows the sidebar itself) */
 .sidebar-hamburger {
     display: none;
     flex-direction: column;
@@ -116,7 +152,8 @@ a:hover {
 }
 
 @media (max-width: 768px) {
-    .header-buttons { display: flex; }
+    .sidebar-hamburger { display: flex; }
+    .vs-pmenu-uname { display: none; } /* mobile keeps the avatar only */
     .header-nav {
         display: none;
         position: absolute;
@@ -361,15 +398,6 @@ tbody tr:hover {
     height: 18px;
     flex-shrink: 0;
 }
-/* Small grey label above the Turnstile widget — same color/size as the
-   "Forgot password?" link. Rendered alongside the widget itself so it
-   only appears when Turnstile is configured. */
-.turnstile-label {
-    font-size: 13px;
-    color: #6b7280;
-    margin-bottom: 6px;
-}
-
 /* "or" separator between password sign-in and passkey sign-in. Two
    horizontal rules with the word centered between them. */
 .login-or-divider {
@@ -391,6 +419,12 @@ tbody tr:hover {
 /* === Forms === */
 .form-group {
     margin-bottom: 16px;
+}
+.form-hint {
+    display: block;
+    font-size: 12px;
+    color: #6b7280;
+    margin-top: 4px;
 }
 .form-group label {
     display: block;
@@ -477,8 +511,9 @@ textarea.form-control {
    admin content area (top: 56px, left: 240px, right: 0, bottom: 43px) so
    the sidebar / header / footer stayed visible behind the dim; switched to
    inset: 0 so admin-page modals (worker key, HMAC, email service, etc.)
-   center against the whole browser window — same shape the confirm-overlay
-   uses. z-index 900 still keeps it below confirm/MFA challenges (1100). */
+   center against the whole browser window — same shape the .vs-scrim modals
+   use. z-index 900 still keeps it below the confirm dialog (1400) and the MFA
+   challenge overlay (1500). */
 .content-overlay {
     display: none;
     position: fixed;
@@ -490,43 +525,38 @@ textarea.form-control {
 }
 .content-overlay.active { display: flex; }
 
-/* Confirm dialog — full-page overlay, above everything */
-.confirm-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.4);
-    z-index: 1100;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-.confirm-modal {
-    background: #fff;
-    border-radius: 8px;
-    padding: 24px;
-    max-width: 400px;
-    width: 90%;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
-}
-.confirm-modal {
-    background: #fff;
-    border-radius: 12px;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.18);
-    max-width: 400px;
-    width: 90%;
-    padding: 24px;
-}
-.confirm-message {
-    font-size: 14px;
-    line-height: 1.6;
-    color: #333;
-    margin-bottom: 20px;
-}
-.confirm-buttons {
-    display: flex;
-    gap: 8px;
-    justify-content: flex-end;
-}
+/* Confirm dialog — rides the .vs-modal look (ConfirmModal.jsx). Its scrim sits
+   above every other modal scrim (.vs-scrim 1200, .vs-scrim-nested 1250,
+   .vs-dropveil 1300) so a confirmation is never obscured by the modal that
+   invoked it — but BELOW the MFA challenge overlay (1500), which must win when a
+   step-up is triggered from a confirmed action. */
+.vs-scrim-confirm { z-index: 1400; }
+.vs-confirm-msg { margin: 0; font-size: 13.5px; line-height: 1.6; color: #3c4043; }
+
+/* SSO step-up (sudo) challenge modal + error cards (StepUpProvider). A centered
+   card echoing the SSO auth card — shield badge, org wordmark, identity chip. Sits
+   at 1500 (above confirm 1400) so a step-up triggered from a confirmed action wins. */
+.vs-su-scrim { z-index: 1500; }
+.vs-su-card { width: 100%; max-width: 360px; background: #fff; border-radius: 16px; box-shadow: 0 12px 32px rgba(0, 0, 0, .18); padding: 28px 26px; text-align: center; animation: vs-modal-in .16s ease; }
+.vs-su-brand { display: flex; align-items: center; justify-content: center; gap: 8px; margin-bottom: 16px; }
+.vs-su-badge { width: 34px; height: 34px; border-radius: 10px; display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, #1a73e8, #1557b0); box-shadow: 0 2px 8px rgba(26, 115, 232, .35); flex-shrink: 0; }
+.vs-su-wordmark { font-size: 14px; font-weight: 500; color: #1f2937; letter-spacing: -.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 230px; }
+.vs-su-chip { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; border: 1px solid #e5e7eb; border-radius: 99px; padding: 4px 14px 4px 5px; margin-bottom: 18px; }
+.vs-su-av { width: 22px; height: 22px; border-radius: 50%; object-fit: cover; flex-shrink: 0; display: flex; align-items: center; justify-content: center; background: #e8f0fe; color: #1a73e8; font-size: 10px; font-weight: 600; }
+.vs-su-name { font-size: 13px; color: #374151; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vs-su-state { width: 52px; height: 52px; border-radius: 50%; background: #fef3e2; display: flex; align-items: center; justify-content: center; margin: 0 auto 14px; }
+.vs-su-title { font-size: 18px; font-weight: 500; color: #1f2937; margin: 0 0 6px; }
+.vs-su-msg { font-size: 13.5px; line-height: 1.55; color: #6b7280; margin: 0 auto 18px; max-width: 290px; }
+.vs-su-btn { width: 100%; padding: 10px 16px; font-size: 14px; }
+.vs-su-btn + .vs-su-btn { margin-top: 9px; }
+
+/* In-card "verify to continue" reminder + loading text — fill and centre inside a
+   page's own white card (flex:1 for flex-row cards, min-height for block cards). */
+.vs-su-inline { flex: 1; min-height: 280px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; text-align: center; padding: min(15vh, 150px) 24px 40px; }
+.vs-su-inline-ico { width: 56px; height: 56px; border-radius: 50%; background: #e8f0fe; color: #1a73e8; display: flex; align-items: center; justify-content: center; margin-bottom: 14px; }
+.vs-su-inline h3 { font-size: 17px; font-weight: 500; color: #1f2937; margin: 0 0 6px; }
+.vs-su-inline p { font-size: 13.5px; color: #6b7280; margin: 0 0 18px; max-width: 300px; }
+.vs-card-msg { flex: 1; min-height: 280px; display: flex; align-items: center; justify-content: center; color: #9ca3af; font-size: 13px; padding: 40px 16px; }
 
 /* Worker key modal */
 .wk-modal {
@@ -956,94 +986,34 @@ textarea.form-control {
     pointer-events: none;
 }
 
-/* Watch page: page-level scroll, viewport-edge scrollbar. .container above
-   restricts width via `width: min(100%, max(60vw, 100vh))` so its scrollbar
-   sits well inside the viewport on wide monitors; .container-player undoes
-   that for the watch page so the scrollbar lands at the actual right edge.
-   The inner .player-container keeps its own max-width and margin: 0 auto
-   for the centered player layout. */
-.container-player {
-    width: 100%;
-    max-width: none;
-    padding-bottom: 56px;
-}
-
-/* The fixed footer is scoped to the watch page via the sibling combinator —
-   any page that mounts .container-player gets it stuck to the viewport
-   bottom; everywhere else .site-footer flows normally at the document end. */
-.container-player ~ .site-footer {
-    position: fixed;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    z-index: 10;
-}
-
-/* === Player Page === */
-.player-container {
-    /* Two-clamp ceiling. The first matches .container's old width formula
-       (min(100%, max(60vw, 100vh)) - 48px padding) so the watch page lays
-       out at the same effective width as every other page even though
-       .container-player is now full-viewport for the scrollbar. The second
-       (calc(1.77 * 100vh - 570px)) is the pre-existing "16:9 player fits in
-       viewport height" rule — only binds on short / portrait viewports. */
-    max-width: min(calc(max(60vw, 100vh) - 48px), calc(1.77 * 100vh - 570px));
-    margin: 0 auto;
-    width: 100%;
-}
-.player-nav-bar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    background: #fff;
-    border: 1px solid #e5e7eb;
-    border-radius: 8px;
-    padding: 10px 16px;
-    margin-bottom: 10px;
-    gap: 16px;
-    min-width: 0;
-}
-.player-scroll {
-    /* No internal overflow — the whole page scrolls now, so the description
-       card just flows under the player. */
-}
-.player-back-link {
+/* === Watch page (in-shell) === */
+.vs-wp-back {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
-    color: #374151;
-    font-size: 14px;
+    gap: 6px;
+    color: #5f6368;
+    font-size: 13.5px;
     font-weight: 500;
     text-decoration: none;
-    white-space: nowrap;
-    flex-shrink: 0;
-    transition: color 0.12s;
+    margin-bottom: 14px;
+    transition: color .12s;
 }
-.player-back-link:hover {
-    color: #1a73e8;
-    text-decoration: none;
-}
-.player-nav-title {
-    font-size: 13px;
-    color: #6b7280;
+.vs-wp-back:hover { color: #1a73e8; text-decoration: none; }
+.vs-wp-back svg { width: 16px; height: 16px; flex-shrink: 0; }
+
+.vs-wp-stage {
+    border-radius: 12px;
     overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    text-align: right;
-    min-width: 0;
+    background: #000;
 }
 .video-player {
     width: 100%;
-    aspect-ratio: 16/9;        /* placeholder; overridden inline once metadata loads */
-    max-height: 70vh;          /* cap player height; adjust to taste later */
+    aspect-ratio: 16 / 9;      /* placeholder; overridden inline once metadata loads */
+    max-height: 70vh;
     background: #000;
-    border-radius: 8px;
     overflow: hidden;
 }
-.video-player video {
-    width: 100%;
-    height: 100%;
-}
+.video-player video { width: 100%; height: 100%; }
 .player-error-overlay {
     display: flex;
     align-items: center;
@@ -1056,101 +1026,74 @@ textarea.form-control {
     padding: 24px;
     box-sizing: border-box;
 }
-.player-error-overlay h2 {
-    font-size: 1.2rem;
-    margin-bottom: 6px;
-}
-.player-error-overlay p {
-    color: #999;
-    font-size: 0.9rem;
-}
+.player-error-overlay h2 { font-size: 1.2rem; margin-bottom: 6px; }
+.player-error-overlay p { color: #999; font-size: 0.9rem; }
 
-/* === Theater Mode === */
-body.theater-mode {
-    overflow: hidden;
+.vs-wp-info {
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin-top: 14px;
 }
-.theater-mode .top-header,
-.theater-mode .site-footer {
-    display: none;
+.vs-wp-title { font-size: 20px; font-weight: 500; color: #1f2937; margin: 0 0 6px; }
+.vs-wp-meta { font-size: 13px; color: #6b7280; margin: 0; display: flex; align-items: center; flex-wrap: wrap; }
+.vs-wp-desc { margin: 12px 0 0; font-size: 14px; line-height: 1.65; color: #374151; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* Theater toggle button injected into the Shaka control bar */
+.shaka-theater-button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 40px;
+    padding: 0 6px;
+    background: transparent;
+    border: none;
+    color: #fff;
+    cursor: pointer;
+    opacity: .9;
+    transition: opacity .1s;
 }
-.theater-mode .container {
-    width: 100%;
-    max-width: none;
-    margin: 0;
-    padding: 0;
-}
-.theater-mode .player-container {
-    max-width: none;
+.shaka-theater-button:hover { opacity: 1; }
+.shaka-theater-button svg { width: 22px; height: 22px; display: block; }
+
+/* === Theater mode: immersive overlay — no shell header/sidebar, a dark back
+   bar, the player fills the viewport, and nothing scrolls === */
+body.theater-mode { overflow: hidden; }
+.theater-mode .vs-wp {
     position: fixed;
     inset: 0;
-    z-index: 999;
+    z-index: 1000;
+    background: #000;
     display: flex;
     flex-direction: column;
-    background: #000;
 }
-.theater-mode .player-nav-bar {
-    border-radius: 0;
-    border: none;
-    border-bottom: 1px solid #333;
-    margin-bottom: 0;
+.theater-mode .vs-wp-back {
+    margin: 0;
+    padding: 11px 20px;
     background: #111;
+    color: #e8eaed;
+    border-bottom: 1px solid #2a2a2a;
     flex-shrink: 0;
 }
-.theater-mode .player-back-link {
-    color: #ccc;
-}
-.theater-mode .player-back-link:hover {
-    color: #fff;
-}
-.theater-mode .player-nav-title {
-    color: #999;
-}
-.theater-mode .player-container > .card {
+.theater-mode .vs-wp-back:hover { color: #fff; }
+.theater-mode .vs-wp-stage {
     flex: 1;
+    min-height: 0;
     border-radius: 0;
-    border: none;
-    box-shadow: none;
-    margin: 0;
+    background: #000;
     display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
 }
 .theater-mode .video-player {
-    flex: 1;
-    aspect-ratio: auto;
-    max-height: none;       /* override the page-mode 70vh cap so the player can fill */
+    width: min(100%, calc((100vh - 46px) * 16 / 9));
+    height: auto;
+    max-height: calc(100vh - 46px);
     border-radius: 0;
-    width: 100%;
-    height: 100%;
 }
-.theater-mode .player-scroll {
-    display: none;
-}
-.theater-toggle-btn {
-    background: none;
-    border: 1px solid #d1d5db;
-    border-radius: 4px;
-    cursor: pointer;
-    padding: 4px 8px;
-    display: inline-flex;
-    align-items: center;
-    color: #374151;
-    font-size: 12px;
-    gap: 4px;
-    transition: all 0.15s;
-    flex-shrink: 0;
-}
-.theater-toggle-btn:hover {
-    background: #f0f2f5;
-    border-color: #9ca3af;
-}
-.theater-mode .theater-toggle-btn {
-    border-color: #555;
-    color: #ccc;
-}
-.theater-mode .theater-toggle-btn:hover {
-    background: #333;
-    border-color: #777;
-    color: #fff;
-}
+.theater-mode .vs-wp-info { display: none; }
 
 /* === Pagination Bar === */
 .pagination-bar {
@@ -1428,7 +1371,9 @@ a.pagination-btn:hover {
     position: fixed;
     inset: 0;
     background: rgba(0, 0, 0, 0.4);
-    z-index: 1100;
+    /* Topmost overlay: a step-up challenge must win over every modal AND over a
+       confirm dialog (1400) that triggered the action requiring it. */
+    z-index: 1500;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1812,6 +1757,16 @@ tr.clickable-row:hover { background-color: #f9fafb; }
   }
 }
 
+/* === Profile page — Account tab: avatar sits right of the details; on
+   narrow screens it moves between the section title and the table === */
+.account-info-flex { display: flex; gap: 28px; align-items: flex-start; }
+.account-info-flex .profile-info-table { flex: 1; min-width: 0; }
+.account-avatar { width: 96px; height: 96px; border-radius: 50%; object-fit: cover; flex-shrink: 0; margin-top: 6px; }
+@media (max-width: 768px) {
+  .account-info-flex { flex-direction: column-reverse; }
+  .account-avatar { margin: 0 0 8px; }
+}
+
 /* === Profile page — Account tab info table === */
 .profile-info-table {
   width: 100%;
@@ -1912,3 +1867,833 @@ tr.clickable-row:hover { background-color: #f9fafb; }
     height: 28px;
   }
 }
+
+/* === SSO + mTLS settings cards === */
+.sso-pill { font-size: 12px; padding: 3px 11px; border-radius: 12px; font-weight: 500; }
+.sso-pill.gray { background: #f0f2f5; color: #5f6368; }
+.sso-pill.green { background: #d1fae5; color: #065f46; }
+.sso-pill.amber { background: #fef3c7; color: #92400e; }
+.sso-pill.red { background: #fee2e2; color: #991b1b; }
+.sso-warn { background: #fffbeb; border: 1px solid #fcd34d; color: #92400e; border-radius: 6px; padding: 10px 12px; font-size: 13px; margin-bottom: 16px; }
+.sso-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 18px; }
+.sso-full { grid-column: 1 / -1; }
+.sso-hint { color: #9ca3af; font-weight: 400; }
+.sso-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+.sso-bad { border-color: #dc2626 !important; }
+.sso-certinfo { border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden; }
+.sso-certinfo .r { display: flex; justify-content: space-between; padding: 9px 14px; border-top: 1px solid #eef0f2; font-size: 13px; }
+.sso-certinfo .r:first-child { border-top: 0; }
+.sso-certinfo .r .k { color: #6b7280; }
+.sso-certinfo .r .v { font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; color: #1f2937; word-break: break-all; }
+.sso-toggle { display: flex; align-items: center; gap: 12px; padding: 14px 16px; background: #f8f9fa; border: 1px solid #e5e7eb; border-radius: 8px; margin: 16px 0; }
+.sso-toggle .lbl { flex: 1; } .sso-toggle .lbl .sub { font-size: 12.5px; color: #6b7280; margin: 0; }
+.sso-switch { position: relative; display: inline-block; width: 44px; height: 24px; flex-shrink: 0; }
+.sso-switch input { opacity: 0; width: 0; height: 0; }
+.sso-slider { position: absolute; inset: 0; background: #d1d5db; border-radius: 24px; transition: .2s; cursor: pointer; }
+.sso-slider::before { content: ""; position: absolute; height: 18px; width: 18px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: .2s; box-shadow: 0 1px 3px rgba(0,0,0,.2); }
+.sso-switch input:checked + .sso-slider { background: #16a34a; }
+.sso-switch input:checked + .sso-slider::before { transform: translateX(20px); }
+.sso-switch input:disabled + .sso-slider { opacity: .45; cursor: not-allowed; }
+.sso-actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+.sso-subhead { font-size: 13px; font-weight: 600; color: #374151; margin: 22px 0 10px; }
+.sso-ro { display: flex; align-items: stretch; border: 1px solid #e5e7eb; border-radius: 6px; background: #f8f9fa; overflow: hidden; max-width: 520px; }
+.sso-ro code { flex: 1; min-width: 0; align-self: center; font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; padding: 8px 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #1f2937; }
+.sso-ro .btn { border-radius: 0; border: 0; border-left: 1px solid #e5e7eb; flex-shrink: 0; }
+@media (max-width: 640px) { .sso-grid { grid-template-columns: 1fr; } }
+
+/* ============================================================
+   Account-portal-style shell (vs- prefixed). Wraps both the
+   student course view and the (unchanged) admin pages. Retires
+   the legacy .top-header / .admin-layout / dark .sidebar chrome.
+   ============================================================ */
+.vs-topbar { height: 56px; flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; border-bottom: 1px solid #e5e7eb; background: #fff; }
+.vs-brand { display: flex; align-items: center; gap: 9px; font-size: 16px; font-weight: 500; color: #1f2937; }
+.vs-brand:hover { text-decoration: none; }
+.vs-brand-mark { width: 27px; height: 27px; border-radius: 7px; background: #1a73e8; color: #fff; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.vs-brand-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46vw; }
+.vs-topbar-right { display: flex; align-items: center; gap: 10px; }
+
+.vs-body { display: flex; flex: 1; min-height: 0; overflow: hidden; }
+.vs-side { width: 240px; flex-shrink: 0; background: #f8f9fa; border-right: 1px solid #e5e7eb; overflow: hidden; }
+.vs-side-collapsed { display: none; }
+.vs-side-track { display: flex; width: 200%; height: 100%; transition: transform .22s ease; }
+.vs-side-track.admin { transform: translateX(-50%); }
+.vs-side-pane { width: 50%; height: 100%; box-sizing: border-box; padding: 14px 12px 18px; display: flex; flex-direction: column; min-height: 0; }
+.vs-side-label { font-size: 11px; font-weight: 500; letter-spacing: .04em; text-transform: uppercase; color: #9ca3af; padding: 2px 12px 8px; flex-shrink: 0; }
+.vs-nav-scroll { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; margin: 0 -4px; padding: 0 4px; }
+.vs-nav { display: flex; align-items: center; gap: 11px; padding: 9px 12px; border-radius: 8px; font-size: 14px; color: #5f6368; cursor: pointer; border: 0; background: none; width: 100%; text-align: left; font-family: inherit; line-height: 1.3; }
+.vs-nav:hover { background: #eef0f3; color: #1f2937; text-decoration: none; }
+.vs-nav.active { background: #e8f0fe; color: #1a73e8; font-weight: 500; }
+.vs-nav-ico { width: 19px; height: 19px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; }
+.vs-nav-ico svg { width: 19px; height: 19px; }
+.vs-nav-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vs-nav-chev { margin-left: auto; color: #9ca3af; flex-shrink: 0; display: inline-flex; }
+.vs-admin-entry { flex-shrink: 0; border-top: 1px solid #e5e7eb; margin-top: 8px; padding-top: 12px; }
+.vs-admin-entry .vs-nav { padding-top: 10px; padding-bottom: 10px; }
+.vs-nav-back { font-weight: 500; color: #1f2937; border-bottom: 1px solid #e5e7eb; border-radius: 8px 8px 0 0; margin-bottom: 6px; padding-bottom: 11px; flex-shrink: 0; }
+.vs-side-empty { font-size: 13px; color: #9ca3af; padding: 8px 12px; margin: 0; }
+.vs-nav-skel { height: 37px; border-radius: 8px; margin: 0 0 2px; background: linear-gradient(90deg, #eceef1 25%, #f3f4f6 37%, #eceef1 63%); background-size: 400% 100%; animation: vs-shimmer 1.4s ease infinite; }
+@keyframes vs-shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
+
+.vs-content { flex: 1; min-width: 0; padding: 24px 32px; background: #f0f2f5; overflow-y: auto; scrollbar-gutter: stable; }
+.vs-content-inner { max-width: 920px; margin: 0 auto; }
+.vs-content::-webkit-scrollbar { width: 6px; }
+.vs-content::-webkit-scrollbar-thumb { background: #c3c8cf; border-radius: 3px; }
+
+@media (max-width: 768px) {
+  .vs-body { flex-direction: column; overflow: visible; }
+  /* Collapsed by default: a single bar shows the current course/page; tapping
+     it drops the full list down (5 rows tall, then scrolls). */
+  .vs-side { width: 100%; height: auto; border-right: 0; border-bottom: 1px solid #e5e7eb; position: relative; overflow: visible; }
+  .vs-side-collapsed { display: flex; align-items: center; gap: 11px; width: 100%; padding: 12px 16px; background: none; border: 0; cursor: pointer; font-family: inherit; font-size: 14px; color: #1f2937; text-align: left; }
+  .vs-side-collapsed .vs-nav-ico { color: #5f6368; }
+  .vs-cc-label { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .vs-cc-more { color: #9ca3af; font-size: 13px; flex-shrink: 0; }
+  .vs-cc-chev { margin-left: auto; color: #9ca3af; display: inline-flex; flex-shrink: 0; transition: transform .18s ease; }
+  .vs-side.expanded .vs-cc-chev { transform: rotate(180deg); }
+  .vs-side-track { display: none; }
+  .vs-side.expanded .vs-side-track {
+    display: block; width: 100%; transform: none !important;
+    position: absolute; top: 100%; left: 0; right: 0; z-index: 90;
+    background: #f8f9fa; border-bottom: 1px solid #e5e7eb;
+    box-shadow: 0 10px 20px rgba(0, 0, 0, 0.10);
+    /* height:auto is REQUIRED — the base .vs-side-track has height:100%, which
+       here resolves to the collapsed bar's ~48px and pins the dropdown to one
+       row regardless of max-height. Let it size to content, then cap. */
+    height: auto; max-height: min(58vh, 320px); overflow-y: auto;
+  }
+  .vs-side-pane { width: 100%; height: auto; display: none; padding: 8px 10px; }
+  .vs-side-track:not(.admin) .vs-side-pane:first-child { display: block; }
+  .vs-side-track.admin .vs-side-pane:last-child { display: block; }
+  .vs-side-pane .vs-side-label { display: none; }
+  .vs-side-pane .vs-nav-scroll { overflow: visible; flex: none; }
+  .vs-content { padding: 16px; }
+}
+
+/* Welcome landing ("/", no course selected) */
+.vs-welcome { min-height: 62vh; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 40px 24px; }
+.vs-welcome-ico { color: #b2b8c0; margin-bottom: 16px; }
+.vs-welcome h1 { font-size: 24px; font-weight: 500; color: #1f2937; margin: 0 0 8px; }
+.vs-welcome p { font-size: 15px; line-height: 1.6; color: #6b7280; margin: 0; max-width: 440px; }
+
+/* ============================================================
+   Course view — video/materials toggle, rows, account-portal pager
+   ============================================================ */
+.vs-cv-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
+.vs-cv-title { font-size: 22px; font-weight: 500; color: #1f2937; margin: 0 0 3px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vs-cv-sub { font-size: 13px; color: #6b7280; margin: 0; }
+.vs-seg { display: inline-flex; background: #eceef1; padding: 3px; border-radius: 9px; flex-shrink: 0; }
+.vs-seg-btn { border: 1px solid transparent; background: none; color: #6b7280; padding: 6px 13px; border-radius: 7px; font-size: 13px; display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-family: inherit; }
+.vs-seg-btn svg { width: 15px; height: 15px; }
+.vs-seg-btn.on { background: #fff; color: #1f2937; font-weight: 500; border-color: #e0e2e6; }
+/* Icon-only segmented switch on narrow screens — the text labels eat the head's
+   horizontal room next to a long course title + Upload. */
+@media (max-width: 640px) {
+  .vs-seg-lbl { display: none; }
+  .vs-seg-btn { padding: 7px 11px; }
+}
+
+.vs-cv-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; }
+.vs-cv-row { display: flex; align-items: center; gap: 14px; padding: 13px 16px; border-top: 1px solid #eef0f2; text-decoration: none; color: inherit; }
+.vs-cv-row:first-child { border-top: 0; }
+.vs-cv-row.clk { cursor: pointer; }
+.vs-cv-row.clk:hover { background: #f8f9fb; text-decoration: none; }
+.vs-cv-row.proc { opacity: .6; }
+.vs-cv-thumb { width: 100px; aspect-ratio: 16 / 9; border-radius: 7px; flex-shrink: 0; background: #0d0d0f; overflow: hidden; position: relative; }
+.vs-cv-thumb.loading { background: linear-gradient(90deg, #dbe1e8 25%, #eaeef2 37%, #dbe1e8 63%); background-size: 400% 100%; animation: vs-shimmer 1.4s ease infinite; }
+.vs-cv-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; transition: opacity .2s ease; }
+.vs-cv-play { width: 100px; aspect-ratio: 16 / 9; border-radius: 7px; flex-shrink: 0; background: #e8f0fe; color: #1a73e8; display: flex; align-items: center; justify-content: center; font-size: 16px; }
+.vs-cv-rmn { flex: 1; min-width: 0; }
+.vs-cv-rt { font-size: 14px; font-weight: 500; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vs-cv-rs { font-size: 12px; color: #6b7280; margin: 3px 0 0; display: flex; align-items: center; }
+.vs-wk { background: #e8f0fe; color: #1a73e8; font-size: 11px; font-weight: 500; padding: 1px 7px; border-radius: 6px; margin-right: 8px; flex-shrink: 0; }
+/* Round avatar for a user row — works as <img> (photo) or <div> (initials). */
+.vs-cv-av { width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0; object-fit: cover; background: #e8f0fe; color: #1a73e8; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 500; text-transform: uppercase; }
+/* "you" pill beside your own name in the users list. */
+.vs-you { display: inline-flex; align-items: center; margin-left: 8px; padding: 1px 8px; border-radius: 999px; background: #e8f0fe; color: #1a73e8; font-size: 10.5px; font-weight: 500; letter-spacing: .02em; line-height: 1.55; vertical-align: middle; flex-shrink: 0; }
+.vs-cv-dot { margin: 0 6px; color: #c3c8cf; }
+.vs-cv-chev { color: #c3c8cf; flex-shrink: 0; display: inline-flex; }
+.vs-cv-stb { font-size: 11px; font-weight: 500; padding: 2px 8px; border-radius: 6px; flex-shrink: 0; white-space: nowrap; }
+.vs-cv-stb-p { background: #fef3c7; color: #92400e; }
+.vs-cv-stb-f { background: #fce8e6; color: #c5221f; }
+.vs-cv-stb-n { background: #f1f3f4; color: #5f6368; }
+.vs-cv-fico { width: 36px; height: 36px; border-radius: 9px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
+.vs-cv-fico svg { width: 18px; height: 18px; }
+.fico-pdf { background: #fdecea; color: #c5221f; }
+.fico-doc { background: #e8f0fe; color: #1a73e8; }
+.fico-zip { background: #fef3c7; color: #92400e; }
+.fico-csv { background: #e6f4ea; color: #137333; }
+.fico-gen { background: #f1f3f4; color: #5f6368; }
+.vs-cv-acts { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.vs-cv-view { font-size: 12px; padding: 5px 10px; border: 1px solid #d1d5db; background: #fff; border-radius: 8px; cursor: pointer; color: #1f2937; display: inline-flex; align-items: center; gap: 4px; font-family: inherit; text-decoration: none; }
+.vs-cv-view:hover { background: #f8f9fa; text-decoration: none; }
+.vs-cv-view svg { width: 15px; height: 15px; }
+.vs-cv-dl { width: 30px; height: 30px; border: 1px solid #d1d5db; background: #fff; border-radius: 8px; cursor: pointer; color: #5f6368; display: inline-flex; align-items: center; justify-content: center; }
+.vs-cv-dl:hover { background: #f8f9fa; color: #1f2937; }
+.vs-cv-dl svg { width: 16px; height: 16px; }
+.vs-cv-empty { padding: 40px 24px; text-align: center; color: #9ca3af; font-size: 14px; }
+
+/* Scoped error state shown IN the content pane when a course 404s/403s out from
+   under the user — never a full-page redirect. The sidebar drops the course via
+   a background refresh; this explains the empty content area. */
+.vs-cv-gone { display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; min-height: 46vh; padding: 40px 24px; }
+.vs-cv-gone-ico { color: #b2b8c0; margin-bottom: 16px; }
+.vs-cv-gone-ico svg { width: 42px; height: 42px; }
+.vs-cv-gone h2 { font-size: 19px; font-weight: 500; color: #1f2937; margin: 0 0 6px; }
+.vs-cv-gone p { font-size: 14px; color: #6b7280; margin: 0 0 20px; max-width: 380px; line-height: 1.55; }
+
+/* Reserves the pager's row so it doesn't stay mounted only when data is ready —
+   keeps the layout from shifting on a course switch (count briefly unknown). */
+.vs-cv-foot { min-height: 42px; }
+.vs-pager { display: flex; align-items: center; gap: 8px; margin-top: 14px; font-size: 12.5px; color: #6b7280; }
+.vs-pbtn { padding: 5px 11px; border: 1px solid #d1d5db; border-radius: 8px; background: #fff; cursor: pointer; font-size: 12.5px; color: #1f2937; font-family: inherit; }
+.vs-pbtn:disabled { opacity: .45; cursor: default; }
+.vs-pnum { min-width: 30px; text-align: center; padding: 5px 8px; border-radius: 8px; border: 1px solid transparent; cursor: pointer; background: none; color: #1f2937; font-size: 12.5px; font-family: inherit; }
+.vs-pnum.on { background: #1a73e8; color: #fff; font-weight: 500; }
+.vs-pdots { color: #9ca3af; padding: 0 2px; }
+.vs-pager-count { color: #6b7280; flex-shrink: 0; }
+.vs-pager-nav { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+
+/* Sort control (lives in the pager row, opens upward) */
+.vs-sort { position: relative; display: inline-flex; }
+.vs-sort-btn { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border: 1px solid #d1d5db; border-radius: 8px; background: #fff; color: #374151; font-size: 12.5px; font-family: inherit; cursor: pointer; transition: background .12s, border-color .12s; }
+.vs-sort-btn:hover { background: #f8f9fa; border-color: #9ca3af; }
+.vs-sort-btn.open { border-color: #1a73e8; background: #f8f9fb; }
+.vs-sort-btn > svg { width: 15px; height: 15px; color: #6b7280; }
+.vs-sort-cur { font-weight: 500; color: #1f2937; }
+.vs-sort-dir { display: inline-flex; color: #6b7280; }
+.vs-sort-dir svg { width: 13px; height: 13px; }
+.vs-sort-menu { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 30; min-width: 172px; background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.14); padding: 6px; }
+.vs-sort-sec { font-size: 10.5px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: #9ca3af; padding: 8px 10px 4px; }
+.vs-sort-opt { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 10px; border: 0; border-radius: 8px; background: none; font-size: 13px; color: #1f2937; font-family: inherit; cursor: pointer; text-align: left; }
+.vs-sort-opt:hover { background: #f1f3f4; }
+.vs-sort-opt.on { color: #1a73e8; font-weight: 500; }
+.vs-sort-opt svg { width: 15px; height: 15px; flex-shrink: 0; color: #1a73e8; }
+.vs-sort-div { height: 1px; background: #eef0f2; margin: 5px 2px; }
+
+.vs-cv-skel { height: 13px; border-radius: 5px; background: linear-gradient(90deg, #eceef1 25%, #f3f4f6 37%, #eceef1 63%); background-size: 400% 100%; animation: vs-shimmer 1.4s ease infinite; }
+/* Skeleton "line" whose HEIGHT comes from its own (transparent, non-breaking)
+   text at the parent's font size — so it occupies the exact same line box as the
+   real text it stands in for. Used inside .vs-cv-rt / .vs-cv-rs so a skeleton row
+   measures the identical height to a loaded row (keeps useFitHeight from
+   oscillating pageSize on the skeleton↔real swap). Width is set inline. */
+.vs-skln { display: inline-block; border-radius: 5px; color: transparent; user-select: none; background: linear-gradient(90deg, #eceef1 25%, #f3f4f6 37%, #eceef1 63%); background-size: 400% 100%; animation: vs-shimmer 1.4s ease infinite; }
+.vs-cv-sub-skel { display: inline-block; width: 56px; vertical-align: middle; }
+
+/* ============================================================
+   vs- primitives — button, field, modal, dropzone, progress.
+   The .vs-* system grew out of read-only views and never needed
+   these. Everything below is shared by the admin Resources page
+   and is the substrate for retiring the legacy .card/.admin-*
+   /.modal-* chrome on the remaining admin pages.
+   ============================================================ */
+
+/* --- Buttons --- */
+.vs-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 7px 14px; border: 1px solid #d1d5db; border-radius: 8px; background: #fff; color: #1f2937; font-size: 13px; font-weight: 500; font-family: inherit; line-height: 1.35; cursor: pointer; white-space: nowrap; transition: background .12s, border-color .12s; }
+.vs-btn:hover:not(:disabled) { background: #f8f9fa; border-color: #9ca3af; }
+.vs-btn:disabled { opacity: .5; cursor: default; }
+.vs-btn svg { width: 15px; height: 15px; flex-shrink: 0; }
+.vs-btn-primary { background: #1a73e8; border-color: #1a73e8; color: #fff; }
+.vs-btn-primary:hover:not(:disabled) { background: #1557b0; border-color: #1557b0; }
+.vs-btn-danger { color: #c5221f; border-color: #f2b8b5; }
+.vs-btn-danger:hover:not(:disabled) { background: #fce8e6; border-color: #c5221f; }
+.vs-btn-sm { padding: 5px 10px; font-size: 12px; }
+/* Square icon-only button; .vs-cv-dl is the same box, kept for the student view. */
+.vs-ico-btn { width: 30px; height: 30px; padding: 0; border: 1px solid #d1d5db; border-radius: 8px; background: #fff; color: #5f6368; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; transition: background .12s, border-color .12s, color .12s; }
+.vs-ico-btn:hover:not(:disabled) { background: #f8f9fa; border-color: #9ca3af; color: #1f2937; }
+.vs-ico-btn:disabled { opacity: .45; cursor: default; }
+.vs-ico-btn svg { width: 16px; height: 16px; }
+/* Destructive actions read red at rest, not only on hover. */
+.vs-ico-btn.dg { border-color: #f2b8b5; color: #c5221f; }
+.vs-ico-btn.dg:hover:not(:disabled) { background: #fce8e6; border-color: #c5221f; color: #c5221f; }
+
+/* --- Fields --- */
+.vs-field { margin-bottom: 14px; }
+.vs-field:last-child { margin-bottom: 0; }
+.vs-field-row { display: flex; gap: 12px; }
+.vs-field-row > .vs-field { flex: 1; min-width: 0; }
+.vs-label { display: block; font-size: 12px; font-weight: 500; color: #374151; margin-bottom: 5px; }
+.vs-input, .vs-select, .vs-textarea { width: 100%; box-sizing: border-box; border: 1px solid #d1d5db; border-radius: 8px; padding: 8px 11px; font-size: 13.5px; font-family: inherit; color: #1f2937; background: #fff; transition: border-color .12s, box-shadow .12s; }
+.vs-input:focus, .vs-select:focus, .vs-textarea:focus { outline: none; border-color: #1a73e8; box-shadow: 0 0 0 3px rgba(26, 115, 232, .12); }
+.vs-input::placeholder, .vs-textarea::placeholder { color: #9ca3af; }
+.vs-input:disabled, .vs-select:disabled, .vs-textarea:disabled { background: #f8f9fa; color: #6b7280; cursor: default; }
+
+/* Search field: a .vs-input with a leading glyph and a trailing clear button.
+   Fixed height (icon + button are absolutely positioned) so it never shifts the
+   card top and destabilises the fit-height page size. */
+.vs-search { position: relative; margin-bottom: 14px; }
+.vs-search .vs-input { padding-left: 34px; padding-right: 34px; }
+.vs-search-ico { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); color: #9ca3af; display: flex; pointer-events: none; }
+.vs-search-ico svg { width: 16px; height: 16px; }
+.vs-search-clear { position: absolute; right: 7px; top: 50%; transform: translateY(-50%); width: 24px; height: 24px; padding: 0; border: 0; border-radius: 6px; background: none; color: #9ca3af; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+.vs-search-clear:hover { background: #f1f3f4; color: #1f2937; }
+.vs-search-clear svg { width: 15px; height: 15px; }
+.vs-input.err, .vs-select.err { border-color: #c5221f; }
+.vs-input.err:focus { box-shadow: 0 0 0 3px rgba(197, 34, 31, .12); }
+.vs-textarea { resize: vertical; min-height: 66px; line-height: 1.5; }
+.vs-select { appearance: none; padding-right: 30px; background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' stroke='%236b7280' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m4 6 4 4 4-4'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 9px center; }
+.vs-hint { font-size: 11.5px; color: #6b7280; margin: 5px 0 0; line-height: 1.45; }
+.vs-hint.err { color: #c5221f; }
+/* Marks a field the filename parser filled in. */
+.vs-auto { font-size: 10.5px; font-weight: 500; color: #1a73e8; background: #e8f0fe; border-radius: 5px; padding: 1px 6px; margin-left: 6px; }
+
+/* --- Modal --- */
+.vs-scrim { position: fixed; inset: 0; z-index: 1200; background: rgba(32, 33, 36, .45); display: flex; align-items: center; justify-content: center; padding: 24px; animation: vs-scrim-in .14s ease; }
+@keyframes vs-scrim-in { from { opacity: 0; } to { opacity: 1; } }
+.vs-modal { width: 100%; max-width: 520px; max-height: calc(100vh - 48px); display: flex; flex-direction: column; background: #fff; border-radius: 12px; box-shadow: 0 12px 32px rgba(0, 0, 0, .18); overflow: hidden; animation: vs-modal-in .16s ease; }
+@keyframes vs-modal-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.vs-modal-wide { max-width: 620px; }
+.vs-modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-shrink: 0; padding: 15px 18px; border-bottom: 1px solid #eef0f2; }
+.vs-modal-title { font-size: 15px; font-weight: 500; color: #1f2937; margin: 0; }
+.vs-modal-x { width: 30px; height: 30px; flex-shrink: 0; border: 0; border-radius: 8px; background: none; color: #6b7280; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+.vs-modal-x:hover:not(:disabled) { background: #f1f3f4; color: #1f2937; }
+.vs-modal-x:disabled { opacity: .4; cursor: default; }
+.vs-modal-x svg { width: 18px; height: 18px; }
+.vs-modal-body { flex: 1; min-height: 0; overflow-y: auto; padding: 18px; }
+.vs-modal-body::-webkit-scrollbar { width: 6px; }
+.vs-modal-body::-webkit-scrollbar-thumb { background: #c3c8cf; border-radius: 3px; }
+.vs-modal-foot { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-shrink: 0; padding: 13px 18px; border-top: 1px solid #eef0f2; background: #f8f9fa; }
+.vs-modal-note { margin-right: auto; font-size: 12.5px; color: #6b7280; }
+
+/* --- Dropzone --- */
+.vs-dropzone { border: 2px dashed #d1d5db; border-radius: 12px; padding: 34px 20px; text-align: center; background: #fff; cursor: pointer; transition: border-color .14s, background .14s; }
+.vs-dropzone:hover { border-color: #1a73e8; background: #f7faff; }
+.vs-dropzone.drag { border-color: #1a73e8; background: #e8f0fe; }
+.vs-dropzone-ico { display: flex; justify-content: center; color: #9ca3af; margin-bottom: 10px; }
+.vs-dropzone-ico svg { width: 30px; height: 30px; }
+.vs-dropzone.drag .vs-dropzone-ico { color: #1a73e8; }
+.vs-dropzone-t { font-size: 14px; font-weight: 500; color: #1f2937; margin: 0 0 4px; }
+.vs-dropzone-h { font-size: 12px; color: #9ca3af; margin: 0; }
+
+/* Single chosen file, shown in place of the dropzone once picked. */
+.vs-filechip { display: flex; align-items: center; gap: 11px; padding: 11px 12px; border: 1px solid #ceead6; border-radius: 10px; background: #e6f4ea; }
+.vs-filechip-ico { display: flex; flex-shrink: 0; color: #137333; }
+.vs-filechip-ico svg { width: 19px; height: 19px; }
+.vs-filechip-mn { flex: 1; min-width: 0; }
+.vs-filechip-t { font-size: 13px; font-weight: 500; color: #1f2937; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vs-filechip-s { font-size: 11.5px; color: #6b7280; margin: 2px 0 0; }
+
+/* --- Batch staging list (bulk material upload) --- */
+.vs-batch { padding: 12px; margin-bottom: 14px; border: 1px solid #e5e7eb; border-radius: 10px; background: #f8f9fa; }
+.vs-filelist { border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden; }
+.vs-fl-row { display: flex; align-items: center; gap: 11px; padding: 9px 11px; border-top: 1px solid #eef0f2; }
+.vs-fl-row:first-child { border-top: 0; }
+.vs-fl-row.bad { background: #fef7f6; }
+.vs-fl-mn { flex: 1; min-width: 0; }
+.vs-fl-t { font-size: 13px; font-weight: 500; color: #1f2937; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vs-fl-s { font-size: 11.5px; color: #6b7280; margin: 3px 0 0; }
+.vs-fl-s.err { color: #c5221f; }
+.vs-fl-mod { width: 78px; flex-shrink: 0; }
+.vs-fl-mod .vs-input { padding: 5px 8px; font-size: 12.5px; text-align: center; }
+.vs-fl-pct { min-width: 34px; flex-shrink: 0; text-align: right; font-size: 11.5px; color: #6b7280; font-variant-numeric: tabular-nums; }
+.vs-fl-ok { display: inline-flex; flex-shrink: 0; color: #137333; }
+.vs-fl-ok svg { width: 17px; height: 17px; }
+.vs-fl-x { width: 24px; height: 24px; flex-shrink: 0; border: 0; border-radius: 6px; background: none; color: #9ca3af; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+.vs-fl-x:hover:not(:disabled) { background: #f1f3f4; color: #1f2937; }
+.vs-fl-x:disabled { opacity: .35; cursor: default; }
+.vs-fl-x svg { width: 15px; height: 15px; }
+
+/* --- Progress --- */
+.vs-progress { height: 5px; margin-top: 6px; border-radius: 3px; background: #eceef1; overflow: hidden; }
+.vs-progress-fill { height: 100%; border-radius: 3px; background: #1a73e8; transition: width .18s ease; }
+.vs-progress-fill.done { background: #137333; }
+.vs-progress-fill.err { background: #c5221f; }
+.vs-progress-lg { height: 6px; }
+
+/* --- Split modal: a tab rail beside a content pane ---
+   For object settings that are more than one form (course edit). The rail's
+   last item is the destructive one, pushed to the bottom by .vs-rail-spacer so
+   it never sits next to the tab you actually came for. Collapses to a
+   horizontal tab bar on narrow viewports. */
+.vs-modal-split { max-width: 720px; height: min(576px, calc(100vh - 48px)); }
+.vs-modal-split .vs-modal-body { padding: 0; display: flex; overflow: hidden; }
+.vs-split-rail { width: 176px; flex-shrink: 0; display: flex; flex-direction: column; gap: 2px; padding: 12px 10px; border-right: 1px solid #eef0f2; background: #f8f9fa; }
+.vs-rail-item { display: flex; align-items: center; gap: 9px; width: 100%; padding: 8px 10px; border: 0; border-radius: 8px; background: none; color: #5f6368; font-size: 13px; font-family: inherit; line-height: 1.3; text-align: left; cursor: pointer; }
+.vs-rail-item:hover:not(:disabled) { background: #eef0f3; color: #1f2937; }
+.vs-rail-item.on { background: #e8f0fe; color: #1a73e8; font-weight: 500; }
+.vs-rail-item svg { width: 17px; height: 17px; flex-shrink: 0; }
+.vs-rail-item.dg { color: #c5221f; }
+.vs-rail-item.dg:hover:not(:disabled) { background: #fce8e6; color: #c5221f; }
+.vs-rail-item:disabled { opacity: .45; cursor: default; }
+.vs-rail-spacer { flex: 1; min-height: 12px; }
+.vs-rail-sep { height: 1px; margin: 6px 2px; background: #e5e7eb; }
+.vs-split-pane { flex: 1; min-width: 0; overflow-y: auto; padding: 18px 20px; }
+.vs-split-pane::-webkit-scrollbar { width: 6px; }
+.vs-split-pane::-webkit-scrollbar-thumb { background: #c3c8cf; border-radius: 3px; }
+.vs-pane-h { font-size: 14px; font-weight: 500; color: #1f2937; margin: 0 0 3px; }
+.vs-pane-sub { font-size: 12px; color: #6b7280; margin: 0 0 16px; line-height: 1.5; }
+.vs-pane-sec { margin-top: 22px; padding-top: 18px; border-top: 1px solid #eef0f2; }
+.vs-pane-sec:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+
+@media (max-width: 640px) {
+  .vs-modal-split { height: calc(100vh - 32px); }
+  .vs-modal-split .vs-modal-body { flex-direction: column; }
+  .vs-split-rail { flex-direction: row; width: auto; padding: 8px; gap: 4px; border-right: 0; border-bottom: 1px solid #eef0f2; overflow-x: auto; }
+  .vs-split-rail::-webkit-scrollbar { display: none; }
+  .vs-rail-item { width: auto; white-space: nowrap; }
+  .vs-rail-spacer, .vs-rail-sep { display: none; }
+}
+
+/* A dialog opened from inside another dialog (delete/profile over course edit).
+   Same family as .vs-scrim, lifted so it can never render behind its parent. */
+.vs-scrim-nested { z-index: 1250; }
+
+/* Page-level version of the modal's rail+pane split (course edit is modal; the
+   user edit page is a page). Bounded height so the rail stays put while the
+   pane scrolls and .vs-savebar sticks to the pane's bottom — same behaviour as
+   inside the modal, no change to the rail/pane/savebar classes. */
+.vs-edit-split { display: flex; overflow: hidden; height: min(620px, calc(100vh - 210px)); border: 1px solid #e5e7eb; border-radius: 12px; background: #fff; }
+@media (max-width: 640px) {
+  .vs-edit-split { flex-direction: column; height: auto; }
+  /* Same fixed-on-mobile save bar as the enrollment page: the pane isn't a
+     bounded scroll box on mobile (the page scrolls), so pin the bar to the
+     viewport bottom and reserve room so the last field clears it. */
+  .vs-edit-split .vs-savebar-wrap { position: fixed; left: 16px; right: 16px; bottom: 12px; z-index: 50; margin-top: 0; }
+  .vs-edit-split .vs-split-pane { padding-bottom: 84px; }
+}
+
+/* Identity header above the split: avatar + name/handle + a role pill. */
+.vs-edit-head { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; }
+.vs-edit-idn { flex: 1; min-width: 0; }
+.vs-edit-name { font-size: 19px; font-weight: 500; color: #1f2937; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vs-edit-sub { font-size: 13px; color: #6b7280; margin: 2px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vs-edit-role { flex-shrink: 0; display: inline-flex; align-items: center; gap: 6px; background: #f1f3f4; color: #5f6368; font-size: 12px; font-weight: 500; padding: 4px 11px; border-radius: 999px; }
+
+/* Permission list: grouped rows, each with a tri-state control. */
+.vs-perm-grp { font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: #9ca3af; margin: 0 0 5px; }
+/* Gap between permission categories lives on the group WRAPPER — each header is
+   alone in its wrapper, so :first-of-type would match every one of them. */
+.vs-perm-group { margin-top: 28px; }
+.vs-perm-group:first-child { margin-top: 6px; }
+.vs-perm-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 10px 0; border-top: 1px solid #f4f5f6; }
+.vs-perm-mn { min-width: 0; }
+.vs-perm-name { font-size: 13.5px; color: #1f2937; }
+.vs-perm-key { font-size: 11px; color: #9ca3af; font-family: ui-monospace, Menlo, monospace; margin-top: 1px; }
+.vs-perm-row.locked { opacity: .5; }
+.vs-perm-row.changed .vs-perm-name { font-weight: 500; }
+.vs-perm-row.changed { position: relative; }
+.vs-perm-row.changed::before { content: ""; position: absolute; left: -12px; top: 12px; bottom: 12px; width: 2px; border-radius: 2px; background: #1a73e8; }
+
+/* Tri-state segmented control: Inherit / Grant / Deny. */
+.vs-tri { display: inline-flex; background: #eceef1; border-radius: 8px; padding: 2px; flex-shrink: 0; }
+.vs-tri button { border: 0; background: none; font-family: inherit; font-size: 12px; padding: 4px 11px; border-radius: 6px; color: #5f6368; cursor: pointer; white-space: nowrap; transition: color .12s; }
+.vs-tri button:disabled { cursor: default; }
+.vs-tri button.on { background: #fff; font-weight: 500; box-shadow: 0 1px 2px rgba(0, 0, 0, .1); }
+.vs-tri button.on.on-grant { color: #137333; }
+.vs-tri button.on.on-deny { color: #c5221f; }
+.vs-tri button.on.on-inherit { color: #1f2937; }
+
+/* Sliding segmented selector (PermSelector) — roles Grant/Deny + edit-user tri.
+   One indicator slides between segments via translateX(--i * 100%). */
+.vs-seg2 { position: relative; display: inline-grid; grid-auto-flow: column; grid-auto-columns: 1fr; background: #eceef1; border-radius: 8px; padding: 2px; flex-shrink: 0; }
+.vs-seg2.disabled { opacity: .5; }
+.vs-seg2.invalid { box-shadow: 0 0 0 2px rgba(197, 34, 31, .5); }
+.vs-seg2-ind { position: absolute; top: 2px; bottom: 2px; left: 2px; width: calc((100% - 4px) / var(--n)); border-radius: 6px; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .1); transform: translateX(calc(var(--i, 0) * 100%)); transition: transform .2s cubic-bezier(.4, 0, .2, 1); }
+.vs-seg2-btn { position: relative; z-index: 1; border: 0; background: none; font-family: inherit; font-size: 12px; padding: 4px 12px; border-radius: 6px; color: #5f6368; cursor: pointer; white-space: nowrap; transition: color .15s; }
+.vs-seg2-btn:disabled { cursor: default; }
+.vs-seg2-btn:not(:disabled):not(.on):hover { color: #1f2937; }
+.vs-seg2-btn.on { font-weight: 500; }
+.vs-seg2-btn.on.tone-grant { color: #137333; }
+.vs-seg2-btn.on.tone-deny { color: #c5221f; }
+.vs-seg2-btn.on.tone-inherit { color: #1f2937; }
+@media (prefers-reduced-motion: reduce) { .vs-seg2-ind { transition: none; } }
+
+/* Prerequisite-violation row + note (below the permission name). */
+.vs-perm-row.bad .vs-perm-name { color: #c5221f; }
+.vs-perm-note { font-size: 11.5px; color: #c5221f; margin-top: 3px; line-height: 1.4; }
+
+/* Save bar — invalid (unmet prerequisite) state: red frame + greyed Save. The
+   !important beats the frosted-glass @supports block that also sets border. */
+.vs-savebar.vs-savebar-invalid { border-color: #f2b8b5 !important; box-shadow: 0 8px 24px rgba(197, 34, 31, .16), 0 0 0 1px #f2b8b5 !important; }
+.vs-sb-invalidnote { margin-right: auto; font-size: 12.5px; color: #c5221f; padding-right: 10px; }
+
+/* Roles page — ONE big white card holding the role list (left) + detail (right)
+   split by a vertical divider. On desktop the card fills the viewport height and
+   the two columns scroll independently; the page flows on mobile (master-detail). */
+.vs-roles-page { height: 100%; max-width: 920px; margin: 0 auto; display: flex; flex-direction: column; }
+.vs-roles-page .vs-cv-head { flex-shrink: 0; }
+.vs-roles { flex: 1; min-height: 0; display: flex; align-items: stretch; background: #fff; border: 1px solid #eef0f2; border-radius: 12px; overflow: hidden; }
+.vs-roles-side { width: 290px; flex-shrink: 0; border-right: 1px solid #eef0f2; overflow-y: auto; }
+.vs-roles-detail { flex: 1; min-width: 0; overflow-y: auto; padding: 20px 22px; }
+.vs-roles-div { border: 0; border-top: 1px solid #eef0f2; margin: 20px 0; }
+.vs-roles-row { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; border: none; background: none; padding: 11px 14px; border-bottom: 1px solid #f1f3f4; cursor: pointer; font-family: inherit; }
+.vs-roles-row:last-child { border-bottom: 0; }
+.vs-roles-row:hover { background: #f8f9fb; }
+.vs-roles-row.on { background: #e8f0fe; }
+.vs-roles-mn { flex: 1; min-width: 0; }
+.vs-roles-name { font-size: 14px; font-weight: 500; color: #1f2937; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vs-roles-lvl { font-size: 12px; color: #9ca3af; margin-top: 1px; }
+.vs-roles-pills { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; flex-shrink: 0; }
+.vs-roles-pill { font-size: 11px; color: #6b7280; background: #f1f3f4; border-radius: 20px; padding: 2px 8px; flex-shrink: 0; white-space: nowrap; }
+.vs-roles-pill.sys { color: #1a73e8; background: #e8f0fe; }
+.vs-roles-pill.def { color: #188038; background: #e6f4ea; }
+.vs-roles-detail-h { display: flex; align-items: center; gap: 10px; }
+.vs-roles-back { display: none; }
+/* Carded detail sections (Settings, Permissions) — the white cards that make
+   the detail pane read as finished rather than floating on the grey page. */
+.vs-roles-card { background: #fff; border: 1px solid #eef0f2; border-radius: 12px; padding: 16px 18px; margin-bottom: 14px; }
+.vs-roles-permh { font-size: 13px; font-weight: 500; color: #1f2937; }
+@media (max-width: 760px) {
+  .vs-roles-page { height: auto; }
+  .vs-roles { flex: none; flex-direction: column; }
+  .vs-roles-side { width: 100%; border-right: none; overflow-y: visible; }
+  .vs-roles-detail { overflow-y: visible; }
+  .vs-roles.has-sel .vs-roles-side { display: none; }
+  .vs-roles:not(.has-sel) .vs-roles-detail { display: none; }
+  .vs-roles-back { display: inline-flex; align-items: center; gap: 4px; margin-bottom: 10px; border: none; background: none; color: #1a73e8; font-size: 14px; font-family: inherit; cursor: pointer; padding: 0; }
+}
+/* Narrow phones: stack the permission row so the selector never overflows. */
+@media (max-width: 560px) {
+  .vs-perm-row { flex-direction: column; align-items: stretch; gap: 8px; }
+  .vs-perm-row .vs-seg2 { width: 100%; }
+}
+
+/* Read-only-ish table for the transcoding profile list. .locked is the
+   "showing global profiles" state — visible, but not yours to edit. */
+.vs-ptable { border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden; }
+.vs-ptable.locked { opacity: .6; pointer-events: none; }
+.vs-ptable-head { display: flex; align-items: center; gap: 10px; padding: 8px 11px; background: #f8f9fa; border-bottom: 1px solid #eef0f2; font-size: 11px; font-weight: 500; color: #6b7280; }
+.vs-prow { display: flex; align-items: center; gap: 10px; padding: 9px 11px; }
+.vs-prow + .vs-prow { border-top: 1px solid #eef0f2; }
+.vs-prow-c { font-size: 12.5px; color: #1f2937; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vs-prow-c.mut { color: #6b7280; }
+.vs-ptable-empty { padding: 22px; text-align: center; font-size: 12.5px; color: #9ca3af; }
+
+/* ── Unified Settings page ──────────────────────────────────────────────
+   Height-capped rail + swap-pane, same family as .vs-roles. The rail lists
+   all sections (Site / Security groups are visual only — the surface gates on
+   manageSite); the pane shows one section at a time and owns the only scroll,
+   so a section's save bar sticks to the pane bottom. */
+.vs-set-page { height: 100%; max-width: 1000px; margin: 0 auto; display: flex; flex-direction: column; }
+.vs-set-head { flex-shrink: 0; margin-bottom: 14px; }
+.vs-set-title { margin: 0; font-size: 20px; font-weight: 500; color: #1f2937; }
+.vs-set-psub { margin: 3px 0 0; font-size: 13px; color: #6b7280; }
+.vs-set { flex: 1; min-height: 0; display: flex; align-items: stretch; background: #fff; border: 1px solid #eef0f2; border-radius: 12px; overflow: hidden; }
+.vs-set-rail { width: 216px; flex-shrink: 0; border-right: 1px solid #eef0f2; overflow-y: auto; padding: 12px 10px; background: #f8f9fa; }
+.vs-set-grp { font-size: 11px; font-weight: 500; letter-spacing: .04em; text-transform: uppercase; color: #9ca3af; padding: 12px 10px 5px; }
+.vs-set-grp:first-child { padding-top: 4px; }
+.vs-set-nav { display: flex; align-items: center; gap: 8px; width: 100%; border: 0; background: none; text-align: left; font-family: inherit; font-size: 13px; color: #5f6368; padding: 8px 10px; border-radius: 8px; cursor: pointer; }
+.vs-set-nav:hover { background: #eceef1; }
+.vs-set-nav.on { background: #e8f0fe; color: #1a73e8; font-weight: 500; }
+.vs-set-dot { width: 7px; height: 7px; border-radius: 50%; background: #1a73e8; margin-left: auto; flex-shrink: 0; }
+.vs-set-pane { flex: 1; min-width: 0; overflow-y: auto; padding: 20px 24px; }
+.vs-set-pane::-webkit-scrollbar { width: 6px; }
+.vs-set-pane::-webkit-scrollbar-thumb { background: #c3c8cf; border-radius: 3px; }
+.vs-set-h { margin: 0 0 3px; font-size: 15px; font-weight: 500; color: #1f2937; }
+.vs-set-sub { margin: 0 0 16px; font-size: 12.5px; color: #6b7280; line-height: 1.5; max-width: 640px; }
+
+/* Dense settings tables (transcoding profiles, worker keys, MFA policy) — the
+   edit-course-modal row idiom: rounded bordered card, grey header, hairline
+   rows, right-aligned actions. */
+.vs-st-tbl { border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden; }
+.vs-st-th { display: flex; align-items: center; gap: 10px; padding: 9px 12px; background: #f8f9fa; font-size: 11px; font-weight: 500; color: #6b7280; text-transform: uppercase; letter-spacing: .03em; }
+.vs-st-tr { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-top: 1px solid #eef0f2; font-size: 13px; color: #1f2937; }
+.vs-st-tr.changed { background: #f8fbff; }
+.vs-st-empty { padding: 22px; text-align: center; font-size: 12.5px; color: #9ca3af; border-top: 1px solid #eef0f2; }
+.vs-st-pill { display: inline-block; font-size: 11px; font-weight: 500; padding: 2px 9px; border-radius: 20px; }
+.vs-st-pill.g { background: #e6f4ea; color: #137333; }
+.vs-st-pill.y { background: #fef7e0; color: #b06000; }
+.vs-st-pill.r { background: #fce8e6; color: #c5221f; }
+.vs-st-pill.n { background: #f0f2f5; color: #5f6368; } /* neutral / not-configured */
+
+/* A pane heading with a status pill sitting inline right after the title. */
+.vs-set-h-row { display: flex; align-items: center; gap: 10px; margin-bottom: 3px; }
+.vs-set-h-row .vs-set-h { margin-bottom: 0; }
+
+/* A switch hugging its label (no space-between fill). */
+.vs-switch-inline { display: inline-flex; align-items: center; gap: 10px; }
+
+/* Amber advisory banner (the vs- language ships only red inline warnings). */
+.vs-warn { margin: 0 0 16px; padding: 10px 12px; border-radius: 8px; background: #fef7e0; border: 1px solid #fde293; color: #7c4a00; font-size: 12.5px; line-height: 1.5; }
+.vs-select-sm { padding: 5px 8px; font-size: 12.5px; }
+.vs-mono-area { font-family: monospace; font-size: 12px; background: #f9fafb; resize: vertical; }
+.vs-copylink { color: #9ca3af; font-size: 13px; cursor: pointer; }
+.vs-copylink:hover { color: #6b7280; }
+.vs-modal-warn { margin: 10px 0 0; font-size: 12.5px; color: #c5221f; font-weight: 500; }
+
+@media (max-width: 760px) {
+  .vs-set-page { height: auto; }
+  .vs-set { flex: none; flex-direction: column; }
+  .vs-set-rail { width: auto; border-right: 0; border-bottom: 1px solid #eef0f2; display: flex; gap: 4px; overflow-x: auto; padding: 8px; }
+  .vs-set-rail::-webkit-scrollbar { display: none; }
+  .vs-set-grp { display: none; }
+  .vs-set-nav { white-space: nowrap; flex-shrink: 0; width: auto; }
+  .vs-set-pane { overflow-y: visible; padding-bottom: 84px; }
+  .vs-set .vs-savebar-wrap { position: fixed; left: 16px; right: 16px; bottom: 12px; z-index: 50; margin-top: 0; }
+}
+
+/* Floating save bar, after the account portal's. Sticky inside .vs-split-pane
+   so it rides the pane's scroll and never covers the rail; the pane's own
+   padding gives it the left/right float. In-flow (not fixed), so it also can't
+   permanently hide the last field the way a pinned bar would. Only appears
+   when the pane is dirty. */
+/* The wrapper is the sticky element (so the pop-list can be its sibling and
+   escape the bar's backdrop-filter root); the bar itself is relative. */
+.vs-savebar-wrap { position: sticky; bottom: 12px; z-index: 3; margin-top: 22px; }
+.vs-savebar { position: relative; display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 12px; background: #fff; box-shadow: 0 8px 24px rgba(0, 0, 0, .14); animation: vs-savebar-in .16s ease; }
+@keyframes vs-savebar-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .vs-savebar { animation: none; } }
+
+/* Staged-change tags on the left of the bar (ported from the account portal). */
+.vs-sb-left { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; }
+.vs-sb-left.clk { cursor: pointer; }
+.vs-sb-count { background: #1a73e8; color: #fff; border-radius: 99px; font-size: 11px; padding: 1px 8px; font-weight: 600; flex-shrink: 0; }
+.vs-sb-pending { position: relative; flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px; overflow: hidden; font-size: 12.5px; }
+.vs-sb-tag { background: #e8f0fe; color: #1a73e8; border-radius: 6px; padding: 2px 8px; white-space: nowrap; flex-shrink: 0; font-weight: 500; }
+.vs-sb-tag.add { background: #e6f4ea; color: #137333; }
+.vs-sb-tag.remove { background: #fce8e6; color: #c5221f; }
+.vs-sb-more { color: #9ca3af; white-space: nowrap; cursor: inherit; flex-shrink: 0; }
+/* off-screen measuring rail: every tag + a "+N more…" probe, same metrics */
+.vs-sb-rail { position: absolute; left: 0; top: 0; display: flex; gap: 7px; visibility: hidden; pointer-events: none; width: max-content; }
+/* squeezed (not even one tag fits): fade the first under the overlapping "+N more…" */
+.vs-sb-fadetag { flex: 1 1 auto; min-width: 0; overflow: hidden; -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 86px), transparent calc(100% - 8px)); mask-image: linear-gradient(to right, #000 calc(100% - 86px), transparent calc(100% - 8px)); }
+.vs-sb-overmore { position: absolute; right: 0; }
+/* folded-changes pop-list above the bar */
+.vs-sb-pop { position: absolute; left: 0; bottom: calc(100% + 8px); z-index: 4; display: flex; flex-wrap: wrap; gap: 5px 8px; width: fit-content; min-width: min-content; font-size: 12.5px; background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; box-shadow: 0 8px 24px rgba(0, 0, 0, .16); padding: 6px; max-height: 140px; overflow-y: auto; transform-origin: bottom left; animation: vs-sb-pop-in .14s ease; }
+.vs-sb-pop.out { animation: vs-sb-pop-out .15s ease forwards; }
+@keyframes vs-sb-pop-in { from { opacity: 0; transform: translateY(6px) scale(.97); } to { opacity: 1; transform: none; } }
+@keyframes vs-sb-pop-out { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateY(6px) scale(.97); } }
+@media (prefers-reduced-motion: reduce) { .vs-sb-pop, .vs-sb-pop.out { animation: none; } }
+
+/* ============================================================
+   Enrollment: two-pane (student selector + detail), staged.
+   ============================================================ */
+.vs-enroll { display: flex; gap: 16px; align-items: stretch; height: min(640px, calc(100vh - 200px)); }
+.vs-enroll-sel { width: 320px; flex-shrink: 0; display: flex; flex-direction: column; border: 1px solid #e5e7eb; border-radius: 12px; background: #fff; overflow: hidden; }
+.vs-enroll-sel-head { flex-shrink: 0; padding: 12px 12px 0; }
+.vs-enroll-sel-head .vs-search { margin-bottom: 12px; }
+.vs-enroll-sel-list { flex: 1; min-height: 0; overflow-y: auto; padding: 0 6px 8px; }
+.vs-enroll-sel-list::-webkit-scrollbar { width: 6px; }
+.vs-enroll-sel-list::-webkit-scrollbar-thumb { background: #c3c8cf; border-radius: 3px; }
+.vs-enroll-srow { display: flex; align-items: center; gap: 11px; padding: 9px 10px; border-radius: 8px; cursor: pointer; }
+.vs-enroll-srow:hover { background: #f8f9fb; }
+.vs-enroll-srow.on { background: #e8f0fe; }
+.vs-enroll-srow.on .vs-cv-rt { color: #1a73e8; }
+/* Avatars keep the default blue base + blue initials — EXCEPT when the row is
+   selected, where the highlight is also light blue, so the base goes grey to
+   stay visible (initials stay blue). */
+.vs-enroll-srow.on .vs-cv-av { background: #e8eaed; }
+
+/* ── Playback stats — course modal (two-pane) + edit-user pane ─────────── */
+.vs-ps-modal { width: 100%; max-width: 760px; max-height: calc(100vh - 48px); display: flex; flex-direction: column; background: #fff; border-radius: 12px; box-shadow: 0 12px 32px rgba(0, 0, 0, .18); overflow: hidden; animation: vs-modal-in .16s ease; }
+.vs-ps-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-shrink: 0; padding: 14px 18px; border-bottom: 1px solid #eef0f2; }
+.vs-ps-title { font-size: 15px; font-weight: 500; color: #1f2937; }
+.vs-ps-sub { font-size: 12px; color: #6b7280; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vs-ps-sub span { color: #1f2937; }
+.vs-ps-x { border: none; background: none; color: #9ca3af; cursor: pointer; padding: 4px; display: flex; border-radius: 6px; }
+.vs-ps-x:hover { background: #f1f3f4; color: #5f6368; }
+.vs-ps-x svg { width: 20px; height: 20px; }
+
+.vs-ps-body { display: flex; min-height: 0; height: 460px; }
+.vs-ps-side { width: 244px; flex-shrink: 0; border-right: 1px solid #eef0f2; display: flex; flex-direction: column; min-height: 0; }
+.vs-ps-search-wrap { padding: 12px 12px 4px; flex-shrink: 0; }
+/* left roster already fixes the search + count and scrolls only .vs-ps-slist */
+.vs-ps-search { position: relative; }
+.vs-ps-search input { width: 100%; height: 34px; padding: 0 10px 0 32px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 13px; font-family: inherit; color: #1f2937; box-sizing: border-box; }
+.vs-ps-search input:focus { outline: none; border-color: #1a73e8; box-shadow: 0 0 0 3px rgba(26, 115, 232, .12); }
+.vs-ps-search > svg { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); width: 15px; height: 15px; color: #9ca3af; pointer-events: none; }
+.vs-ps-count { font-size: 11px; color: #9ca3af; margin: 7px 2px 0; min-height: 14px; }
+.vs-ps-slist { flex: 1; overflow-y: auto; padding: 4px 8px 10px; }
+.vs-ps-srow { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 7px 8px; border: none; background: none; border-radius: 8px; cursor: pointer; font-family: inherit; }
+.vs-ps-srow:hover { background: #f8f9fb; }
+.vs-ps-srow.on { background: #e8f0fe; }
+.vs-ps-srow.on .vs-cv-av { background: #e8eaed; }
+.vs-ps-sinfo { flex: 1; min-width: 0; }
+.vs-ps-sname { font-size: 13px; color: #1f2937; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; }
+.vs-ps-suser { font-size: 11px; color: #9ca3af; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vs-ps-stot { font-size: 11px; color: #6b7280; flex-shrink: 0; }
+.vs-ps-tag { font-size: 10px; color: #1a73e8; background: #e8f0fe; border-radius: 20px; padding: 1px 6px; margin-left: 6px; flex-shrink: 0; }
+.vs-ps-skav { background: #eceef1 !important; color: transparent !important; }
+
+.vs-ps-main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.vs-ps-mhead { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 13px 16px 11px; border-bottom: 1px solid #f1f3f4; flex-shrink: 0; }
+.vs-ps-mh-t { font-size: 13px; font-weight: 500; color: #1f2937; }
+.vs-ps-mh-s { font-size: 11px; color: #6b7280; margin-top: 2px; }
+.vs-ps-backrow { display: flex; align-items: center; gap: 9px; width: 100%; text-align: left; border: none; background: none; border-bottom: 1px solid #f1f3f4; padding: 11px 16px; cursor: pointer; font-family: inherit; flex-shrink: 0; }
+.vs-ps-backrow:hover { background: #f8f9fb; }
+.vs-ps-backrow > svg:first-child { width: 16px; height: 16px; color: #9ca3af; flex-shrink: 0; }
+.vs-ps-backav { width: 28px !important; height: 28px !important; font-size: 11px !important; }
+
+.vs-ps-reset { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; border: 1px solid #f2b8b5; background: #fff; color: #c5221f; font-size: 12px; font-weight: 500; font-family: inherit; padding: 5px 10px; border-radius: 7px; cursor: pointer; white-space: nowrap; transition: background .12s; }
+.vs-ps-reset svg { width: 13px; height: 13px; }
+.vs-ps-reset:hover:not(:disabled) { background: #fce8e6; }
+.vs-ps-reset:disabled { opacity: .5; cursor: default; }
+
+.vs-ps-vlist { flex: 1; min-height: 0; overflow-y: auto; padding: 2px 0 6px; }
+.vs-ps-vrow { display: flex; align-items: center; gap: 12px; padding: 9px 16px; border-bottom: 1px solid #f4f5f6; }
+.vs-ps-vrow.none { opacity: .5; }
+.vs-ps-vmn { flex: 1; min-width: 0; }
+.vs-ps-vt { font-size: 13px; color: #1f2937; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vs-ps-vd { font-size: 11px; color: #9ca3af; margin-top: 1px; }
+.vs-ps-vr { text-align: right; flex-shrink: 0; }
+.vs-ps-vr1 { font-size: 12px; color: #1f2937; }
+.vs-ps-vr2 { font-size: 11px; color: #9ca3af; margin-top: 1px; }
+.vs-ps-time { border-bottom: 1px dotted #c9ccd1; cursor: pointer; outline: none; }
+.vs-ps-time:focus-visible { border-radius: 3px; box-shadow: 0 0 0 2px rgba(26, 115, 232, .4); }
+/* Custom tooltip for TimeAgo — fixed so it escapes the modal overflow clip;
+   above the modal scrim (1200) and drop veil (1300). JS positions left/top. */
+.vs-tip { position: fixed; z-index: 1350; max-width: calc(100vw - 16px); background: #1f2937; color: #fff; font-size: 12px; line-height: 1.45; padding: 6px 9px; border-radius: 7px; box-shadow: 0 6px 20px rgba(0, 0, 0, .24); white-space: nowrap; pointer-events: none; animation: vs-tip-in .1s ease; }
+@keyframes vs-tip-in { from { opacity: 0; } to { opacity: 1; } }
+.vs-ps-empty { padding: 20px 14px; text-align: center; font-size: 12px; color: #9ca3af; }
+.vs-ps-empty-lg { padding: 40px 16px; font-size: 13px; }
+
+/* Edit-user "Playback stats" pane (rides inside .vs-split-pane) */
+.vs-ps-panehead { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
+.vs-ps-resets { display: flex; gap: 8px; flex-shrink: 0; }
+.vs-ps-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.vs-ps-chip { display: flex; align-items: baseline; gap: 6px; max-width: 240px; padding: 6px 11px; border: 1px solid #d1d5db; background: #fff; border-radius: 20px; cursor: pointer; font-family: inherit; }
+.vs-ps-chip:hover { background: #f8f9fb; }
+.vs-ps-chip.on { border: 1.5px solid #1a73e8; background: #e8f0fe; padding: 5.5px 10.5px; }
+.vs-ps-chip-code { font-size: 12px; font-weight: 500; color: #1f2937; flex-shrink: 0; }
+.vs-ps-chip.on .vs-ps-chip-code { color: #1a73e8; }
+.vs-ps-chip-name { font-size: 11px; color: #9ca3af; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vs-split-pane .vs-ps-vrow { padding-left: 0; padding-right: 0; }
+
+@media (max-width: 620px) {
+  .vs-ps-body { height: 70vh; }
+  .vs-ps-side { width: 100%; border-right: none; }
+  .vs-ps-modal.has-sel .vs-ps-side { display: none; }
+  .vs-ps-modal:not(.has-sel) .vs-ps-main { display: none; }
+}
+
+/* ── Transcoding status — dense job rows; on desktop only the list scrolls,
+   the title + filter tabs stay pinned (the page flows on mobile) ──────── */
+.vs-tc { height: 100%; max-width: 920px; margin: 0 auto; display: flex; flex-direction: column; }
+.vs-tc-head { flex-shrink: 0; }
+.vs-tc-headrow { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+.vs-tc-filters { display: inline-flex; background: #eceef1; padding: 3px; border-radius: 9px; gap: 2px; margin-bottom: 14px; max-width: 100%; overflow-x: auto; }
+.vs-tc-fbtn { border: 1px solid transparent; background: none; color: #6b7280; font-weight: 400; padding: 5px 12px; border-radius: 7px; font-size: 13px; cursor: pointer; font-family: inherit; white-space: nowrap; }
+.vs-tc-fbtn:hover:not(.on) { color: #1f2937; }
+.vs-tc-fbtn.on { background: #fff; color: #1f2937; font-weight: 500; border-color: #e0e2e6; }
+.vs-tc-fbtn .n { color: #9ca3af; }
+.vs-tc-fbtn.on .n { color: #6b7280; }
+.vs-tc-card { flex: 1; min-height: 0; overflow-y: auto; background: #fff; border: 1px solid #eef0f2; border-radius: 12px; }
+.vs-tc-empty { padding: 44px 16px; text-align: center; color: #9ca3af; font-size: 13px; }
+.vs-tc-row { display: flex; gap: 12px; padding: 12px 16px; border-bottom: 1px solid #f1f3f4; }
+.vs-tc-row:last-child { border-bottom: 0; }
+.vs-tc-ic { width: 30px; height: 30px; flex-shrink: 0; border-radius: 50%; display: flex; align-items: center; justify-content: center; }
+.vs-tc-ic svg { width: 17px; height: 17px; }
+.vs-tc-mn { flex: 1; min-width: 0; }
+.vs-tc-toprow { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.vs-tc-title { font-size: 14px; font-weight: 500; color: #1f2937; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vs-tc-meta { font-size: 12px; color: #6b7280; margin-top: 2px; line-height: 1.55; word-break: break-word; }
+.vs-tc-jid { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #9ca3af; }
+.vs-tc-err { font-size: 12px; color: #c5221f; margin-top: 5px; word-break: break-word; }
+.vs-tc-pbar { height: 4px; background: #eceef1; border-radius: 3px; margin-top: 8px; overflow: hidden; max-width: 420px; }
+.vs-tc-pfill { height: 100%; background: #1a73e8; border-radius: 3px; transition: width .3s ease; }
+.vs-tc-pill { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; font-size: 12px; font-weight: 500; border-radius: 20px; padding: 3px 10px; white-space: nowrap; }
+.vs-tc-accent { background: #e8f0fe; color: #1a73e8; }
+.vs-tc-success { background: #e6f4ea; color: #188038; }
+.vs-tc-danger { background: #fce8e6; color: #c5221f; }
+.vs-tc-neutral { background: #f1f3f4; color: #6b7280; }
+@keyframes vs-tc-spin { to { transform: rotate(360deg); } }
+.vs-tc-spin { transform-origin: center; animation: vs-tc-spin .9s linear infinite; }
+@media (max-width: 768px) {
+  .vs-tc { height: auto; }
+  .vs-tc-card { flex: none; overflow: visible; }
+}
+.vs-enroll-chev { display: none; margin-left: auto; color: #c3c8cf; flex-shrink: 0; }
+.vs-enroll-chev svg { width: 18px; height: 18px; }
+/* Mobile-only back button at the top of the detail pane. */
+.vs-enroll-back { display: none; align-items: center; gap: 4px; background: none; border: 0; padding: 0; margin-bottom: 12px; font: inherit; font-size: 13px; color: #6b7280; cursor: pointer; }
+.vs-enroll-back:hover { color: #1a73e8; }
+.vs-enroll-back svg { width: 16px; height: 16px; }
+/* Stacked "N / enrolled" count (not a badge). */
+.vs-enroll-count { flex-shrink: 0; text-align: right; line-height: 1.15; }
+.vs-enroll-count-n { font-size: 24px; font-weight: 500; color: #1f2937; }
+.vs-enroll-count-l { font-size: 12px; color: #9ca3af; }
+/* Course rows: code (slightly smaller) then name, both black, one line + gap. */
+.vs-cs-line { font-size: 15px; }
+.vs-cs-code { font-size: 13.5px; color: #1f2937; margin-right: 12px; }
+.vs-cs-name { color: #1f2937; }
+.vs-enroll-pane { flex: 1; min-width: 0; display: flex; flex-direction: column; border: 1px solid #e5e7eb; border-radius: 12px; background: #fff; overflow: hidden; }
+.vs-enroll-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 18px 20px; }
+.vs-enroll-scroll::-webkit-scrollbar { width: 6px; }
+.vs-enroll-scroll::-webkit-scrollbar-thumb { background: #c3c8cf; border-radius: 3px; }
+.vs-enroll-empty { display: flex; align-items: center; justify-content: center; height: 100%; color: #9ca3af; font-size: 14px; }
+/* a course row staged for change gets a coloured left rail */
+.vs-cv-row.staged-add { position: relative; }
+.vs-cv-row.staged-remove { position: relative; }
+.vs-cv-row.staged-add::before, .vs-cv-row.staged-remove::before { content: ""; position: absolute; left: 0; top: 8px; bottom: 8px; width: 3px; border-radius: 3px; }
+.vs-cv-row.staged-add::before { background: #137333; }
+.vs-cv-row.staged-remove::before { background: #c5221f; }
+/* Mobile: master-detail — the student list is one screen, the selected
+   student's enrollment another. `has-selection` (set by the page when a student
+   is picked) swaps which is shown; a per-row chevron and a pane back button
+   appear only here. */
+@media (max-width: 760px) {
+  .vs-enroll { flex-direction: column; height: auto; gap: 0; }
+  .vs-enroll-sel, .vs-enroll-pane { width: auto; }
+  .vs-enroll-sel-list, .vs-enroll-scroll { overflow: visible; }
+  .vs-enroll:not(.has-selection) .vs-enroll-pane { display: none; }
+  .vs-enroll.has-selection .vs-enroll-sel { display: none; }
+  .vs-enroll-chev { display: inline-flex; }
+  .vs-enroll-back { display: inline-flex; }
+  /* The page scrolls on mobile (the pane isn't a bounded scroll box), so a
+     sticky bar wouldn't stay pinned. Fix the bar to the viewport bottom — the
+     mobile equivalent of the desktop sticky-at-pane-bottom. No ancestor has a
+     transform, so fixed anchors to the viewport. Only when a change is staged
+     (has-staged) do we reserve bottom room so the last row clears the bar. */
+  .vs-enroll .vs-savebar-wrap { position: fixed; left: 16px; right: 16px; bottom: 12px; z-index: 50; margin-top: 0; }
+  .vs-enroll.has-staged .vs-enroll-scroll { padding-bottom: 84px; }
+}
+/* frosted glass, matching the portal's approved variant */
+@supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+  .vs-savebar {
+    background: rgba(255, 255, 255, .62);
+    -webkit-backdrop-filter: blur(18px) saturate(1.8);
+    backdrop-filter: blur(18px) saturate(1.8);
+    border-color: rgba(255, 255, 255, .55);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, .14), inset 0 1px 0 rgba(255, 255, 255, .65), inset 0 0 0 1px rgba(0, 0, 0, .05);
+  }
+}
+
+/* A header action that reads as centred against the title+subtitle block.
+   .vs-cv-head is flex-start (the seg switch wants that); this opts one child
+   out and nudges it a touch below true centre. */
+.vs-head-action { align-self: center; margin-top: 5px; flex-shrink: 0; }
+
+/* The course title carries a quiet pencil. Object actions sit LEFT with the
+   title; content actions (pane switch, upload) stay in the header's right
+   cluster, so nothing destructive lands beside a button pressed all day. */
+.vs-titlerow { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.vs-title-edit { width: 28px; height: 28px; flex-shrink: 0; border: 0; border-radius: 8px; background: none; color: #9ca3af; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+.vs-title-edit:hover { background: #eef0f3; color: #1a73e8; }
+.vs-title-edit svg { width: 16px; height: 16px; }
+
+/* Inline switch, for boolean settings inside a pane. */
+.vs-toggle { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.vs-toggle-lbl { flex: 1; }
+.vs-toggle-lbl .vs-label { margin-bottom: 2px; }
+.vs-switch { position: relative; display: inline-block; width: 40px; height: 22px; flex-shrink: 0; }
+.vs-switch input { opacity: 0; width: 0; height: 0; }
+.vs-switch-slider { position: absolute; inset: 0; border-radius: 22px; background: #d1d5db; cursor: pointer; transition: background .16s; }
+.vs-switch-slider::before { content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, .2); transition: transform .16s; }
+.vs-switch input:checked + .vs-switch-slider { background: #1a73e8; }
+.vs-switch input:checked + .vs-switch-slider::before { transform: translateX(18px); }
+.vs-switch input:disabled + .vs-switch-slider { opacity: .45; cursor: default; }
+
+/* --- Full-window drop veil ---
+   Sits above the modal (z-index > .vs-scrim) so the whole viewport is the drop
+   target. `.refuse` is shown while an upload is in flight: the drop is still
+   intercepted, but visibly rejected. */
+.vs-dropveil { position: fixed; inset: 0; z-index: 1300; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(26, 115, 232, .10); backdrop-filter: blur(1.5px); pointer-events: none; animation: vs-scrim-in .1s ease; }
+.vs-dropveil-box { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 30px 40px; border: 2px dashed #1a73e8; border-radius: 14px; background: #fff; box-shadow: 0 12px 32px rgba(0, 0, 0, .18); }
+.vs-dropveil-ico { color: #1a73e8; display: flex; }
+.vs-dropveil-ico svg { width: 34px; height: 34px; }
+.vs-dropveil-t { font-size: 15px; font-weight: 500; color: #1f2937; margin: 0; }
+.vs-dropveil-h { font-size: 12.5px; color: #6b7280; margin: 0; }
+.vs-dropveil.refuse { background: rgba(197, 34, 31, .10); }
+.vs-dropveil.refuse .vs-dropveil-box { border-color: #c5221f; animation: vs-refuse-shake .3s ease; }
+.vs-dropveil.refuse .vs-dropveil-ico { color: #c5221f; }
+.vs-dropveil.refuse .vs-dropveil-t { color: #c5221f; }
+@keyframes vs-refuse-shake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-5px); }
+  75% { transform: translateX(5px); }
+}
+
+/* --- Back link above a drilled-in page header --- */
+.vs-back { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; color: #6b7280; background: none; border: 0; padding: 0; margin-bottom: 8px; cursor: pointer; font-family: inherit; text-decoration: none; }
+.vs-back:hover { color: #1a73e8; text-decoration: none; }
+.vs-back svg { width: 15px; height: 15px; }
