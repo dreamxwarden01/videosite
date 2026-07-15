@@ -128,8 +128,8 @@ export default function CoursesPage() {
             <div className="vs-cv-row" key={i}>
               <span className="vs-cv-fico fico-gen" />
               <div className="vs-cv-rmn">
-                <div className="vs-cv-skel" style={{ width: 160 + ((i * 37) % 90) }} />
-                <div className="vs-cv-skel" style={{ width: 100 + ((i * 23) % 60), marginTop: 7 }} />
+                <p className="vs-cv-rt"><span className="vs-skln" style={{ width: 160 + ((i * 37) % 90) }}>&nbsp;</span></p>
+                <p className="vs-cv-rs"><span className="vs-skln" style={{ width: 100 + ((i * 23) % 60) }}>&nbsp;</span></p>
               </div>
             </div>
           ))

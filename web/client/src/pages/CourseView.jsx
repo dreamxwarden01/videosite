@@ -431,12 +431,17 @@ export default function CourseView({ tab }) {
           first measurement (rowH 0) the skeleton sizes naturally. */}
       <div className="vs-cv-card" ref={cardRef} style={rowH > 0 ? { height: pageSize * (rowH + 1) } : undefined}>
         {showSkeleton ? (
+          // Skeleton rows MUST match the real row height, or useFitHeight settles
+          // on a shorter skeleton rowH and derives one row too many — the materials
+          // n+1 (a video poster tile dominates its height so videos match either
+          // way; a material row's height comes from the .vs-cv-rmn text). Mirror the
+          // real row's .vs-cv-rt / .vs-cv-rs <p> line boxes with the bar inline.
           Array.from({ length: skelCount }).map((_, i) => (
             <div className="vs-cv-row" key={i}>
               {isVideos ? <div className="vs-cv-thumb loading" /> : <span className="vs-cv-fico fico-gen" />}
               <div className="vs-cv-rmn">
-                <div className="vs-cv-skel" style={{ width: 150 + ((i * 37) % 90) }} />
-                <div className="vs-cv-skel" style={{ width: 90 + ((i * 23) % 60), marginTop: 7 }} />
+                <p className="vs-cv-rt"><span className="vs-skln" style={{ width: 150 + ((i * 37) % 90) }}>&nbsp;</span></p>
+                <p className="vs-cv-rs"><span className="vs-skln" style={{ width: 90 + ((i * 23) % 60) }}>&nbsp;</span></p>
               </div>
             </div>
           ))

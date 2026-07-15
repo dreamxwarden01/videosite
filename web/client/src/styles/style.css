@@ -2046,8 +2046,9 @@ tr.clickable-row:hover { background-color: #f9fafb; }
    keeps the layout from shifting on a course switch (count briefly unknown). */
 .vs-cv-foot { min-height: 42px; }
 .vs-pager { display: flex; align-items: center; gap: 8px; margin-top: 14px; font-size: 12.5px; color: #6b7280; }
-.vs-pbtn { padding: 5px 11px; border: 1px solid #d1d5db; border-radius: 8px; background: #fff; cursor: pointer; font-size: 12.5px; color: #1f2937; font-family: inherit; }
+.vs-pbtn { display: inline-flex; align-items: center; gap: 3px; padding: 5px 10px; border: 1px solid #d1d5db; border-radius: 8px; background: #fff; cursor: pointer; font-size: 12.5px; color: #1f2937; font-family: inherit; }
 .vs-pbtn:disabled { opacity: .45; cursor: default; }
+.vs-pbtn svg { width: 15px; height: 15px; }
 .vs-pnum { min-width: 30px; text-align: center; padding: 5px 8px; border-radius: 8px; border: 1px solid transparent; cursor: pointer; background: none; color: #1f2937; font-size: 12.5px; font-family: inherit; }
 .vs-pnum.on { background: #1a73e8; color: #fff; font-weight: 500; }
 .vs-pdots { color: #9ca3af; padding: 0 2px; }
@@ -2070,6 +2071,21 @@ tr.clickable-row:hover { background-color: #f9fafb; }
 .vs-sort-opt.on { color: #1a73e8; font-weight: 500; }
 .vs-sort-opt svg { width: 15px; height: 15px; flex-shrink: 0; color: #1a73e8; }
 .vs-sort-div { height: 1px; background: #eef0f2; margin: 5px 2px; }
+
+/* Mobile pager (≤640px): the row gets cramped, so drop the page-number buttons
+   and the text labels — leaving the count, a bigger sort glyph, and two clear
+   arrow buttons. The prev/next chevrons and the sort glyph enlarge (and gain a
+   little height) so they stay comfortably tappable. */
+@media (max-width: 640px) {
+  .vs-pnum, .vs-pdots { display: none; }
+  .vs-pbtn-lbl { display: none; }
+  .vs-pbtn { padding: 7px 9px; }
+  .vs-pbtn svg { width: 20px; height: 20px; }
+  .vs-pager-nav { gap: 6px; }
+  .vs-sort-cur, .vs-sort-dir { display: none; }
+  .vs-sort-btn { padding: 8px 9px; }
+  .vs-sort-btn > svg { width: 19px; height: 19px; }
+}
 
 .vs-cv-skel { height: 13px; border-radius: 5px; background: linear-gradient(90deg, #eceef1 25%, #f3f4f6 37%, #eceef1 63%); background-size: 400% 100%; animation: vs-shimmer 1.4s ease infinite; }
 /* Skeleton "line" whose HEIGHT comes from its own (transparent, non-breaking)

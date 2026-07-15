@@ -605,12 +605,19 @@ export default function CoursePage() {
         {!hasTab ? (
           <div className="vs-cv-empty">You don’t have access to this course’s contents.</div>
         ) : showSkeleton ? (
+          // Skeleton rows MUST be the same height as real rows, or useFitHeight
+          // measures a shorter rowH on the skeleton (which it settles+freezes on)
+          // and derives one row too many — the materials n+1 (a video row's poster
+          // tile dominates its height so videos match either way; a material row's
+          // height comes from the .vs-cv-rmn text, which the old flat bars
+          // under-measured). Mirror the real row's exact box: same fico/poster +
+          // the .vs-cv-rt / .vs-cv-rs <p> line boxes with the shimmer bar inline.
           Array.from({ length: skelCount }).map((_, i) => (
             <div className="vs-cv-row" key={i}>
               {isVideos ? <div className="vs-cv-thumb loading" /> : <span className="vs-cv-fico fico-gen" />}
               <div className="vs-cv-rmn">
-                <div className="vs-cv-skel" style={{ width: 150 + ((i * 37) % 90) }} />
-                <div className="vs-cv-skel" style={{ width: 90 + ((i * 23) % 60), marginTop: 7 }} />
+                <p className="vs-cv-rt"><span className="vs-skln" style={{ width: 150 + ((i * 37) % 90) }}>&nbsp;</span></p>
+                <p className="vs-cv-rs"><span className="vs-skln" style={{ width: 90 + ((i * 23) % 60) }}>&nbsp;</span></p>
               </div>
             </div>
           ))

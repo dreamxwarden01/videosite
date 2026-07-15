@@ -6,6 +6,13 @@ const pageNums = (page, pages) => {
   return [...s].filter((n) => n >= 1 && n <= pages).sort((a, b) => a - b);
 };
 
+// Chevrons for the prev/next buttons. On desktop they sit beside the "Prev"/
+// "Next" label; on mobile (≤640px) the label is hidden and the chevron enlarges,
+// so the pager collapses to count + sort glyph + two clear arrows (the page-number
+// buttons hide too — see .vs-pnum in the media query).
+const ChevL = () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6" /></svg>;
+const ChevR = () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m9 18 6-6-6-6" /></svg>;
+
 export default function VsPager({ page, pages, total, from, to, unit, onPage, sortControl }) {
   if (total === 0) return null;
   return (
@@ -13,14 +20,18 @@ export default function VsPager({ page, pages, total, from, to, unit, onPage, so
       <span className="vs-pager-count">{from}–{to} of {total} {unit}</span>
       {sortControl}
       <div className="vs-pager-nav">
-        <button className="vs-pbtn" disabled={page === 1} onClick={() => onPage(page - 1)}>‹ Prev</button>
+        <button className="vs-pbtn" disabled={page === 1} onClick={() => onPage(page - 1)} aria-label="Previous page">
+          <ChevL /><span className="vs-pbtn-lbl">Prev</span>
+        </button>
         {pageNums(page, pages).map((n, i, arr) => (
           <span key={n}>
             {i > 0 && n - arr[i - 1] > 1 && <span className="vs-pdots">…</span>}
             <button className={'vs-pnum' + (n === page ? ' on' : '')} onClick={() => onPage(n)}>{n}</button>
           </span>
         ))}
-        <button className="vs-pbtn" disabled={page === pages} onClick={() => onPage(page + 1)}>Next ›</button>
+        <button className="vs-pbtn" disabled={page === pages} onClick={() => onPage(page + 1)} aria-label="Next page">
+          <span className="vs-pbtn-lbl">Next</span><ChevR />
+        </button>
       </div>
     </div>
   );
