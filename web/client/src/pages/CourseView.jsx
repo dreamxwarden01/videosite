@@ -374,7 +374,7 @@ export default function CourseView({ tab }) {
     else tail = <span className="vs-cv-stb vs-cv-stb-p">Processing{video.processing_progress ? ` ${video.processing_progress}%` : ''}</span>;
     const inner = (<>{renderPoster(video)}<div className="vs-cv-rmn"><p className="vs-cv-rt">{video.title}</p>{meta}</div>{tail}</>);
     return clickable ? (
-      <Link key={video.video_id} to={`/course/${courseId}/watch/${video.video_id}`} className="vs-cv-row clk">{inner}</Link>
+      <Link key={video.video_id} to={`/course/${courseId}/watch/${video.video_id}`} state={{ from: 'course' }} className="vs-cv-row clk">{inner}</Link>
     ) : (
       <div key={video.video_id} className={'vs-cv-row' + (video.status === 'finished' ? '' : ' proc')}>{inner}</div>
     );

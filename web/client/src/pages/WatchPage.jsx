@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { useParams, Link } from 'react-router-dom';
+import { useParams, Link, useNavigate, useLocation } from 'react-router-dom';
 import { useSite } from '../context/SiteContext';
 import { useAuth } from '../context/AuthContext';
 import { useToast } from '../context/ToastContext';
@@ -125,6 +125,8 @@ function registerTheaterElement(shaka) {
 
 export default function WatchPage() {
   const { videoId } = useParams();
+  const navigate = useNavigate();
+  const location = useLocation();
   const { siteName } = useSite();
   const { refresh } = useAuth();
   const { showToast } = useToast();
@@ -823,13 +825,29 @@ export default function WatchPage() {
 
   const { video } = data;
   const backUrl = `/course/${video.course_id}`;
+  // The course page marks its video links with state.from === 'course'. When we
+  // arrived that way the course page is the previous history entry, so a plain
+  // click POPS the stack (history back) instead of PUSHING a duplicate course
+  // entry — otherwise the system back button/gesture (esp. Android) would bounce
+  // the user right back into the player after they used the bar to leave. A
+  // direct visit (typed/pasted URL, or a hard refresh of one) has no such state,
+  // so we fall through to the Link's normal push to the course page. Modified
+  // clicks (⌘/ctrl/new-tab) also fall through to the href.
+  const cameFromCourse = location.state?.from === 'course';
+  const onBack = (e) => {
+    flushWatchRef.current?.();
+    if (cameFromCourse && e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      navigate(-1);
+    }
+  };
 
   return (
     <div className="vs-wp">
       <Link
         to={backUrl}
         className="vs-wp-back"
-        onClick={() => { flushWatchRef.current?.(); }}
+        onClick={onBack}
       >
         <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
           <path d="M10 12L6 8l4-4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
