@@ -42,6 +42,7 @@ async function createSession(userId, userAgent, ipAddress, ssoSid = null, ssoExp
         ipAddress,
         userAgent,
         ssoExpiresAt,
+        ssoSid,
     }, ttl);
 
     return sessionId;
@@ -82,7 +83,7 @@ async function getSession(sessionId) {
     // (Redis expired it) and is invalid, or Redis was cold-restarted.
     const pool = getPool();
     const [rows] = await pool.execute(
-        `SELECT session_id, user_id, last_seen, last_sign_in, user_agent, ip_address, sso_expires_at
+        `SELECT session_id, user_id, last_seen, last_sign_in, user_agent, ip_address, sso_expires_at, sso_sid
          FROM sessions WHERE session_id = ?`,
         [sessionId]
     );
@@ -106,6 +107,7 @@ async function getSession(sessionId) {
             ip_address: row.ip_address,
             user_agent: row.user_agent,
             sso_expires_at: ssoExpMs,
+            sso_sid: row.sso_sid || null,
             _stale: true,
         };
     }
@@ -119,6 +121,7 @@ async function getSession(sessionId) {
         ipAddress: row.ip_address,
         userAgent: row.user_agent,
         ssoExpiresAt: ssoExpMs,
+        ssoSid: row.sso_sid || null,
     }, remainingTtl);
 
     return {
@@ -129,6 +132,7 @@ async function getSession(sessionId) {
         ip_address: row.ip_address,
         user_agent: row.user_agent,
         sso_expires_at: ssoExpMs,
+        sso_sid: row.sso_sid || null,
     };
 }
 

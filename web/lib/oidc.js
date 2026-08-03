@@ -153,16 +153,23 @@ function authorizeUrl({ challenge, state, nonce, extra = {} }) {
   return u.toString();
 }
 
-// Authorization-code -> tokens, authenticating with private_key_jwt (RFC 7523).
-async function exchangeCode(code, verifier) {
+// private_key_jwt client assertion (RFC 7523) — our credential for the SSO's
+// /token and /internal/* endpoints. iss=sub=CLIENT_ID, aud=ISSUER, 60s life.
+// One definition, three callers (/token, /internal/avatar, /internal/session-activity).
+async function signClientAssertion() {
   const { SignJWT } = await jose();
   const key = await clientKey(); // also populates _privJwk (for the kid)
   const now = Math.floor(Date.now() / 1000);
-  const assertion = await new SignJWT({})
+  return new SignJWT({})
     .setProtectedHeader({ alg: 'EdDSA', kid: _privJwk.kid })
     .setIssuer(CLIENT_ID).setSubject(CLIENT_ID).setAudience(ISSUER)
     .setIssuedAt(now).setExpirationTime(now + 60).setJti(crypto.randomUUID())
     .sign(key);
+}
+
+// Authorization-code -> tokens, authenticating with private_key_jwt (RFC 7523).
+async function exchangeCode(code, verifier) {
+  const assertion = await signClientAssertion();
 
   const r = await s2sFetch(INTERNAL + '/token', {
     method: 'POST',
@@ -230,8 +237,11 @@ async function signEventToken(events) {
     .sign(key);
 }
 
-// Verify an inbound envelope from the SSO (its JWKS; audience = us).
-async function verifyEventToken(token) {
+// Verify any JWT the SSO addressed to us — its JWKS, iss = SSO, aud = us, at most
+// 5 minutes old. Used for the inbound event envelope and for the signed verdict
+// on an activity report (which authorizes destroying a session, so it must be
+// proven to come from the SSO rather than from anything else in the path).
+async function verifySsoToken(token) {
   const { jwtVerify } = await jose();
   const { payload } = await jwtVerify(token, await jwks(), {
     issuer: ISSUER, audience: CLIENT_ID, clockTolerance: 10, maxTokenAge: '5 minutes',
@@ -239,19 +249,18 @@ async function verifyEventToken(token) {
   return payload;
 }
 
+// Verify an inbound envelope from the SSO (its JWKS; audience = us).
+async function verifyEventToken(token) {
+  return verifySsoToken(token);
+}
+
 function ssoEventsUrl() { return INTERNAL + '/backchannel/events'; }
+function ssoActivityUrl() { return INTERNAL + '/internal/session-activity'; }
 
 // Fetch avatar bytes from the SSO's internal endpoint (client assertion —
 // same private_key_jwt material as /token). Returns a Buffer or null.
 async function fetchInternalAvatar(file) {
-  const { SignJWT } = await jose();
-  const key = await clientKey(); // also populates _privJwk (for the kid)
-  const now = Math.floor(Date.now() / 1000);
-  const assertion = await new SignJWT({})
-    .setProtectedHeader({ alg: 'EdDSA', kid: _privJwk.kid })
-    .setIssuer(CLIENT_ID).setSubject(CLIENT_ID).setAudience(ISSUER)
-    .setIssuedAt(now).setExpirationTime(now + 60).setJti(crypto.randomUUID())
-    .sign(key);
+  const assertion = await signClientAssertion();
   const r = await s2sFetch(INTERNAL + '/internal/avatar', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -274,4 +283,4 @@ function publicJwks() {
   return { keys: publishedKeys(readKeyFile()).map(({ d, p, q, dp, dq, qi, k, ...pub }) => ({ use: 'sig', ...pub })) };
 }
 
-module.exports = { loadConfig, beginFlow, authorizeUrl, exchangeCode, verifyIdToken, userinfo, verifyLogoutToken, endSessionUrl, signEventToken, verifyEventToken, ssoEventsUrl, publicJwks, fetchInternalAvatar, rotateClientKey, clientKeyInfo, ensureClientKey, hasClientKey };
+module.exports = { loadConfig, beginFlow, authorizeUrl, exchangeCode, verifyIdToken, userinfo, verifyLogoutToken, endSessionUrl, signEventToken, verifyEventToken, verifySsoToken, ssoEventsUrl, ssoActivityUrl, signClientAssertion, publicJwks, fetchInternalAvatar, rotateClientKey, clientKeyInfo, ensureClientKey, hasClientKey };

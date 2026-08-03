@@ -56,6 +56,15 @@ async function loadUser(req, res, next) {
         // these to DB every 15 min — the per-request DB write is gone.
         await updateSessionActivity(sessionId, getClientIp(req), req.headers['user-agent'] || null);
 
+        // Tell the SSO this session is in use, so its idle window reflects real
+        // activity instead of only SSO-side traffic. Coalesced to ~5 min per
+        // session inside the service, so this is a single Redis probe on the hot
+        // path. Deliberately NOT awaited — it must never add latency here — which
+        // also means it escapes the try/catch below, hence the explicit .catch().
+        require('../services/ssoActivity')
+            .reportActivity(sessionId, session.sso_sid, session.last_seen)
+            .catch((e) => console.error('activity report failed:', e.message));
+
         // Resolve permissions + permission_level in one cached bundle (2 Redis GETs).
         const { permissions, permission_level } = await resolveAuthBundle(session.user_id);
 
