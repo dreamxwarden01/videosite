@@ -14,6 +14,7 @@ const {
     completeMultipartUpload,
     abortMultipartUpload,
     calculateTotalParts,
+    getObjectSize,
     PART_SIZE
 } = require('../../services/uploadService');
 const {
@@ -232,8 +233,25 @@ router.post('/upload/:uploadId/presign', requireAuth, checkPermission('uploadVid
         if (!partNumbers || !Array.isArray(partNumbers)) {
             return res.status(400).json({ error: 'partNumbers array is required' });
         }
+        // total_parts was computed from the declared file size at session-create
+        // and then never enforced, which made it decorative: a session declaring
+        // a 1 MB file could still mint URLs for parts 1..10000. Bound every part
+        // to the session's own range, and cap the batch (the client asks for 10
+        // at a time) so one request can't mint thousands of signatures.
+        if (partNumbers.length === 0 || partNumbers.length > 100) {
+            return res.status(400).json({ error: 'partNumbers must contain between 1 and 100 entries' });
+        }
+        const totalParts = Number(session.total_parts);
+        const bad = partNumbers.some(
+            (n) => !Number.isInteger(n) || n < 1 || n > totalParts
+        );
+        if (bad) {
+            return res.status(400).json({ error: `partNumbers must be integers within 1..${totalParts}` });
+        }
 
-        const urls = await getPresignedPartUrls(session.object_key, session.r2_upload_id, partNumbers);
+        const urls = await getPresignedPartUrls(
+            session.object_key, session.r2_upload_id, partNumbers, Number(session.file_size_bytes)
+        );
         res.json({ urls });
     } catch (err) {
         console.error('Upload presign error:', err);
@@ -277,6 +295,24 @@ router.post('/upload/:uploadId/complete', requireAuth, checkPermission('uploadVi
         // Finalize R2 multipart upload
         await completeMultipartUpload(session.object_key, session.r2_upload_id, parts);
 
+        // Backstop to the signed per-part content-length: ask R2 what actually
+        // assembled rather than trusting the size declared at session-create.
+        // Over the cap, the source is dropped instead of being handed to the
+        // transcoder and recorded against the video.
+        const actualSize = await getObjectSize(session.object_key);
+        if (actualSize === null) {
+            await markAborted(session.upload_id);
+            return res.status(422).json({ error: 'Upload not found in storage.' });
+        }
+        if (actualSize > MAX_FILE_SIZE) {
+            await deletionService.enqueuePrefix(
+                session.object_key.substring(0, session.object_key.lastIndexOf('/') + 1),
+                { source: 'oversize_source' }
+            );
+            await markAborted(session.upload_id);
+            return res.status(413).json({ error: 'Uploaded file exceeds the 50 GB limit.' });
+        }
+
         const pool = getPool();
         let videoId;
 
@@ -293,7 +329,7 @@ router.post('/upload/:uploadId/complete', requireAuth, checkPermission('uploadVi
                 module_number: session.module_number,
                 lecture_date: session.lecture_date,
                 original_filename: session.original_filename,
-                file_size_bytes: session.file_size_bytes,
+                file_size_bytes: actualSize,
                 uploaded_by: user.user_id,
                 r2_source_key: session.object_key,
                 video_type: 'cmaf'
@@ -348,7 +384,7 @@ router.post('/upload/:uploadId/complete', requireAuth, checkPermission('uploadVi
                  processing_progress = 0, processing_error = NULL, duration_seconds = NULL,
                  video_type = 'cmaf'
                  WHERE video_id = ?`,
-                [session.object_key, session.original_filename, session.file_size_bytes, videoId]
+                [session.object_key, session.original_filename, actualSize, videoId]
             );
             await require('../../services/cache/videoCache').invalidate(videoId);
 

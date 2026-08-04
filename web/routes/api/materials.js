@@ -6,6 +6,7 @@ const { getPool, idBuf } = require('../../config/database');
 const {
     generateMaterialId,
     getPresignedUploadUrl,
+    getObjectSize,
     getPresignedDownloadUrl,
     applyHeaders,
     createMaterialRecord,
@@ -111,7 +112,14 @@ router.post('/materials/courses/:courseId/upload', requireAuth, checkPermission(
         if (!filename || !fileSize || !module_number) {
             return res.status(400).json({ error: 'filename, fileSize, and a module number are required.' });
         }
-        if (fileSize > MAX_FILE_SIZE) {
+        // fileSize is signed into the presigned URL below, so it has to be a real
+        // integer — a non-numeric value would make `> MAX_FILE_SIZE` NaN-false and
+        // sail through, then be signed as garbage.
+        const declaredSize = Number(fileSize);
+        if (!Number.isInteger(declaredSize) || declaredSize <= 0) {
+            return res.status(400).json({ error: 'invalid fileSize' });
+        }
+        if (declaredSize > MAX_FILE_SIZE) {
             return res.status(400).json({ error: 'File size exceeds 100 MB limit.' });
         }
 
@@ -137,12 +145,13 @@ router.post('/materials/courses/:courseId/upload', requireAuth, checkPermission(
             objectKey,
             contentType: finalContentType,
             originalFilename: filename,
-            fileSizeBytes: fileSize,
+            fileSizeBytes: declaredSize,
             createdBy: user.user_id,
         });
 
-        // Presigned PUT URL — the client uploads directly to R2.
-        const uploadUrl = await getPresignedUploadUrl(objectKey, finalContentType);
+        // Presigned PUT URL — the client uploads directly to R2. The declared
+        // size is SIGNED into it, so R2 refuses any body of a different length.
+        const uploadUrl = await getPresignedUploadUrl(objectKey, finalContentType, declaredSize);
 
         res.status(201).json({ uploadId, uploadUrl });
     } catch (err) {
@@ -203,16 +212,30 @@ router.post('/materials/:uploadId/complete', requireAuth, checkPermission('uploa
             return res.status(410).json({ error: 'Course deleted.' });
         }
 
+        // Backstop to the signed content-length: ask R2 what actually landed
+        // rather than trusting the size the client declared at session-create.
+        // Anything over the cap is dropped instead of recorded.
+        const actualSize = await getObjectSize(session.object_key);
+        if (actualSize === null) {
+            await markCompleted(uploadId, null);
+            return res.status(422).json({ error: 'Upload not found in storage.' });
+        }
+        if (actualSize > MAX_FILE_SIZE) {
+            await deletionService.enqueueKey(session.object_key, { source: 'oversize_attachment' });
+            await markCompleted(uploadId, null);
+            return res.status(413).json({ error: 'Uploaded file exceeds the 100 MB limit.' });
+        }
+
         // Re-stamp the object's headers from the cached content_type.
         await applyHeaders(session.object_key, session.content_type);
 
-        // Insert the real `course_materials` row.
+        // Insert the real `course_materials` row — with the VERIFIED size.
         const module_number = req.body && typeof req.body.module_number === 'string' ? req.body.module_number : null;
         const materialId = await createMaterialRecord(
             session.course_id,
             session.object_key,
             session.original_filename,
-            session.file_size_bytes,
+            actualSize,
             session.content_type,
             module_number,
             userId

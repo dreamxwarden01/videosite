@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { PutObjectCommand, GetObjectCommand, CopyObjectCommand } = require('@aws-sdk/client-s3');
+const { PutObjectCommand, GetObjectCommand, CopyObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { getR2Client, getR2BucketName } = require('../config/r2');
 const { getPool, idBuf } = require('../config/database');
@@ -22,15 +22,39 @@ function generateMaterialId() {
 
 // --- R2 presigned URLs ---
 
-async function getPresignedUploadUrl(objectKey, contentType) {
+// contentLength is SIGNED into the URL (not merely declared), so R2 rejects a
+// body of any other size with SignatureDoesNotMatch before accepting any bytes.
+// Without it only `host` is signed and the URL is a blank cheque — one issued for
+// a 1 KB file will happily store gigabytes, and the size we record in the DB
+// becomes fiction. The client already PUTs exactly the file.size it declared, so
+// this costs nothing at the caller.
+async function getPresignedUploadUrl(objectKey, contentType, contentLength) {
     const r2 = getR2Client();
     const bucket = getR2BucketName();
     const command = new PutObjectCommand({
         Bucket: bucket,
         Key: objectKey,
         ContentType: contentType || 'application/octet-stream',
+        ContentLength: contentLength,
     });
-    return getSignedUrl(r2, command, { expiresIn: 3600 });
+    return getSignedUrl(r2, command, {
+        expiresIn: 3600,
+        signableHeaders: new Set(['content-length']),
+    });
+}
+
+// Actual stored size straight from R2 — the only number we didn't take on trust.
+// null when the object is missing.
+async function getObjectSize(objectKey) {
+    try {
+        const r = await getR2Client().send(new HeadObjectCommand({
+            Bucket: getR2BucketName(),
+            Key: objectKey,
+        }));
+        return r.ContentLength ?? null;
+    } catch {
+        return null;
+    }
 }
 
 async function getPresignedDownloadUrl(objectKey, filename, { inline = false } = {}) {
@@ -168,6 +192,7 @@ async function getCoursesWithMaterialCount(userId, hasAllCourseAccess) {
 module.exports = {
     generateMaterialId,
     getPresignedUploadUrl,
+    getObjectSize,
     getPresignedDownloadUrl,
     applyHeaders,
     createMaterialRecord,
