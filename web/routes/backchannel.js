@@ -13,6 +13,18 @@ const ssoEvents = require('../services/ssoEvents');
 
 const SEEN_TTL = 7 * 24 * 3600;
 
+// SSO `sub` (dashed UUID) -> local user_id (dash-less LOWER hex).
+//
+// Both halves matter. idBuf() is case-insensitive (Buffer.from(hex)), so a
+// wrong-case id still finds the right DB row — but the Redis caches are keyed by
+// the STRING (`user:meta:{id}`, `user:perms:{id}`, `user:sessions:{id}`), and
+// those are written from mysql2's typeCast, i.e. buf.toString('hex') = lower.
+// Feed an upper-case id in and the row updates while its cache purge silently
+// misses, leaving the user on stale permissions until the TTL expires. The two
+// handlers had drifted (profile_change lower-cased, roles_change did not); one
+// definition so they cannot drift again.
+const localUserId = (sub) => sub.replace(/-/g, '').toLowerCase();
+
 router.post('/backchannel/events', express.urlencoded({ extended: false }), async (req, res) => {
     res.set('Cache-Control', 'no-store');
     const token = req.body && req.body.event_token;
@@ -55,8 +67,7 @@ router.post('/backchannel/events', express.urlencoded({ extended: false }), asyn
                     const { updateUser } = require('../services/userService');
                     const { roleIdExists } = require('../services/roleService');
                     const { deleteUserSessions } = require('../config/session');
-                    // local user ids are DASH-LESS hex (idBuf does Buffer.from(hex))
-                    const localId = p.sub.replace(/-/g, '');
+                    const localId = localUserId(p.sub);
                     if (p.role_id == null) {
                         await deleteUserSessions(localId);
                     } else if (await roleIdExists(p.role_id)) {
@@ -79,7 +90,7 @@ router.post('/backchannel/events', express.urlencoded({ extended: false }), asyn
                 if (typeof p.sub === 'string') {
                     const { applyAvatar } = require('../services/avatarService');
                     await applyAvatar(
-                        p.sub.replace(/-/g, '').toLowerCase(),
+                        localUserId(p.sub),
                         typeof p.avatar === 'string' ? p.avatar : null
                     );
                 }

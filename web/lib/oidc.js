@@ -237,21 +237,25 @@ async function signEventToken(events) {
     .sign(key);
 }
 
-// Verify any JWT the SSO addressed to us — its JWKS, iss = SSO, aud = us, at most
-// 5 minutes old. Used for the inbound event envelope and for the signed verdict
-// on an activity report (which authorizes destroying a session, so it must be
-// proven to come from the SSO rather than from anything else in the path).
-async function verifySsoToken(token) {
+// Verify a JWT the SSO addressed to us — its JWKS, iss = SSO, aud = us, at most
+// 5 minutes old, AND of the expected media type.
+//
+// `typ` is not decoration: every token the SSO signs for us shares iss/aud, so
+// without it an events envelope and an activity-report verdict are
+// interchangeable at the verifier. Each carries different authority — a verdict
+// authorises destroying a session — and they must not be substitutable for each
+// other just because both are validly signed.
+async function verifySsoToken(token, typ) {
   const { jwtVerify } = await jose();
   const { payload } = await jwtVerify(token, await jwks(), {
-    issuer: ISSUER, audience: CLIENT_ID, clockTolerance: 10, maxTokenAge: '5 minutes',
+    issuer: ISSUER, audience: CLIENT_ID, clockTolerance: 10, maxTokenAge: '5 minutes', typ,
   });
   return payload;
 }
 
 // Verify an inbound envelope from the SSO (its JWKS; audience = us).
 async function verifyEventToken(token) {
-  return verifySsoToken(token);
+  return verifySsoToken(token, 'events+jwt');
 }
 
 function ssoEventsUrl() { return INTERNAL + '/backchannel/events'; }

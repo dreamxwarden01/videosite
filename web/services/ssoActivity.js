@@ -43,12 +43,27 @@ const TIMEOUT_MS = 5000;
 
 const lockKey = (sid) => `sso:activity:${sid}`;
 
+// Logged once per process, not per request — see the ssoSid guard below.
+let warnedMissingSsoSid = false;
+
 // Report activity for one session. Returns quietly on every path — the caller
 // attaches a .catch() but this should rarely reject.
 async function reportActivity(sessionId, ssoSid, lastSeenMs) {
-    // Sessions cached before sso_sid existed (or logins that predate it) have
-    // nothing to report against; they'll pick it up on next sign-in.
-    if (!sessionId || !ssoSid) return;
+    if (!sessionId) return;
+    // A missing sso_sid is a ROLLOUT-window condition, not a steady state: every
+    // login stores one (routes/auth.js takes it from the id_token `sid`, which the
+    // SSO always issues) and the DB-fallback read selects it, so the only sessions
+    // without one are Redis hashes cached before this shipped — they age out
+    // within an idle window. If it persists past that, those sessions can never
+    // keep their SSO session alive, which is precisely the failure this feature
+    // exists to prevent, so it should be visible rather than silently skipped.
+    if (!ssoSid) {
+        if (!warnedMissingSsoSid) {
+            warnedMissingSsoSid = true;
+            console.warn('sso activity: session has no sso_sid — expected briefly after upgrade; a login bug if it persists');
+        }
+        return;
+    }
 
     const redis = getClient();
     // Acquire the window/lock. Null = someone else holds it, or we're still
@@ -89,9 +104,12 @@ async function reportActivity(sessionId, ssoSid, lastSeenMs) {
         let verdict = null;
         try {
             const body = await r.json();
-            verdict = await oidc.verifySsoToken(String(body.verdict || ''));
+            // typ pins this to a verdict specifically: an events envelope is
+            // signed by the same key for the same audience, so without it any
+            // SSO-issued token would be accepted as authority to end a session.
+            verdict = await oidc.verifySsoToken(String(body.verdict || ''), 'verdict+jwt');
         } catch {
-            return; // not provably from the SSO — fail open
+            return; // not provably a verdict from the SSO — fail open
         }
         if (verdict.status !== 'invalid' || verdict.sid !== ssoSid) return;
         // Kill every local session bound to that SSO session (usually just ours).
