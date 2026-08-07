@@ -1,6 +1,21 @@
 const express = require('express');
 const router = express.Router();
 
+// Canonicalise a user id taken from the path.
+//
+// user_id is 32-char hex and every DB comparison goes through idBuf(), which is
+// case-INSENSITIVE — but Redis cache keys are built from the STRING and are
+// case-SENSITIVE. An upper-case id (pasted from a MySQL HEX() dump, say) therefore
+// updated the row while its cache purge silently missed, leaving the victim on
+// stale permissions until the TTL; it also slipped past blockSelfTarget's ===
+// comparison, defeating "cannot modify your own account". Normalising once here
+// means no downstream site has to remember. Role ids are numeric and are left
+// untouched by the shape test.
+router.param('id', (req, res, next, value) => {
+    if (/^[0-9a-f]{32}$/i.test(value)) req.params.id = value.toLowerCase();
+    next();
+});
+
 // Middleware
 const { requireAuth } = require('../../middleware/auth');
 const { checkPermission, checkPermissionLevel, checkAnyPermission } = require('../../middleware/permissions');
@@ -61,7 +76,8 @@ function formatUserAgent(ua) {
 
 // Helper: block self-targeting on admin mutation endpoints
 function blockSelfTarget(req, res) {
-    if (req.params.id === res.locals.user.user_id) {
+    // Case-insensitive on purpose — see the router.param note above.
+    if (String(req.params.id).toLowerCase() === String(res.locals.user.user_id).toLowerCase()) {
         res.status(403).json({ error: 'Cannot modify your own account through admin panel' });
         return true;
     }

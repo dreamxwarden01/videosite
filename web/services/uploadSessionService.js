@@ -107,17 +107,44 @@ async function handleStaleUpload(uploadId) {
 }
 
 /**
- * Startup sweep: abort sessions that went stale while the server was
- * down. The DB `last_heartbeat` is the only reliable signal here
- * (Redis may itself be cold-starting and not yet populated).
+ * Startup sweep: abort sessions that went stale while the server was down.
+ *
+ * The DB `last_heartbeat` alone is NOT a safe signal. Live heartbeats land in
+ * Redis every 5s and only reach the DB when the flusher drains, every 15 min — so
+ * on any ungraceful exit (SIGKILL, OOM, host reboot) the shutdown flushAll() never
+ * runs and that column can be a quarter of an hour stale while the upload is
+ * perfectly healthy. Measured against a 60-SECOND threshold, that aborted LIVE
+ * uploads on the way back up, destroying in-progress multipart work whose client
+ * would have resumed heartbeating seconds later.
+ *
+ * So the query only nominates CANDIDATES; each is confirmed against Redis, which
+ * holds the real last-heartbeat. Redis having no record (its own cold start, or an
+ * evicted key) leaves the DB as the only evidence and the candidate is aborted —
+ * the original behaviour, now the fallback rather than the rule.
  */
 async function resetStaleUploads() {
     const pool = getPool();
-    const [stale] = await pool.execute(
+    const STALE_MS = 60 * 1000;
+    const [candidates] = await pool.execute(
         `SELECT upload_id, type, r2_upload_id, object_key FROM upload_sessions
          WHERE status = 'active'
          AND last_heartbeat < DATE_SUB(NOW(), INTERVAL 60 SECOND)`
     );
+
+    const stale = [];
+    for (const session of candidates) {
+        let live = null;
+        try {
+            live = await uploadHeartbeatCache.getLastHeartbeat(session.upload_id);
+        } catch {
+            // Redis unreachable — fall back to the DB's verdict.
+        }
+        if (live !== null && Date.now() - live < STALE_MS) {
+            console.log(`Startup: keeping ${session.type} upload ${session.upload_id} — cache heartbeat is live`);
+            continue;
+        }
+        stale.push(session);
+    }
 
     for (const session of stale) {
         console.log(`Startup: aborting stale ${session.type} upload ${session.upload_id}`);

@@ -103,6 +103,30 @@ async function readHash(uid, vid) {
     };
 }
 
+// Settle exactly what the flusher just wrote, INSTEAD of deleting the hash.
+//
+// deleteEntry() blew away the whole entry, so a /watch-progress landing between
+// the flusher's read and its cleanup — it HINCRBYFLOATs onto `delta` — was
+// discarded without ever reaching the DB. Subtracting only the written amount
+// leaves any concurrent remainder intact. Nothing left (allowing for float dust)
+// means the entry is removed and the dirty marker cleared; a remainder stays
+// dirty for the next cycle.
+//
+// Note: if this call fails AFTER the DB write committed, the next cycle re-reads
+// the same delta and counts it twice. Two systems, no shared transaction — but
+// over-counting on a rare Redis failure beats silently losing watch time on every
+// concurrent report, which is what deleting did.
+async function settleDelta(uid, vid, written) {
+    const redis = getClient();
+    const k = key(uid, vid);
+    const remaining = parseFloat(await redis.hincrbyfloat(k, 'delta', -written));
+    if (!Number.isFinite(remaining) || remaining <= 0.001) {
+        await redis.multi().del(k).srem(DIRTY, memberId(uid, vid)).exec();
+        return 0;
+    }
+    return remaining;
+}
+
 async function deleteEntry(uid, vid) {
     const redis = getClient();
     await redis.multi()
@@ -214,6 +238,7 @@ module.exports = {
     getLastPosition,
     readHash,
     deleteEntry,
+    settleDelta,
     getDirtyMembers,
     getAllPending,
     removeDirty,

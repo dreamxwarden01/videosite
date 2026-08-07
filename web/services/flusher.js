@@ -147,9 +147,9 @@ async function flushDirtyWatch() {
                     [idBuf(uid), vid, data.delta, data.last_position, lastWatchAt]
                 );
 
-                // Clear the hash + dirty marker. Subsequent /watch-progress starts
-                // a fresh delta accumulator from 0.
-                await watchCache.deleteEntry(uid, vid);
+                // Subtract what we just wrote rather than deleting the entry, so a
+                // report that arrived mid-flush is kept instead of discarded.
+                await watchCache.settleDelta(uid, vid, data.delta);
                 flushed++;
             } catch (err) {
                 console.error(`Watch flusher: failed for ${member}: ${err.message}`);

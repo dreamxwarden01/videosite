@@ -1,6 +1,7 @@
 const { getPool, idBuf } = require('../config/database');
 const { resolvePermissions } = require('./permissionService');
 const enrollmentCache = require('./cache/enrollmentCache');
+const watchProgressCache = require('./cache/watchProgressCache');
 
 async function addEnrollment(userId, courseId) {
     const pool = getPool();
@@ -13,6 +14,7 @@ async function addEnrollment(userId, courseId) {
 
 async function removeEnrollment(userId, courseId) {
     const pool = getPool();
+    let purgeVideoIds = [];
     const conn = await pool.getConnection();
     try {
         await conn.beginTransaction();
@@ -34,8 +36,13 @@ async function removeEnrollment(userId, courseId) {
             [idBuf(userId), courseId]
         );
 
-        // Delete watch progress for this user/course unless they have allCourseAccess
+        // Delete watch progress for this user/course unless they have allCourseAccess.
+        // Collect the video ids so the CACHE can be purged after commit — deleting
+        // only the rows leaves any unflushed delta in Redis, and the next flush
+        // UPSERTs it straight back, resurrecting what was just removed.
         if (!keepWatchProgress) {
+            const [vids] = await conn.execute('SELECT video_id FROM videos WHERE course_id = ?', [courseId]);
+            purgeVideoIds = vids.map((v) => v.video_id);
             await conn.execute(
                 `DELETE wp FROM watch_progress wp
                  JOIN videos v ON wp.video_id = v.video_id
@@ -53,6 +60,8 @@ async function removeEnrollment(userId, courseId) {
     }
 
     await enrollmentCache.invalidateUser(userId);
+    // After commit: a rollback must not wipe a live cache.
+    if (purgeVideoIds.length) await watchProgressCache.clearForUserVideos(userId, purgeVideoIds);
 }
 
 async function isEnrolled(userId, courseId) {
@@ -160,6 +169,7 @@ async function setEnrollmentBatch(userId, adds, removes) {
     // Remove wins when a course is staged in both directions.
     for (const id of removeSet) addSet.delete(id);
 
+    let purgeVideoIds = [];
     const conn = await pool.getConnection();
     try {
         await conn.beginTransaction();
@@ -203,6 +213,8 @@ async function setEnrollmentBatch(userId, adds, removes) {
                 [idBuf(userId), courseId]
             );
             if (!keepWatchProgress) {
+                const [vids] = await conn.execute('SELECT video_id FROM videos WHERE course_id = ?', [courseId]);
+                purgeVideoIds.push(...vids.map((v) => v.video_id));
                 await conn.execute(
                     `DELETE wp FROM watch_progress wp
                      JOIN videos v ON wp.video_id = v.video_id
@@ -221,6 +233,8 @@ async function setEnrollmentBatch(userId, adds, removes) {
     }
 
     await enrollmentCache.invalidateUser(userId);
+    // After commit — see removeEnrollment.
+    if (purgeVideoIds.length) await watchProgressCache.clearForUserVideos(userId, purgeVideoIds);
 
     const [rows] = await pool.execute(
         'SELECT course_id FROM enrollments WHERE user_id = ? ORDER BY course_id ASC',
