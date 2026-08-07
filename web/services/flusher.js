@@ -113,10 +113,18 @@ async function flushDirtyWatch() {
         const batch = members.slice(i, i + BATCH_SIZE);
         for (const member of batch) {
             try {
-                const [uidStr, vidStr] = member.split(':');
-                const uid = parseInt(uidStr, 10);
-                const vid = parseInt(vidStr, 10);
-                if (!Number.isInteger(uid) || !Number.isInteger(vid)) {
+                // user_id is a 32-char hex UUID (BINARY(16)) — it stopped being an int
+                // at the identity migration. parseInt() on it silently yielded a
+                // PARTIAL number ('019ef1…' -> 19) which still passed the integer
+                // guard, so the flusher read progress:watch:19:{vid}, missed, treated
+                // the miss as "already cleared" and dropped the dirty marker WITHOUT
+                // writing. Every watch record since that migration was discarded on
+                // its first flush. Keep the id as the string it actually is.
+                const sep = member.lastIndexOf(':');
+                const uid = sep > 0 ? member.slice(0, sep) : '';
+                const vid = parseInt(member.slice(sep + 1), 10);
+                if (!/^[0-9a-f]{32}$/i.test(uid) || !Number.isInteger(vid)) {
+                    console.error(`Watch flusher: unparseable member '${member}' — dropping`);
                     await watchCache.removeDirty(member);
                     continue;
                 }

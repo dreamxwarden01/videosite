@@ -16,7 +16,7 @@
 // cache; users referencing that role pick up the new values on their next
 // request. A user's role change or override change clears only that user.
 
-const { getClient } = require('../redis');
+const { getClient, scanKeys } = require('../redis');
 const { getPool, idBuf } = require('../../config/database');
 const { ALL_PERMISSIONS } = require('../permissionConstants');
 
@@ -122,12 +122,15 @@ async function invalidateRole(roleId) {
 // permissions, so they don't need flushing here.
 async function invalidateAllRoles() {
     const redis = getClient();
-    let cursor = '0';
-    do {
-        const [next, batch] = await redis.scan(cursor, 'MATCH', 'role:perms:*', 'COUNT', 100);
-        cursor = next;
-        if (batch.length > 0) await redis.del(...batch);
-    } while (cursor !== '0');
+    // Via scanKeys: a bare redis.scan() does NOT get the client's key prefix on
+    // its MATCH pattern, so this matched nothing and the boot-time flush this
+    // function exists for never actually happened — a deploy adding a permission
+    // left every role cache reading it as false until its 24h TTL expired.
+    const keys = await scanKeys('role:perms:*', 100);
+    for (let i = 0; i < keys.length; i += 100) {
+        const batch = keys.slice(i, i + 100);
+        if (batch.length) await redis.del(...batch);
+    }
 }
 
 async function invalidateUser(userId) {

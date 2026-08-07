@@ -17,11 +17,14 @@
 // Resume reads (playback start, watch page) check this cache first for the
 // freshest last_position, then fall through to watch_progress on miss.
 
-const { getClient } = require('../redis');
+const { getClient, scanKeys } = require('../redis');
 
 const DIRTY = 'dirty:watch';
 const key = (uid, vid) => `progress:watch:${uid}:${vid}`;
 const memberId = (uid, vid) => `${uid}:${vid}`;
+// "progress:watch:{uid}:{vid}" -> "{uid}:{vid}". Taken from the END of the key so
+// it cannot be thrown off by extra leading segments (a key prefix, say).
+const memberFromKey = (k) => k.split(':').slice(-2).join(':');
 const rateLimitKey = (uid, vid) => `ratelimit:watch:${uid}:${vid}`;
 const RATE_LIMIT_TTL = 120;       // seconds — anchor expires after 2 min of no accepted reports
 const RATE_LIMIT_TOLERANCE_MS = 2000; // covers clock drift / network jitter / GC pauses
@@ -149,23 +152,14 @@ async function removeDirty(member) {
 // at the old video's position.
 async function clearForVideo(videoId) {
     const redis = getClient();
-    const pattern = `progress:watch:*:${videoId}`;
-    let cursor = '0';
-    const toDelete = [];
-    do {
-        const [next, batch] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 500);
-        cursor = next;
-        toDelete.push(...batch);
-    } while (cursor !== '0');
-
+    // scanKeys handles the key prefix on both ends and returns UN-prefixed keys;
+    // a bare redis.scan() here matched nothing, so this purge silently did nothing.
+    const toDelete = await scanKeys(`progress:watch:*:${videoId}`);
     if (toDelete.length === 0) return;
 
     // Also drop the matching dirty members so the flusher doesn't try to
     // UPSERT a row that's about to be cascade-deleted.
-    const dirtyMembers = toDelete.map(k => {
-        const parts = k.split(':');
-        return `${parts[2]}:${parts[3]}`;
-    });
+    const dirtyMembers = toDelete.map(memberFromKey);
     const tx = redis.multi();
     tx.del(...toDelete);
     tx.srem(DIRTY, ...dirtyMembers);
@@ -181,20 +175,9 @@ async function clearForVideos(videoIds) {
 // (the exact form used in the key, since recordProgress keys on user.user_id).
 async function clearForUser(userId) {
     const redis = getClient();
-    const pattern = `progress:watch:${userId}:*`;
-    let cursor = '0';
-    const toDelete = [];
-    do {
-        const [next, batch] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 500);
-        cursor = next;
-        toDelete.push(...batch);
-    } while (cursor !== '0');
-
+    const toDelete = await scanKeys(`progress:watch:${userId}:*`);
     if (toDelete.length === 0) return;
-    const dirtyMembers = toDelete.map(k => {
-        const parts = k.split(':');
-        return `${parts[2]}:${parts[3]}`;
-    });
+    const dirtyMembers = toDelete.map(memberFromKey);
     const tx = redis.multi();
     tx.del(...toDelete);
     tx.srem(DIRTY, ...dirtyMembers);
@@ -217,12 +200,11 @@ async function clearForUserVideos(userId, videoIds) {
 // Wipe everything. For admin "clear all playback stats".
 async function clearAll() {
     const redis = getClient();
-    let cursor = '0';
-    do {
-        const [next, batch] = await redis.scan(cursor, 'MATCH', 'progress:watch:*', 'COUNT', 500);
-        cursor = next;
-        if (batch.length > 0) await redis.del(...batch);
-    } while (cursor !== '0');
+    const keys = await scanKeys('progress:watch:*');
+    for (let i = 0; i < keys.length; i += 500) {
+        const batch = keys.slice(i, i + 500);
+        if (batch.length) await redis.del(...batch);
+    }
     await redis.del(DIRTY);
 }
 

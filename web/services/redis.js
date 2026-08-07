@@ -23,9 +23,9 @@ function buildOptions() {
         port: parseInt(process.env.REDIS_PORT || '6379'),
         password: process.env.REDIS_PASSWORD || undefined,
         db: parseInt(process.env.REDIS_DB || '0'),
-        // Project-level key prefix. ioredis prepends this transparently to
-        // every command (writes, reads, MULTI, scans, key-name args) so the
-        // per-cache `key()` factories stay un-prefixed in code and we get
+        // Project-level key prefix. ioredis prepends this to every declared KEY
+        // argument (writes, reads, MULTI) so the per-cache `key()` factories stay
+        // un-prefixed in code and we get
         // a clean namespace at the wire level. Costs ~10 bytes per key in
         // RAM, buys collision-safety when an operator points another app
         // (SSO, email queue, dev script) at the same Redis instance.
@@ -121,4 +121,29 @@ function getClient() {
     return client;
 }
 
-module.exports = { connect, quit, getClient, testConnection };
+// SCAN with the key prefix handled on BOTH ends — always use this, never a bare
+// redis.scan().
+//
+// ioredis prefixes declared KEY arguments, but a SCAN's MATCH is just a string
+// argument to it, so a pattern written the way the rest of the code writes keys
+// silently matches NOTHING. That is not hypothetical: every SCAN-based purge in
+// this codebase was a no-op, which let deleted watch_progress rows be resurrected
+// by the next flush and left invalidateAllRoles doing nothing at boot.
+//
+// The replies come back FULLY prefixed, which then get prefixed AGAIN if handed
+// to DEL — so this strips the prefix and returns keys in the same un-prefixed
+// space every other function here works in.
+async function scanKeys(pattern, count = 500) {
+    const redis = getClient();
+    const prefix = redis.options.keyPrefix || '';
+    const out = [];
+    let cursor = '0';
+    do {
+        const [next, batch] = await redis.scan(cursor, 'MATCH', prefix + pattern, 'COUNT', count);
+        cursor = next;
+        for (const k of batch) out.push(prefix && k.startsWith(prefix) ? k.slice(prefix.length) : k);
+    } while (cursor !== '0');
+    return out;
+}
+
+module.exports = { connect, quit, getClient, testConnection, scanKeys };
