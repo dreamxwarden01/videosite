@@ -98,6 +98,8 @@ const FileIcon = () => (
   </svg>
 );
 const PencilIcon = () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z" /></svg>;
+const EyeIcon = () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" /><circle cx="12" cy="12" r="3" /></svg>;
+const DownloadIcon = () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><path d="M7 10l5 5 5-5" /><path d="M12 15V3" /></svg>;
 const StatsBarIcon = () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18" /><rect x="7" y="11" width="3" height="6" /><rect x="12" y="7" width="3" height="10" /><rect x="17" y="13" width="3" height="4" /></svg>;
 const EditIcon = () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z" /></svg>;
 const TrashIcon = () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18" /><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /><path d="M10 11v6" /><path d="M14 11v6" /></svg>;
@@ -120,6 +122,11 @@ export default function CoursePage() {
   const canDeleteVideo = !!perms.deleteVideo;
   const canUploadAtt = !!perms.uploadAttachments;
   const canDeleteAtt = !!perms.deleteAttachments;
+  // View/download are a SEPARATE permission from managing the page. This page is
+  // gated on manageCourse alone, and /materials/:id/view|download both require
+  // accessAttachments — so an admin can legitimately stand here without it, and
+  // unconditional buttons would 403. Same gate the student list uses.
+  const canAccessAtt = !!perms.accessAttachments;
   const canChangeCourse = !!perms.changeCourse;
   // Playback-stats modal: view needs manageCourse + viewPlaybackStat (server
   // also requires the admin's own course access via requireCourseAccess).
@@ -422,6 +429,20 @@ export default function CoursePage() {
     else loadVideosSilent();
   };
 
+  // Same contract as the student list: the server hands back a short-lived
+  // presigned R2 URL, `view` serving inline and `download` as an attachment.
+  const openMaterial = async (materialId, mode) => {
+    try {
+      const url = mode === 'view' ? `/api/materials/${materialId}/view` : `/api/materials/${materialId}/download`;
+      const { data, ok } = await apiGet(url);
+      if (ok && data?.downloadUrl) { window.open(data.downloadUrl, '_blank'); return; }
+      // accessAttachments may have been revoked mid-session — a coded 403.
+      // Refresh perms so the buttons drop away, and say why.
+      if (data?.code === 'PERMISSION_DENIED') { refreshMe?.(); showToast('You no longer have access to download materials.'); return; }
+      showToast(data?.error || 'Couldn’t get the file link.');
+    } catch { showToast(mode === 'view' ? 'Couldn’t open the file.' : 'Download failed.'); }
+  };
+
   const handleDeleteMaterial = async (m) => {
     if (!await confirm({ title: 'Delete file?', message: 'This permanently deletes the material file. This can\'t be undone.', confirmLabel: 'Delete', danger: true })) return;
     const { ok, data } = await apiDelete(`/api/materials/${m.material_id}`);
@@ -538,26 +559,36 @@ export default function CoursePage() {
     );
   };
 
-  const renderMaterialRow = (m) => (
-    <div key={m.material_id} className="vs-cv-row">
-      <span className={`vs-cv-fico ${ficoClass(m.filename)}`}><FileIcon /></span>
-      <div className="vs-cv-rmn">
-        <p className="vs-cv-rt" title={m.filename}>{m.filename}</p>
-        <p className="vs-cv-rs">
-          {m.module_number != null && <span className="vs-wk">{modTerm} {m.module_number}</span>}
-          {m.file_size > 0 && <span>{formatFileSize(m.file_size)}</span>}
-        </p>
+  const renderMaterialRow = (m) => {
+    const isPdf = (m.filename.split('.').pop() || '').toLowerCase() === 'pdf'
+      || m.content_type === 'application/pdf';
+    return (
+      <div key={m.material_id} className="vs-cv-row">
+        <span className={`vs-cv-fico ${ficoClass(m.filename)}`}><FileIcon /></span>
+        <div className="vs-cv-rmn">
+          <p className="vs-cv-rt" title={m.filename}>{m.filename}</p>
+          <p className="vs-cv-rs">
+            {m.module_number != null && <span className="vs-wk">{modTerm} {m.module_number}</span>}
+            {m.file_size > 0 && <span>{formatFileSize(m.file_size)}</span>}
+          </p>
+        </div>
+        <div className="vs-cv-acts">
+          {canAccessAtt && isPdf && (
+            <button className="vs-cv-view" onClick={() => openMaterial(m.material_id, 'view')}><EyeIcon />View</button>
+          )}
+          {canAccessAtt && (
+            <button className="vs-cv-dl" aria-label="Download" onClick={() => openMaterial(m.material_id)}><DownloadIcon /></button>
+          )}
+          {canUploadAtt && (
+            <button className="vs-ico-btn" title="Edit" onClick={() => setEditingMaterial(m)}><EditIcon /></button>
+          )}
+          {canDeleteAtt && (
+            <button className="vs-ico-btn dg" title="Delete" onClick={() => handleDeleteMaterial(m)}><TrashIcon /></button>
+          )}
+        </div>
       </div>
-      <div className="vs-cv-acts">
-        {canUploadAtt && (
-          <button className="vs-ico-btn" title="Edit" onClick={() => setEditingMaterial(m)}><EditIcon /></button>
-        )}
-        {canDeleteAtt && (
-          <button className="vs-ico-btn dg" title="Delete" onClick={() => handleDeleteMaterial(m)}><TrashIcon /></button>
-        )}
-      </div>
-    </div>
-  );
+    );
+  };
 
   return (
     <>

@@ -46,7 +46,7 @@ const ArrowLeft = () => (
 // On narrow screens it collapses to a single bar showing the current course /
 // admin page; tapping it drops the full list down (route-driven pane, same as
 // desktop). Selecting an item (or a route change) re-collapses it.
-export default function Sidebar({ courses, inAdmin, backRef }) {
+export default function Sidebar({ courses, inAdmin, backTo }) {
   const { user } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
@@ -67,6 +67,19 @@ export default function Sidebar({ courses, inAdmin, backRef }) {
   const adminLinks = ADMIN.filter((l) => (l.any ? l.any.some((p) => perms[p]) : perms[l.perm]));
   const hasAdmin = adminLinks.length > 0;
   const firstAdmin = adminLinks[0]?.to || '/admin/courses';
+
+  // Admin back-button target + label. Name where the button actually goes rather
+  // than the generic "Courses": the course code when we came from a course, and
+  // "Home" when we didn't (backTo is '/' after a full page load, i.e. someone who
+  // opened an admin URL directly). "Back" covers the rare case where the course
+  // is no longer in the list — deactivated, or unenrolled while we were in admin.
+  // The id segment precedes any query string, so [^/?] stops at both.
+  const backPath = backTo || '/';
+  const backMatch = backPath.match(/^\/course\/([^/?]+)/);
+  const backCourse = backMatch && courses
+    ? courses.find((c) => String(c.course_id) === backMatch[1])
+    : null;
+  const backLabel = backMatch ? (backCourse ? backCourse.course_code : 'Back') : 'Home';
 
   // Collapsed-bar context (narrow only).
   let curLabel, CurIcon, moreCount;
@@ -135,10 +148,11 @@ export default function Sidebar({ courses, inAdmin, backRef }) {
           <button
             type="button"
             className="vs-nav vs-nav-back"
-            onClick={() => navigate((backRef && backRef.current) || '/')}
+            onClick={() => navigate(backPath)}
+            title={`Back to ${backLabel}`}
           >
             <span className="vs-nav-ico"><ArrowLeft /></span>
-            <span className="vs-nav-label">Courses</span>
+            <span className="vs-nav-label">{backLabel}</span>
           </button>
           <div className="vs-nav-scroll">
             {adminLinks.map((l) => (

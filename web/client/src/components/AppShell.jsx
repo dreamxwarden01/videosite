@@ -76,11 +76,16 @@ export default function AppShell() {
   const inAdmin = location.pathname.startsWith('/admin');
 
   // Remember the last course-area location (path + query, so the list page is
-  // preserved) so the sidebar's "← Courses" back button restores exactly where
-  // the user was before they went into Admin.
-  const lastCourseRef = useRef('/');
+  // preserved) so the sidebar's back button restores exactly where the user was
+  // before they went into Admin. STATE, not a ref: the button is LABELLED from
+  // this now, and a ref mutated in an effect gives React no reason to re-render
+  // (and reading it during render is impure). React bails out when the value is
+  // unchanged, so moving around the course area costs no extra renders. Resets
+  // to '/' on a full page load — which is exactly the "entered admin without a
+  // course" case, and the button then reads "Home".
+  const [lastCoursePath, setLastCoursePath] = useState('/');
   useEffect(() => {
-    if (!inAdmin) lastCourseRef.current = location.pathname + location.search;
+    if (!inAdmin) setLastCoursePath(location.pathname + location.search);
   }, [inAdmin, location.pathname, location.search]);
 
   const isPlaybackPage = location.pathname === '/'
@@ -115,7 +120,7 @@ export default function AppShell() {
     <>
       <Header onBrand={refreshCourses} />
       <div className="vs-body">
-        <Sidebar courses={courses} inAdmin={inAdmin} backRef={lastCourseRef} />
+        <Sidebar courses={courses} inAdmin={inAdmin} backTo={lastCoursePath} />
         <main className="vs-content">
           {capped ? <div className="vs-content-inner">{body}</div> : body}
         </main>
