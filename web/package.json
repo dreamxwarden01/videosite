@@ -11,7 +11,8 @@
     "db:bless": "node scripts/check-db-baseline.js --bless",
     "test:db": "node scripts/db-baseline-test.js",
     "test:install": "node scripts/install-e2e-test.mjs",
-    "test:upload": "node scripts/upload-size-test.js"
+    "test:upload": "node scripts/upload-size-test.js",
+    "check:typecast": "node scripts/check-typecast-collisions.js"
   },
   "keywords": [],
   "author": "",
