@@ -36,6 +36,13 @@ type FilteredProfile struct {
 	CanRemux bool // true if source matches this profile's specs
 	OutW     int  // actual encoded output width (≤ profile.Width)
 	OutH     int  // actual encoded output height (≤ profile.Height)
+
+	// Plan is the authoritative segmentation decision for this rendition,
+	// in whole frames. GOPSeconds/SegmentDuration on the embedded
+	// OutputProfile are kept in sync with it for the consumers that work in
+	// seconds (bitrate caps, manifests, logs), but FFmpeg is driven from
+	// Plan — see SegmentPlan for why the frame counts are the source of truth.
+	Plan SegmentPlan
 }
 
 // ActualOutputDims computes the encoded dimensions a source should land at

@@ -854,21 +854,21 @@ const (
 	defaultTargetSeg  = 6.0 // fallback target if profiles don't supply one
 )
 
-// computeGOPDecision probes the source's GOP cadence and picks the per-job
-// (chosenGOPSec, chosenSegSec, useSourceGOP) tuple every rendition will use.
-// Logs the decision so operators can see which path each job took.
+// computeGOPDecision scans the source's GOP cadence and picks the per-job
+// (chosenGOPSec, chosenSegSec, useSourceGOP) tuple every rendition starts
+// from. Logs the decision so operators can see which path each job took.
 //
-// When useSourceGOP is true AND probe.FrameRate is known, chosenGOPSec is
-// snapped to the source's frame grid: round(probed_mean × fps) / fps. This
-// matters because ffprobe quantizes packet PTS to ms-precision, which makes
-// the raw probe mean drift a few μs above the true rational source GOP.
-// That tiny overshoot is enough to make the encoder skip a frame when
-// evaluating `-force_key_frames "expr:gte(t, n_forced*X)"` — the natural
-// frame's PTS lands just *under* the threshold and the encoder fires at
-// frame N+1 instead, producing 118-frame GOPs from a 117-frame source.
-// Snapping aligns transcoded renditions to the same time grid the remuxed
-// renditions inherit from the source, so cross-rendition segment boundaries
-// stay coherent.
+// The scan covers the WHOLE file, not a leading window, because a source can
+// look constant at the head and drift later — see transcoder.ScanGOP. It is
+// cheap: the moov sample index answers the question in tens of milliseconds
+// and only containers without one pay for a full packet scan.
+//
+// The values recorded here are targets in seconds. They are NOT what reaches
+// FFmpeg: runTranscode resolves each rendition onto its own output frame grid
+// via transcoder.NewSegmentPlan, and the resulting frame counts are
+// authoritative from that point on. Keeping the seconds values around is still
+// worth it — ApplyBitrateCaps compares source against target GOP, and the
+// manifests are written in seconds.
 func (j *Job) computeGOPDecision(sourcePath string, probe *transcoder.ProbeResult) {
 	targetSeg := defaultTargetSeg
 	if len(j.OutputProfiles) > 0 && j.OutputProfiles[0].SegmentDuration > 0 {
@@ -876,29 +876,31 @@ func (j *Job) computeGOPDecision(sourcePath string, probe *transcoder.ProbeResul
 	}
 	j.targetSegSec = targetSeg
 
-	gop, variance, idrCount, err := transcoder.ProbeGOP(sourcePath)
+	scan, err := transcoder.ScanGOP(sourcePath)
 	if err != nil {
-		j.UI.Logf("[%s] gop probe failed: %v — falling back to default %.1fs GOP", j.JobID, err, defaultGOPSec)
+		j.UI.Logf("[%s] gop scan failed: %v — falling back to default %.1fs GOP", j.JobID, err, defaultGOPSec)
 	}
 
-	// Stash the probed mean whenever the probe produced a usable number, even
-	// if we don't adopt it for output. ApplyBitrateCaps uses this as the
-	// "source GOP" for the tightening-boost heuristic; sources with variable
-	// or too-few-IDR probe results leave sourceGOPSec at 0 and skip the boost.
-	probeUsable := err == nil && idrCount >= 3 && gop > 0
-	if probeUsable {
-		j.sourceGOPSec = gop
+	// Stash the scanned mean whenever it produced a usable number, even if we
+	// don't adopt it for output. ApplyBitrateCaps uses this as the "source GOP"
+	// for the tightening-boost heuristic; sources with variable or
+	// too-few-IDR results leave sourceGOPSec at 0 and skip the boost.
+	scanUsable := err == nil && scan != nil && scan.Count() >= 3 && scan.MeanSec > 0
+	if scanUsable {
+		j.sourceGOPSec = scan.MeanSec
 	}
 
-	if probeUsable && variance <= gopToleranceSec && gop <= maxRemuxGOPSec {
-		snapped := gop
+	if scanUsable && scan.MaxDevSec <= gopToleranceSec && scan.MeanSec <= maxRemuxGOPSec {
+		// Snap the adopted cadence onto the source frame grid so it names a
+		// whole number of frames rather than a measured average.
+		snapped := scan.MeanSec
 		if probe != nil && probe.FrameRate > 0 {
-			framesPerGOP := math.Round(gop * probe.FrameRate)
+			framesPerGOP := math.Round(scan.MeanSec * probe.FrameRate)
 			if framesPerGOP > 0 {
 				snapped = framesPerGOP / probe.FrameRate
 			}
 		}
-		j.sourceGOPSec = snapped // overwrite with fps-snapped value when we adopt it for output
+		j.sourceGOPSec = snapped // overwrite with fps-snapped value when adopted for output
 		j.chosenGOPSec = snapped
 		j.useSourceGOP = true
 	} else {
@@ -908,20 +910,25 @@ func (j *Job) computeGOPDecision(sourcePath string, probe *transcoder.ProbeResul
 	j.chosenSegSec = math.Ceil(targetSeg/j.chosenGOPSec) * j.chosenGOPSec
 
 	if j.useSourceGOP {
-		j.UI.Logf("[%s] gop: source cadence %.3fs (var %.3fs, %d IDRs/60s) — adopted, seg=%.3fs",
-			j.JobID, gop, variance, idrCount, j.chosenSegSec)
+		j.UI.Logf("[%s] gop: source cadence %.4fs (max dev %.4fs, %d IDRs, %s scan) — adopted, target seg=%.3fs",
+			j.JobID, scan.MeanSec, scan.MaxDevSec, scan.Count(), scan.Source, j.chosenSegSec)
 	} else {
 		reason := "variable"
-		if err != nil {
-			reason = "probe failed"
-		} else if idrCount < 3 {
-			reason = fmt.Sprintf("only %d IDRs in 60s", idrCount)
-		} else if variance > gopToleranceSec {
-			reason = fmt.Sprintf("variance %.3fs > %.3fs", variance, gopToleranceSec)
-		} else if gop > maxRemuxGOPSec {
-			reason = fmt.Sprintf("gop %.3fs > %.1fs ceiling", gop, maxRemuxGOPSec)
+		switch {
+		case err != nil:
+			reason = "scan failed"
+		case scan == nil || scan.Count() < 3:
+			n := 0
+			if scan != nil {
+				n = scan.Count()
+			}
+			reason = fmt.Sprintf("only %d IDRs in file", n)
+		case scan.MaxDevSec > gopToleranceSec:
+			reason = fmt.Sprintf("max dev %.4fs > %.3fs", scan.MaxDevSec, gopToleranceSec)
+		case scan.MeanSec > maxRemuxGOPSec:
+			reason = fmt.Sprintf("gop %.3fs > %.1fs ceiling", scan.MeanSec, maxRemuxGOPSec)
 		}
-		j.UI.Logf("[%s] gop: %s — default %.1fs GOP, seg=%.3fs", j.JobID, reason, j.chosenGOPSec, j.chosenSegSec)
+		j.UI.Logf("[%s] gop: %s — default %.1fs GOP, target seg=%.3fs", j.JobID, reason, j.chosenGOPSec, j.chosenSegSec)
 	}
 }
 
@@ -1376,19 +1383,21 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 		p.OutW, p.OutH = transcoder.ActualOutputDims(probe.Width, probe.Height, p.Width, p.Height)
 	}
 
-	// Apply the per-job GOP / segment decision to every rendition, re-snapping
-	// per-profile when fps caps cause different renditions to land on
-	// different output frame grids.
+	// Resolve the per-job GOP / segment targets onto each rendition's own
+	// output frame grid.
 	//
 	// Why per-profile: a 60fps source with fps_limit=30 on a downscaled
-	// rendition emits frames at 30fps. The source-fps-snapped chosenGOPSec
-	// (e.g. 1.95195s = 117 source frames) doesn't land on a 30fps frame
-	// boundary — frame 58 at 30fps is 1.9333s (below), frame 59 is 1.9666s
-	// (above). The encoder fires at frame 59, giving 1.9666s GOPs at the
-	// downsampled output. Without re-snapping, that drifts vs the source-fps
-	// renditions cross-rendition. With per-profile re-snap, each rendition
-	// honors its own frame grid; manifest carries per-Representation
-	// durations (DASH allows it).
+	// rendition emits frames at 30fps, so a GOP named in seconds by the
+	// source's grid (e.g. 1.95195s = 117 source frames) does not land on a
+	// whole number of 30fps frames. Each rendition therefore builds its own
+	// SegmentPlan from its own effective rate; the manifest carries
+	// per-Representation durations (DASH allows it).
+	//
+	// The plan is the last point at which these numbers are decided. From
+	// here they travel to FFmpeg as integers and nothing recomputes them.
+	// GOPSeconds/SegmentDuration are refreshed from the plan so the
+	// seconds-based consumers below (ApplyBitrateCaps, the manifest writers)
+	// agree with what was actually encoded.
 	//
 	// If the source GOP wasn't adopted (variable or > maxRemuxGOPSec), force
 	// re-encode for every profile: remux would import the source's variable
@@ -1397,25 +1406,35 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 	// Runs BEFORE ApplyBitrateCaps so the cap logic sees post-flip CanRemux
 	// and reads the final per-profile GOPSeconds (used by the GOP-tightening
 	// bitrate boost inside ApplyBitrateCaps).
+	fpsNum, fpsDen := probe.FrameRateNum, probe.FrameRateDen
+	if fpsNum <= 0 || fpsDen <= 0 {
+		// NewSegmentPlan falls back to a nominal rate, but the encoder will
+		// still run at whatever the source actually is, so the frame counts
+		// below describe a grid the output may not land on. Worth saying out
+		// loud rather than silently producing a playlist that fails the DASH
+		// uniformity check later.
+		j.UI.Logf("[%s] WARN: source frame rate is not a usable rational (r_frame_rate unparsed); segment plan falls back to a nominal rate and segments may not be uniform", j.JobID)
+	}
 	for i := range profiles {
 		p := &profiles[i]
-		if j.useSourceGOP && probe.FrameRate > 0 {
-			// Effective output fps for this profile (capped if set below source).
-			outFps := probe.FrameRate
-			if p.FpsLimit > 0 && float64(p.FpsLimit) < outFps {
-				outFps = float64(p.FpsLimit)
-			}
-			framesPerGOP := math.Round(j.chosenGOPSec * outFps)
-			if framesPerGOP < 1 {
-				framesPerGOP = 1
-			}
-			p.GOPSeconds = framesPerGOP / outFps
-			p.SegmentDuration = math.Ceil(j.targetSegSec/p.GOPSeconds) * p.GOPSeconds
-		} else {
-			p.GOPSeconds = j.chosenGOPSec
-			p.SegmentDuration = j.chosenSegSec
+
+		targetGOP := j.chosenGOPSec
+		if !j.useSourceGOP {
+			targetGOP = defaultGOPSec
 			p.CanRemux = false
 		}
+
+		// Effective output rate for this rendition: an fps cap replaces the
+		// source rational with an exact integer rate.
+		planNum, planDen := fpsNum, fpsDen
+		if p.FpsLimit > 0 && probe.FrameRate > 0 && float64(p.FpsLimit) < probe.FrameRate {
+			planNum, planDen = p.FpsLimit, 1
+		}
+
+		p.Plan = transcoder.NewSegmentPlan(planNum, planDen, targetGOP, j.targetSegSec)
+		p.GOPSeconds = p.Plan.GOPSeconds()
+		p.SegmentDuration = p.Plan.SegmentSeconds()
+		j.UI.Logf("[%s] segment plan %s: %s", j.JobID, p.Name, p.Plan)
 	}
 
 	profiles = transcoder.ApplyBitrateCaps(j.JobID, profiles, probe.Height, probe.VideoBitrateKbps, j.sourceGOPSec)
@@ -1661,7 +1680,7 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 			segDur := profiles[0].SegmentDuration
 			err = transcoder.TranscodeAudio(
 				egCtx, sourcePath, audioDir,
-				j.AudioBitrateKbps, segDur, loudnormFilter,
+				j.AudioBitrateKbps, segDur, probe.AudioSampleRate, loudnormFilter,
 				probe.AudioStreamCount,
 				probe.DurationSeconds, encodeProgress, logFile,
 			)
@@ -1759,7 +1778,7 @@ func (j *Job) transcodeVideoProfile(ctx context.Context, encoder *config.Encoder
 	if profile.CanRemux {
 		j.UI.Logf("[%s] remuxing %s...", j.JobID, profile.Name)
 		remuxLog := ffmpegLogPath(j.JobID, profile.Name, "remux")
-		progressCh, errCh := transcoder.RemuxVideo(ctx, sourcePath, profileDir, profile.OutputProfile, probe.DurationSeconds, remuxLog)
+		progressCh, errCh := transcoder.RemuxVideo(ctx, sourcePath, profileDir, profile.OutputProfile, profile.Plan, probe.DurationSeconds, remuxLog)
 		for pct := range progressCh {
 			onProgress(pct)
 		}
@@ -1813,7 +1832,7 @@ func (j *Job) transcodeVideoProfile(ctx context.Context, encoder *config.Encoder
 		onProgress(0)
 
 		logFile := ffmpegLogPath(j.JobID, profile.Name, tierLabel)
-		progressCh, errCh := transcoder.TranscodeVideo(ctx, sourcePath, profileDir, profile.OutputProfile, *encoder, probe.DurationSeconds, swDecode, logFile, profile.OutW, profile.OutH, probe.FrameRate)
+		progressCh, errCh := transcoder.TranscodeVideo(ctx, sourcePath, profileDir, profile.OutputProfile, profile.Plan, *encoder, probe.DurationSeconds, swDecode, logFile, profile.OutW, profile.OutH, probe.FrameRate)
 
 		for pct := range progressCh {
 			onProgress(pct)

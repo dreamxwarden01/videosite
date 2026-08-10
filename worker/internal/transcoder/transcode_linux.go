@@ -15,9 +15,9 @@ import (
 func applyEncoderOpts(args []string, encoder config.Encoder, ffmpegEncoder string, profile config.OutputProfile) []string {
 	switch encoder.EncoderType {
 	case hardware.EncoderNVENC:
-		return insertAfter(args, ffmpegEncoder, "-gpu", strconv.Itoa(encoder.DeviceIndex), "-preset", profile.Preset, "-rc", "vbr")
+		return insertAfter(args, ffmpegEncoder, "-gpu", strconv.Itoa(encoder.DeviceIndex), "-preset", profile.Preset, "-rc", "vbr", "-forced-idr", "1")
 	case hardware.EncoderQSV:
-		return insertAfter(args, ffmpegEncoder, "-preset", profile.Preset)
+		return insertAfter(args, ffmpegEncoder, "-preset", profile.Preset, "-forced_idr", "1")
 	default:
 		return insertAfter(args, ffmpegEncoder, "-preset", profile.Preset)
 	}

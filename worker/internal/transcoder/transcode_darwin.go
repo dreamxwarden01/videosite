@@ -9,6 +9,14 @@ import (
 // applyEncoderOpts injects encoder-specific FFmpeg flags (preset, RC mode,
 // quality tuning) immediately after the -c:v value. Platform-specific because
 // the set of encoders differs (VT only on darwin).
+//
+// Unlike NVENC and QSV, VideoToolbox needs no forced-IDR flag: FFmpeg's
+// videotoolboxenc maps a forced keyframe onto
+// kVTEncodeFrameOptionKey_ForceKeyFrame, which produces a real IDR that the
+// HLS muxer can split on. That claim is from the encoder's implementation, not
+// from a measurement — the darwin path has not been exercised since this
+// change, so if a Mac worker is ever redeployed, confirm the produced playlist
+// is uniform before trusting it.
 func applyEncoderOpts(args []string, encoder config.Encoder, ffmpegEncoder string, profile config.OutputProfile) []string {
 	switch encoder.EncoderType {
 	case hardware.EncoderVT:

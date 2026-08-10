@@ -1,7 +1,9 @@
 package transcoder
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -102,99 +104,144 @@ func h264ProfileIDC(profile string) (idc, compat int) {
 	return 0, 0
 }
 
-// ProbeGOP samples the first 120s of video packets to determine the source's
-// GOP cadence. Returns (mean GOP duration, max-deviation variance, IDR count
-// in window, error).
+// GOPScan is the result of scanning a source's IDR layout across the WHOLE
+// file. The worker uses it to decide whether to adopt the source cadence for
+// the job (so every rendition cuts on the same instants, enabling DASH
+// SegmentTemplate-without-Timeline) or fall back to the fixed default.
 //
-// The worker uses these to decide whether to adopt the source GOP for the
-// entire job (every rendition cuts at the same instants, enabling DASH
-// SegmentTemplate-without-Timeline) or fall back to a fixed default. The
-// probed mean is also stashed by the caller so the bitrate-cap logic can
-// boost transcoded outputs when GOP tightens (longer source GOP → tighter
-// target GOP needs proportionally more bits to preserve quality).
+// MeanSec is also stashed by the caller so the bitrate-cap logic can boost
+// transcoded outputs when the GOP tightens (longer source GOP → tighter target
+// GOP needs proportionally more bits to preserve quality).
 //
-// 120s is a deliberate compromise: doubles IDR-sample confidence vs 60s
-// (matters most around the 10–30s GOP range), still only ~1–2s wall clock
-// since ffprobe walks packet headers without decoding.
+// Source records which path produced the data ("moov" or "ffprobe") purely so
+// the decision log says where the numbers came from.
+type GOPScan struct {
+	IDRTimes  []float64
+	Source    string
+	MeanSec   float64
+	MaxDevSec float64
+}
+
+// Count returns the number of IDRs found.
+func (g *GOPScan) Count() int { return len(g.IDRTimes) }
+
+// ScanGOP measures the source's inter-IDR intervals over the entire file.
 //
-// Sources with fewer than 3 IDRs in the window are treated as "indeterminate"
-// — caller should fall back to the default. Same for the ffprobe-missing case.
-func ProbeGOP(filePath string) (gopSec float64, varianceSec float64, idrCount int, err error) {
-	// -read_intervals 0%+120 reads packets between time 0 and 120s in.
-	// -select_streams v:0 limits to the first video stream.
-	// -show_entries packet=pts_time,flags emits only the fields we need.
+// Scanning the whole file rather than a leading window matters because a
+// source can look perfectly constant at the head and drift later: a 3.4h
+// 59.94fps lecture measured 0.001s max deviation over its first 120s while
+// carrying 22 longer-than-nominal GOPs spread through the rest of the file.
+// Those extra frames feed straight into the muxer's cumulative segment
+// threshold, so a decision made on the first two minutes is a decision made on
+// the wrong data.
+//
+// The cost is paid on the index, not the payload: ReadKeyframeTimes parses
+// only the moov sample tables (2 KB - 4 MB, 5-75 ms on our sources) and we
+// fall back to a full ffprobe packet scan (0.35-4.3 s on the same files) only
+// for containers with no usable index.
+//
+// Sources with fewer than 3 IDRs are "indeterminate" — the caller falls back
+// to the default GOP. Same for the ffprobe-missing case.
+func ScanGOP(filePath string) (*GOPScan, error) {
+	scan := &GOPScan{Source: "moov"}
+
+	times, err := ReadKeyframeTimes(filePath)
+	if err != nil {
+		if !errors.Is(err, ErrNoMP4Index) {
+			return nil, err
+		}
+		scan.Source = "ffprobe"
+		times, err = probeKeyframeTimesFFprobe(filePath)
+		if err != nil {
+			return nil, err
+		}
+	}
+	scan.IDRTimes = times
+
+	if len(times) < 3 {
+		return scan, nil
+	}
+
+	// Inter-IDR intervals, from the second IDR onward (the first is usually at
+	// t=0 and contributes no interval).
+	var sum float64
+	for i := 1; i < len(times); i++ {
+		sum += times[i] - times[i-1]
+	}
+	scan.MeanSec = sum / float64(len(times)-1)
+
+	// Max deviation (not stddev) — easier to reason about against the
+	// tolerance the caller compares to.
+	for i := 1; i < len(times); i++ {
+		dev := times[i] - times[i-1] - scan.MeanSec
+		if dev < 0 {
+			dev = -dev
+		}
+		if dev > scan.MaxDevSec {
+			scan.MaxDevSec = dev
+		}
+	}
+	return scan, nil
+}
+
+// probeKeyframeTimesFFprobe is the fallback keyframe scan for containers with
+// no usable moov index (MKV, MPEG-TS, fragmented MP4). It walks packet headers
+// without decoding, so it is I/O bound rather than CPU bound — roughly 1 GB/s
+// on a warm page cache.
+//
+// Deliberately NOT -skip_frame nokey: that decodes every keyframe and measured
+// 7x slower than reading every packet header on the same file.
+//
+// Output is streamed as CSV rather than buffered as JSON. This scan now covers
+// the whole file, and a 3-hour 60fps source is on the order of 700k packets —
+// enough that collecting the entire output and then unmarshalling it would
+// cost a couple of hundred MB per job, multiplied by the number of concurrent
+// slots. Only the keyframe timestamps are retained.
+func probeKeyframeTimesFFprobe(filePath string) ([]float64, error) {
 	cmd := exec.Command(ffprobePath,
 		"-v", "error",
 		"-select_streams", "v:0",
-		"-show_packets",
-		"-read_intervals", "0%+120",
 		"-show_entries", "packet=pts_time,flags",
-		"-print_format", "json",
+		"-of", "csv=p=0",
 		filePath,
 	)
-	out, runErr := cmd.Output()
-	if runErr != nil {
-		if isExecMissing(runErr) {
-			return 0, 0, 0, fmt.Errorf("%w: %v", ErrFFmpegMissing, runErr)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("ffprobe gop scan pipe: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		if isExecMissing(err) {
+			return nil, fmt.Errorf("%w: %v", ErrFFmpegMissing, err)
 		}
-		return 0, 0, 0, fmt.Errorf("ffprobe gop probe: %w", runErr)
+		return nil, fmt.Errorf("ffprobe gop scan: %w", err)
 	}
 
-	var parsed struct {
-		Packets []struct {
-			PTSTime string `json:"pts_time"`
-			Flags   string `json:"flags"`
-		} `json:"packets"`
-	}
-	if err := json.Unmarshal(out, &parsed); err != nil {
-		return 0, 0, 0, fmt.Errorf("parse ffprobe packets: %w", err)
-	}
-
-	// Collect PTS times for keyframe packets. ffprobe marks keyframes by
-	// setting the first character of "flags" to 'K' (e.g. "K_" or "K__").
+	// Each line is "<pts_time>,<flags>"; ffprobe marks keyframes by setting the
+	// first character of flags to 'K' (e.g. "K_" or "K__"). A packet with no
+	// timestamp prints "N/A" and is skipped.
 	var idrTimes []float64
-	for _, p := range parsed.Packets {
-		if len(p.Flags) == 0 || p.Flags[0] != 'K' {
+	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		comma := strings.IndexByte(line, ',')
+		if comma < 0 || comma+1 >= len(line) || line[comma+1] != 'K' {
 			continue
 		}
-		t, ferr := strconv.ParseFloat(p.PTSTime, 64)
+		t, ferr := strconv.ParseFloat(line[:comma], 64)
 		if ferr != nil {
 			continue
 		}
 		idrTimes = append(idrTimes, t)
 	}
-
-	if len(idrTimes) < 3 {
-		return 0, 0, len(idrTimes), nil
+	scanErr := sc.Err()
+	if err := cmd.Wait(); err != nil {
+		return nil, fmt.Errorf("ffprobe gop scan: %w", err)
 	}
-
-	// Compute inter-IDR intervals from the second IDR onward (the first IDR is
-	// usually at t=0, which doesn't contribute an interval).
-	intervals := make([]float64, 0, len(idrTimes)-1)
-	for i := 1; i < len(idrTimes); i++ {
-		intervals = append(intervals, idrTimes[i]-idrTimes[i-1])
+	if scanErr != nil {
+		return nil, fmt.Errorf("read ffprobe packets: %w", scanErr)
 	}
-
-	var sum float64
-	for _, iv := range intervals {
-		sum += iv
-	}
-	mean := sum / float64(len(intervals))
-
-	// Max-deviation variance (not stddev) — easier to reason about against the
-	// 100ms tolerance the caller compares to.
-	var maxDev float64
-	for _, iv := range intervals {
-		dev := iv - mean
-		if dev < 0 {
-			dev = -dev
-		}
-		if dev > maxDev {
-			maxDev = dev
-		}
-	}
-
-	return mean, maxDev, len(idrTimes), nil
+	return idrTimes, nil
 }
 
 // ProbeResult holds the results from probing a source file.
@@ -207,6 +254,17 @@ func ProbeGOP(filePath string) (gopSec float64, varianceSec float64, idrCount in
 // AudioStreamCount is the total number of audio streams in the source. Used
 // to (a) skip the audio pipeline entirely when 0, and (b) decide whether to
 // emit an amix filter chain (≥ 2).
+//
+// AudioSampleRate is the rate of the first audio stream. The audio encoder
+// keeps this rate rather than resampling to a fixed one — see TranscodeAudio.
+// 0 means unknown (no audio, or an unparseable rate), and the caller falls
+// back to defaultAudioSampleRate.
+//
+// FrameRateNum/FrameRateDen carry the source frame rate as the exact rational
+// ffprobe reported (e.g. 24000/1001), not just its float quotient. Segment and
+// GOP lengths are decided in whole frames and converted back to time with this
+// rational, so NTSC rates land on exact values instead of accumulating the
+// rounding error a float carries.
 type ProbeResult struct {
 	Width            int
 	Height           int
@@ -214,8 +272,11 @@ type ProbeResult struct {
 	VideoBitrateKbps int
 	DurationSeconds  float64
 	FrameRate        float64
+	FrameRateNum     int
+	FrameRateDen     int
 	AudioCodec       string
 	AudioStreamCount int
+	AudioSampleRate  int
 }
 
 // ffprobeOutput holds the raw ffprobe JSON output.
@@ -225,12 +286,13 @@ type ffprobeOutput struct {
 }
 
 type ffprobeStream struct {
-	CodecType    string `json:"codec_type"`
-	CodecName    string `json:"codec_name"`
-	Width        int    `json:"width"`
-	Height       int    `json:"height"`
-	RFrameRate   string `json:"r_frame_rate"`
-	BitRate      string `json:"bit_rate"`
+	CodecType  string `json:"codec_type"`
+	CodecName  string `json:"codec_name"`
+	Width      int    `json:"width"`
+	Height     int    `json:"height"`
+	RFrameRate string `json:"r_frame_rate"`
+	BitRate    string `json:"bit_rate"`
+	SampleRate string `json:"sample_rate"`
 }
 
 type ffprobeFormat struct {
@@ -276,12 +338,25 @@ func Probe(filePath string) (*ProbeResult, error) {
 				}
 			}
 
-			// Parse frame rate (e.g., "30/1" or "24000/1001")
+			// Parse frame rate (e.g., "30/1" or "24000/1001"). Both the exact
+			// rational and its float quotient are kept: the rational drives
+			// frame-count segment maths, the float stays for the existing
+			// comparisons (fps caps, remux eligibility).
+			//
+			// The float is parsed independently of the integer pair so an
+			// unexpected non-integer numerator still yields a usable rate for
+			// the comparisons rather than zeroing the frame rate outright.
 			if parts := strings.Split(s.RFrameRate, "/"); len(parts) == 2 {
-				num, _ := strconv.ParseFloat(parts[0], 64)
-				den, _ := strconv.ParseFloat(parts[1], 64)
-				if den > 0 {
-					result.FrameRate = num / den
+				fnum, errN := strconv.ParseFloat(parts[0], 64)
+				fden, errD := strconv.ParseFloat(parts[1], 64)
+				if errN == nil && errD == nil && fden > 0 {
+					result.FrameRate = fnum / fden
+				}
+				num, errN := strconv.Atoi(parts[0])
+				den, errD := strconv.Atoi(parts[1])
+				if errN == nil && errD == nil && num > 0 && den > 0 {
+					result.FrameRateNum = num
+					result.FrameRateDen = den
 				}
 			}
 		}
@@ -293,6 +368,9 @@ func Probe(filePath string) (*ProbeResult, error) {
 			// which silently disagreed with what we actually encoded.
 			if result.AudioStreamCount == 0 {
 				result.AudioCodec = s.CodecName
+				if sr, err := strconv.Atoi(s.SampleRate); err == nil && sr > 0 {
+					result.AudioSampleRate = sr
+				}
 			}
 			result.AudioStreamCount++
 		}

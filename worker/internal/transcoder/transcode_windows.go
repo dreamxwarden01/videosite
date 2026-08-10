@@ -12,12 +12,26 @@ import (
 // applyEncoderOpts injects encoder-specific FFmpeg flags (preset, RC mode,
 // quality tuning) immediately after the -c:v value. Platform-specific because
 // the set of encoders differs (NVENC/QSV on windows).
+//
+// The forced-IDR flag is not optional. Both hardware encoders answer a
+// -force_key_frames request with a plain I-frame rather than an IDR unless
+// told otherwise, and a non-IDR I-frame is not flagged as a keyframe in the
+// packet, so FFmpeg's HLS muxer cannot start a segment there. On QSV the
+// effect is severe: the muxer falls back to whatever sparse IDRs the encoder
+// emits on its own, producing 15-50 s segments followed by a run of
+// minimum-length ones as the cumulative threshold catches up. NVENC hides the
+// problem because its own -g cadence happens to land IDRs on schedule, but the
+// forced grid is equally inert there.
+//
+// The spellings genuinely differ — NVENC exposes `forced-idr` (hyphen), QSV
+// exposes `forced_idr` (underscore). Passing the wrong one is silent: FFmpeg
+// logs "Codec AVOption ... has not been used for any stream" and exits 0.
 func applyEncoderOpts(args []string, encoder config.Encoder, ffmpegEncoder string, profile config.OutputProfile) []string {
 	switch encoder.EncoderType {
 	case hardware.EncoderNVENC:
-		return insertAfter(args, ffmpegEncoder, "-gpu", strconv.Itoa(encoder.DeviceIndex), "-preset", profile.Preset, "-rc", "vbr")
+		return insertAfter(args, ffmpegEncoder, "-gpu", strconv.Itoa(encoder.DeviceIndex), "-preset", profile.Preset, "-rc", "vbr", "-forced-idr", "1")
 	case hardware.EncoderQSV:
-		return insertAfter(args, ffmpegEncoder, "-preset", profile.Preset)
+		return insertAfter(args, ffmpegEncoder, "-preset", profile.Preset, "-forced_idr", "1")
 	default:
 		return insertAfter(args, ffmpegEncoder, "-preset", profile.Preset)
 	}

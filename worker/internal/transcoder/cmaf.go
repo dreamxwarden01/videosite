@@ -27,11 +27,13 @@ import (
 //
 // When srcFrameRate > profile.FpsLimit we append `-r fps_limit` to force
 // frame-rate downsampling; the flag is a global output option that works on
-// every HW path (NVENC/QSV/VT) and software.
+// every HW path (NVENC/QSV/VT) and software. plan is built on the resulting
+// effective rate, so its frame counts describe the frames the encoder actually
+// emits rather than the source's.
 //
 // progressCh and errCh behave exactly like RunFFmpegWithProgress — callers
 // drain progressCh until close and then read a single error from errCh.
-func TranscodeVideo(ctx context.Context, sourcePath, outputDir string, profile config.OutputProfile, encoder config.Encoder, duration float64, swDecode bool, logFile string, outW, outH int, srcFrameRate float64) (<-chan int, <-chan error) {
+func TranscodeVideo(ctx context.Context, sourcePath, outputDir string, profile config.OutputProfile, plan SegmentPlan, encoder config.Encoder, duration float64, swDecode bool, logFile string, outW, outH int, srcFrameRate float64) (<-chan int, <-chan error) {
 	os.MkdirAll(outputDir, 0755)
 
 	ffmpegEncoder := hardware.FFmpegEncoderName[encoder.EncoderType]
@@ -45,15 +47,7 @@ func TranscodeVideo(ctx context.Context, sourcePath, outputDir string, profile c
 	// the HLS / DASH manifests advertise.
 	hwArgs, vfFilter := resolveHWArgs(encoder, swDecode, outW, outH)
 
-	// Effective output fps drives the keyint (-g) computation in
-	// buildBaseVideoArgs. Sources slower than the cap pass through at source
-	// rate; faster ones get capped via -r below.
-	effectiveFps := srcFrameRate
-	if profile.FpsLimit > 0 && srcFrameRate > float64(profile.FpsLimit)+0.01 {
-		effectiveFps = float64(profile.FpsLimit)
-	}
-
-	args := buildBaseVideoArgs(hwArgs, sourcePath, outputDir, profile, ffmpegEncoder, vfFilter, effectiveFps)
+	args := buildBaseVideoArgs(hwArgs, sourcePath, outputDir, profile, plan, ffmpegEncoder, vfFilter)
 
 	// Encoder-specific options.
 	args = applyEncoderOpts(args, encoder, ffmpegEncoder, profile)
@@ -72,7 +66,7 @@ func TranscodeVideo(ctx context.Context, sourcePath, outputDir string, profile c
 // Remux is only chosen by the caller when FilterProfiles/ApplyBitrateCaps
 // determined that resolution, codec, bitrate, and fps_limit all match —
 // otherwise TranscodeVideo is used.
-func RemuxVideo(ctx context.Context, sourcePath, outputDir string, profile config.OutputProfile, duration float64, logFile string) (<-chan int, <-chan error) {
+func RemuxVideo(ctx context.Context, sourcePath, outputDir string, profile config.OutputProfile, plan SegmentPlan, duration float64, logFile string) (<-chan int, <-chan error) {
 	os.MkdirAll(outputDir, 0755)
 
 	// ffmpeg's HLS muxer locates the fMP4 init file via strrchr(playlist_url,
@@ -89,14 +83,11 @@ func RemuxVideo(ctx context.Context, sourcePath, outputDir string, profile confi
 		"-map", "0:v:0",
 		"-c:v", "copy",
 		"-an",
-		// Pass -hls_time slightly under the true chosen_seg so the muxer always
-		// cuts on the natural IDR rather than skipping past it. Without the
-		// margin, %.3f rounds chosen_seg UP (e.g. true 7.807807s → "7.808") and
-		// cumulative drift eventually places the threshold milliseconds past
-		// the source's natural IDR — the muxer then waits for the NEXT IDR and
-		// emits a segment one source-GOP longer than intended. 100ms is well
-		// under the smallest realistic GOP (~250ms).
-		"-hls_time", fmt.Sprintf("%.3f", hlsTimeArg(profile.SegmentDuration)),
+		// Remux keeps a margin under the true segment length — unlike the
+		// transcode path, which passes the exact value. See
+		// remuxSafetyGOPDivisor for why a stream copy cannot be exact and why
+		// the margin scales with the GOP instead of being a fixed 1 ms.
+		"-hls_time", RemuxHLSTimeArg(plan.SegmentSeconds(), plan.GOPSeconds()),
 		"-hls_playlist_type", "vod",
 		"-hls_segment_type", "fmp4",
 		"-hls_fmp4_init_filename", initName,
@@ -108,24 +99,6 @@ func RemuxVideo(ctx context.Context, sourcePath, outputDir string, profile confi
 	return RunFFmpegWithProgress(ctx, duration, logFile, args...)
 }
 
-// hlsTimeArg returns the safe -hls_time value for the given chosen segment
-// duration. We subtract a 1ms epsilon for two reasons:
-//
-//  1. Round-up protection: the muxer's "first IDR ≥ start + hls_time" lookup
-//     skips the natural source IDR if hls_time's %.3f representation lands
-//     fractionally *above* the true segment-end PTS (e.g., true 7.8078s
-//     formatted as "7.808" loses the IDR at 7.8078s and waits for 9.760s).
-//     1ms is enough to stay below source-grid PTS rounding.
-//
-//  2. Don't induce cumulative drift: ffmpeg's HLS muxer uses *cumulative*
-//     thresholds (N × hls_time), so a large margin accumulates over N
-//     segments. With 1ms × N segments, drift stays well under one source
-//     GOP (~2s) even for multi-hour videos — large margins (e.g., 100ms)
-//     produce a short segment every ~20 segments once cumulative drift
-//     pushes the threshold before a natural IDR.
-//
-// chosenSegSec is expected to already be snapped to source-GOP multiples
-// via slot/job.go computeGOPDecision when useSourceGOP is set.
 // aacAlignedSegmentDuration returns the AAC-frame-aligned segment duration
 // closest to the requested target, for the given output sample rate.
 //
@@ -141,10 +114,16 @@ func RemuxVideo(ctx context.Context, sourcePath, outputDir string, profile confi
 // count, every segment is identical, and the worker's uniform check
 // reflects reality.
 //
-// Picks via round() so the chosen alignment is whichever side of the
-// target is closer (matching Cloudflare's pattern — they target 4.0 s on
-// 44.1 kHz audio and ship 173 frames = 4.01701 s because 173 is closer
-// than 172). For a 6.0 s target on 48 kHz, round picks 281 (5.995 s).
+// Picks via round(), so the chosen alignment is whichever side of the
+// target is closer. For a 6.0 s target at 48 kHz that is 281 frames
+// (5.99467 s); at 44.1 kHz it is 172 frames (3.99383 s) for a 4.0 s target.
+//
+// Note on the Cloudflare comparison this once cited: their 44.1 kHz audio
+// ships 173 frames (4.01705 s) against a 4.0 s target, and 173 is NOT the
+// closer choice — 172 is (Δ 0.0062 s versus Δ 0.0171 s). They round up, we
+// round to nearest. Either is drift-free because both land on a whole number
+// of AAC frames, which is the property that actually matters; round() simply
+// keeps the audio segment nearer the video segment.
 //
 // Defensive: if computation underflows to ≤ 0 (absurd inputs), fall
 // through to the unmodified target so we don't hand FFmpeg garbage.
@@ -160,15 +139,34 @@ func aacAlignedSegmentDuration(targetSec float64, sampleRateHz int) float64 {
 	return frames * float64(aacFrameSamples) / float64(sampleRateHz)
 }
 
-func hlsTimeArg(chosenSegSec float64) float64 {
-	const safetyMarginSec = 0.001
-	t := chosenSegSec - safetyMarginSec
-	if t < 0.5 {
-		// Defensive: for absurdly small chosen_seg the margin would dominate.
-		// Fall back to 99.9% of the value rather than going negative.
-		t = chosenSegSec * 0.999
+// defaultAudioSampleRate is used when the probe could not report the source's
+// rate. It is only a fallback — the encoder otherwise keeps whatever the
+// source has (see TranscodeAudio).
+const defaultAudioSampleRate = 48000
+
+// aacSampleRates are the rates AAC-LC can represent, per the MPEG-4 sampling
+// frequency index.
+var aacSampleRates = []int{8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000}
+
+// aacSampleRate maps a source rate onto the closest rate AAC-LC can encode.
+// An exact match (the overwhelming majority — sources are 44.1 or 48 kHz)
+// passes through untouched, which is the whole point: no resample, no
+// fragment-duration jitter.
+func aacSampleRate(srcHz int) int {
+	if srcHz <= 0 {
+		return defaultAudioSampleRate
 	}
-	return t
+	best, bestDist := defaultAudioSampleRate, -1
+	for _, r := range aacSampleRates {
+		d := r - srcHz
+		if d < 0 {
+			d = -d
+		}
+		if bestDist < 0 || d < bestDist {
+			best, bestDist = r, d
+		}
+	}
+	return best
 }
 
 // TranscodeAudio produces a single AAC-LC fMP4 HLS audio rendition at
@@ -191,11 +189,31 @@ func hlsTimeArg(chosenSegSec float64) float64 {
 // All ffmpeg paths are forward-slash normalized so the HLS muxer's
 // dirname-by-strrchr logic writes init.mp4 into outputDir on Windows (see
 // RemuxVideo for the full backstory).
+// sourceSampleRateHz is the rate of the source's first audio track. The
+// encoder keeps it rather than forcing a fixed rate, for the same reason the
+// video side works in frames: a rate conversion is an avoidable source of
+// per-segment error, and the AAC frame grid is only exact in the rate actually
+// being encoded. Cloudflare Stream makes the same choice — their 44.1 kHz
+// audio stays 44.1 kHz and publishes `duration="177152" timescale="44100"`,
+// exactly 173 AAC frames.
+//
+// This does NOT make every output uniform, and it is worth being precise about
+// why. Segment lengths also inherit whatever irregularity the source's own
+// audio timeline carries: a lecture whose source packets alternate 1024 /
+// 1036 / 1017 samples yields segments spread over a fraction of a millisecond
+// no matter what rate we encode at, while sources with a clean constant-1024
+// timeline collapse to a single length once the resample is gone. The spread
+// in the bad case is ~0.4 ms against a 100 ms uniformity budget, so it costs
+// nothing — but do not read a single-valued playlist as guaranteed.
+//
+// Rates AAC-LC cannot represent are snapped to the nearest one it can; 0
+// (unknown) falls back to defaultAudioSampleRate.
 func TranscodeAudio(
 	ctx context.Context,
 	sourcePath, outputDir string,
 	audioBitrateKbps int,
 	segmentDurationSec float64,
+	sourceSampleRateHz int,
 	loudnormFilter string,
 	audioStreamCount int,
 	duration float64,
@@ -245,11 +263,12 @@ func TranscodeAudio(
 		args = append(args, "-af", strings.Join(afParts, ","))
 	}
 
+	sampleRate := aacSampleRate(sourceSampleRateHz)
 	args = append(args,
 		"-c:a", "aac",
 		"-b:a", fmt.Sprintf("%dk", audioBitrateKbps),
 		"-ac", "2",
-		"-ar", "48000",
+		"-ar", fmt.Sprintf("%d", sampleRate),
 	)
 	// Cap output to the video's exact duration. Paired with apad above: if
 	// source audio is shorter than `duration`, apad extends it with silence
@@ -258,21 +277,21 @@ func TranscodeAudio(
 	// segDur), which matches the video playlist and prevents the HLS
 	// tail-stall (player waiting on a missing trailing audio segment).
 	args = append(args, "-t", fmt.Sprintf("%.3f", duration))
-	// Snap -hls_time to an exact integer number of AAC-LC frames at our
-	// fixed 48 kHz output rate. Without this, FFmpeg's HLS muxer treats
-	// the requested 6.0 s as a soft target and alternates between 281
-	// and 282 frames per segment (5.9947 s / 6.016 s) to average out
-	// near 6.0 s — producing a playlist that LOOKS uniform within the
-	// worker's 100 ms tolerance but actually has a ~1.9 s cumulative
-	// drift over a 90-min job. That drift pushes
-	// `ceil(period / @duration)` one segment past what the worker
-	// actually wrote, and Shaka 404s on the phantom tail.
+	// Snap -hls_time to an exact integer number of AAC-LC frames at the
+	// output rate. Without this, FFmpeg's HLS muxer treats the requested
+	// 6.0 s as a soft target and alternates between 281 and 282 frames
+	// per segment (5.9947 s / 6.016 s) to average out near 6.0 s —
+	// producing a playlist that LOOKS uniform within the worker's 100 ms
+	// tolerance but actually has a ~1.9 s cumulative drift over a 90-min
+	// job. That drift pushes `ceil(period / @duration)` one segment past
+	// what the worker actually wrote, and Shaka 404s on the phantom tail.
 	//
 	// With an AAC-aligned target the cut point IS the target — every
 	// segment is exactly the same frame count, the modal-equals-average
 	// invariant holds, and DASH's SegmentTemplate@duration tells the
-	// truth.
-	alignedSegSec := aacAlignedSegmentDuration(segmentDurationSec, 48000)
+	// truth. The rate here must be the rate actually being encoded, which
+	// is why it comes from sampleRate rather than a constant.
+	alignedSegSec := aacAlignedSegmentDuration(segmentDurationSec, sampleRate)
 	args = append(args,
 		"-hls_time", fmt.Sprintf("%.6f", alignedSegSec),
 		"-hls_playlist_type", "vod",
@@ -308,22 +327,13 @@ func TranscodeAudio(
 // the init file via strrchr(playlist_url, '/'), so Windows-native backslash
 // paths send the init segment to the worker's CWD. See RemuxVideo.
 //
-// effectiveFps is the output frame rate (capped by profile.FpsLimit). It feeds
-// the keyint calculation so GOP stays at profile.GOPSeconds regardless of
-// source fps.
-func buildBaseVideoArgs(hwArgs []string, sourcePath, outputDir string, profile config.OutputProfile, ffmpegEncoder, vfFilter string, effectiveFps float64) []string {
+// plan carries the resolved frame counts for this rendition (already built on
+// the effective output fps, i.e. after any profile.FpsLimit cap). Both the
+// keyint and the segment length come from it, so the two cannot disagree.
+func buildBaseVideoArgs(hwArgs []string, sourcePath, outputDir string, profile config.OutputProfile, plan SegmentPlan, ffmpegEncoder, vfFilter string) []string {
 	playlistPath := filepath.ToSlash(filepath.Join(outputDir, "playlist.m3u8"))
 	segmentPattern := filepath.ToSlash(filepath.Join(outputDir, "segment_%04d.m4s"))
 	initName := "init.mp4"
-
-	// ceil so the first frame at-or-after GOPSeconds becomes the next IDR;
-	// matches the time-based -force_key_frames expression below. At 23.976
-	// fps + 2.0s target → 48 frames (2.002s real), within the per-job
-	// tolerance carried in slot/job.go computeGOPDecision.
-	keyint := int(math.Ceil(profile.GOPSeconds * effectiveFps))
-	if keyint < 1 {
-		keyint = 1
-	}
 
 	args := make([]string, 0, 32+len(hwArgs))
 	args = append(args, hwArgs...)
@@ -337,23 +347,25 @@ func buildBaseVideoArgs(hwArgs []string, sourcePath, outputDir string, profile c
 		"-vf", vfFilter,
 		"-profile:v", profile.Profile,
 		"-an",
-		// -g is the ceiling (encoder won't go longer than this); -force_key_frames
-		// pins the actual cadence in seconds so every rendition in the same job
-		// cuts at identical time grid positions regardless of effective fps.
-		// Scene-cut IDRs are explicitly NOT suppressed (no -sc_threshold 0) —
-		// extras only add seek points without disturbing segmentation.
+		// -g and -force_key_frames state the same frame count two ways: -g is
+		// the encoder's own GOP ceiling, the expression pins each IDR to a
+		// frame index. Both are integers off plan.GOPFrames, so there is no
+		// float to disagree about.
 		//
-		// The 1ms epsilon on -force_key_frames mirrors hlsTimeArg's
-		// safety-margin logic. ffprobe quantizes source PTS to ms, so even
-		// a snapped chosenGOPSec can round a few μs above the true rational
-		// frame PTS; subtracting 1ms guarantees frame N (the natural source
-		// IDR) lands at-or-above the threshold and the encoder fires there
-		// rather than skipping to frame N+1 (which produces +1-frame GOPs
-		// and cross-rendition misalignment).
-		"-g", fmt.Sprintf("%d", keyint),
-		"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%g)", profile.GOPSeconds-0.001),
-		// See hlsTimeArg / RemuxVideo for the safety-margin rationale.
-		"-hls_time", fmt.Sprintf("%.3f", hlsTimeArg(profile.SegmentDuration)),
+		// Scene-cut IDRs are explicitly NOT suppressed (no -sc_threshold 0) —
+		// extras only add seek points. They cannot move a segment boundary,
+		// because the boundary is always the forced IDR that sits exactly on
+		// the muxer's threshold.
+		//
+		// NOTE: on NVENC and QSV this expression is inert unless the encoder's
+		// forced-IDR flag is also set — both emit plain (non-IDR) I-frames for
+		// a forced keyframe by default, and a non-IDR I-frame carries no
+		// AV_PKT_FLAG_KEY, so the HLS muxer cannot split there. applyEncoderOpts
+		// sets that flag; the two must stay together.
+		"-g", fmt.Sprintf("%d", plan.GOPFrames),
+		"-force_key_frames", plan.KeyframeExpr(),
+		// Exact, no safety margin — see SegmentPlan.HLSTimeArg.
+		"-hls_time", plan.HLSTimeArg(),
 		"-hls_playlist_type", "vod",
 		"-hls_segment_type", "fmp4",
 		"-hls_fmp4_init_filename", initName,

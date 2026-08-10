@@ -20,14 +20,18 @@ import (
 // FpsLimit caps the output frame rate for this profile; sources below the limit
 // are passed through unchanged (no upsampling).
 //
-// GOPSeconds is the keyframe interval in seconds — the FFmpeg keyint flag is
-// computed as ceil(GOPSeconds * effective_fps) at arg-build time and
-// -force_key_frames pins the cadence to multiples of GOPSeconds so every
-// rendition cuts at the same instants regardless of source frame rate.
+// GOPSeconds and SegmentDuration are the requested keyframe interval and
+// segment length in seconds. Both are TARGETS, not the values handed to
+// FFmpeg: slot/job.go runTranscode resolves each rendition onto its own output
+// frame grid via transcoder.NewSegmentPlan, and the resulting frame counts are
+// what drive the encoder and the muxer. The two fields are then rewritten from
+// the plan so anything reading them in seconds (bitrate caps, manifests, logs)
+// sees what was actually produced.
 //
-// SegmentDuration is in seconds and accepts fractional values. The worker may
-// override this at runtime to align with a probed source GOP — see
-// slot/job.go runTranscode for the per-job override that propagates here.
+// The distinction matters because FFmpeg's HLS muxer accumulates an absolute
+// segment threshold; a length expressed in seconds that the encoder cannot hit
+// exactly drifts a little further out of step on every segment. See
+// transcoder.SegmentPlan.
 type OutputProfile struct {
 	Name             string  `json:"name"`
 	Width            int     `json:"width"`
