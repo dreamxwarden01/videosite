@@ -152,6 +152,12 @@ type Job struct {
 	targetSegSec float64
 	useSourceGOP bool
 
+	// sourceIDRTimes is the full keyframe layout from the GOP scan, kept so
+	// runTranscode can predict what a stream copy would segment into before
+	// committing to one (see transcoder.RemuxSegmentsWouldBeUniform). Empty
+	// when the scan failed or the container had no usable index.
+	sourceIDRTimes []float64
+
 	// Current status for the batched /tasks/status reporter. Read by
 	// Manager.SnapshotStatuses every 2 s; written by the job goroutine on
 	// progress. Duration is NOT mirrored here — it lives on j.duration and
@@ -888,6 +894,7 @@ func (j *Job) computeGOPDecision(sourcePath string, probe *transcoder.ProbeResul
 	scanUsable := err == nil && scan != nil && scan.Count() >= 3 && scan.MeanSec > 0
 	if scanUsable {
 		j.sourceGOPSec = scan.MeanSec
+		j.sourceIDRTimes = scan.IDRTimes
 	}
 
 	if scanUsable && scan.MaxDevSec <= gopToleranceSec && scan.MeanSec <= maxRemuxGOPSec {
@@ -1435,6 +1442,25 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 		p.GOPSeconds = p.Plan.GOPSeconds()
 		p.SegmentDuration = p.Plan.SegmentSeconds()
 		j.UI.Logf("[%s] segment plan %s: %s", j.JobID, p.Name, p.Plan)
+
+		// A stream copy can only cut where the source already has an IDR, so
+		// whether it produces a uniform playlist is decided entirely by the
+		// source and is knowable up front. Predict it and re-encode instead
+		// when the answer is no.
+		//
+		// The inter-IDR deviation the GOP decision measures cannot stand in
+		// for this: two sources can measure the same deviation and segment
+		// completely differently depending on how often they run long. The
+		// simulation asks the question that actually matters, so a bit-exact
+		// copy is kept wherever it genuinely works.
+		if p.CanRemux {
+			if ok, reason := transcoder.RemuxSegmentsWouldBeUniform(j.sourceIDRTimes, p.Plan); !ok {
+				p.CanRemux = false
+				j.UI.Logf("[%s] %s: remux would give %s — re-encoding instead", j.JobID, p.Name, reason)
+			} else {
+				j.UI.Logf("[%s] %s: remux predicted uniform (%s)", j.JobID, p.Name, reason)
+			}
+		}
 	}
 
 	profiles = transcoder.ApplyBitrateCaps(j.JobID, profiles, probe.Height, probe.VideoBitrateKbps, j.sourceGOPSec)

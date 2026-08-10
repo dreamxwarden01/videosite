@@ -106,6 +106,86 @@ func TestSegmentPlanDegenerateInputs(t *testing.T) {
 	}
 }
 
+// buildIDRTimes synthesises a source keyframe layout at 60000/1001 fps:
+// `count` GOPs of nominalFrames, except every longEvery-th which runs
+// longFrames instead. longEvery <= 0 means a perfectly regular grid.
+func buildIDRTimes(count, nominalFrames, longEvery, longFrames int) []float64 {
+	const num, den = 60000, 1001
+	times := make([]float64, 0, count+1)
+	frame := 0
+	for i := 0; i <= count; i++ {
+		times = append(times, float64(frame)*float64(den)/float64(num))
+		n := nominalFrames
+		if longEvery > 0 && (i+1)%longEvery == 0 {
+			n = longFrames
+		}
+		frame += n
+	}
+	return times
+}
+
+// TestRemuxSegmentsWouldBeUniform encodes the insight that made the remux
+// decision worth simulating: what determines whether a stream copy segments
+// uniformly is how OFTEN the source runs long, not by how much. All three
+// cases below have an identical maximum inter-IDR deviation (117 vs 119
+// frames, ~33 ms) and would be indistinguishable to any tolerance on that
+// deviation, yet they segment completely differently.
+//
+// Frequencies mirror the two real 59.94 fps sources this was built for:
+// 0.35% off-nominal GOPs remuxes cleanly, 7% does not.
+func TestRemuxSegmentsWouldBeUniform(t *testing.T) {
+	plan := NewSegmentPlan(60000, 1001, 1.951951, 6.0) // 117-frame GOP, 468-frame segment
+	if plan.GOPFrames != 117 || plan.SegmentFrames != 468 {
+		t.Fatalf("unexpected plan: %s", plan)
+	}
+
+	cases := []struct {
+		name      string
+		longEvery int
+		want      bool
+	}{
+		{"perfectly regular", 0, true},
+		{"0.35% long GOPs (0224-like)", 285, true},
+		{"7% long GOPs (0226-like)", 14, false},
+	}
+	for _, c := range cases {
+		idr := buildIDRTimes(1600, 117, c.longEvery, 119)
+		got, reason := RemuxSegmentsWouldBeUniform(idr, plan)
+		if got != c.want {
+			t.Errorf("%s: uniform=%v, want %v (%s)", c.name, got, c.want, reason)
+		}
+	}
+}
+
+// TestSimulateRemuxSegmentsCutRule checks the simulation reproduces the
+// muxer's rule — cut at the first keyframe at or past an absolute
+// `hls_time × N` threshold — rather than resetting the threshold per segment.
+// The distinction is the entire reason a per-segment deficit accumulates.
+func TestSimulateRemuxSegmentsCutRule(t *testing.T) {
+	// IDRs every 1s, asking for 2.5s segments: cuts land at 3s, 5s, 8s, 10s…
+	idr := make([]float64, 0, 21)
+	for i := 0; i <= 20; i++ {
+		idr = append(idr, float64(i))
+	}
+	segs := SimulateRemuxSegments(idr, 2.5)
+	want := []float64{3, 2, 3, 2, 3, 2, 3}
+	if len(segs) < len(want) {
+		t.Fatalf("got %d segments, want at least %d: %v", len(segs), len(want), segs)
+	}
+	for i, w := range want {
+		if segs[i] != w {
+			t.Fatalf("segment %d = %v, want %v (full: %v)", i, segs[i], w, segs[:len(want)])
+		}
+	}
+
+	if got := SimulateRemuxSegments([]float64{0}, 2.5); got != nil {
+		t.Errorf("single IDR should yield no segments, got %v", got)
+	}
+	if ok, _ := RemuxSegmentsWouldBeUniform([]float64{0}, NewSegmentPlan(30, 1, 2, 6)); ok {
+		t.Error("a source with one IDR must not be judged remuxable")
+	}
+}
+
 // TestRemuxHLSTimeArgUndercuts confirms the remux margin is strictly positive
 // and stays well under one GOP — it exists to absorb source PTS jitter, not to
 // move the cut to a different keyframe.

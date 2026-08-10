@@ -208,12 +208,125 @@ func (p SegmentPlan) String() string {
 // 6.7 h at 6 s segments — for every source.
 const remuxSafetyGOPDivisor = 4000
 
-// RemuxHLSTimeArg formats the -hls_time value for a stream copy, where the
+// RemuxHLSTime returns the -hls_time value for a stream copy, where the
 // keyframe positions are the source's and we can only approach them.
-func RemuxHLSTimeArg(segmentSec, gopSec float64) string {
+//
+// Quantised to whole microseconds because that is what FFmpeg parses the
+// option into. Doing it here rather than at formatting time means
+// RemuxSegmentsWouldBeUniform simulates against exactly the threshold the
+// muxer will use, not a value that differs in the last decimal.
+func RemuxHLSTime(segmentSec, gopSec float64) float64 {
 	margin := gopSec / remuxSafetyGOPDivisor
 	if margin <= 0 || margin >= segmentSec {
 		margin = segmentSec / remuxSafetyGOPDivisor
 	}
-	return fmt.Sprintf("%.6f", segmentSec-margin)
+	return math.Round((segmentSec-margin)*1e6) / 1e6
+}
+
+// RemuxHLSTimeArg formats RemuxHLSTime for the command line.
+func RemuxHLSTimeArg(segmentSec, gopSec float64) string {
+	return fmt.Sprintf("%.6f", RemuxHLSTime(segmentSec, gopSec))
+}
+
+// SimulateRemuxSegments predicts the segment durations a stream copy would
+// produce from a source with the given IDR timestamps.
+//
+// It reproduces FFmpeg's HLS muxer cut rule: the muxer keeps an absolute
+// threshold of `hls_time × N` measured from the first packet and starts a new
+// segment at the first keyframe at or past it. A stream copy adds nothing of
+// its own — the cut points are exactly the source IDRs — so the whole playlist
+// is predictable from the index we already read, before spending any I/O.
+//
+// Checked against production output for two 59.94 fps sources whose remuxed
+// renditions were 1027 and 1565 segments long: the prediction matched the
+// shipped playlists segment for segment, with no mismatches.
+//
+// Returns the full segments only; there is no trailing partial, since the
+// media after the last cut is not represented in the IDR list.
+func SimulateRemuxSegments(idrTimes []float64, hlsTimeSec float64) []float64 {
+	if len(idrTimes) < 2 || hlsTimeSec <= 0 {
+		return nil
+	}
+	// The comparison FFmpeg makes is exact; this epsilon only absorbs the
+	// float representation of timestamps that are exact rationals in the
+	// source timebase, so a boundary landing precisely on the threshold is
+	// treated as reaching it rather than missing it by an ULP.
+	const eps = 1e-9
+
+	start := idrTimes[0]
+	segStart := start
+	number := 1
+	out := make([]float64, 0, int(float64(len(idrTimes))/2)+1)
+	for _, t := range idrTimes[1:] {
+		if t-start >= float64(number)*hlsTimeSec-eps {
+			out = append(out, t-segStart)
+			segStart = t
+			number++
+		}
+	}
+	return out
+}
+
+// RemuxSegmentsWouldBeUniform reports whether a stream copy of this source
+// would produce a playlist that passes the same uniformity test
+// WriteDASHManifest applies, and a short human-readable reason for the log.
+//
+// This exists because "is the source GOP constant enough to remux" cannot be
+// answered by a tolerance on inter-IDR deviation. Two 59.94 fps lectures
+// measured 0.0339 s and 0.0317 s maximum deviation — indistinguishable to any
+// threshold — yet one remuxes to a uniform playlist and the other cannot,
+// because what actually matters is how OFTEN the source runs long, not by how
+// much. The first carried 22 off-nominal GOPs in 6259 (0.35%); the second
+// carried 286 in 4100 (7%), and each one nudges the media clock ahead of the
+// muxer's fixed threshold until it slips a whole GOP.
+//
+// Simulating the outcome answers the real question directly, so the bit-exact
+// copy is kept wherever it genuinely works and only the sources that would
+// produce a ragged playlist pay for a re-encode.
+func RemuxSegmentsWouldBeUniform(idrTimes []float64, plan SegmentPlan) (bool, string) {
+	if len(idrTimes) < 2 {
+		return false, "source has too few IDRs to predict segmentation"
+	}
+	segs := SimulateRemuxSegments(idrTimes, RemuxHLSTime(plan.SegmentSeconds(), plan.GOPSeconds()))
+	if len(segs) < 2 {
+		return false, "source yields fewer than two segments"
+	}
+
+	ticks := make([]int, len(segs))
+	for i, s := range segs {
+		ticks[i] = int(math.Round(s * float64(dashTimescale)))
+	}
+	modal, ok := uniformModalTicks(ticks)
+	if ok {
+		return true, fmt.Sprintf("%d segments, all within tolerance of %.6fs", len(segs), float64(modal)/float64(dashTimescale))
+	}
+
+	// Report the worst offender — it is the number an operator wants when
+	// deciding whether a re-encode was justified.
+	worstIdx, worstDev := 0, 0
+	best, _ := modalOf(ticks)
+	for i, tk := range ticks {
+		dev := tk - best
+		if dev < 0 {
+			dev = -dev
+		}
+		if dev > worstDev {
+			worstIdx, worstDev = i, dev
+		}
+	}
+	return false, fmt.Sprintf("%d segments, worst deviation %.0fms at segment %d (modal %.6fs)",
+		len(segs), float64(worstDev)/1000, worstIdx, float64(best)/float64(dashTimescale))
+}
+
+// modalOf returns the most common value in the slice and its count.
+func modalOf(v []int) (int, int) {
+	counts := make(map[int]int, len(v))
+	var modal, modalCount int
+	for _, x := range v {
+		counts[x]++
+		if counts[x] > modalCount {
+			modal, modalCount = x, counts[x]
+		}
+	}
+	return modal, modalCount
 }

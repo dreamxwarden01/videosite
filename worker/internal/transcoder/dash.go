@@ -317,12 +317,26 @@ func segmentDurationIfUniform(durs []int) (int, bool) {
 	if len(durs) < 2 {
 		return 0, false
 	}
-	// Modal value over all-but-last. AAC quantization typically produces
-	// one of two adjacent durations; fps-cap renditions produce a single
-	// value with ±1 frame jitter. Either way, mode + tolerance handles it.
+	return uniformModalTicks(durs[:len(durs)-1])
+}
+
+// uniformModalTicks is the uniformity test itself, over a sequence that
+// contains no trailing partial segment.
+//
+// Split out from segmentDurationIfUniform so the remux eligibility check can
+// ask the same question of a *predicted* playlist before any encoding happens
+// (see RemuxSegmentsWouldBeUniform). The prediction and the manifest decision
+// have to agree, and the only way to guarantee that is to run the same code.
+func uniformModalTicks(durs []int) (int, bool) {
+	if len(durs) == 0 {
+		return 0, false
+	}
+	// Modal value. AAC quantization typically produces one of two adjacent
+	// durations; fps-cap renditions produce a single value with ±1 frame
+	// jitter. Either way, mode + tolerance handles it.
 	counts := make(map[int]int)
-	for i := 0; i < len(durs)-1; i++ {
-		counts[durs[i]]++
+	for _, d := range durs {
+		counts[d]++
 	}
 	var modal, modalCount int
 	for d, c := range counts {
@@ -331,8 +345,8 @@ func segmentDurationIfUniform(durs []int) (int, bool) {
 			modalCount = c
 		}
 	}
-	for i := 0; i < len(durs)-1; i++ {
-		dev := durs[i] - modal
+	for _, d := range durs {
+		dev := d - modal
 		if dev < 0 {
 			dev = -dev
 		}
