@@ -87,7 +87,7 @@ const dashMPDTemplate = `<?xml version="1.0" encoding="UTF-8"?>
     </AdaptationSet>
 {{- if .HasAudio}}
     <AdaptationSet contentType="audio" mimeType="audio/mp4" lang="und">
-      <Representation id="{{.AudioName}}" codecs="mp4a.40.2" bandwidth="{{.AudioBandwidth}}" audioSamplingRate="48000">
+      <Representation id="{{.AudioName}}" codecs="mp4a.40.2" bandwidth="{{.AudioBandwidth}}" audioSamplingRate="{{.AudioSampleRate}}">
         <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2"/>
 {{- if .AudioUniform}}
         <SegmentTemplate media="audio/{{.AudioName}}/segment_$Number%04d$.m4s" initialization="audio/{{.AudioName}}/init.mp4" timescale="{{$.Timescale}}" startNumber="0" duration="{{.AudioSegmentDurationTicks}}"/>
@@ -150,6 +150,7 @@ type dashTmplContext struct {
 	HasAudio                  bool
 	AudioName                 string
 	AudioBandwidth            int
+	AudioSampleRate           int // Hz, as encoded — NOT a fixed constant
 	AudioUniform              bool
 	AudioSegmentDurationTicks int              // when AudioUniform
 	AudioTimeline             []dashSegmentRun // when !AudioUniform
@@ -161,6 +162,14 @@ type dashTmplContext struct {
 // so Codecs/FrameRate/Bandwidth stay consistent across the HLS and DASH
 // manifests). audioName is the audio folder name under audio/ (e.g.
 // "aac_192k"); audioBitrateKbps feeds the DASH bandwidth attribute.
+//
+// audioSampleRateHz must be the rate that was actually encoded, not a
+// site-wide constant. The audio encoder keeps whatever rate the source had
+// (see TranscodeAudio), so a hard-coded value here silently misdeclares every
+// 44.1 kHz source as 48 kHz. The caller reads it back off the produced audio
+// init segment via ProbeAudioSampleRate for exactly that reason. HLS needs no
+// equivalent — neither EXT-X-MEDIA nor the mp4a.40.2 codec string carries a
+// sample rate, so master.m3u8 was never affected.
 // durationSec is the source duration from ffprobe — used as a cap for
 // mediaPresentationDuration. If any rendition's timeline sum falls below
 // that cap we take the shortest timeline instead, so the MPD header does
@@ -178,7 +187,7 @@ type dashTmplContext struct {
 // SegmentTimeline. The playlist is the authoritative source: FFmpeg
 // decides the exact segment count and durations per rendition, and the
 // HLS playlist is the only record that reflects those decisions.
-func WriteDASHManifest(outputDir string, variants []Variant, audioName string, audioBitrateKbps int, durationSec float64, hasAudio bool) error {
+func WriteDASHManifest(outputDir string, variants []Variant, audioName string, audioBitrateKbps int, audioSampleRateHz int, durationSec float64, hasAudio bool) error {
 	reps := make([]dashVideoRep, 0, len(variants))
 	// Track the shortest per-rendition timeline (in ticks) so
 	// mediaPresentationDuration can be clamped down if any rendition
@@ -278,6 +287,7 @@ func WriteDASHManifest(outputDir string, variants []Variant, audioName string, a
 		HasAudio:                  hasAudio,
 		AudioName:                 audioName,
 		AudioBandwidth:            audioBitrateKbps * 1000,
+		AudioSampleRate:           audioSampleRateHz,
 		AudioUniform:              audioUniform,
 		AudioSegmentDurationTicks: audioSegTicks,
 		AudioTimeline:             audioRuns,

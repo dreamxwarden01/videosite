@@ -1780,7 +1780,20 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 	}
 	// WriteDASHManifest now decides per-Representation uniformity from the
 	// modal value of each rendition's playlist — no global hint needed.
-	if err := transcoder.WriteDASHManifest(j.outputDir, variants, audioName, j.AudioBitrateKbps, probe.DurationSeconds, hasAudio); err != nil {
+	// The MPD has to declare the rate that was actually encoded. Read it back
+	// off the produced init segment rather than assuming, since the encoder
+	// keeps the source's rate; fall back to the rate we asked for if the probe
+	// fails, which is still right in every case except a broken encode.
+	audioSampleRate := transcoder.AACSampleRate(probe.AudioSampleRate)
+	if hasAudio {
+		if rate, err := transcoder.ProbeAudioSampleRate(filepath.Join(audioDir, "init.mp4")); err == nil {
+			audioSampleRate = rate
+		} else {
+			j.UI.Logf("[%s] WARN: could not read audio sample rate from init.mp4, declaring %d Hz: %v", j.JobID, audioSampleRate, err)
+		}
+	}
+
+	if err := transcoder.WriteDASHManifest(j.outputDir, variants, audioName, j.AudioBitrateKbps, audioSampleRate, probe.DurationSeconds, hasAudio); err != nil {
 		return fmt.Errorf("write DASH manifest: %w", err)
 	}
 

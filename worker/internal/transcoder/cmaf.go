@@ -148,11 +148,11 @@ const defaultAudioSampleRate = 48000
 // frequency index.
 var aacSampleRates = []int{8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000}
 
-// aacSampleRate maps a source rate onto the closest rate AAC-LC can encode.
+// AACSampleRate maps a source rate onto the closest rate AAC-LC can encode.
 // An exact match (the overwhelming majority — sources are 44.1 or 48 kHz)
 // passes through untouched, which is the whole point: no resample, no
 // fragment-duration jitter.
-func aacSampleRate(srcHz int) int {
+func AACSampleRate(srcHz int) int {
 	if srcHz <= 0 {
 		return defaultAudioSampleRate
 	}
@@ -263,7 +263,7 @@ func TranscodeAudio(
 		args = append(args, "-af", strings.Join(afParts, ","))
 	}
 
-	sampleRate := aacSampleRate(sourceSampleRateHz)
+	sampleRate := AACSampleRate(sourceSampleRateHz)
 	args = append(args,
 		"-c:a", "aac",
 		"-b:a", fmt.Sprintf("%dk", audioBitrateKbps),

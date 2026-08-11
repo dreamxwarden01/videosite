@@ -76,6 +76,40 @@ func ProbeCodecString(mp4Path string) (string, error) {
 	return "", fmt.Errorf("could not determine codec string for %s", mp4Path)
 }
 
+// ProbeAudioSampleRate reads the sample rate out of a produced audio fMP4 init
+// segment.
+//
+// The DASH manifest has to declare audioSamplingRate, and it has to be the
+// rate that was actually encoded — the encoder keeps the source's rate rather
+// than forcing a fixed one (see TranscodeAudio), so there is no constant to
+// fall back on. Reading it off the artefact is the same approach
+// ProbeCodecString takes for the video codec string, and it cannot drift from
+// what shipped.
+//
+// Returns 0 with an error if the init segment has no audio stream or an
+// unparseable rate; the caller falls back to the rate it asked for.
+func ProbeAudioSampleRate(mp4Path string) (int, error) {
+	cmd := exec.Command(ffprobePath,
+		"-v", "error",
+		"-select_streams", "a:0",
+		"-show_entries", "stream=sample_rate",
+		"-of", "csv=p=0",
+		mp4Path,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		if isExecMissing(err) {
+			return 0, fmt.Errorf("%w: %v", ErrFFmpegMissing, err)
+		}
+		return 0, fmt.Errorf("ffprobe audio sample rate: %w", err)
+	}
+	rate, convErr := strconv.Atoi(strings.TrimSpace(string(out)))
+	if convErr != nil || rate <= 0 {
+		return 0, fmt.Errorf("could not parse sample rate from %s", mp4Path)
+	}
+	return rate, nil
+}
+
 // h264ProfileIDC maps ffprobe's human-readable profile name to the
 // (profile_idc, profile_compat_flags) bytes used in the avc1 codec string.
 // Returns (0, 0) for unknown profiles — callers should fall back.
