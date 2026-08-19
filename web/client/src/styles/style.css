@@ -1089,11 +1089,26 @@ body.theater-mode { overflow: hidden; }
     overflow: hidden;
 }
 .theater-mode .video-player {
-    width: min(100%, calc((100vh - 46px) * 16 / 9));
-    height: auto;
-    max-height: calc(100vh - 46px);
+    /* Fill the stage. The stage is already `flex: 1` inside a fixed, full-height
+       column, so it owns exactly the area under the back bar — no viewport maths
+       needed, and nothing to keep in sync with the bar's height.
+
+       aspect-ratio must be beaten explicitly: the base rule sets 16/9 and
+       WatchPage then writes the video's REAL ratio inline once metadata loads
+       (pages/WatchPage.jsx). Inline beats the stylesheet, so !important is what
+       actually releases the box — without it the player stays letterboxed to the
+       video's own ratio instead of expanding, which is the bug this fixes.
+       max-height likewise clears the base 70vh cap. */
+    width: 100%;
+    height: 100%;
+    aspect-ratio: auto !important;
+    max-height: none;
     border-radius: 0;
 }
+/* The container is now the window's shape rather than the video's, so the video
+   has to letterbox inside it — `video { width/height: 100% }` would otherwise
+   stretch it out of ratio. */
+.theater-mode .video-player video { object-fit: contain; }
 .theater-mode .vs-wp-info { display: none; }
 
 /* === Pagination Bar === */

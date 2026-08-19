@@ -7,7 +7,11 @@
 # binary, ffmpeg runtime, and Debian's TLS roots.
 
 # ---------- Stage 1: build the Go binary ----------
-FROM golang:1.25-bookworm AS builder
+# --platform=$BUILDPLATFORM pins the BUILDER to the machine doing the building
+# (the amd64 runner) rather than the target. Go cross-compiles, so an arm64 image
+# costs a different GOARCH and nothing else — without this, BuildKit would run the
+# whole Go toolchain under QEMU for the arm64 leg and take many times longer.
+FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS builder
 WORKDIR /src
 
 COPY go.mod go.sum ./
@@ -18,7 +22,15 @@ COPY . ./
 # absolute paths and DWARF debug info; the linux-amd64 binary lands ~13 MB.
 # Linux-only build tags (*_linux.go) select the right platform files; the
 # darwin/windows variants are excluded by the build constraint.
-ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+#
+# TARGETOS/TARGETARCH are supplied by BuildKit per requested platform. They MUST
+# be declared without defaults: a default shadows the value BuildKit injects, and
+# the stage then silently builds for that default instead of the requested
+# platform — an `ARG TARGETARCH=amd64` here produced an x86-64 binary inside the
+# arm64 image, which would not have run at all.
+ARG TARGETOS
+ARG TARGETARCH
+ENV CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH
 RUN go build -trimpath -ldflags='-s -w' -o /out/videosite-worker .
 
 
@@ -27,7 +39,16 @@ FROM debian:bookworm-slim AS runtime
 
 # jellyfin-ffmpeg7 bundles NVENC, QSV (libvpl + iHD driver), and VA-API
 # runtime in a single apt package — no separate intel-media-va-driver,
-# libvpl, or NVIDIA encoder headers needed.
+# libvpl, or NVIDIA encoder headers needed. Jellyfin publishes it for arm64 as
+# well as amd64, so the arch comes from dpkg rather than being pinned.
+#
+# NVENC and QSV are x86 accelerators: an arm64 image gets the same ffmpeg but
+# encodes in software unless the host exposes a VA-API device it supports. arm64
+# is for running the worker at all on Apple Silicon, not for accelerated
+# transcoding there.
+#
+# Unlike the builder this stage runs target-arch binaries (apt/dpkg), so the
+# arm64 leg is emulated via QEMU and is the slow part of a multi-arch build.
 #
 # Host responsibilities (NOT in the image):
 #   NVIDIA: nvidia-container-toolkit installed, run with `--gpus all`
@@ -39,7 +60,7 @@ RUN set -eux \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key \
         | gpg --dearmor -o /etc/apt/keyrings/jellyfin.gpg \
-    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/jellyfin.gpg] https://repo.jellyfin.org/debian bookworm main" \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/jellyfin.gpg] https://repo.jellyfin.org/debian bookworm main" \
         > /etc/apt/sources.list.d/jellyfin.list \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
