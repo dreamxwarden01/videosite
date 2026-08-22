@@ -47,13 +47,29 @@ app.use('/assets', express.static(path.join(__dirname, 'client', 'dist', 'assets
 }));
 app.use('/favicon.ico', express.static(path.join(__dirname, 'client', 'dist', 'favicon.ico')));
 
+// Shaka Player, vendored from npm into a version-stamped directory at build
+// time (see client/vite.config.js). The version is in the PATH rather than a
+// content hash because these files are copied verbatim and Vite never hashes
+// them — immutable on an unversioned URL would make an upgrade unreachable for
+// a year. A new version is a new directory, so the old one simply stops being
+// requested.
+app.use('/vendor', express.static(path.join(__dirname, 'client', 'dist', 'vendor'), {
+    maxAge: '1y', immutable: true,
+}));
+
 // Client public keys for the SSO (private_key_jwt) — before the install gate:
 // the install flow registers this URL at the SSO while the app is live.
 app.get('/.well-known/jwks.json', (req, res) => {
   try {
+    const jwks = require('./lib/oidc').publicJwks();
+    // Set freshness only once the keys actually read. Setting it first meant a
+    // 500 (the key file does not exist until install mints it) went out as
+    // public, max-age=300 — cached by the SSO and by the installer's own
+    // preflight, which then cannot complete until the entry ages out.
     res.set('Cache-Control', 'public, max-age=300');
-    res.json(require('./lib/oidc').publicJwks());
+    res.json(jwks);
   } catch (e) {
+    res.set('Cache-Control', 'no-store');
     res.status(500).json({ error: 'keys_unavailable' });
   }
 });
@@ -101,6 +117,16 @@ app.use('/api', (req, res, next) => {
 });
 
 app.use(installRoutes);
+// /auth/* is per-user or per-flow without exception, and none of it may be
+// cached. The /api no-store guard below is mounted on '/api', so it never
+// covered these. Two of them are cacheable-status responses that carry no
+// Set-Cookie for Cloudflare to key off: /auth/login returns a bare 302 when the
+// user is already signed in, and /auth/stepup/status returns this session's
+// step-up state as 200 JSON. A cached /auth/login 302 would send every
+// anonymous visitor to returnTo instead of the SSO — a login loop for the whole
+// colo — and a cached stepup/status hands one user's state to another. The
+// origin should say so itself rather than depend on an edge rule's path scope.
+app.use('/auth', (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 app.use(authRoutes);
 
 app.use(backchannelRoutes); // /backchannel/events (envelope-authed, no session; unified path)
@@ -202,11 +228,18 @@ app.use((err, req, res, next) => {
         return res.status(500).json({ error: message });
     }
 
+    // Set the status explicitly: a custom error middleware runs instead of
+    // finalhandler, so res.statusCode is still 200 here and every unhandled
+    // error on a non-API path was being reported as a successful 200 — with
+    // send()'s default `public, max-age=0` on it. A malformed JSON body to any
+    // SPA path was enough to produce that.
+    res.status(err.status || err.statusCode || 500);
+    res.set('Cache-Control', 'no-store');
     if (fs.existsSync(spaIndexPath)) {
         return res.sendFile(spaIndexPath);
     }
 
-    res.status(500).json({ error: message });
+    res.json({ error: message });
 });
 
 // Start server

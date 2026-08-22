@@ -8,6 +8,7 @@ import { moduleTerm } from '../utils/moduleLabel';
 import useFitHeight from '../hooks/useFitHeight';
 import SortMenu from '../components/SortMenu';
 import VsPager from '../components/VsPager';
+import { prefetchShaka } from '../services/shakaLoader';
 
 const MAX_POSTER_RETRIES = 10;
 
@@ -77,6 +78,13 @@ export default function CourseView({ tab }) {
   const [gone, setGone] = useState(null); // null | 'notfound' | 'forbidden'
   const goneRef = useRef(null);
   useEffect(() => { setGone(null); goneRef.current = null; }, [courseId]);
+
+  // Warm the player while the user is picking a video. rel=prefetch is the
+  // lowest priority the browser offers and is fired on idle, so it never
+  // competes with this page's own work and is skipped outright under data-saver
+  // or memory pressure. If it lands, opening a video is a cache hit; if it does
+  // not, the watch page downloads it normally. Purely an optimisation.
+  useEffect(() => { prefetchShaka(); }, []);
   const markGone = (data) => {
     const g = goneFromCode(data);
     if (!g) return false;

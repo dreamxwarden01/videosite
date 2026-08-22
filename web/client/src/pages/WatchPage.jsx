@@ -6,6 +6,7 @@ import { useToast } from '../context/ToastContext';
 import { apiGet, apiPost, triggerAuthFailure, isSigningOut } from '../api';
 import LoadingSpinner from '../components/LoadingSpinner';
 import { moduleTerm } from '../utils/moduleLabel';
+import { loadShaka } from '../services/shakaLoader';
 
 // isAppleDevice returns true for clients whose video stack prefers HLS over
 // DASH: iOS/iPadOS Safari (all browsers on iOS share WebKit), macOS Safari,
@@ -179,6 +180,11 @@ export default function WatchPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [theaterActive, setTheaterActive] = useState(false);
+  // Shaka is fetched on demand rather than shipped in the bundle, so it is not
+  // on `window` at first mount. This flag re-runs the init effect once it is —
+  // the effect's other deps never change on their own, so without it the early
+  // return below would be permanent and the player would silently never start.
+  const [shakaReady, setShakaReady] = useState(() => !!window.shaka);
 
   const videoRef = useRef(null);
   const containerRef = useRef(null);
@@ -244,9 +250,20 @@ export default function WatchPage() {
     }
   }, []);
 
+  // Fetch the player itself. Separate from the init effect below so a slow or
+  // failed download surfaces as an error the user can see, rather than an
+  // effect that quietly does nothing.
+  useEffect(() => {
+    if (shakaReady) return;
+    let cancelled = false;
+    loadShaka().then(() => { if (!cancelled) setShakaReady(true); })
+               .catch(() => { if (!cancelled) setError('Video player failed to load. Please refresh.'); });
+    return () => { cancelled = true; };
+  }, [shakaReady]);
+
   // Init Shaka Player
   useEffect(() => {
-    if (!data || !videoRef.current) return;
+    if (!data || !videoRef.current || !shakaReady) return;
     const shaka = window.shaka;
     if (!shaka) return;
 
@@ -675,7 +692,7 @@ export default function WatchPage() {
       try { ui?.destroy(); } catch {}
       try { player.destroy(); } catch {}
     };
-  }, [data, videoId, destroyAndShowError]);
+  }, [data, videoId, destroyAndShowError, shakaReady]);
 
   // Keyboard controls
   useEffect(() => {

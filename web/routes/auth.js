@@ -14,6 +14,11 @@ const { findOrCreateBySub, updateUser } = require('../services/userService');
 const { roleIdExists } = require('../services/roleService');
 
 const FLOW_COOKIE = 'oidc_flow';
+// Dockerfile sets NODE_ENV=production and the site is HTTPS (Caddy), so cookies
+// are Secure in normal operation. OIDC_COOKIE_SECURE=false is an escape hatch
+// for a plain-HTTP dev run.
+const cookieSecure = process.env.OIDC_COOKIE_SECURE !== 'false';
+
 // One cookie PER in-flight authorization flow, named by its state.
 //
 // The flow used to live in a single cookie, which made it a one-slot store: two
