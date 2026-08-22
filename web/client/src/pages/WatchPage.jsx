@@ -93,6 +93,18 @@ const THEATER_ICON_ACTIVE =
 // loads don't re-register). Each button auto-cleans its listeners when the UI
 // is destroyed because it uses this.eventManager.
 let theaterElementRegistered = false;
+// True when anything is currently fullscreen, covering both models: the
+// document-level Fullscreen API used by every desktop browser (plus the legacy
+// webkit/moz property names), and iPhone Safari, which has no document-level
+// fullscreen at all and instead flags the <video> element itself while its
+// native player is up.
+function isVideoFullscreen(videoEl) {
+  if (document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement) {
+    return true;
+  }
+  return !!(videoEl && videoEl.webkitDisplayingFullscreen);
+}
+
 function registerTheaterElement(shaka) {
   if (theaterElementRegistered || !shaka?.ui?.Controls || !shaka?.ui?.Element) return;
 
@@ -105,15 +117,47 @@ function registerTheaterElement(shaka) {
       this.button_.classList.add('shaka-theater-button', 'shaka-tooltip');
       this.parent.appendChild(this.button_);
       this.syncIcon_();
+      this.syncVisibility_();
       this.eventManager.listen(this.button_, 'click', () => {
         window.dispatchEvent(new CustomEvent('vs-theater-toggle'));
       });
       this.eventManager.listen(window, 'vs-theater-changed', () => this.syncIcon_());
+
+      // Fullscreen already owns the whole screen, so a theater toggle there is
+      // meaningless — hide the button for as long as fullscreen lasts.
+      //
+      // 'fullscreenchange' on document is what shaka.ui.FullscreenButton itself
+      // listens to, and shaka.polyfill.Fullscreen re-dispatches the legacy
+      // moz/webkit document events under that same name. The two video-element
+      // events are for iPhone, where Safari fullscreens the <video> itself via
+      // webkitEnterFullscreen() and no document-level event ever fires.
+      this.eventManager.listen(document, 'fullscreenchange', () => this.syncVisibility_());
+      // getLocalVideo(), NOT this.video / getVideo(). The latter two return
+      // Shaka's CastProxy Proxy, whose addEventListener is intercepted and
+      // rerouted to a FakeEventTarget that only replays a fixed list of media
+      // events (play, pause, seeking, …) — the webkit fullscreen events are not
+      // on it, so listeners registered there can never fire. Shaka's own
+      // FullscreenButton uses getLocalVideo() for exactly this reason.
+      const localVideo = this.controls?.getLocalVideo?.() || null;
+      if (localVideo) {
+        this.eventManager.listen(localVideo, 'webkitbeginfullscreen', () => this.syncVisibility_());
+        this.eventManager.listen(localVideo, 'webkitendfullscreen', () => this.syncVisibility_());
+      }
     }
     syncIcon_() {
       const active = document.body.classList.contains('theater-mode');
       this.button_.innerHTML = active ? THEATER_ICON_ACTIVE : THEATER_ICON_INACTIVE;
       this.button_.setAttribute('aria-label', active ? 'Exit Theater Mode' : 'Theater Mode');
+    }
+    syncVisibility_() {
+      // Inline display, not shaka.ui.Utils.setDisplay: Utils carries no @export
+      // annotation, so Closure ADVANCED renames it away in the minified CDN
+      // build this app loads and shaka.ui.Utils is undefined at runtime. The
+      // effect is identical anyway — nothing sets display on
+      // .shaka-theater-button with !important, so an inline none/'' removes the
+      // button from the control-bar flex row and puts it back.
+      const fs = isVideoFullscreen(this.controls?.getLocalVideo?.());
+      this.button_.style.display = fs ? 'none' : '';
     }
   }
   TheaterButton.Factory = class {
@@ -279,13 +323,40 @@ export default function WatchPage() {
       // before metadata arrives; once we know the real dims, we override
       // inline so non-16:9 content (1280×832, vertical phone, etc.) renders
       // without baked-in or CSS-imposed letterboxing. Reset on cleanup.
+      // Last ratio actually written, so a re-fire that reports the same shape
+      // is a no-op rather than a style write.
+      let appliedRatio = 0;
       metadataHandler = () => {
         const c = containerRef.current;
-        if (c && videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
-          c.style.aspectRatio = `${videoEl.videoWidth} / ${videoEl.videoHeight}`;
-        }
+        if (!c || !(videoEl.videoWidth > 0) || !(videoEl.videoHeight > 0)) return;
+        const ratio = videoEl.videoWidth / videoEl.videoHeight;
+        // 'resize' fires on every ABR rendition switch, and renditions do NOT
+        // share an exact display aspect — each profile's output dimensions are
+        // rounded to even independently, so 1106x720 and 960x624 differ by ~0.2%.
+        // Re-writing the container for that would make the page twitch during
+        // playback, which the old loadedmetadata-only binding never did. Ignore
+        // changes under 1%; a genuine anamorphic or rotation change is far larger.
+        if (appliedRatio && Math.abs(ratio / appliedRatio - 1) < 0.01) return;
+        appliedRatio = ratio;
+        c.style.aspectRatio = `${videoEl.videoWidth} / ${videoEl.videoHeight}`;
       };
+      // 'loadedmetadata' alone is not enough. Safari reaches HAVE_METADATA as
+      // soon as it knows the duration, which can be before the decoder has
+      // resolved the presentation size — videoWidth/videoHeight are still 0,
+      // the guard above fails, and because this was previously the only
+      // listener the real ratio was lost for the whole life of the player.
+      // That is the intermittent "stuck at 16:9" seen on iOS roughly half the
+      // time, and never on Chrome/Firefox where the dimensions are already
+      // known by the time the event fires.
+      //
+      // 'resize' is the media element's own event for exactly this: it fires
+      // whenever videoWidth/videoHeight CHANGE, including the 0 -> real
+      // transition. 'loadeddata' is a cheap third chance. The handler is
+      // idempotent — it writes the same value — so firing two or three times
+      // costs nothing, and every listener is torn down together in cleanup.
       videoEl.addEventListener('loadedmetadata', metadataHandler);
+      videoEl.addEventListener('loadeddata', metadataHandler);
+      videoEl.addEventListener('resize', metadataHandler);
 
       player.configure('streaming.bufferingGoal', 60);
       player.configure('streaming.rebufferingGoal', 2);
@@ -592,7 +663,11 @@ export default function WatchPage() {
       if (tickVisHandler) document.removeEventListener('visibilitychange', tickVisHandler);
       if (pauseHandler) videoEl.removeEventListener('pause', pauseHandler);
       if (pagehideHandler) window.removeEventListener('pagehide', pagehideHandler);
-      if (metadataHandler) videoEl.removeEventListener('loadedmetadata', metadataHandler);
+      if (metadataHandler) {
+        videoEl.removeEventListener('loadedmetadata', metadataHandler);
+        videoEl.removeEventListener('loadeddata', metadataHandler);
+        videoEl.removeEventListener('resize', metadataHandler);
+      }
       // Clear the inline aspect-ratio override so the next mount starts fresh
       // from the 16:9 CSS placeholder (avoids carrying the previous video's
       // aspect into the new video's initial render).
@@ -624,7 +699,9 @@ export default function WatchPage() {
       } else if (e.key === 't' || e.key === 'T') {
         setTheaterActive(v => !v);
       } else if (e.key === 'Escape') {
-        if (!document.fullscreenElement) setTheaterActive(false);
+        // Same fullscreen test as the reset effect — document.fullscreenElement
+        // alone is blind to iPhone's element-level native fullscreen.
+        if (!isVideoFullscreen(videoRef.current)) setTheaterActive(false);
       }
     }
 
@@ -659,6 +736,30 @@ export default function WatchPage() {
     window.addEventListener('vs-theater-toggle', onToggle);
     return () => window.removeEventListener('vs-theater-toggle', onToggle);
   }, []);
+
+  // Leaving fullscreen returns to the plain windowed layout, dropping theater
+  // if it was on. Exiting fullscreen overwhelmingly means "done watching", and
+  // landing back in a black full-viewport stage instead of the normal page is
+  // disorienting — every mainstream player (YouTube, Bilibili) resets the same
+  // way, including when the user entered theater first and fullscreen second.
+  //
+  // Only the exit edge is acted on; entering fullscreen leaves the state alone
+  // so it is still there if the user comes back out via the theater button.
+  // The webkit* events cover iPhone, where document fullscreen never fires.
+  useEffect(() => {
+    const videoEl = videoRef.current;
+    const onChange = () => {
+      if (!isVideoFullscreen(videoRef.current)) setTheaterActive(false);
+    };
+    document.addEventListener('fullscreenchange', onChange);
+    document.addEventListener('webkitfullscreenchange', onChange);
+    if (videoEl) videoEl.addEventListener('webkitendfullscreen', onChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange);
+      document.removeEventListener('webkitfullscreenchange', onChange);
+      if (videoEl) videoEl.removeEventListener('webkitendfullscreen', onChange);
+    };
+  }, [data]);
 
   // Media Session metadata — drives iOS Control Center / Dynamic Island,
   // Android notification shade, and any connected Bluetooth display. Shaka
@@ -844,18 +945,26 @@ export default function WatchPage() {
 
   return (
     <div className="vs-wp">
-      <Link
-        to={backUrl}
-        className="vs-wp-back"
-        onClick={onBack}
-      >
-        <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <path d="M10 12L6 8l4-4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
-        </svg>
-        {video.course_code && video.course_name
-          ? `${video.course_code} · ${video.course_name}`
-          : (video.course_code || video.course_name)}
-      </Link>
+      {/* The bar and the link are deliberately separate boxes. In theater mode
+          the BAR is the column-flex item that stretches the full viewport
+          width and carries the bar chrome; the link inside it sizes to its own
+          content, so only the chevron and the course name are clickable.
+          Merging the two (the link being the bar) is what previously made the
+          entire strip a single navigation target. */}
+      <div className="vs-wp-bar">
+        <Link
+          to={backUrl}
+          className="vs-wp-back"
+          onClick={onBack}
+        >
+          <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <path d="M10 12L6 8l4-4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+          {video.course_code && video.course_name
+            ? `${video.course_code} · ${video.course_name}`
+            : (video.course_code || video.course_name)}
+        </Link>
+      </div>
 
       <div className="vs-wp-stage">
         <div className="video-player" ref={containerRef} data-shaka-player-container>

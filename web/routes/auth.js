@@ -14,13 +14,83 @@ const { findOrCreateBySub, updateUser } = require('../services/userService');
 const { roleIdExists } = require('../services/roleService');
 
 const FLOW_COOKIE = 'oidc_flow';
-// Dockerfile sets NODE_ENV=production and the site is HTTPS (Caddy), so cookies
-// are Secure in normal operation. OIDC_COOKIE_SECURE=false is an escape hatch
-// for a plain-HTTP dev run.
-const cookieSecure = process.env.OIDC_COOKIE_SECURE !== 'false';
+// One cookie PER in-flight authorization flow, named by its state.
+//
+// The flow used to live in a single cookie, which made it a one-slot store: two
+// overlapping /auth/login requests each wrote it, the last write won, and the
+// browser then reached the SSO holding one state while carrying another — so
+// the callback failed `req.query.state !== flow.state` and the user got
+// bad_state. Overlap is routine: a cold browser restoring tabs hits it, and so
+// does Safari's address-bar top-hit preloading, which loads the URL once
+// speculatively and again when you press Enter.
+//
+// A list inside one cookie does NOT fix this. Writing a list is a
+// read-modify-write, and two requests in flight at once both read the same
+// (empty) cookie the browser attached to their own request, then each write
+// back a list containing only their own flow — last Set-Cookie still wins.
+// Giving every flow its own cookie NAME removes the shared slot entirely:
+// concurrent responses set different cookies and the browser keeps them all.
+const FLOW_COOKIE_PREFIX = 'oidc_flow_';
+const MAX_CONCURRENT_FLOWS = 5;
+const FLOW_TTL_MS = 10 * 60 * 1000;
+
+// State is base64url from crypto.randomBytes, so it is already a valid cookie
+// name character set; validate anyway before using it to build a name.
+const FLOW_STATE_RE = /^[A-Za-z0-9_-]{8,128}$/;
+
+function flowCookieName(state) { return FLOW_COOKIE_PREFIX + state; }
+function flowCookieOpts() {
+  return { httpOnly: true, secure: cookieSecure, sameSite: 'lax', maxAge: FLOW_TTL_MS };
+}
+function flowCookieNames(req) {
+  return Object.keys(req.cookies || {}).filter((n) => n.startsWith(FLOW_COOKIE_PREFIX));
+}
+
+// Record a newly started flow under its own name. Each cookie carries its own
+// maxAge from the moment it is written, so an abandoned flow expires on its own
+// schedule rather than having its deadline slid forward by unrelated traffic.
+function pushFlow(req, res, flow) {
+  const names = flowCookieNames(req);
+  // Best-effort hygiene only — correctness never depends on this. Abandoned
+  // flows expire by themselves; this just stops a pathological client from
+  // accumulating cookies until the request header gets too large to send.
+  if (names.length >= MAX_CONCURRENT_FLOWS) {
+    for (const n of names.slice(0, names.length - MAX_CONCURRENT_FLOWS + 1)) res.clearCookie(n);
+  }
+  res.cookie(flowCookieName(flow.state), JSON.stringify(flow), flowCookieOpts());
+}
+
+// Claim the flow this callback belongs to and drop only that one; every other
+// flow the browser still has open stays valid. The old code cleared the single
+// cookie before it had even validated, so the first callback to land killed
+// every other flow in flight.
+function takeFlow(req, res, state) {
+  if (state && FLOW_STATE_RE.test(state)) {
+    const name = flowCookieName(state);
+    const raw = req.cookies && req.cookies[name];
+    if (raw) {
+      res.clearCookie(name);
+      try { return JSON.parse(raw); } catch { return null; }
+    }
+  }
+  // A flow started before this change shipped still has the old single-object
+  // cookie, so it completes rather than failing across the deploy.
+  const legacy = req.cookies && req.cookies[FLOW_COOKIE];
+  if (legacy) {
+    res.clearCookie(FLOW_COOKIE);
+    try {
+      const f = JSON.parse(legacy);
+      return f && typeof f === 'object' && f.state === state ? f : null;
+    } catch { return null; }
+  }
+  return null;
+}
 
 function sanitizeReturnTo(rt) {
   if (!rt || typeof rt !== 'string') return '/';
+  // The flow cookie carries this verbatim; a 4 KB deep link would push the
+  // cookie past the browser limit and silently lose the whole flow.
+  if (rt.length > 512) return '/';
   // Reject protocol-relative ('//'), absolute ('://'), and the backslash variant
   // ('/\\evil.com' — browsers treat '\' as '/', so it resolves off-origin and
   // encodeUrl leaves '\' unescaped in the Location header).
@@ -51,9 +121,7 @@ router.get('/auth/login', (req, res) => {
   if (res.locals.user) return res.redirect(returnTo);
 
   const { verifier, challenge, state, nonce } = oidc.beginFlow();
-  res.cookie(FLOW_COOKIE, JSON.stringify({ verifier, state, nonce, returnTo }), {
-    httpOnly: true, secure: cookieSecure, sameSite: 'lax', maxAge: 10 * 60 * 1000,
-  });
+  pushFlow(req, res, { verifier, state, nonce, returnTo });
   res.redirect(oidc.authorizeUrl({ challenge, state, nonce }));
 });
 
@@ -75,9 +143,7 @@ router.get('/auth/stepup/start', (req, res) => {
   const whitelisted = reqParam.split(',').map((s) => s.trim()).filter((m) => m === 'totp' || m === 'passkey');
   const required = whitelisted.length ? whitelisted : STEPUP_METHODS;
   const { verifier, challenge, state, nonce } = oidc.beginFlow();
-  res.cookie(FLOW_COOKIE, JSON.stringify({
-    verifier, state, nonce, returnTo, purpose: 'stepup', required,
-  }), { httpOnly: true, secure: cookieSecure, sameSite: 'lax', maxAge: 10 * 60 * 1000 });
+  pushFlow(req, res, { verifier, state, nonce, returnTo, purpose: 'stepup', required });
   const extra = { stepup: required.join(',') };
   const idt = req.cookies['oidc_idt'];
   if (idt) extra.id_token_hint = idt; // OIDC hint: "this should be the same subject"
@@ -175,9 +241,10 @@ async function handleStepupCallback(req, res, flow) {
 
 // GET /auth/callback -> exchange the code and establish the session.
 router.get('/auth/callback', async (req, res) => {
-  let flow;
-  try { flow = JSON.parse(req.cookies[FLOW_COOKIE] || '{}'); } catch { flow = {}; }
-  res.clearCookie(FLOW_COOKIE);
+  const returnedState = typeof req.query.state === 'string' ? req.query.state : '';
+  const pendingCount = flowCookieNames(req).length;
+  // Claim only the flow this callback belongs to; any others stay valid.
+  const flow = takeFlow(req, res, returnedState) || {};
   const isStepup = flow.purpose === 'stepup';
 
   if (req.query.error) {
@@ -192,6 +259,22 @@ router.get('/auth/callback', async (req, res) => {
     return res.redirect('/auth/error' + q);
   }
   if (!req.query.code || !flow.state || req.query.state !== flow.state) {
+    // bad_state used to fail silently, which left no way to tell a clobbered
+    // cookie from an expired one from a host mismatch. Log the distinguishing
+    // facts (never the code or the state values themselves — both are live
+    // credentials): whether the browser sent a cookie at all, how many flows
+    // it held, and which host served this callback. A missing cookie on a host
+    // that differs from the one that served /auth/login means the cookie is
+    // host-scoped to the wrong name; zero pending flows means it expired or was
+    // already consumed; pending > 0 with no match means a genuine mismatch.
+    console.warn('auth callback bad_state:', JSON.stringify({
+      host: req.headers.host,
+      hasCode: !!req.query.code,
+      hasStateParam: !!returnedState,
+      legacyCookiePresent: Object.prototype.hasOwnProperty.call(req.cookies || {}, FLOW_COOKIE),
+      pendingFlows: pendingCount,
+      stepup: isStepup,
+    }));
     if (isStepup) return res.redirect(stepupReturn(flow, 'error'));
     return res.redirect('/auth/error?code=bad_state');
   }

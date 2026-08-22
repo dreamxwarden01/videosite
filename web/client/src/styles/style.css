@@ -1069,13 +1069,28 @@ body.theater-mode { overflow: hidden; }
     display: flex;
     flex-direction: column;
 }
-.theater-mode .vs-wp-back {
-    margin: 0;
-    padding: 11px 20px;
+/* The BAR is the full-width flex item; the link inside only covers its own
+   content. Previously the bar chrome lived on .vs-wp-back itself, which made
+   the anchor a column-flex item — blockified, `align-items: stretch`, so its
+   cross size became the whole 100vw viewport and the entire strip navigated
+   back. Row direction here is deliberate: the link shrink-wraps on the main
+   axis instead of stretching. */
+.theater-mode .vs-wp-bar {
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
     background: #111;
-    color: #e8eaed;
     border-bottom: 1px solid #2a2a2a;
     flex-shrink: 0;
+}
+/* Vertical padding belongs to the LINK, not the bar: it keeps the bar the same
+   height as before while making the full height of the link clickable. Putting
+   it on the bar instead would leave the anchor only as tall as its text (~20px)
+   — a smaller tap target than the original, which is the opposite of the point. */
+.theater-mode .vs-wp-back {
+    margin: 0;
+    padding: 11px 0;
+    color: #e8eaed;
 }
 .theater-mode .vs-wp-back:hover { color: #fff; }
 .theater-mode .vs-wp-stage {
@@ -1948,7 +1963,10 @@ tr.clickable-row:hover { background-color: #f9fafb; }
 .vs-admin-entry .vs-nav { padding-top: 10px; padding-bottom: 10px; }
 .vs-nav-back { font-weight: 500; color: #1f2937; border-bottom: 1px solid #e5e7eb; border-radius: 8px 8px 0 0; margin-bottom: 6px; padding-bottom: 11px; flex-shrink: 0; }
 .vs-side-empty { font-size: 13px; color: #9ca3af; padding: 8px 12px; margin: 0; }
-.vs-nav-skel { height: 37px; border-radius: 8px; margin: 0 0 2px; background: linear-gradient(90deg, #eceef1 25%, #f3f4f6 37%, #eceef1 63%); background-size: 400% 100%; animation: vs-shimmer 1.4s ease infinite; }
+/* flex-shrink:0 matters now that .vs-nav-scroll is a bounded flex column on
+   mobile: an empty div's automatic minimum size is 0, so without this the
+   skeletons squash flat instead of the list scrolling. */
+.vs-nav-skel { height: 37px; flex-shrink: 0; border-radius: 8px; margin: 0 0 2px; background: linear-gradient(90deg, #eceef1 25%, #f3f4f6 37%, #eceef1 63%); background-size: 400% 100%; animation: vs-shimmer 1.4s ease infinite; }
 @keyframes vs-shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
 
 .vs-content { flex: 1; min-width: 0; padding: 24px 32px; background: #f0f2f5; overflow-y: auto; scrollbar-gutter: stable; }
@@ -1969,20 +1987,36 @@ tr.clickable-row:hover { background-color: #f9fafb; }
   .vs-side.expanded .vs-cc-chev { transform: rotate(180deg); }
   .vs-side-track { display: none; }
   .vs-side.expanded .vs-side-track {
-    display: block; width: 100%; transform: none !important;
+    display: flex; flex-direction: column; width: 100%; transform: none !important;
     position: absolute; top: 100%; left: 0; right: 0; z-index: 90;
     background: #f8f9fa; border-bottom: 1px solid #e5e7eb;
     box-shadow: 0 10px 20px rgba(0, 0, 0, 0.10);
     /* height:auto is REQUIRED — the base .vs-side-track has height:100%, which
        here resolves to the collapsed bar's ~48px and pins the dropdown to one
-       row regardless of max-height. Let it size to content, then cap. */
-    height: auto; max-height: min(58vh, 320px); overflow-y: auto;
+       row regardless of max-height. Let it size to content, then cap.
+
+       The track CLIPS rather than scrolls. Scrolling here is what used to drag
+       the pinned Admin entry along with the course list: the whole dropdown was
+       one scrollport, so the footer was just its last in-flow block. Handing the
+       scroll back to .vs-nav-scroll (below) restores the desktop arrangement —
+       a bounded flex column whose list scrolls inside a fixed footer. */
+    height: auto; overflow: hidden;
+    max-height: min(58vh, 320px);
+    /* dvh tracks iOS Safari's collapsing toolbars. Declared second so engines
+       without dvh keep the vh value above — an invalid math function drops the
+       whole declaration, and .vs-side-track has no base max-height to fall back
+       on, which would leave the dropdown unbounded. */
+    max-height: min(58dvh, 320px);
   }
+  /* height:auto (with min-height:0 inherited from the base rule) lets the pane
+     shrink below its content so .vs-nav-scroll becomes the scrollport. */
   .vs-side-pane { width: 100%; height: auto; display: none; padding: 8px 10px; }
-  .vs-side-track:not(.admin) .vs-side-pane:first-child { display: block; }
-  .vs-side-track.admin .vs-side-pane:last-child { display: block; }
+  .vs-side-track:not(.admin) .vs-side-pane:first-child { display: flex; }
+  .vs-side-track.admin .vs-side-pane:last-child { display: flex; }
   .vs-side-pane .vs-side-label { display: none; }
-  .vs-side-pane .vs-nav-scroll { overflow: visible; flex: none; }
+  /* .vs-nav-scroll keeps its base `flex: 1; overflow-y: auto` here — that is
+     the scrollport, and .vs-admin-entry's base `flex-shrink: 0` sits outside
+     it as the pinned footer, exactly as on desktop. */
   .vs-content { padding: 16px; }
 }
 

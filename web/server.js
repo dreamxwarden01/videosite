@@ -16,13 +16,35 @@ const app = express();
 app.disable('etag');
 
 // Middleware
-app.use(morgan('dev'));
+//
+// morgan('dev') logs :url with the query string attached, which on
+// /auth/callback means live single-use authorization codes (and the flow state)
+// land in the container log. Strip the query from the auth routes rather than
+// relying on log retention to age the credentials out; every other route keeps
+// its full URL, which is what makes the log useful.
+// Routes whose query string carries a live single-use credential. /auth/*
+// holds the authorization code and flow state; /install holds the install
+// token, which gates an unauthenticated takeover surface. Match
+// case-insensitively — Express routing is case-insensitive by default, so
+// /Auth/Callback reaches the same handler and must be redacted the same way.
+const LOGGED_QUERY_REDACTED = /^\/(auth|install)(\/|$|\?)/i;
+morgan.token('safeurl', (req) => {
+    const url = req.originalUrl || req.url || '';
+    return LOGGED_QUERY_REDACTED.test(url) ? url.split('?')[0] : url;
+});
+app.use(morgan(':method :safeurl :status :response-time ms - :res[content-length]'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
 // Serve static assets before install check (CSS/JS/images needed by install page)
-app.use('/assets', express.static(path.join(__dirname, 'client', 'dist', 'assets')));
+// Vite content-hashes everything under /assets, so a given URL's bytes can
+// never change — the filename changes instead. `immutable` tells the browser to
+// skip revalidation entirely for a year. Without it serve-static defaults to
+// max-age=0 and every bundle costs a conditional request on every page load.
+app.use('/assets', express.static(path.join(__dirname, 'client', 'dist', 'assets'), {
+    maxAge: '1y', immutable: true,
+}));
 app.use('/favicon.ico', express.static(path.join(__dirname, 'client', 'dist', 'favicon.ico')));
 
 // Client public keys for the SSO (private_key_jwt) — before the install gate:
