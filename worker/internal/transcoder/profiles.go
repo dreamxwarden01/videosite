@@ -53,11 +53,11 @@ type FilteredProfile struct {
 // the target on both axes.
 //
 // Examples:
-//   src 1280×832, tgt 1280×720 → 1108×720  (height-bound, width shrinks)
-//   src 2560×1664, tgt 1280×720 → 1108×720 (same shape, source ½ size)
+//   src 1280×832, tgt 1280×720 → 1106×720  (height-bound, width shrinks)
+//   src 2560×1664, tgt 1280×720 → 1106×720 (same shape, source ½ size)
 //   src 640×360,  tgt 854×480  → 640×360   (no upscale)
 //   src 3840×1620 (21:9), tgt 1920×1080 → 1920×810  (width-bound, ultrawide)
-//   src 1080×1920 (vertical), tgt 1920×1080 → 608×1080 (height-bound, tall)
+//   src 1080×1920 (vertical), tgt 1920×1080 → 606×1080 (height-bound, tall)
 func ActualOutputDims(srcW, srcH, tgtW, tgtH int) (outW, outH int) {
 	if srcW <= 0 || srcH <= 0 || tgtW <= 0 || tgtH <= 0 {
 		// Defensive fallback. Probe failure shouldn't happen here in
