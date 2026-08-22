@@ -38,6 +38,26 @@ morgan.token('safeurl', (req) => {
 // request forever, because no-store guarantees the edge never absorbs one.
 // Static assets are amortised to once per colo per deploy by the immutable
 // headers, so the JSON is where this actually pays.
+// Constrain content-encoding negotiation to gzip (deflate if that is all a
+// client offers). compression@1.8 negotiates brotli whenever the client offers
+// it, and there is no option to turn that off — SUPPORTED_ENCODING and
+// PREFERRED_ENCODING are module constants, not settings. Debugging proxies vary
+// in how well they decode non-gzip bodies, and a response body that reads as
+// garbage in Charles costs far more debugging time than brotli's extra few
+// percent saves on a hop Cloudflare re-compresses to the client anyway.
+//
+// Rewritten rather than deleted so a client that cannot take gzip still gets
+// whatever it can handle instead of being forced to identity.
+app.use((req, res, next) => {
+    const accepted = req.headers['accept-encoding'];
+    if (typeof accepted === 'string') {
+        const offers = accepted.toLowerCase().split(',').map((v) => v.split(';')[0].trim());
+        if (offers.includes('gzip')) req.headers['accept-encoding'] = 'gzip';
+        else if (offers.includes('deflate')) req.headers['accept-encoding'] = 'deflate';
+        else req.headers['accept-encoding'] = 'identity';
+    }
+    next();
+});
 app.use(compression());
 
 app.use(morgan(':method :safeurl :status :response-time ms - :res[content-length]'));
