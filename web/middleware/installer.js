@@ -7,8 +7,18 @@ const { verifyInstallToken } = require('../lib/installToken');
 // per-request DB hit.
 let installed = null;
 
+// Thrown when the app is clearly configured but the database cannot be reached,
+// so the caller can fail loudly instead of mistaking an outage for a fresh box.
+class InstallStateUnknownError extends Error {
+    constructor(cause) {
+        super(`database unreachable while resolving install state: ${cause.message}`);
+        this.name = 'InstallStateUnknownError';
+        this.cause = cause;
+    }
+}
+
 async function checkInstallStatus() {
-    // Check if .env has DB_HOST set (basic indicator that install happened)
+    // No DB configured at all — genuinely a fresh box, not a failure.
     if (!process.env.DB_HOST || !process.env.DB_NAME) {
         return false;
     }
@@ -21,7 +31,15 @@ async function checkInstallStatus() {
         );
         return rows.length > 0 && rows[0].setting_value === 'true';
     } catch (err) {
-        return false;
+        // DB_HOST and DB_NAME ARE set, so this box was configured — the query
+        // failing means the database is down, not that we need an installer.
+        // Swallowing this into `false` made a transient DB outage at boot look
+        // exactly like a fresh install: every path served the neutral 503 and
+        // the installer surface came back, with a log line reading
+        // "FIRST-RUN INSTALL" instead of naming the real fault. The latch is
+        // resolved once at boot and never re-checked, so that state persisted
+        // for the life of the process.
+        throw new InstallStateUnknownError(err);
     }
 }
 
@@ -96,7 +114,14 @@ function tokenOk(req, res) {
 }
 
 function checkInstalled(req, res, next) {
-    const isInstallRoute = req.path === '/install' || req.path.startsWith('/api/install');
+    // '/install.html' as well as '/install': the built installer page is a real
+    // file in client/dist, so without this it falls through to the dist-root
+    // static mount and is served 200 on a live site. Every endpoint it calls
+    // already 404s, so this is not an exploitable surface — but the gate exists
+    // to avoid ADVERTISING an installer at all, and a 200 here hands a scanner
+    // exactly the fingerprint the neutral-503 design is meant to withhold.
+    const isInstallRoute = req.path === '/install' || req.path === '/install.html' ||
+        req.path.startsWith('/api/install');
     const isStaticRoute = req.path.startsWith('/assets') || req.path.startsWith('/css') ||
         req.path.startsWith('/js') || req.path.startsWith('/img') ||
         req.path === '/favicon.ico';
@@ -124,6 +149,7 @@ function resetInstallCache() {
 }
 
 module.exports = {
+    InstallStateUnknownError,
     checkInstalled,
     markInstalled,
     resetInstallCache,

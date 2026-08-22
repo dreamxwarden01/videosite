@@ -3,6 +3,7 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const morgan = require('morgan');
+const compression = require('compression');
 const cookieParser = require('cookie-parser');
 const { cleanExpiredSessions } = require('./config/session');
 
@@ -32,6 +33,13 @@ morgan.token('safeurl', (req) => {
     const url = req.originalUrl || req.url || '';
     return LOGGED_QUERY_REDACTED.test(url) ? url.split('?')[0] : url;
 });
+// Compress origin responses. Cloudflare compresses edge->client regardless, so
+// this is purely about the origin->edge leg — which for /api is every single
+// request forever, because no-store guarantees the edge never absorbs one.
+// Static assets are amortised to once per colo per deploy by the immutable
+// headers, so the JSON is where this actually pays.
+app.use(compression());
+
 app.use(morgan(':method :safeurl :status :response-time ms - :res[content-length]'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -83,7 +91,34 @@ app.use(express.static(path.join(__dirname, 'client', 'dist'), { index: false })
 
 // Auth middleware (load user on every request if session cookie exists)
 const { loadUser } = require('./middleware/auth');
-app.use(loadUser);
+// loadUser is scoped to the routers that actually read res.locals.user (/api
+// and /auth) rather than mounted app-wide. Two reasons, both real:
+//
+// 1. Correctness of the cache headers. loadUser calls res.clearCookie(sid) on a
+//    stale, expired or orphaned session, and it used to run ahead of the SPA
+//    shell (public, max-age=120) and the 404 catch-all (public, max-age=600).
+//    Those responses then went out as publicly cacheable AND carrying
+//    `Set-Cookie: sid=; Expires=1970`. Cloudflare declines to cache anything
+//    with a Set-Cookie, so the edge caching those constants exist for silently
+//    never happened for exactly the users with expired sessions — and any cache
+//    that does NOT implement that heuristic (a corporate proxy, a future CDN,
+//    or a Cache Rule someone adds to make /assets/* eligible) would store the
+//    cookie-clearing header and replay it to everyone, logging them out for the
+//    life of the entry. The 404 branch was the dangerous one: it fires for
+//    stray .js/.css/.ico paths, exactly the extensions an edge treats as
+//    cacheable by default.
+//
+// 2. Cost. Resolving a session is ~8-10 Redis operations INCLUDING A WRITE
+//    (session read, validity + limits, user meta, activity touch, auth bundle).
+//    Doing all of that to hand back a byte-identical 480-byte static shell —
+//    and then labelling the result `public`, i.e. explicitly user-independent —
+//    was a contradiction, and every bot hitting an unmatched URL with a stale
+//    cookie drove Redis traffic through the 404 handler.
+//
+// Session activity is still refreshed on every page load: the SPA calls
+// /api/me on mount, and playback keeps up a steady stream of /api traffic.
+app.use('/api', loadUser);
+app.use('/auth', loadUser);
 
 // Routes
 const installRoutes = require('./routes/install');
@@ -250,9 +285,24 @@ const server = app.listen(PORT, async () => {
     // Resolve the install latch ONCE, here — every later request reads it from
     // RAM. Not installed => the gate answers everything with a neutral 503 and
     // only the token-locked installer responds.
-    const { resolveInstallState } = require('./middleware/installer');
+    const { resolveInstallState, InstallStateUnknownError } = require('./middleware/installer');
     const { ensureInstallToken, clearInstallToken, TOKEN_FILE } = require('./lib/installToken');
-    const alreadyInstalled = await resolveInstallState();
+    let alreadyInstalled;
+    try {
+        alreadyInstalled = await resolveInstallState();
+    } catch (err) {
+        if (!(err instanceof InstallStateUnknownError)) throw err;
+        // Configured box, unreachable database. Exit rather than come up: the
+        // latch is resolved once and never re-checked, so serving on through
+        // this would leave the process permanently believing it is a fresh
+        // install — 503 on every path, the installer surface reopened, and a
+        // startup banner naming the wrong problem. Same posture as the Redis
+        // check below: a clear startup failure beats a half-working process.
+        console.error('FATAL: could not determine install state —', err.message);
+        console.error('The database is configured (DB_HOST/DB_NAME are set) but unreachable.');
+        console.error('Refusing to start: continuing would look identical to an uninstalled site.');
+        process.exit(1);
+    }
     if (!alreadyInstalled) {
         const token = ensureInstallToken();
         console.log('VideoSite — FIRST-RUN INSTALL');
