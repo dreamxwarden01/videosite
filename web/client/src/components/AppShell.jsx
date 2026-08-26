@@ -5,6 +5,7 @@ import Sidebar from './Sidebar';
 import PlaybackDisabledBanner from './PlaybackDisabledBanner';
 import { useAuth } from '../context/AuthContext';
 import { apiGet } from '../api';
+import { slideDirection } from '../utils/navSlide';
 
 // Refetch reconcile (mirrors the admin CoursePage mergeRows idiom): when a
 // refetch returns the same data, hand setCourses an Object.is-equal value so
@@ -73,6 +74,14 @@ export default function AppShell() {
     if (atHome) refreshCourses();
   }, [atHome, refreshCourses]);
 
+  // Course list <-> watch slide. Computed during render, because at this point
+  // the ref still holds the PREVIOUS committed path — which is what lets the
+  // animation class be on the incoming page's very first paint. Setting it from
+  // an effect would paint one frame at rest and then jump.
+  const prevPathRef = useRef(null);
+  const slide = slideDirection(prevPathRef.current, location.pathname);
+  useEffect(() => { prevPathRef.current = location.pathname; }, [location.pathname]);
+
   const inAdmin = location.pathname.startsWith('/admin');
 
   // Remember the last course-area location (path + query, so the list page is
@@ -122,7 +131,12 @@ export default function AppShell() {
       <div className="vs-body">
         <Sidebar courses={courses} inAdmin={inAdmin} backTo={lastCoursePath} />
         <main className="vs-content">
-          {capped ? <div className="vs-content-inner">{body}</div> : body}
+          {/* .vs-page spans the whole content pane, unlike the 920px-capped
+              .vs-content-inner — translateX(100%) has to clear the pane, and on
+              a wide screen the capped box is narrower than that. */}
+          <div className={slide ? "vs-page " + slide : "vs-page"}>
+            {capped ? <div className="vs-content-inner">{body}</div> : body}
+          </div>
         </main>
       </div>
     </>

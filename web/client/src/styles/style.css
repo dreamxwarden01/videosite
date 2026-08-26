@@ -1041,6 +1041,25 @@ textarea.form-control {
 .vs-wp-meta { font-size: 13px; color: #6b7280; margin: 0; display: flex; align-items: center; flex-wrap: wrap; }
 .vs-wp-desc { margin: 12px 0 0; font-size: 14px; line-height: 1.65; color: #374151; white-space: pre-wrap; overflow-wrap: anywhere; }
 
+/* Watch page loading skeleton. The bar / title / meta lines are .vs-skln, so
+   each one inherits its parent's font size and occupies exactly the real text's
+   line box — the swap to the player fills the placeholders in without moving
+   anything. Only the stage needs its own rule: it repeats .video-player's
+   aspect-ratio and max-height (clipped by .vs-wp-stage's own 12px radius) and
+   uses a darker ramp than the card skeletons, because on the black stage the
+   light grey used on white cards reads as a flash of blank page. */
+.vs-wp-skel-stage {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    max-height: 70vh;
+    background: linear-gradient(90deg, #dbe1e8 25%, #eaeef2 37%, #dbe1e8 63%);
+    background-size: 400% 100%;
+    animation: vs-shimmer 1.4s ease infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+    .vs-wp .vs-skln, .vs-wp-skel-stage { animation: none; }
+}
+
 /* Theater toggle button injected into the Shaka control bar */
 .shaka-theater-button {
     display: flex;
@@ -1969,7 +1988,37 @@ tr.clickable-row:hover { background-color: #f9fafb; }
 .vs-nav-skel { height: 37px; flex-shrink: 0; border-radius: 8px; margin: 0 0 2px; background: linear-gradient(90deg, #eceef1 25%, #f3f4f6 37%, #eceef1 63%); background-size: 400% 100%; animation: vs-shimmer 1.4s ease infinite; }
 @keyframes vs-shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
 
-.vs-content { flex: 1; min-width: 0; padding: 24px 32px; background: #f0f2f5; overflow-y: auto; scrollbar-gutter: stable; }
+/* overflow-x was already effectively clipped (a scroll container clips both
+   axes); naming it only stops a horizontal scrollbar flashing during the page
+   slide below. */
+.vs-content { flex: 1; min-width: 0; padding: 24px 32px; background: #f0f2f5; overflow-y: auto; overflow-x: hidden; scrollbar-gutter: stable; }
+
+/* Course list <-> watch page slide. Only the INCOMING page animates: by the
+   time it paints, the router has already unmounted the outgoing one, so there
+   are no old pixels left to push off. See utils/navSlide.js for why the
+   direction comes from the path pair rather than from the navigation itself.
+
+   Each keyframe set declares a from-step only, so the animation ends with no
+   transform at all rather than a retained translateX(0) — a transform left on
+   .vs-page would make it the containing block for theater mode's
+   position: fixed .vs-wp. Same reason there is no will-change here. */
+/* 100% is the page box, which sits inside .vs-content's 32px padding — on its
+   own it leaves a ~20px sliver of the incoming card already on screen at the
+   first frame. The extra 32px clears it. Overshoot on the 16px mobile padding
+   is harmless: .vs-content clips it either way. */
+@keyframes vs-slide-in-right { from { transform: translateX(calc(100% + 32px)); } }
+@keyframes vs-slide-in-left  { from { transform: translateX(calc(-100% - 32px)); } }
+.vs-slide-in-right, .vs-slide-in-left {
+    animation-duration: 200ms;
+    animation-timing-function: cubic-bezier(.32, .72, 0, 1);
+    animation-fill-mode: backwards;
+}
+.vs-slide-in-right { animation-name: vs-slide-in-right; }
+.vs-slide-in-left  { animation-name: vs-slide-in-left; }
+@media (prefers-reduced-motion: reduce) {
+    .vs-slide-in-right, .vs-slide-in-left { animation: none; }
+}
+
 .vs-content-inner { max-width: 920px; margin: 0 auto; }
 .vs-content::-webkit-scrollbar { width: 6px; }
 .vs-content::-webkit-scrollbar-thumb { background: #c3c8cf; border-radius: 3px; }

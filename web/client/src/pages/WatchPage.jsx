@@ -4,7 +4,6 @@ import { useSite } from '../context/SiteContext';
 import { useAuth } from '../context/AuthContext';
 import { useToast } from '../context/ToastContext';
 import { apiGet, apiPost, triggerAuthFailure, isSigningOut } from '../api';
-import LoadingSpinner from '../components/LoadingSpinner';
 import { moduleTerm } from '../utils/moduleLabel';
 import { loadShaka } from '../services/shakaLoader';
 
@@ -168,8 +167,42 @@ function registerTheaterElement(shaka) {
   theaterElementRegistered = true;
 }
 
+// Loading state for a visit that knows nothing yet — a typed URL, a shared
+// link, a new tab. Arriving from the course list carries a seed instead (see
+// the render below) and never gets here; only the stage shimmers there.
+//
+// Deliberately shaped like the real thing — the same back bar, the same stage
+// box, the same info card — so the swap is a fill-in rather than a re-layout.
+// Held until BOTH the watch API and the Shaka bundle have arrived. The manifest
+// is NOT waited on: Shaka raises its own buffering spinner inside the stage for
+// that, and blocking on it here would leave the page blank through a slow first
+// segment fetch.
+function WatchSkeleton() {
+  return (
+    <div className="vs-wp" aria-busy="true" aria-label="Loading video">
+      <div className="vs-wp-bar">
+        <div className="vs-wp-back">
+          <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <path d="M10 12L6 8l4-4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+          <span className="vs-skln" style={{ width: 220, maxWidth: '55vw' }}>&nbsp;</span>
+        </div>
+      </div>
+
+      <div className="vs-wp-stage">
+        <div className="vs-wp-skel-stage" />
+      </div>
+
+      <div className="vs-wp-info">
+        <h2 className="vs-wp-title"><span className="vs-skln" style={{ width: '58%', maxWidth: 420 }}>&nbsp;</span></h2>
+        <p className="vs-wp-meta"><span className="vs-skln" style={{ width: '32%', maxWidth: 240 }}>&nbsp;</span></p>
+      </div>
+    </div>
+  );
+}
+
 export default function WatchPage() {
-  const { videoId } = useParams();
+  const { courseId, videoId } = useParams();
   const navigate = useNavigate();
   const location = useLocation();
   const { siteName } = useSite();
@@ -177,7 +210,6 @@ export default function WatchPage() {
   const { showToast } = useToast();
 
   const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [theaterActive, setTheaterActive] = useState(false);
   // Shaka is fetched on demand rather than shipped in the bundle, so it is not
@@ -220,8 +252,13 @@ export default function WatchPage() {
   // the in-flight lock.
   const flushWatchRef = useRef(null);
 
-  // Fetch video data
+  // Fetch video data. videoId is the only thing that re-runs this (refresh is
+  // a stable useCallback), so clearing data up front is exactly "a different
+  // video was asked for": it tears the old player down and lets the render
+  // below fall back to the incoming video's seed rather than briefly showing
+  // the previous one's title.
   useEffect(() => {
+    setData(null);
     (async () => {
       try {
         const { data: d, ok } = await apiGet(`/api/watch/${videoId}`);
@@ -242,7 +279,6 @@ export default function WatchPage() {
       } catch {
         setError('Failed to load video.');
       }
-      setLoading(false);
     })();
   }, [videoId, refresh]);
 
@@ -806,7 +842,12 @@ export default function WatchPage() {
       document.removeEventListener('webkitfullscreenchange', onChange);
       if (videoEl) videoEl.removeEventListener('webkitendfullscreen', onChange);
     };
-  }, [data]);
+    // shakaReady, not just data: the <video> is only rendered once the player
+    // bundle is in (see the skeleton gate in the render below), so on the run
+    // where data arrives first videoRef.current is still null and the
+    // webkitendfullscreen listener — the only signal iOS Safari gives us —
+    // would never be attached.
+  }, [data, shakaReady]);
 
   // Media Session metadata — drives iOS Control Center / Dynamic Island,
   // Android notification shade, and any connected Bluetooth display. Shaka
@@ -955,9 +996,10 @@ export default function WatchPage() {
       setHandler('seekforward', null);
       setHandler('seekbackward', null);
     };
-  }, [data]);
-
-  if (loading) return <LoadingSpinner />;
+    // Same reason as the fullscreen effect above: this bails on a null
+    // videoRef during the skeleton window, so it has to re-run once the
+    // element exists.
+  }, [data, shakaReady]);
 
   if (error) {
     return (
@@ -971,8 +1013,32 @@ export default function WatchPage() {
     );
   }
 
-  const { video } = data;
-  const backUrl = `/course/${video.course_id}`;
+  // What the bar and the info card render. The course list already holds every
+  // one of these fields, and hands them over in link state, so arriving from
+  // there paints the real text at once instead of shimmering through a
+  // round-trip we have already made. `data` takes over the moment it lands,
+  // which silently corrects anything that changed since the list was fetched —
+  // React just updates the text nodes, there is no second loading state.
+  //
+  // The state rides on the history entry, so it survives the back and forward
+  // buttons and a reload too; that is the common way onto this page on a phone.
+  // A visit with no state at all — typed URL, shared link, new tab — falls back
+  // to the full skeleton.
+  //
+  // description is the one field the list response does not carry, so it
+  // appears when the API answers.
+  const seed = location.state?.seed || null;
+  const video = data?.video || seed;
+  // The player always waits for both the manifest data and the bundle.
+  const playerReady = !!data && shakaReady;
+  // With a seed there is nothing to hold back — the text is already right, so
+  // only the stage shimmers. With no seed we hold the whole page until the
+  // player can actually start: revealing the title on the API and the stage a
+  // beat later on the bundle reads as two separate loads.
+  if (!video || (!seed && !playerReady)) return <WatchSkeleton />;
+
+  // courseId comes from the route, so the back link works on the seed path too.
+  const backUrl = `/course/${courseId || video.course_id}`;
   // The course page marks its video links with state.from === 'course'. When we
   // arrived that way the course page is the previous history entry, so a plain
   // click POPS the stack (history back) instead of PUSHING a duplicate course
@@ -991,7 +1057,7 @@ export default function WatchPage() {
   };
 
   return (
-    <div className="vs-wp">
+    <div className="vs-wp" aria-busy={playerReady ? undefined : true}>
       {/* The bar and the link are deliberately separate boxes. In theater mode
           the BAR is the column-flex item that stretches the full viewport
           width and carries the bar chrome; the link inside it sizes to its own
@@ -1026,16 +1092,20 @@ export default function WatchPage() {
             duration) underneath ours. We construct the Overlay explicitly
             below and its constructor sets the attribute itself, so nothing is
             lost by leaving it off here. */}
-        <div className="video-player" ref={containerRef}>
-          {/* `playsInline` is the iOS Safari kill switch for background
-              audio: without it, locking the screen or app-switching
-              hard-pauses the <video> the moment the document hides.
-              `autoPlay` only fires on mobile when the video is muted, but
-              the attribute is still useful for desktop and for the first
-              play-after-user-tap on mobile (the tap counts as the user
-              gesture that authorizes subsequent programmatic playback). */}
-          <video ref={videoRef} id="video-element" autoPlay playsInline />
-        </div>
+        {playerReady ? (
+          <div className="video-player" ref={containerRef}>
+            {/* `playsInline` is the iOS Safari kill switch for background
+                audio: without it, locking the screen or app-switching
+                hard-pauses the <video> the moment the document hides.
+                `autoPlay` only fires on mobile when the video is muted, but
+                the attribute is still useful for desktop and for the first
+                play-after-user-tap on mobile (the tap counts as the user
+                gesture that authorizes subsequent programmatic playback). */}
+            <video ref={videoRef} id="video-element" autoPlay playsInline />
+          </div>
+        ) : (
+          <div className="vs-wp-skel-stage" />
+        )}
       </div>
 
       <div className="vs-wp-info">

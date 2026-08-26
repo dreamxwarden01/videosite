@@ -366,6 +366,22 @@ export default function CourseView({ tab }) {
     );
   }
 
+  // Everything the watch page's back bar and info card render, handed over on
+  // the link so that page can paint them immediately rather than shimmering
+  // through a request we have already made. Field names mirror the API's video
+  // object, so the watch page just prefers its own data once that arrives and
+  // silently corrects any drift. description is not in the list response and is
+  // the one thing that still waits there.
+  const watchSeed = (video) => ({
+    course_code: headCode ?? null,
+    course_name: headName ?? null,
+    module_label: curCourse?.module_label ?? sidebarCourse?.module_label ?? null,
+    title: video.title,
+    module_number: video.module_number ?? null,
+    lecture_date: video.lecture_date ?? null,
+    duration_seconds: video.duration_seconds ?? 0,
+  });
+
   const VideoRow = (video) => {
     const clickable = video.status === 'finished' && canPlay;
     const meta = (
@@ -382,7 +398,7 @@ export default function CourseView({ tab }) {
     else tail = <span className="vs-cv-stb vs-cv-stb-p">Processing{video.processing_progress ? ` ${video.processing_progress}%` : ''}</span>;
     const inner = (<>{renderPoster(video)}<div className="vs-cv-rmn"><p className="vs-cv-rt">{video.title}</p>{meta}</div>{tail}</>);
     return clickable ? (
-      <Link key={video.video_id} to={`/course/${courseId}/watch/${video.video_id}`} state={{ from: 'course' }} className="vs-cv-row clk">{inner}</Link>
+      <Link key={video.video_id} to={`/course/${courseId}/watch/${video.video_id}`} state={{ from: 'course', seed: watchSeed(video) }} className="vs-cv-row clk">{inner}</Link>
     ) : (
       <div key={video.video_id} className={'vs-cv-row' + (video.status === 'finished' ? '' : ' proc')}>{inner}</div>
     );
