@@ -190,6 +190,14 @@ export default function WatchPage() {
   const containerRef = useRef(null);
   const playerRef = useRef(null);
   const destroyedRef = useRef(false);
+  // Shaka's destroy() is async, and on its way out it unloads MediaSource,
+  // which strips `src` off the <video>. Every run of the init effect shares
+  // that same element — a route change between two videos re-runs the effect
+  // without remounting the DOM — so an unsequenced rebuild lets the outgoing
+  // player's teardown yank the incoming player's media source out from under
+  // it, stalling playback at 0:00. Each run attaches only once the previous
+  // run's teardown has settled.
+  const teardownRef = useRef(Promise.resolve());
   const tokenRef = useRef('');
   const validityRef = useRef(0);
 
@@ -221,7 +229,6 @@ export default function WatchPage() {
           setData(d);
           tokenRef.current = d.hmacToken || '';
           validityRef.current = d.tokenValiditySeconds || 0;
-          if (siteName) document.title = `${d.video.title} - ${siteName}`;
         } else {
           setError(d?.error || 'Failed to load video.');
           // If the server says playback was rejected for this user, the
@@ -237,7 +244,17 @@ export default function WatchPage() {
       }
       setLoading(false);
     })();
-  }, [videoId, siteName, refresh]);
+  }, [videoId, refresh]);
+
+  // Document title. Split out of the fetch effect on purpose: siteName starts
+  // empty for anyone without the localStorage seed (first visit, private
+  // window, ITP eviction) and fills in when /api/settings/public answers.
+  // While it was a dep of the fetch above, that arrival re-ran the request and
+  // handed setData a fresh object, which tore the player down and rebuilt it
+  // mid-load for nothing.
+  useEffect(() => {
+    if (data && siteName) document.title = `${data.video.title} - ${siteName}`;
+  }, [data, siteName]);
 
   // Destroy and show error
   const destroyAndShowError = useCallback((title, message) => {
@@ -305,7 +322,10 @@ export default function WatchPage() {
     const player = new shaka.Player();
     playerRef.current = player;
 
-    player.attach(videoEl).then(() => {
+    const attached = teardownRef.current.then(
+      () => (cancelled ? null : player.attach(videoEl)));
+
+    attached.then(() => {
       if (cancelled) return;
       ui = new shaka.ui.Overlay(player, containerRef.current, videoEl);
       const isTouchDevice = navigator.maxTouchPoints > 0;
@@ -659,6 +679,10 @@ export default function WatchPage() {
           videoEl.addEventListener('pause', pauseHandler);
         })
         .catch(handleShakaError);
+    }).catch((err) => {
+      // attach() rejects if the run was torn down while it was in flight,
+      // which `cancelled` already covers. Anything else is worth seeing.
+      if (!cancelled) console.error('Player attach failed:', err);
     });
 
     return () => {
@@ -689,8 +713,14 @@ export default function WatchPage() {
       // from the 16:9 CSS placeholder (avoids carrying the previous video's
       // aspect into the new video's initial render).
       if (containerRef.current) containerRef.current.style.aspectRatio = '';
-      try { ui?.destroy(); } catch {}
-      try { player.destroy(); } catch {}
+      // Hand the next run something to wait on. ui.destroy() also destroys
+      // the player it was constructed with; Shaka makes a second destroy a
+      // no-op, and calling it explicitly covers the run where the overlay was
+      // never reached.
+      teardownRef.current = (async () => {
+        try { await ui?.destroy(); } catch {}
+        try { await player.destroy(); } catch {}
+      })();
     };
   }, [data, videoId, destroyAndShowError, shakaReady]);
 
@@ -984,7 +1014,19 @@ export default function WatchPage() {
       </div>
 
       <div className="vs-wp-stage">
-        <div className="video-player" ref={containerRef} data-shaka-player-container>
+        {/* Deliberately NOT tagged data-shaka-player-container. The UI build
+            scans the document for that attribute when it loads and auto-builds
+            its own Player + Overlay in every container carrying one, injecting
+            a <video> of its own if it doesn't find one it recognises. That was
+            unreachable while the library shipped in the bundle — the scan ran
+            before this page had rendered and matched nothing. Loading it on
+            demand moved the scan after the container exists whenever the
+            script is slower than /api/watch, which stacked Shaka's own control
+            bar (bound to its empty <video>, so frozen at 0:00 with no
+            duration) underneath ours. We construct the Overlay explicitly
+            below and its constructor sets the attribute itself, so nothing is
+            lost by leaving it off here. */}
+        <div className="video-player" ref={containerRef}>
           {/* `playsInline` is the iOS Safari kill switch for background
               audio: without it, locking the screen or app-switching
               hard-pauses the <video> the moment the document hides.
