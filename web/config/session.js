@@ -20,7 +20,7 @@ async function getInactivityTtlSeconds() {
     return inactivityDays * 24 * 60 * 60;
 }
 
-async function createSession(userId, userAgent, ipAddress, ssoSid = null, ssoExpiresAt = null) {
+async function createSession(userId, userAgent, ipAddress, ssoSid = null, ssoExpiresAt = null, roleGeneration = '0') {
     const pool = getPool();
     const sessionId = generateSessionId();
     const now = new Date();
@@ -29,9 +29,9 @@ async function createSession(userId, userAgent, ipAddress, ssoSid = null, ssoExp
     // live values from Redis. sso_expires_at = the SSO session's absolute expiry
     // (from the id_token's sess_exp) — enforced in isSessionValid.
     await pool.execute(
-        `INSERT INTO sessions (session_id, user_id, last_seen, last_sign_in, user_agent, ip_address, sso_sid, sso_expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [sessionId, idBuf(userId), now, now, userAgent || null, ipAddress || null, ssoSid, ssoExpiresAt]
+        `INSERT INTO sessions (session_id, user_id, last_seen, last_sign_in, user_agent, ip_address, sso_sid, sso_expires_at,sso_role_generation)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [sessionId, idBuf(userId), now, now, userAgent || null, ipAddress || null, ssoSid, ssoExpiresAt, roleGeneration]
     );
 
     const ttl = await getInactivityTtlSeconds();
@@ -43,6 +43,7 @@ async function createSession(userId, userAgent, ipAddress, ssoSid = null, ssoExp
         userAgent,
         ssoExpiresAt,
         ssoSid,
+        roleGeneration,
     }, ttl);
 
     return sessionId;
@@ -83,7 +84,8 @@ async function getSession(sessionId) {
     // (Redis expired it) and is invalid, or Redis was cold-restarted.
     const pool = getPool();
     const [rows] = await pool.execute(
-        `SELECT session_id, user_id, last_seen, last_sign_in, user_agent, ip_address, sso_expires_at, sso_sid
+        `SELECT session_id, user_id, last_seen, last_sign_in, user_agent, ip_address, sso_expires_at, sso_sid,
+                CAST(sso_role_generation AS CHAR) AS sso_role_generation
          FROM sessions WHERE session_id = ?`,
         [sessionId]
     );
@@ -108,6 +110,7 @@ async function getSession(sessionId) {
             user_agent: row.user_agent,
             sso_expires_at: ssoExpMs,
             sso_sid: row.sso_sid || null,
+            sso_role_generation: row.sso_role_generation,
             _stale: true,
         };
     }
@@ -122,6 +125,7 @@ async function getSession(sessionId) {
         userAgent: row.user_agent,
         ssoExpiresAt: ssoExpMs,
         ssoSid: row.sso_sid || null,
+        roleGeneration: row.sso_role_generation,
     }, remainingTtl);
 
     return {
@@ -133,6 +137,7 @@ async function getSession(sessionId) {
         user_agent: row.user_agent,
         sso_expires_at: ssoExpMs,
         sso_sid: row.sso_sid || null,
+        sso_role_generation: row.sso_role_generation,
     };
 }
 

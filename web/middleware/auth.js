@@ -40,7 +40,7 @@ async function loadUser(req, res, next) {
         }
 
         // Look up user metadata from cache (replaces the old session→users JOIN).
-        const userMeta = await getUserMeta(session.user_id);
+        let userMeta = await getUserMeta(session.user_id);
         if (!userMeta) {
             // User row vanished — kill the orphan session.
             await deleteSession(sessionId);
@@ -48,9 +48,18 @@ async function loadUser(req, res, next) {
             return next();
         }
 
-        // (Account enable/disable is SSO-owned now: a suspended user's sessions
-        // are killed via the back-channel and future sign-ins are refused at
-        // the SSO — no local is_active gate.)
+        const authorityService = require('../services/ssoRoleAuthority').service();
+        let authority = await authorityService.sessionState(session.user_id);
+        if (authority?.effects_pending) {
+            await authorityService.completeEffects(authority.subject_id);
+            authority = await authorityService.sessionState(session.user_id);
+        }
+        if (authority?.effects_pending) return next();
+        if (!require('../lib/ssoRoleProtocol').sessionPermitted(authority, session.sso_role_generation || '0')) {
+            await deleteSession(sessionId);
+            res.clearCookie(SESSION_COOKIE);
+            return next();
+        }
 
         // Update last_seen + ip + ua in Redis. The periodic flusher drains
         // these to DB every 15 min — the per-request DB write is gone.
@@ -66,7 +75,19 @@ async function loadUser(req, res, next) {
             .catch((e) => console.error('activity report failed:', e.message));
 
         // Resolve permissions + permission_level in one cached bundle (2 Redis GETs).
-        const { permissions, permission_level } = await resolveAuthBundle(session.user_id);
+        let bundle = await resolveAuthBundle(session.user_id);
+        if (authority && (bundle.role_id !== authority.role_id || userMeta.role_id !== authority.role_id)) {
+            // A cache read begun before the SQL commit can finish after its
+            // invalidation. Never authorize with that stale cached role pointer.
+            await require('../services/userService').invalidateUserCaches(session.user_id);
+            userMeta = await getUserMeta(session.user_id);
+            bundle = await resolveAuthBundle(session.user_id);
+            if (!userMeta || bundle.role_id !== authority.role_id || userMeta.role_id !== authority.role_id) {
+                res.clearCookie(SESSION_COOKIE);
+                return next();
+            }
+        }
+        const { permissions, permission_level } = bundle;
 
         res.locals.user = {
             user_id: session.user_id,

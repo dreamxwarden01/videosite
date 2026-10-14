@@ -127,6 +127,27 @@ npx vite                # dev server on :5173, proxies API to :3000
 
 **First run.** videosite boots unconfigured behind a token-locked `/install` wizard: infrastructure → site → SSO connection (issuer, client id, portal URL) → optional mTLS → the **connect** hard-gate that registers videosite at the SSO and publishes its role catalogue. No account is created at install — whoever holds the SSO's root org role signs in and lands as videosite's superadmin (the SSO's `roles.sync` re-points the top org role at videosite's top role).
 
+**Role synchronization.** Migration `050_sso_role_consistency` adds the SQL pending
+event queue, catalog lineage, per-subject authority watermarks, and a session
+revocation generation. The frozen database baseline is unchanged. Catalog reports
+contain a persisted `catalog_epoch` and decimal-string `catalog_revision`; their
+event IDs and payloads stay immutable across retries. A periodic database snapshot
+reconciles missed role-change notifications. Legacy Redis pending jobs are removed
+only after a durable SQL receipt; old catalog jobs trigger a new current snapshot.
+
+Role events, login claims, and signed access-state reads share the same subject
+watermark. Once a subject has versioned authority, unversioned or older observations
+cannot replace it. Conflicts deny access while a current SSO read is requested;
+a different authority epoch requires explicit recovery. Cache cleanup is retried
+behind a durable access gate, and restoring access does not revive sessions from
+before a denial. Keep the database's lineage and generation tables with backups;
+restoring an older database is an explicit recovery operation, not a revision reset.
+
+Run `npm run test:sso-roles` in `web` for protocol and HTTP boundary checks. The
+SQL/Redis test is skipped unless `VS_SSO_ISOLATED_TEST=1`, `VS_TEST_DB_URI`, and
+`VS_TEST_REDIS_URI` name disposable loopback fixtures; the database name must start
+with `vs_sso_test_`. It does not load application environment files.
+
 ### Worker
 
 The worker uses an interactive first-run setup to configure server connection, API keys, and mTLS.

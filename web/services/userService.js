@@ -76,8 +76,8 @@ async function getUserById(userId) {
     return rows[0] || null;
 }
 
-async function updateUser(userId, updates) {
-    const pool = getPool();
+async function updateUser(userId, updates, { connection = null, invalidate = true } = {}) {
+    const pool = connection || getPool();
     const fields = [];
     const values = [];
 
@@ -96,9 +96,15 @@ async function updateUser(userId, updates) {
     // Invalidate cached permissions when role_id changes; invalidate user_meta
     // for any field change (callers always read meta on auth, so it must reflect
     // the latest display_name / email / role_id).
+    if (!invalidate) return;
     if (updates.role_id !== undefined) {
         await permCache.invalidateUser(userId);
     }
+    await userCache.invalidate(userId);
+}
+
+async function invalidateUserCaches(userId) {
+    await permCache.invalidateUser(userId);
     await userCache.invalidate(userId);
 }
 
@@ -163,5 +169,6 @@ module.exports = {
     findOrCreateBySub,
     getUserById,
     updateUser,
+    invalidateUserCaches,
     listUsers,
 };

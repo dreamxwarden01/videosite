@@ -10,8 +10,7 @@ const oidc = require('../lib/oidc');
 const { createSession, deleteSession, deleteSessionsBySsoSid, getSessionMaxDays, stampSessionStepup } = require('../config/session');
 const { STEPUP_METHODS, STEPUP_PRECHECK_BUFFER_MS, STEPUP_WINDOW_MS, stepupState, scenarioPolicy, stepupMethodsForLevel, windowSecondsFor } = require('../middleware/stepup');
 const { SESSION_COOKIE, getClientIp } = require('../middleware/auth');
-const { findOrCreateBySub, updateUser } = require('../services/userService');
-const { roleIdExists } = require('../services/roleService');
+const { findOrCreateBySub } = require('../services/userService');
 
 const FLOW_COOKIE = 'oidc_flow';
 // Dockerfile sets NODE_ENV=production and the site is HTTPS (Caddy), so cookies
@@ -292,20 +291,11 @@ router.get('/auth/callback', async (req, res) => {
 
     const user = await findOrCreateBySub(claims);
 
-    // The SSO defines the app role at login: id_token `app_role` carries OUR
-    // native role_id (the SSO's effective assignment). Apply it through the
-    // service layer exactly like a roles_change event — update + cache purge —
-    // but only when it differs. An unknown role_id means our catalog at the
-    // SSO is out of sync: refuse the login (same rule as event reports).
-    if (typeof claims.app_role === 'number' && claims.app_role !== user.role_id) {
-      if (!(await roleIdExists(claims.app_role))) {
-        console.error(`login app_role: unknown role_id ${claims.app_role} (catalog drift — sync pending?)`);
-        return res.redirect('/auth/error?code=role_out_of_sync');
-      }
-      const hexId = String(claims.sub).replace(/-/g, '').toLowerCase();
-      await updateUser(hexId, { role_id: claims.app_role });
-      user.role_id = claims.app_role;
-    }
+    // Login claims obey the same per-subject watermark as event deliveries.
+    // An older login response cannot undo a role event received in flight.
+    const authorityService = require('../services/ssoRoleAuthority').service();
+    const authority = await authorityService.applyLogin(claims);
+    user.role_id = authority.role_id;
 
     // Profile picture claim: apply like an event report (update + prefetch)
     // when the file name differs from the mirrored one. Absent claim = no
@@ -340,8 +330,13 @@ router.get('/auth/callback', async (req, res) => {
     const ssoExpMs = typeof claims.sess_exp === 'number' ? claims.sess_exp * 1000 : null;
     const sessionId = await createSession(
       user.user_id, req.headers['user-agent'] || null, getClientIp(req), ssoSid,
-      ssoExpMs ? new Date(ssoExpMs) : null,
+      ssoExpMs ? new Date(ssoExpMs) : null, authority.session_generation,
     );
+    const currentAuthority = await authorityService.read(claims.sub);
+    if (!currentAuthority || !require('../lib/ssoRoleProtocol').sessionPermitted(currentAuthority, authority.session_generation)) {
+      await deleteSession(sessionId);
+      return res.redirect('/auth/error?code=role_out_of_sync');
+    }
     const baseCookie = { httpOnly: true, secure: cookieSecure, sameSite: 'lax' };
     let cookieOpts = baseCookie;
     if (persistent) {

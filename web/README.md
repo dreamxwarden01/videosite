@@ -15,6 +15,12 @@ password reset) lives in the SSO; videosite keeps its own **roles, permissions, 
   request — the SSO federates *who you are*, not *what you can do* in the app.
 - Step-up for sensitive admin actions is delegated to the SSO (redirect takeover).
 
+Role catalogs use persistent versions and immutable delivery records. Signed role
+events, login claims and access-state queries are checked against each subject's
+stored version so an older response cannot replace newer authorization. Upgrade
+DreamSSO's role-event schema and server before upgrading the relying party, and
+preserve synchronization metadata with database backups.
+
 ## Layout
 
 | Path | What |
@@ -32,6 +38,18 @@ role catalogue. No account is created at install — the operator who holds the 
 signs in and lands as videosite's superadmin.
 
 ## Deploy
+
+Role-sync regressions can be run independently of an installed application:
+
+```sh
+npm run test:sso-roles       # Protocol and HTTP tests; database tests require a fixture
+npm run test:sso-roles:db    # Complete suite with disposable MariaDB and Redis
+```
+
+The database runner creates generated credentials, publishes loopback-only ports
+and removes its containers afterward. It uses the `orbstack` Docker context by
+default; set `VS_TEST_DOCKER_CONTEXT=default` for a standard Docker installation.
+The web image workflow runs this suite before publishing.
 
 Ships as `ghcr.io/dreamxwarden01/videosite-web` (built from `main`). Secrets, certs, and real user
 data are git-ignored and must never be committed. Three crypto keys carried from the original

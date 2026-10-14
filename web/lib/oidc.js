@@ -255,7 +255,45 @@ async function verifySsoToken(token, typ) {
 
 // Verify an inbound envelope from the SSO (its JWKS; audience = us).
 async function verifyEventToken(token) {
+  if (typeof token !== 'string' || !token || token.length > 262144) throw new Error('invalid_event_token');
   return verifySsoToken(token, 'events+jwt');
+}
+
+// Signed read, with the authority version carried in response headers from the
+// same SSO SQL snapshot as the unchanged access-state JSON body.
+async function fetchAccessState(sub) {
+  const protocol = require('./ssoRoleProtocol');
+  sub = protocol.subject(sub);
+  const route = '/backchannel/access-state', requestId = crypto.randomUUID();
+  const { SignJWT } = await jose();
+  const key = await clientKey(), now = Math.floor(Date.now() / 1000);
+  const token = await new SignJWT({ method: 'GET', path: route, action: 'access-state', subjects: [sub] })
+    .setProtectedHeader({ alg: 'EdDSA', kid: _privJwk.kid, typ: 'backchannel-query+jwt' })
+    .setIssuer(CLIENT_ID).setSubject(CLIENT_ID).setAudience(ISSUER.replace(/\/$/, '') + route)
+    .setIssuedAt(now).setExpirationTime(now + 120).setJti(requestId).sign(key);
+  const response = await s2sFetch(INTERNAL + route, { headers: { authorization: 'Bearer ' + token }, signal: AbortSignal.timeout(5000) });
+  if (response.status !== 200 || !/^application\/json(?:\s*;|$)/i.test(response.headers.get('content-type') || '')) throw new Error('access_state_unavailable');
+  const reader = response.body?.getReader(); if (!reader) throw new Error('access_state_unavailable');
+  let length = 0; const chunks = [];
+  try {
+    while (true) {
+      const { done, value } = await reader.read(); if (done) break;
+      length += value.byteLength; if (length > 65536) throw new Error('access_state_unavailable'); chunks.push(Buffer.from(value));
+    }
+  } finally { await reader.cancel().catch(() => {}); }
+  const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  if (body.client_id !== CLIENT_ID || body.request_id !== requestId || body.complete !== true || !Array.isArray(body.subjects)
+      || body.subjects.length !== 1 || body.subjects[0].sub !== sub) throw new Error('access_state_unavailable');
+  const state = body.subjects[0];
+  if (!state.account || !['active','disabled','locked','deleted','not_found'].includes(state.account.status)
+      || !state.rp || typeof state.rp.catalog_synced !== 'boolean' || typeof state.allowed !== 'boolean'
+      || !['allowed','no_access','unmanaged','unknown_role'].includes(state.rp.access)) throw new Error('access_state_unavailable');
+  const role = protocol.roleId(state.rp.role_id);
+  const epoch = response.headers.get('X-DreamSSO-Authority-Epoch');
+  const rev = response.headers.get('X-DreamSSO-Authority-Revision');
+  const authorityVersion = protocol.version(epoch === null ? undefined : epoch, rev === null ? undefined : rev);
+  return { roleId: ['unknown_role','no_access'].includes(state.rp.access) ? null : role, version: authorityVersion, accountStatus: state.account.status,
+    allowed: state.allowed && state.account.status === 'active' && state.rp.catalog_synced && state.rp.access === 'allowed' && role !== null };
 }
 
 function ssoEventsUrl() { return INTERNAL + '/backchannel/events'; }
@@ -287,4 +325,4 @@ function publicJwks() {
   return { keys: publishedKeys(readKeyFile()).map(({ d, p, q, dp, dq, qi, k, ...pub }) => ({ use: 'sig', ...pub })) };
 }
 
-module.exports = { loadConfig, beginFlow, authorizeUrl, exchangeCode, verifyIdToken, userinfo, verifyLogoutToken, endSessionUrl, signEventToken, verifyEventToken, verifySsoToken, ssoEventsUrl, ssoActivityUrl, signClientAssertion, publicJwks, fetchInternalAvatar, rotateClientKey, clientKeyInfo, ensureClientKey, hasClientKey };
+module.exports = { loadConfig, beginFlow, authorizeUrl, exchangeCode, verifyIdToken, userinfo, verifyLogoutToken, endSessionUrl, signEventToken, verifyEventToken, verifySsoToken, ssoEventsUrl, ssoActivityUrl, signClientAssertion, publicJwks, fetchAccessState, fetchInternalAvatar, rotateClientKey, clientKeyInfo, ensureClientKey, hasClientKey };

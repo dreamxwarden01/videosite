@@ -13,7 +13,27 @@ permissions:
   packages: write
 
 jobs:
+  verify-sso-roles:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm run check:db
+      - run: npm run test:sso-roles:db
+        env:
+          VS_TEST_DOCKER_CONTEXT: default
   build:
+    needs: verify-sso-roles
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

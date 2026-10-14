@@ -13,7 +13,6 @@
 //                            accepted the catalogue (which also sets our display
 //                            name from site_name and hands the SSO's root org
 //                            role this site's top role — the admin bootstrap)
-const crypto = require('crypto');
 const oidc = require('../lib/oidc');
 const { s2sFetch } = require('./s2sFetch');
 
@@ -72,19 +71,18 @@ async function probeSelfJwks(baseUrl) {
 // The real gate. Signs a roles.sync envelope with our registered client key and
 // posts it to the SSO. A 204 is the only way through the installer.
 async function verifyAndPublish() {
-    const { composeRolesPayload } = require('./ssoEvents');
-    let payload;
+    const { reportRoles } = require('./ssoEvents');
+    let payload, event;
     try {
-        payload = await composeRolesPayload();
+        event = await reportRoles();
+        payload = event.payload;
     } catch (e) {
         return { ok: false, stage: 'roles', reason: 'roles_unavailable', detail: e.message };
     }
 
     let token;
     try {
-        token = await oidc.signEventToken([
-            { id: crypto.randomUUID(), type: 'roles.sync', payload },
-        ]);
+        token = await oidc.signEventToken([event]);
     } catch (e) {
         return { ok: false, stage: 'sign', reason: 'sign_failed', detail: e.message };
     }

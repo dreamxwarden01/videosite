@@ -10,6 +10,8 @@ const oidc = require('../lib/oidc');
 const { deleteSessionsBySsoSid } = require('../config/session');
 const { getClient } = require('../services/redis');
 const ssoEvents = require('../services/ssoEvents');
+const roleProtocol = require('../lib/ssoRoleProtocol');
+const { eventFormParser, readEventToken } = require('../middleware/ssoEventBody');
 
 const SEEN_TTL = 7 * 24 * 3600;
 
@@ -25,9 +27,9 @@ const SEEN_TTL = 7 * 24 * 3600;
 // definition so they cannot drift again.
 const localUserId = (sub) => sub.replace(/-/g, '').toLowerCase();
 
-router.post('/backchannel/events', express.urlencoded({ extended: false }), async (req, res) => {
+router.post('/backchannel/events', eventFormParser(), async (req, res) => {
     res.set('Cache-Control', 'no-store');
-    const token = req.body && req.body.event_token;
+    const token = readEventToken(req.body);
     if (!token) return res.status(400).json({ error: 'missing_event_token' });
 
     let payload;
@@ -40,12 +42,32 @@ router.post('/backchannel/events', express.urlencoded({ extended: false }), asyn
     if (!Array.isArray(events) || events.length === 0 || events.length > 100) {
         return res.status(400).json({ error: 'invalid_events' });
     }
+    // Reject malformed role payloads before any batch member has effects. Later
+    // runtime failures still use per-event receipts; the batch is not atomic.
+    for (const ev of events) {
+        if (!ev || typeof ev.id !== 'string' || !ev.id) return res.status(400).json({ error: 'invalid_event_id' });
+        if (ev.type === 'account.roles_change') {
+            try {
+                roleProtocol.observation(ev.payload);
+                roleProtocol.digest({ type: ev.type, payload: ev.payload });
+                if (!roleProtocol.UUID.test(ev.id)) throw new Error('invalid_event_id');
+            } catch { return res.status(400).json({ error: 'invalid_role_event' }); }
+        }
+    }
 
     const redis = getClient();
     for (const ev of events) {
         const id = ev && typeof ev.id === 'string' ? ev.id : null;
         const type = ev && typeof ev.type === 'string' ? ev.type : '';
         if (!id) return res.status(400).json({ error: 'invalid_event_id' });
+
+        // Role receipts, subject watermark, and SQL role mutation commit together.
+        // The durable gate covers the subsequent cache/session cleanup.
+        if (type === 'account.roles_change') {
+            try { await require('../services/ssoRoleAuthority').service().processEvent(ev); }
+            catch { return res.status(500).json({ error: 'server_error' }); }
+            continue;
+        }
 
         const fresh = redis ? await redis.set(`sso:evt:seen:${id}`, '1', 'EX', SEEN_TTL, 'NX') : 'OK';
         if (!fresh) continue; // retry redelivery — already processed
@@ -57,25 +79,6 @@ router.post('/backchannel/events', express.urlencoded({ extended: false }), asyn
                 }
             } else if (type === 'roles.sync_request') {
                 await ssoEvents.reportRoles();
-            } else if (type === 'account.roles_change') {
-                // SSO-held assignment changed. Apply through the SERVICE layer
-                // so profile/permission caches purge exactly like a local
-                // admin edit. role_id null = No access: kill the sessions
-                // (future sign-ins are already refused at the SSO).
-                const p = ev.payload || {};
-                if (typeof p.sub === 'string') {
-                    const { updateUser } = require('../services/userService');
-                    const { roleIdExists } = require('../services/roleService');
-                    const { deleteUserSessions } = require('../config/session');
-                    const localId = localUserId(p.sub);
-                    if (p.role_id == null) {
-                        await deleteUserSessions(localId);
-                    } else if (await roleIdExists(p.role_id)) {
-                        await updateUser(localId, { role_id: p.role_id });
-                    } else {
-                        console.error(`roles_change: unknown role_id ${p.role_id} (catalog drift — sync pending?)`);
-                    }
-                }
             } else if (type === 'org.settings') {
                 // Org-level settings changed at the SSO (site_name today).
                 const p = ev.payload || {};

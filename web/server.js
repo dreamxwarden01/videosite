@@ -50,6 +50,7 @@ morgan.token('safeurl', (req) => {
 app.use(compression());
 
 app.use(morgan(':method :safeurl :status :response-time ms - :res[content-length]'));
+app.use('/backchannel/events', require('./middleware/ssoEventBody').eventFormParser());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());

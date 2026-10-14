@@ -43,6 +43,7 @@ function parseHash(hash) {
         // activity report can name the session without a DB round trip. Null for
         // sessions cached before this field existed — consumers must be null-safe.
         sso_sid: hash.sso_sid || null,
+        sso_role_generation: hash.sso_role_generation || '0',
     };
 }
 
@@ -50,7 +51,7 @@ function parseHash(hash) {
 // (which already happens in createSession). ttlSeconds = idle timeout.
 // ssoExpiresAt = the SSO session's absolute expiry (the app session must never
 // outlive it — checked in isSessionValid).
-async function createSession(sid, { userId, lastSignIn, lastSeen, ipAddress, userAgent, ssoExpiresAt, ssoSid }, ttlSeconds) {
+async function createSession(sid, { userId, lastSignIn, lastSeen, ipAddress, userAgent, ssoExpiresAt, ssoSid, roleGeneration = '0' }, ttlSeconds) {
     const redis = getClient();
     const fields = {
         user_id: String(userId),
@@ -61,6 +62,7 @@ async function createSession(sid, { userId, lastSignIn, lastSeen, ipAddress, use
         sso_expires_at: toEpochMs(ssoExpiresAt),
         // Opaque string, not a timestamp — ioredis rejects null/undefined values.
         sso_sid: ssoSid || '',
+        sso_role_generation: String(roleGeneration),
     };
     await redis.multi()
         .hset(sessionKey(sid), fields)
