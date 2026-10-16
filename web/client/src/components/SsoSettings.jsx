@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { apiFetch } from '../api';
 import { useToast } from '../context/ToastContext';
 import useStepupGuard from '../hooks/useStepupGuard';
@@ -34,6 +34,7 @@ const fmtTs = (s) => {
   try { return new Date(s).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'long' }); }
   catch { return s; }
 };
+const validKeyStatus = value => typeof value?.kid === 'string' && ['active', 'pending'].includes(value.state);
 const CERT_ERR = {
   expired: 'This certificate is already expired. Submit a current certificate.',
   key_mismatch: "Certificate doesn't match the generated key. Submit the CSR shown above.",
@@ -51,6 +52,9 @@ export default function SsoSettings() {
   const [config, setConfig] = useState(null);
   const [orig, setOrig] = useState({});
   const [savingConfig, setSavingConfig] = useState(false);
+  const [keyChecked, setKeyChecked] = useState(false);
+  const unresolvedRotation = useRef(null);
+  const keyReadGeneration = useRef(0);
   const [mtls, setMtls] = useState(null);
   const [enforcePending, setEnforcePending] = useState(false);
   const [savingEnforce, setSavingEnforce] = useState(false);
@@ -81,7 +85,7 @@ export default function SsoSettings() {
   useEffect(() => {
     (async () => {
       const c = await guardFetch('/api/sso/config');
-      if (c.ok) { setConfig(c.data); setOrig(c.data); }
+      if (c.ok) { setConfig(c.data); setOrig(c.data); setKeyChecked(validKeyStatus(c.data.client_key)); }
       await loadMtls();
     })();
   }, [guardFetch, loadMtls]);
@@ -129,15 +133,53 @@ export default function SsoSettings() {
     else if (data?.code !== 'step_up_required') showToast(data?.error || 'Failed to save.');
   };
 
-  // One-click safe: the old key stays published for overlap and the SSO
-  // re-fetches our JWKS when it sees the new kid.
   const [rotating, setRotating] = useState(false);
+  const pendingKey = config?.client_key?.rotation;
+  const loadKey = useCallback(async () => {
+    const generation=++keyReadGeneration.current;
+    try {
+      const { ok, data } = await guardFetch('/api/sso/client-key');
+      if(generation!==keyReadGeneration.current)return null;
+      if (!ok || !validKeyStatus(data)) throw new Error('status_unavailable');
+      // Updating key metadata must not replace an unsaved connection draft.
+      setConfig(c => c && ({ ...c, client_key: data }));
+      setOrig(c => ({ ...c, client_key: data }));setKeyChecked(true);
+      if (unresolvedRotation.current) {
+        const { previousKid } = unresolvedRotation.current;
+        if (data.rotation) showToast('Client key rotation is scheduled.', 'success');
+        else if (data.kid !== previousKid) showToast('Client key rotation completed.', 'success');
+        else showToast('No rotation was scheduled. Check the service before retrying.');
+        unresolvedRotation.current = null;
+      }
+      return data;
+    } catch { if(generation!==keyReadGeneration.current)return null;setKeyChecked(false);return null; }
+  }, [guardFetch, showToast]);
+  useEffect(() => {
+    if (!config || (!pendingKey && keyChecked)) return;
+    const timer = setInterval(() => { if (!document.hidden) void loadKey(); }, 15000);
+    return () => clearInterval(timer);
+  }, [!!config, pendingKey?.id, keyChecked, loadKey]);
   const rotateKey = async () => {
+    if (isDirty) return;
     setRotating(true);
-    const { ok, data } = await apiFetch('/api/sso/rotate-client-key', { method: 'POST' });
-    setRotating(false);
-    if (ok) { setConfig((c) => ({ ...c, client_key: data })); setOrig((c) => ({ ...c, client_key: data })); showToast('Client key rotated.', 'success'); }
-    else if (data?.code !== 'step_up_required') showToast('Failed to rotate the client key.');
+    const previousKid = config?.client_key?.kid;
+    unresolvedRotation.current = null;
+    keyReadGeneration.current++;
+    const resolveOutcome = async () => {
+      unresolvedRotation.current = { previousKid };
+      setKeyChecked(false);
+      const status = await loadKey();
+      if (!status && unresolvedRotation.current) showToast('Could not confirm rotation. Refresh key status before retrying.');
+    };
+    try {
+      const { ok, data } = await apiFetch('/api/sso/rotate-client-key', { method: 'POST' });
+      keyReadGeneration.current++;
+      if (ok && validKeyStatus(data)) {
+        setConfig(c => ({ ...c, client_key: data }));setOrig(c => ({ ...c, client_key: data }));setKeyChecked(true);
+        showToast(data.state === 'pending' ? 'Client key rotation scheduled.' : 'Client key is active.', 'success');
+      } else await resolveOutcome(); // GET resolves an ambiguous response; never repeat POST.
+    } catch { keyReadGeneration.current++;await resolveOutcome(); }
+    finally { setRotating(false); }
   };
 
   // --- mTLS ---
@@ -255,8 +297,16 @@ export default function SsoSettings() {
             <label className="vs-label">Current key{config.client_key?.rotated_at ? ` (rotated ${fmtTs(config.client_key.rotated_at)})` : ''}</label>
             <div style={{ display: 'flex', gap: 8 }}>
               <input className="vs-input" readOnly value={config.client_key?.kid || '—'} style={{ fontFamily: 'monospace', fontSize: 12 }} />
-              <button type="button" className="vs-btn vs-btn-primary" disabled={rotating} onClick={() => guardAction(rotateKey)}>{rotating ? 'Rotating…' : 'Rotate'}</button>
+              <button type="button" className="vs-btn vs-btn-primary" style={{ minWidth: 112, whiteSpace: 'nowrap' }} disabled={rotating || !!pendingKey || !keyChecked || isDirty} onClick={() => guardAction(rotateKey)}>{rotating ? 'Scheduling…' : pendingKey ? 'Scheduled' : 'Rotate'}</button>
             </div>
+            <p className="vs-hint" style={{ marginTop: 8 }}>
+              {pendingKey ? (pendingKey.activate_after
+                ? `New key published. Eligible to activate after ${fmtTs(pendingKey.activate_after)}.`
+                : 'New key published. Preparing the activation window…')
+                : 'A new key is published at least 5 minutes before it starts signing. The previous key stays available for 24 hours.'}
+            </p>
+            {!keyChecked && <><p className="vs-hint">Key status is unavailable. Refresh before scheduling a rotation.</p><button type="button" className="vs-btn" onClick={loadKey}>Refresh key status</button></>}
+            {isDirty && <p className="vs-hint">Save or discard connection changes before rotating the key.</p>}
           </div>
         </>
       )}

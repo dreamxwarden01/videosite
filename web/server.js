@@ -50,6 +50,9 @@ morgan.token('safeurl', (req) => {
 app.use(compression());
 
 app.use(morgan(':method :safeurl :status :response-time ms - :res[content-length]'));
+// Available while registering the RP, before installation/session gates. Mount
+// before body parsers so every non-GET method, including HEAD, returns405.
+app.use(require('./routes/publicJwks').publicJwksRouter());
 app.use('/backchannel/events', require('./middleware/ssoEventBody').eventFormParser());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -74,23 +77,6 @@ app.use('/favicon.ico', express.static(path.join(__dirname, 'client', 'dist', 'f
 app.use('/vendor', express.static(path.join(__dirname, 'client', 'dist', 'vendor'), {
     maxAge: '1y', immutable: true,
 }));
-
-// Client public keys for the SSO (private_key_jwt) — before the install gate:
-// the install flow registers this URL at the SSO while the app is live.
-app.get('/.well-known/jwks.json', (req, res) => {
-  try {
-    const jwks = require('./lib/oidc').publicJwks();
-    // Set freshness only once the keys actually read. Setting it first meant a
-    // 500 (the key file does not exist until install mints it) went out as
-    // public, max-age=300 — cached by the SSO and by the installer's own
-    // preflight, which then cannot complete until the entry ages out.
-    res.set('Cache-Control', 'public, max-age=300');
-    res.json(jwks);
-  } catch (e) {
-    res.set('Cache-Control', 'no-store');
-    res.status(500).json({ error: 'keys_unavailable' });
-  }
-});
 
 // Installation check middleware
 const { checkInstalled } = require('./middleware/installer');

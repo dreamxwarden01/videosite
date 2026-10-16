@@ -52,14 +52,19 @@ router.get('/sso/config', async (req, res) => {
     callback: base ? base + '/auth/callback' : process.env.OIDC_REDIRECT_URI || '',
     backchannel: base ? base + '/backchannel/events' : '',
     jwks: base ? base + '/.well-known/jwks.json' : '',
-    client_key: oidc.clientKeyInfo(),
+    client_key: await oidc.clientKeyInfo().catch(() => null),
   });
 });
 
-// Rotate the client signing key. Safe one-click: the replaced key stays
-// published for overlap and the SSO re-fetches our JWKS on the unknown kid.
+router.get('/sso/client-key', async (_req, res) => {
+  try { res.json(await oidc.clientKeyInfo()); }
+  catch { res.status(503).json({ error: 'client_key_unavailable' }); }
+});
+
+// Publish first; the current signer remains active during cache propagation.
 router.post('/sso/rotate-client-key', async (req, res) => {
-  res.json(await oidc.rotateClientKey());
+  try { const result=await oidc.rotateClientKey();res.status(result.state==='pending'?202:200).json(result); }
+  catch { res.status(503).json({ error: 'client_key_unavailable' }); }
 });
 
 router.put('/sso/config', async (req, res) => {

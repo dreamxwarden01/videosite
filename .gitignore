@@ -31,6 +31,7 @@ worker-macos/
 worker-windows/
 *.md
 !README.md
+!docs/CLIENT_SIGNING_KEYS.md
 
 # Environment / secrets
 .env

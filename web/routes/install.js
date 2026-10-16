@@ -281,7 +281,7 @@ router.get('/api/install/connect', async (_req, res) => {
                       jwks: base + '/.well-known/jwks.json',
                   }
                 : null,
-            key: oidc.hasClientKey() ? oidc.clientKeyInfo() : null,
+            key: await oidc.clientKeyInfo().catch(() => null),
             preflight: base ? await probeSelfJwks(base) : { ok: false, reason: 'no_hostname' },
         });
     } catch (err) {

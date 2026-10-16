@@ -20,7 +20,7 @@ try {
  if(!ready)throw Error('Generated database fixture did not become ready.');
  const ports={};for(const [kind,port] of [['db','3306/tcp'],['redis','6379/tcp']]){const {stdout}=await docker('port',names[kind],port);const m=/^127\.0\.0\.1:(\d+)\s*$/.exec(stdout);if(!m)throw Error('Unexpected fixture binding.');ports[kind]=m[1];}
  const env={...process.env,FORCE_COLOR:'0',DOTENV_CONFIG_PATH:'/dev/null',VS_SSO_ISOLATED_TEST:'1',VS_TEST_DB_URI:`mysql://role_fixture:${password}@127.0.0.1:${ports.db}/${database}`,VS_TEST_REDIS_URI:`redis://127.0.0.1:${ports.redis}`};
- const result=await exec(process.execPath,['--test','--test-reporter=spec','--test-concurrency=1','scripts/sso-role-protocol.test.js','scripts/sso-role-http.test.js','scripts/sso-role-isolated.test.js'],{cwd:dirname(dirname(fileURLToPath(import.meta.url))),env,maxBuffer:8*1024*1024});
+ const result=await exec(process.execPath,['--test','--test-reporter=spec','--test-concurrency=1','scripts/sso-role-protocol.test.js','scripts/sso-role-http.test.js','scripts/sso-role-isolated.test.js','scripts/client-signing-keys.test.js'],{cwd:dirname(dirname(fileURLToPath(import.meta.url))),env,maxBuffer:8*1024*1024});
  process.stdout.write(result.stdout);process.stderr.write(result.stderr);
  if(!/^ℹ skipped 0\s*$/m.test(result.stdout))throw Error('Expected the complete suite with no skipped tests.');
 } catch(error) {

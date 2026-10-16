@@ -14,6 +14,7 @@
     "test:upload": "node scripts/upload-size-test.js",
     "check:typecast": "node scripts/check-typecast-collisions.js",
     "test:sso-roles": "node --test scripts/sso-role-protocol.test.js scripts/sso-role-http.test.js scripts/sso-role-isolated.test.js",
+    "test:jwks": "node --test scripts/jwks-http.test.js scripts/client-signing-keys.test.js",
     "test:sso-roles:db": "node scripts/run-sso-role-tests.mjs"
   },
   "keywords": [],

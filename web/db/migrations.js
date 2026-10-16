@@ -1201,6 +1201,10 @@ async function runMigrations({ strict = false } = {}) {
                 id: '050_sso_role_consistency',
                 up: async () => require('./ssoRoleMigration').migrateSsoRoles(pool),
             },
+            {
+                id: '051_staged_client_signing_key',
+                up: async () => require('./clientSigningKeyMigration').migrateClientSigningKeys(pool),
+            },
         ];
 
         for (const migration of migrations) {

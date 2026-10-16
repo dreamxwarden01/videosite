@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { getSetting } = require('../services/cache/settingsCache');
+const { ClientSigningKeyStore, ClientSigningKeyError, legacyState, publicJwks: projectJwks, status: keyStatus } = require('../services/clientSigningKeys');
 const { s2sFetch } = require('../services/s2sFetch'); // presents the mTLS client cert when enforcement is on
 
 // Connection config — env defaults, overlaid from site_settings (admin-editable
@@ -34,7 +35,7 @@ let _josePromise;
 function jose() { return (_josePromise ||= import('jose')); }
 
 // Cached client signing key (private_key_jwt) + remote JWKS resolver.
-let _privJwk, _clientKey, _jwks;
+let _clientKey, _jwks;
 
 // Overlay editable connection params from site_settings (env fallback when a
 // setting is unset/blank). Resets the cached JWKS resolver in case the back-
@@ -58,8 +59,32 @@ async function loadConfig() {
 // Key file: legacy single private JWK, or {keys:[current, previous], rotated_at}
 // after a rotation. keys[0] signs; every key is published (overlap window).
 function readKeyFile() {
-  const raw = JSON.parse(fs.readFileSync(keyFile(), 'utf8'));
+  const raw = JSON.parse(readLegacyKeyBytes());
   return Array.isArray(raw.keys) ? raw : { keys: [raw] };
+}
+
+function readLegacyKeyBytes() {
+  const fd=fs.openSync(keyFile(),fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
+  try {
+    const before=fs.fstatSync(fd),uid=process.getuid?.();
+    if(!before.isFile()||before.nlink!==1||(before.mode&0o777)!==0o600||(uid!==undefined&&before.uid!==uid)||before.size<1||before.size>65536)throw new ClientSigningKeyError();
+    const buffer=Buffer.alloc(65537);let size=0;
+    while(size<buffer.length){const read=fs.readSync(fd,buffer,size,buffer.length-size,null);if(!read)break;size+=read;}
+    const after=fs.fstatSync(fd);
+    if(size!==before.size||before.ino!==after.ino||before.size!==after.size||before.mtimeMs!==after.mtimeMs||before.ctimeMs!==after.ctimeMs)throw new ClientSigningKeyError();
+    return buffer.subarray(0,size).toString('utf8');
+  } finally { fs.closeSync(fd); }
+}
+function signingStore() {
+  if(!process.env.DB_HOST&&!process.env.DB_NAME)return null;
+  if(!process.env.DB_HOST||!process.env.DB_NAME)throw new ClientSigningKeyError();
+  return new ClientSigningKeyStore(require('../config/database').getPool(),readLegacyKeyBytes);
+}
+async function keyView(reconcile=false,strictReconcile=true) {
+  try {
+    const store=signingStore();
+    return store?await store.read(reconcile,strictReconcile):{state:legacyState(readLegacyKeyBytes(),Date.now()),at:Date.now(),legacy:true};
+  } catch { throw new ClientSigningKeyError(); }
 }
 
 // Mint this app's OIDC client key if it doesn't exist yet. The SSO never
@@ -70,6 +95,8 @@ function readKeyFile() {
 // JWK straight into the SSO's database; that can't exist for a real install.
 async function ensureClientKey() {
   const file = keyFile();
+  const store=signingStore();
+  if(store&&await store.authoritative()){const current=await store.info();return{kid:current.kid,created:false};}
   if (fs.existsSync(file)) {
     const f = readKeyFile();
     return { kid: f.keys[0].kid || null, created: false };
@@ -80,46 +107,22 @@ async function ensureClientKey() {
   jwk.alg = 'EdDSA';
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify({ keys: [jwk] }, null, 2) + '\n', { mode: 0o600 });
-  _privJwk = undefined;
   _clientKey = undefined;
   return { kid: jwk.kid, created: true };
 }
-// A rotated client key stays published for 24h (matching the SSO signing-key
-// window), then only keys[0] (the current signer) is served. `rotated_at` anchors it.
-const CLIENT_KEY_JWKS_WINDOW_MS = 24 * 60 * 60 * 1000;
-function publishedKeys(f) {
-  const fresh = f.rotated_at && Date.now() - new Date(f.rotated_at).getTime() < CLIENT_KEY_JWKS_WINDOW_MS;
-  return fresh ? f.keys : f.keys.slice(0, 1);
-}
+// Selection always consults current authority; imported CryptoKeys cache by kid.
 async function clientKey() {
-  if (_clientKey) return _clientKey;
-  const { importJWK } = await jose();
-  _privJwk = readKeyFile().keys[0];
-  _clientKey = await importJWK(_privJwk, 'EdDSA');
-  return _clientKey;
+  const {state}=await keyView(true,false),selected=state.current;
+  if(_clientKey?.kid===selected.kid)return _clientKey;
+  const {importJWK}=await jose();
+  const pair={kid:selected.kid,key:await importJWK(selected,'EdDSA')};_clientKey=pair;return pair;
 }
-
-// Rotate the client signing key: fresh Ed25519 becomes keys[0] (signing), the
-// key it replaces stays published for 24h (see publishedKeys) — covers in-flight
-// assertions while the SSO's remote JWKS re-fetches on the unknown kid.
-// In-place write: the file is a single-file bind mount, and a tmp+rename inode
-// swap would detach it (the Caddyfile lesson).
 async function rotateClientKey() {
-  const { importJWK, calculateJwkThumbprint } = await jose();
-  const jwk = crypto.generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' });
-  jwk.kid = await calculateJwkThumbprint(jwk); // RFC 7638 (public members only)
-  jwk.alg = 'EdDSA';
-  const file = { keys: [jwk, readKeyFile().keys[0]], rotated_at: new Date().toISOString() };
-  fs.writeFileSync(keyFile(), JSON.stringify(file, null, 2) + '\n');
-  _privJwk = jwk;
-  _clientKey = await importJWK(jwk, 'EdDSA');
-  return { kid: jwk.kid, rotated_at: file.rotated_at };
+  try { const store=signingStore();if(!store)throw new ClientSigningKeyError();return await store.schedule(); }
+  catch { throw new ClientSigningKeyError(); }
 }
-
-// Current-key summary for the admin Connection card.
-function clientKeyInfo() {
-  const f = readKeyFile();
-  return { kid: f.keys[0].kid || null, rotated_at: f.rotated_at || null, published: publishedKeys(f).length };
+async function clientKeyInfo() {
+  const {state,at}=await keyView(true);return{...keyStatus(state),published:projectJwks(state,at).keys.length};
 }
 
 function hasClientKey() {
@@ -158,10 +161,10 @@ function authorizeUrl({ challenge, state, nonce, extra = {} }) {
 // One definition, three callers (/token, /internal/avatar, /internal/session-activity).
 async function signClientAssertion() {
   const { SignJWT } = await jose();
-  const key = await clientKey(); // also populates _privJwk (for the kid)
+  const {kid,key} = await clientKey();
   const now = Math.floor(Date.now() / 1000);
   return new SignJWT({})
-    .setProtectedHeader({ alg: 'EdDSA', kid: _privJwk.kid })
+    .setProtectedHeader({ alg: 'EdDSA', kid })
     .setIssuer(CLIENT_ID).setSubject(CLIENT_ID).setAudience(ISSUER)
     .setIssuedAt(now).setExpirationTime(now + 60).setJti(crypto.randomUUID())
     .sign(key);
@@ -228,10 +231,10 @@ function endSessionUrl(idTokenHint) {
 // event envelope, using the same registered client key as private_key_jwt.
 async function signEventToken(events) {
   const { SignJWT } = await jose();
-  const key = await clientKey(); // also populates _privJwk (for the kid)
+  const {kid,key} = await clientKey();
   const now = Math.floor(Date.now() / 1000);
   return new SignJWT({ events })
-    .setProtectedHeader({ alg: 'EdDSA', kid: _privJwk.kid, typ: 'events+jwt' })
+    .setProtectedHeader({ alg: 'EdDSA', kid, typ: 'events+jwt' })
     .setIssuer(CLIENT_ID).setSubject(CLIENT_ID).setAudience(ISSUER)
     .setIssuedAt(now).setExpirationTime(now + 120).setJti(crypto.randomUUID())
     .sign(key);
@@ -266,9 +269,9 @@ async function fetchAccessState(sub) {
   sub = protocol.subject(sub);
   const route = '/backchannel/access-state', requestId = crypto.randomUUID();
   const { SignJWT } = await jose();
-  const key = await clientKey(), now = Math.floor(Date.now() / 1000);
+  const {kid,key} = await clientKey(), now = Math.floor(Date.now() / 1000);
   const token = await new SignJWT({ method: 'GET', path: route, action: 'access-state', subjects: [sub] })
-    .setProtectedHeader({ alg: 'EdDSA', kid: _privJwk.kid, typ: 'backchannel-query+jwt' })
+    .setProtectedHeader({ alg: 'EdDSA', kid, typ: 'backchannel-query+jwt' })
     .setIssuer(CLIENT_ID).setSubject(CLIENT_ID).setAudience(ISSUER.replace(/\/$/, '') + route)
     .setIssuedAt(now).setExpirationTime(now + 120).setJti(requestId).sign(key);
   const response = await s2sFetch(INTERNAL + route, { headers: { authorization: 'Bearer ' + token }, signal: AbortSignal.timeout(5000) });
@@ -321,8 +324,8 @@ async function fetchInternalAvatar(file) {
 // pasted copy. The key file holds one private JWK today; a {keys:[...]} file
 // (old + new during a client-key rotation) is accepted. Only public members
 // are emitted.
-function publicJwks() {
-  return { keys: publishedKeys(readKeyFile()).map(({ d, p, q, dp, dq, qi, k, ...pub }) => ({ use: 'sig', ...pub })) };
+async function publicJwks() {
+  const {state,at}=await keyView();return projectJwks(state,at);
 }
 
 module.exports = { loadConfig, beginFlow, authorizeUrl, exchangeCode, verifyIdToken, userinfo, verifyLogoutToken, endSessionUrl, signEventToken, verifyEventToken, verifySsoToken, ssoEventsUrl, ssoActivityUrl, signClientAssertion, publicJwks, fetchAccessState, fetchInternalAvatar, rotateClientKey, clientKeyInfo, ensureClientKey, hasClientKey };
