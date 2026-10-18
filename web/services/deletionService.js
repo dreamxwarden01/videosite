@@ -1,3 +1,4 @@
+const backgroundTasks = require('../lib/backgroundTasks');
 // Deletion queue: durable, retryable R2 object deletion.
 //
 // Replaces the scattered fire-and-forget `cleanR2Prefix.catch(log)` calls
@@ -111,6 +112,7 @@ async function deletePrefixSweep(bucket, prefix) {
     const r2 = getR2Client();
     let continuationToken;
     do {
+        if (backgroundTasks.stopping) return false;
         const listResult = await r2.send(new ListObjectsV2Command({
             Bucket: bucket,
             Prefix: prefix,
@@ -121,6 +123,7 @@ async function deletePrefixSweep(bucket, prefix) {
         if (contents.length > 0) {
             // Chunk into batches of DELETE_BATCH_SIZE; S3 caps at 1000 per call.
             for (let i = 0; i < contents.length; i += DELETE_BATCH_SIZE) {
+                if (backgroundTasks.stopping) return false;
                 const batch = contents.slice(i, i + DELETE_BATCH_SIZE);
                 await r2.send(new DeleteObjectsCommand({
                     Bucket: bucket,
@@ -134,11 +137,13 @@ async function deletePrefixSweep(bucket, prefix) {
 
         continuationToken = listResult.IsTruncated ? listResult.NextContinuationToken : undefined;
     } while (continuationToken);
+    return true;
 }
 
 // --- Reaper ---
 
 let reaperRunning = false;
+let reaperPromise = null;
 let reaperIntervalHandle = null;
 
 /**
@@ -146,7 +151,13 @@ let reaperIntervalHandle = null;
  * guarded by `reaperRunning` so the 60s interval can't trample a still-
  * running drain).
  */
-async function runReaper() {
+function runReaper() {
+    if (reaperPromise) return reaperPromise;
+    reaperPromise = backgroundTasks.run(drainReaper).finally(() => { reaperPromise = null; });
+    return reaperPromise;
+}
+
+async function drainReaper() {
     if (reaperRunning) return;
     reaperRunning = true;
     try {
@@ -157,14 +168,14 @@ async function runReaper() {
 
         // Process rows one at a time until either (a) no more due rows or
         // (b) a row fails all 5 attempts (R2 presumed unhealthy, abort).
-        while (true) {
+        while (!backgroundTasks.stopping) {
             const [rows] = await pool.execute(
                 `SELECT id, mode, target FROM pending_deletes
                  WHERE execute_at <= NOW()
                  ORDER BY execute_at ASC
                  LIMIT 1`
             );
-            if (rows.length === 0) break;
+            if (rows.length === 0 || backgroundTasks.stopping) break;
 
             const row = rows[0];
             const ok = await processRow(bucket, row);
@@ -190,14 +201,16 @@ async function processRow(bucket, row) {
     let lastErr = null;
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS_PER_TURN; attempt++) {
+        if (attempt > 0 && backgroundTasks.stopping) return false;
         if (BACKOFF_MS[attempt] > 0) {
             await new Promise(r => setTimeout(r, BACKOFF_MS[attempt]));
+            if (backgroundTasks.stopping) return false;
         }
         try {
             if (row.mode === 'key') {
                 await deleteOneObject(bucket, row.target);
             } else {
-                await deletePrefixSweep(bucket, row.target);
+                if (!(await deletePrefixSweep(bucket, row.target))) return false;
             }
             await pool.execute('DELETE FROM pending_deletes WHERE id = ?', [row.id]);
             return true;
@@ -208,6 +221,8 @@ async function processRow(bucket, row) {
             // Just retry.
         }
     }
+
+    if (backgroundTasks.stopping) return false;
 
     // All MAX_ATTEMPTS_PER_TURN attempts failed. Persist diagnostic state
     // and signal the reaper to abort the turn.
@@ -239,8 +254,8 @@ function startReaper() {
     if (reaperIntervalHandle) return; // already started
     // Boot drain — fire-and-forget; any error is logged inside runReaper.
     runReaper();
-    reaperIntervalHandle = setInterval(runReaper, REAPER_INTERVAL_MS);
-    if (reaperIntervalHandle.unref) reaperIntervalHandle.unref();
+    reaperIntervalHandle = backgroundTasks.interval(runReaper, REAPER_INTERVAL_MS);
+    reaperIntervalHandle?.unref?.();
 }
 
 function stopReaper() {

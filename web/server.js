@@ -6,8 +6,26 @@ const morgan = require('morgan');
 const compression = require('compression');
 const cookieParser = require('cookie-parser');
 const { cleanExpiredSessions } = require('./config/session');
+const backgroundTasks = require('./lib/backgroundTasks');
 
 const app = express();
+let shuttingDown = false;
+let startupFailed = false;
+
+// Reject requests on existing keep-alive connections before any body/auth work.
+app.use((_req, res, next) => {
+    if (!shuttingDown) return next();
+    res.set({ Connection: 'close', 'Cache-Control': 'no-store' });
+    return res.status(503).json({ error: 'service_stopping' });
+});
+
+function safeError(error) {
+    const codes = ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH',
+        'EADDRINUSE', 'EACCES', 'ENOENT', 'ER_ACCESS_DENIED_ERROR', 'ER_BAD_DB_ERROR'];
+    const names = ['Error', 'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError',
+        'AggregateError', 'InstallStateUnknownError'];
+    return codes.includes(error?.code) ? error.code : names.includes(error?.name) ? error.name : 'Error';
+}
 
 // API responses should never be cached: ETags trigger 304s that complicate
 // debugging (have to strip If-None-Match by hand), and stale JSON in a
@@ -275,7 +293,20 @@ app.use((err, req, res, next) => {
 
 // Start server
 const PORT = parseInt(process.env.PORT || '3000');
-const server = app.listen(PORT, async () => {
+let startup = Promise.resolve();
+let redisConnected = false;
+const server = app.listen(PORT, () => {
+    startup = initialize().catch(error => {
+        startupFailed = true;
+        console.error('Startup failed:', safeError(error));
+        if (!shuttingDown) process.exit(1);
+    });
+});
+server.on('request', (_req, res) => res.once('finish', () => {
+    if (shuttingDown) server.closeIdleConnections();
+}));
+async function initialize() {
+    if (shuttingDown) return;
     console.log(`VideoSite running on http://localhost:${PORT}`);
 
     // Resolve the install latch ONCE, here — every later request reads it from
@@ -287,6 +318,7 @@ const server = app.listen(PORT, async () => {
     try {
         alreadyInstalled = await resolveInstallState();
     } catch (err) {
+        if (shuttingDown) throw err;
         if (!(err instanceof InstallStateUnknownError)) throw err;
         // Configured box, unreachable database. Exit rather than come up: the
         // latch is resolved once and never re-checked, so serving on through
@@ -294,11 +326,12 @@ const server = app.listen(PORT, async () => {
         // install — 503 on every path, the installer surface reopened, and a
         // startup banner naming the wrong problem. Same posture as the Redis
         // check below: a clear startup failure beats a half-working process.
-        console.error('FATAL: could not determine install state —', err.message);
+        console.error('FATAL: could not determine install state —', safeError(err));
         console.error('The database is configured (DB_HOST/DB_NAME are set) but unreachable.');
         console.error('Refusing to start: continuing would look identical to an uninstalled site.');
         process.exit(1);
     }
+    if (shuttingDown) return;
     if (!alreadyInstalled) {
         const token = ensureInstallToken();
         console.log('VideoSite — FIRST-RUN INSTALL');
@@ -316,9 +349,12 @@ const server = app.listen(PORT, async () => {
             const { runMigrations } = require('./db/migrations');
             await runMigrations();
         } catch (err) {
-            console.error('Failed to run migrations:', err.message);
+            if (shuttingDown) throw err;
+            console.error('Failed to run migrations:', safeError(err));
         }
     }
+
+    if (shuttingDown) return;
 
     // Connect Redis (required when installed). Fail loud and exit if unreachable —
     // a half-working cache is harder to debug than a clear startup failure.
@@ -326,6 +362,8 @@ const server = app.listen(PORT, async () => {
         try {
             const redisService = require('./services/redis');
             await redisService.connect();
+            redisConnected = true;
+            if (shuttingDown) return;
 
             // Flush cached role permissions once. A deploy that adds a key to
             // ALL_PERMISSIONS leaves pre-deploy role:perms:* entries missing
@@ -333,9 +371,12 @@ const server = app.listen(PORT, async () => {
             // here forces a clean rebuild from DB.
             try {
                 await require('./services/cache/permissionCache').invalidateAllRoles();
+                if (shuttingDown) return;
             } catch (err) {
-                console.error('Role permission cache flush failed:', err.message);
+                if (shuttingDown) throw err;
+                console.error('Role permission cache flush failed:', safeError(err));
             }
+            if (shuttingDown) return;
 
             // Flush the site:settings Redis blob too. After migration 035 the
             // hmac_secret_key / email_secret_key rows are stored encrypted;
@@ -345,21 +386,27 @@ const server = app.listen(PORT, async () => {
             // immediately rather than after the 30 min TTL.
             try {
                 await require('./services/cache/settingsCache').invalidate();
+                if (shuttingDown) return;
             } catch (err) {
-                console.error('Settings cache flush failed:', err.message);
+                if (shuttingDown) throw err;
+                console.error('Settings cache flush failed:', safeError(err));
             }
+            if (shuttingDown) return;
 
             // Overlay the SSO connection config from site_settings (env fallback),
             // so admin edits in the SSO card take effect for the live OIDC flow.
             try {
                 await require('./lib/oidc').loadConfig();
+                if (shuttingDown) return;
             } catch (err) {
-                console.error('SSO config load failed:', err.message);
+                if (shuttingDown) throw err;
+                console.error('SSO config load failed:', safeError(err));
             }
 
             // Start the periodic write-coalescing flusher (drains dirty:session:user
             // every 15 min into DB). Phase 5 will plug watch + transcode into the
             // same module.
+            if (shuttingDown) return;
             const flusher = require('./services/flusher');
             flusher.start();
 
@@ -367,22 +414,28 @@ const server = app.listen(PORT, async () => {
             // the 60s retry sweep for the outbound event queue.
             require('./services/ssoEvents').start();
         } catch (err) {
-            console.error(`Redis is required and unreachable at ${process.env.REDIS_HOST}:${process.env.REDIS_PORT || 6379}: ${err.message}`);
-            process.exit(1);
+            throw err; // Report a safe error code and retain failure even during stop.
         }
     }
 
+    if (shuttingDown) return;
+
     // Clean expired sessions every hour
-    setInterval(cleanExpiredSessions, 60 * 60 * 1000);
+    backgroundTasks.interval(cleanExpiredSessions, 60 * 60 * 1000);
 
     // Clean expired MFA challenges, bmfa tokens, and TOTP rate limits every hour
     // (registration/password-reset/email-OTP cleanups left with their features —
     // identity lives at the SSO now)
     const { cleanupExpiredChallenges, cleanupExpiredBmfa, cleanupExpiredTotpRateLimits } = require('./services/mfaService');
-    setInterval(() => {
-        cleanupExpiredChallenges();
-        cleanupExpiredBmfa();
-        cleanupExpiredTotpRateLimits();
+    backgroundTasks.interval(async () => {
+        const results = await Promise.allSettled([
+            cleanupExpiredChallenges(),
+            cleanupExpiredBmfa(),
+            cleanupExpiredTotpRateLimits(),
+        ]);
+        for (const result of results) {
+            if (result.status === 'rejected') console.error('MFA cleanup failed:', safeError(result.reason));
+        }
     }, 60 * 60 * 1000);
 
     // Periodic R2 deletion reaper. Drains pending_deletes rows whose
@@ -398,7 +451,7 @@ const server = app.listen(PORT, async () => {
 
     // Clean expired worker sessions every hour
     const { cleanupExpiredWorkerSessions } = require('./services/workerAuthService');
-    setInterval(async () => {
+    backgroundTasks.interval(async () => {
         try {
             const n = await cleanupExpiredWorkerSessions();
             if (n > 0) console.log(`Cleaned ${n} expired worker sessions`);
@@ -413,7 +466,7 @@ const server = app.listen(PORT, async () => {
     // because it's a recovery path — the in-process timer fires at 2 min
     // for actively-tracked jobs and the pending hold is only 10s.
     const { resetStaleTasks, resetExpiredPendingTasks } = require('./services/processingService');
-    setInterval(async () => {
+    backgroundTasks.interval(async () => {
         try {
             await resetExpiredPendingTasks();
             await resetStaleTasks();
@@ -427,14 +480,13 @@ const server = app.listen(PORT, async () => {
         const { resetStaleUploads } = require('./services/uploadSessionService');
         await resetStaleUploads();
     } catch (err) {
-        console.error('Failed to reset stale uploads:', err.message);
+        if (shuttingDown) throw err;
+        console.error('Failed to reset stale uploads:', safeError(err));
     }
-});
+}
 
-// Graceful shutdown — stop accepting requests, drain Redis cleanly, exit.
-// Future phases will add flusher.flushAll() here so coalesced progress lands
-// in DB before exit. Wrap in a deadline so we beat orchestrator SIGKILL grace.
-let shuttingDown = false;
+// One total budget, including HTTP requests, startup, background work and final
+// persistence. The container stop grace must exceed this 25s application budget.
 async function shutdown(signal) {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -444,15 +496,31 @@ async function shutdown(signal) {
         console.error('Shutdown deadline (25s) exceeded, forcing exit.');
         process.exit(1);
     }, 25_000);
-    deadline.unref();
+    let exitCode = 0;
+    // Cancel future producers immediately. Accepted requests/startup are still
+    // allowed to complete before closing their Redis/database dependencies.
+    const backgroundStopped = backgroundTasks.stop();
 
     try {
-        await new Promise((resolve) => server.close(() => resolve()));
+        await new Promise((resolve, reject) => {
+            server.close(error => error ? reject(error) : resolve());
+            server.closeIdleConnections();
+        });
     } catch (err) {
-        console.error('Error closing HTTP server:', err.message);
+        exitCode = 1;
+        console.error('Error closing HTTP server:', safeError(err));
     }
 
-    if (process.env.REDIS_HOST) {
+    await startup;
+    if (startupFailed) exitCode = 1;
+    // Requests may detach durable work while draining. Wait again now admission
+    // and startup are closed; track() permits only already-started promises.
+    const results = [...await backgroundStopped, ...await backgroundTasks.wait()];
+    for (const result of results) {
+        if (result.status === 'rejected') console.error('Background task failed during stop:', safeError(result.reason));
+    }
+
+    if (redisConnected) {
         try {
             // Stop the flusher's interval and drain any remaining dirty sets
             // to DB before disconnecting Redis.
@@ -461,18 +529,26 @@ async function shutdown(signal) {
             const drained = await flusher.flushAll();
             if (drained > 0) console.log(`Flusher: drained ${drained} sessions on shutdown`);
         } catch (err) {
-            console.error('Error during shutdown flush:', err.message);
-        }
-        try {
-            const redisService = require('./services/redis');
-            await redisService.quit();
-        } catch (err) {
-            console.error('Error during Redis quit:', err.message);
+            exitCode = 1;
+            console.error('Error during shutdown flush:', safeError(err));
         }
     }
+    try {
+        // Also closes a partially connected client if startup failed/stopped.
+        await require('./services/redis').quit();
+    } catch (err) {
+        exitCode = 1;
+        console.error('Error during Redis quit:', safeError(err));
+    }
 
+    try {
+        await require('./config/database').closePool();
+    } catch (err) {
+        exitCode = 1;
+        console.error('Error closing database pool:', safeError(err));
+    }
     clearTimeout(deadline);
-    process.exit(0);
+    process.exit(exitCode);
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));

@@ -1,8 +1,11 @@
 const mysql = require('mysql2/promise');
 
 let pool = null;
+let closing = false;
+let closePromise = null;
 
 function getPool() {
+    if (closing) throw new Error('Database is shutting down');
     if (!pool) {
         pool = mysql.createPool({
             host: process.env.DB_HOST || 'localhost',
@@ -68,6 +71,14 @@ function resetPool() {
     }
 }
 
+// Close once without creating a pool or allowing a late task to reopen it.
+function closePool() {
+    if (closePromise) return closePromise;
+    closing = true;
+    closePromise = Promise.resolve().then(() => pool?.end()).finally(() => { pool = null; });
+    return closePromise;
+}
+
 // Convert the canonical 32-char hex user id back to BINARY(16) for query params
 // (WHERE / INSERT). Pass-through for null/undefined and already-Buffer values so
 // callers can wrap defensively without double-converting.
@@ -76,4 +87,4 @@ function idBuf(hexId) {
     return Buffer.from(String(hexId), 'hex');
 }
 
-module.exports = { getPool, createInstallPool, resetPool, idBuf };
+module.exports = { getPool, createInstallPool, resetPool, closePool, idBuf };

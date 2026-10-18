@@ -1,3 +1,4 @@
+const backgroundTasks = require('../lib/backgroundTasks');
 const crypto = require('crypto');
 const { getPool, idBuf } = require('../config/database');
 const { abortMultipartUpload } = require('./uploadService');
@@ -41,7 +42,7 @@ const ATTACHMENT_DELETE_BUFFER_MS = 60 * 1000;
 
 function startStaleUploadTimer(uploadId) {
     clearStaleUploadTimer(uploadId);
-    const timerId = setTimeout(async () => {
+    const timerId = backgroundTasks.timeout(async () => {
         staleTimers.delete(uploadId);
         try {
             await handleStaleUpload(uploadId);
@@ -49,14 +50,14 @@ function startStaleUploadTimer(uploadId) {
             console.error(`Stale upload timer failed for ${uploadId}:`, err.message);
         }
     }, STALE_TIMEOUT_MS);
-    if (timerId.unref) timerId.unref();
+    timerId?.unref?.();
     staleTimers.set(uploadId, timerId);
 }
 
 function clearStaleUploadTimer(uploadId) {
     const existing = staleTimers.get(uploadId);
     if (existing) {
-        clearTimeout(existing);
+        backgroundTasks.cancel(existing);
         staleTimers.delete(uploadId);
     }
 }

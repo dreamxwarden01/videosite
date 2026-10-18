@@ -1,4 +1,5 @@
 'use strict';
+const backgroundTasks = require('../lib/backgroundTasks');
 const { observation, compare, subject, digest, UUID } = require('../lib/ssoRoleProtocol');
 const { transaction } = require('./ssoCatalogStore');
 const columns = `subject_id,authority_epoch,CAST(authority_revision AS CHAR) AS authority_revision,
@@ -147,7 +148,11 @@ function createAuthorityService({ pool, updateUser, invalidateUser, deleteUserSe
     }
     async function sweep() {
         const [pending] = await pool.execute(`SELECT subject_id FROM sso_role_authority WHERE effects_pending=1 LIMIT 100`);
-        for (const row of pending) await completeEffects(row.subject_id).catch(() => {});
+        for (const row of pending) {
+            if (backgroundTasks.stopping) return;
+            await completeEffects(row.subject_id).catch(() => {});
+        }
+        if (backgroundTasks.stopping) return;
         // Reserve routine capacity even when a permanent conflict keeps retrying.
         // Unknown subjects retain a watermark but are not polled indefinitely.
         const [urgent] = await pool.execute(`SELECT subject_id FROM sso_role_authority
@@ -163,7 +168,10 @@ function createAuthorityService({ pool, updateUser, invalidateUser, deleteUserSe
                   AND s.last_sign_in>DATE_SUB(NOW(6),INTERVAL ? DAY))
             ORDER BY a.refresh_after,a.subject_id LIMIT ${100 - urgent.length}`, [maxDays]);
         const rows = [...urgent, ...routine];
-        for (const row of rows) await refresh(row.subject_id).catch(() => {});
+        for (const row of rows) {
+            if (backgroundTasks.stopping) break;
+            await refresh(row.subject_id).catch(() => {});
+        }
     }
     async function sessionState(userId) { return read(dashed(userId)); }
     return { read, apply, processEvent, applyLogin, completeEffects, refresh, sweep, sessionState };
@@ -180,9 +188,10 @@ function service() {
     return singleton;
 }
 let sweeping = null;
-function sweep() { if (!sweeping) sweeping = service().sweep().finally(() => { sweeping = null; }); return sweeping; }
+function sweep() { if (!sweeping) sweeping = backgroundTasks.run(() => service().sweep()).finally(() => { sweeping = null; }); return sweeping; }
 function start() {
+    if (backgroundTasks.stopping) return;
     sweep().catch(() => console.error('sso authority reconciliation unavailable'));
-    const timer = setInterval(() => sweep().catch(() => console.error('sso authority reconciliation unavailable')), 60000); timer.unref?.();
+    const timer = backgroundTasks.interval(() => sweep().catch(() => console.error('sso authority reconciliation unavailable')), 60000); timer?.unref?.();
 }
 module.exports = { createAuthorityService, service, start };

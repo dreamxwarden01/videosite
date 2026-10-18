@@ -108,10 +108,9 @@ async function quit() {
     if (!client) return;
     try {
         await client.quit();
-    } catch (err) {
-        console.error('Redis quit error:', err.message);
+    } finally {
+        client = null;
     }
-    client = null;
 }
 
 function getClient() {

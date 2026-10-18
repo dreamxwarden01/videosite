@@ -1,3 +1,4 @@
+const backgroundTasks = require('../lib/backgroundTasks');
 const crypto = require('crypto');
 const { getPool } = require('../config/database');
 const videoCache = require('./cache/videoCache');
@@ -42,7 +43,7 @@ const STALE_TIMEOUT_MS = 2 * 60 * 1000;
 
 function startStaleTimer(jobId) {
     clearStaleTimer(jobId);
-    const timerId = setTimeout(async () => {
+    const timerId = backgroundTasks.timeout(async () => {
         staleTimers.delete(jobId);
         try {
             await resetSingleStaleTask(jobId);
@@ -51,14 +52,14 @@ function startStaleTimer(jobId) {
         }
     }, STALE_TIMEOUT_MS);
     // Don't let the timer keep the process alive on shutdown
-    if (timerId.unref) timerId.unref();
+    timerId?.unref?.();
     staleTimers.set(jobId, timerId);
 }
 
 function clearStaleTimer(jobId) {
     const existing = staleTimers.get(jobId);
     if (existing) {
-        clearTimeout(existing);
+        backgroundTasks.cancel(existing);
         staleTimers.delete(jobId);
     }
 }
@@ -255,7 +256,7 @@ async function completeTask(jobId, durationSeconds = null, hasPoster = false) {
         );
 
         // Clean up R2 source file (fire-and-forget — don't block completion)
-        cleanupSourceFile(task[0].video_id).catch(err => {
+        backgroundTasks.track(cleanupSourceFile(task[0].video_id)).catch(err => {
             console.warn(`R2 source cleanup failed for video ${task[0].video_id} (job ${jobId}):`, err.message);
         });
     }

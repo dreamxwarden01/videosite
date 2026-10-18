@@ -32,6 +32,7 @@
 const { getClient } = require('./redis');
 const { s2sFetch } = require('./s2sFetch');
 const oidc = require('../lib/oidc');
+const backgroundTasks = require('../lib/backgroundTasks');
 
 // How long a successful report suppresses further ones. Far below any idle
 // window (hours), so the SSO's last_seen is never more than this much stale.
@@ -123,4 +124,7 @@ async function reportActivity(sessionId, ssoSid, lastSeenMs) {
     // error page from the edge — all "unknown". Leave the lock to expire.
 }
 
-module.exports = { reportActivity, WINDOW_SECONDS, INFLIGHT_SECONDS };
+module.exports = {
+    reportActivity: (...args) => backgroundTasks.track(reportActivity(...args)),
+    WINDOW_SECONDS, INFLIGHT_SECONDS,
+};

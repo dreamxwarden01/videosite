@@ -1,3 +1,4 @@
+const backgroundTasks = require('../lib/backgroundTasks');
 // Periodic write-coalescing flusher.
 //
 // High-frequency Redis writes (session last_seen / ip / ua, plus watch and
@@ -254,7 +255,7 @@ let intervalHandle = null;
 
 function start() {
     if (intervalHandle) return;
-    intervalHandle = setInterval(async () => {
+    intervalHandle = backgroundTasks.interval(async () => {
         try {
             const sessionsN = await flushDirtyUserSessions();
             const workerSessionsN = await flushDirtyWorkerSessions();
@@ -268,7 +269,7 @@ function start() {
             console.error('Flusher tick error:', err.message);
         }
     }, FLUSH_INTERVAL_MS);
-    if (intervalHandle.unref) intervalHandle.unref();
+    intervalHandle?.unref?.();
 }
 
 function stop() {
