@@ -11,7 +11,7 @@
 # (the amd64 runner) rather than the target. Go cross-compiles, so an arm64 image
 # costs a different GOARCH and nothing else — without this, BuildKit would run the
 # whole Go toolchain under QEMU for the arm64 leg and take many times longer.
-FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.10-bookworm@sha256:632dff7351799a5a9954a48dc06670ade72ee44e8c351cdc0e5a57af2fea21af AS builder
 WORKDIR /src
 
 COPY go.mod go.sum ./
@@ -81,6 +81,6 @@ COPY --from=builder /out/videosite-worker /usr/local/bin/videosite-worker
 
 # Runs as root by default — /dev/dri/renderD<N> on the host is typically
 # root:render 660, and GPU passthrough (NVIDIA toolkit / DRI device perms)
-# is a docker-compose-side concern. The other session can add a `user:`
-# directive + render/video group GIDs once the server layout is settled.
+# is a container configuration concern. Configure the container user and
+# render/video group GIDs according to the host GPU device permissions.
 CMD ["videosite-worker"]

@@ -8,7 +8,7 @@
 # assets.
 
 # ---------- Stage 1: build the React/Vite client ----------
-FROM node:22-bookworm-slim AS client-builder
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS client-builder
 WORKDIR /build
 COPY client/package.json client/package-lock.json ./
 RUN npm ci
@@ -17,7 +17,7 @@ RUN npm run build
 
 
 # ---------- Stage 2: install production server deps ----------
-FROM node:22-bookworm-slim AS server-deps
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS server-deps
 # argon2 ships glibc prebuilds, so this usually isn't exercised — but keep
 # python3+make+g++ available in case a transitive native dep falls back to
 # source. Lives in this stage only; the runtime image below doesn't inherit.
@@ -30,7 +30,7 @@ RUN npm ci --omit=dev
 
 
 # ---------- Stage 3: runtime ----------
-FROM node:22-bookworm-slim AS runtime
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000

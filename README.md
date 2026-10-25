@@ -55,13 +55,13 @@ Redis sits between the server and DB to absorb hot reads and high-frequency writ
 
 | Component | Technology |
 |-----------|-----------|
-| Backend | Express 5, Node.js |
+| Backend | Express 5, Node.js 22.23.4 in the Docker image |
 | Database | MySQL / MariaDB |
 | Cache | Redis 6+ (ioredis) |
 | Frontend | React 19, Vite 8 |
 | Video Player | Shaka Player (HLS + DASH, CMAF) |
 | Storage | Cloudflare R2 |
-| Worker | Go 1.25, FFmpeg |
+| Worker | Go (Docker build toolchain: 1.26.10), FFmpeg |
 | Identity | OpenID Connect — DreamSSO (login-first; `sub` = `user_id`) |
 | Sessions | Signed cookie sessions (issued after the OIDC callback) |
 | Worker auth | Bearer API keys, Argon2id-hashed at rest |
@@ -69,8 +69,8 @@ Redis sits between the server and DB to absorb hot reads and high-frequency writ
 ## Prerequisites
 
 - A running **[DreamSSO](https://github.com/dreamxwarden01/dreamsso)** instance — the identity provider videosite authenticates against (registered as an OIDC client at first-run)
-- **Node.js** (v20.19+ or v22.12+) and npm
-- **Go** 1.25+
+- **Node.js** 22.23.4+ on 22.x, 24.22.1+ on 24.x, or 26.12.1+ on 26.x, and npm
+- **Go** 1.26.10+ on 1.26.x or 1.27.3+ on 1.27.x when building the worker
 - **MySQL** or **MariaDB**
 - **Redis** 6+ — see [Redis configuration](#redis-configuration) below
 - **FFmpeg** and **FFprobe** (in PATH)
@@ -152,6 +152,14 @@ with `vs_sso_test_`. It does not load application environment files.
 
 The worker uses an interactive first-run setup to configure server connection, API keys, and mTLS.
 
+Use a patched Go toolchain for native and cross-platform builds. `worker/Dockerfile`
+pins Go 1.26.10 on Debian Bookworm for compilation; its runtime image contains the
+static worker binary and FFmpeg, without the Go compiler. Go TLS verification code
+is compiled into that binary, so changing only the runtime CA bundle does not
+replace it. Rebuild and restart existing workers to adopt a toolchain update.
+The `go 1.25.0` directive in `worker/go.mod` is the module language baseline,
+not the recommended security patch level for the compiler.
+
 ```bash
 cd worker
 
@@ -166,7 +174,7 @@ GOOS=windows GOARCH=amd64 go build -o videosite-worker-windows-amd64.exe .
 GOOS=linux GOARCH=amd64 go build -o videosite-worker-linux-amd64 .
 ```
 
-On Linux the FFmpeg build must include `--enable-libmfx` / OneVPL for QSV and `--enable-nvenc --enable-cuda-llvm` for NVENC. The `jellyfin/ffmpeg` packages and `BtbN/FFmpeg-Builds` static binaries both ship with the required codecs. (Dockerizing the Linux worker is a separate follow-up — pick a base image that already bundles a hardware-accelerated FFmpeg, mount `config.json` / `capabilities.json` as volumes, pass `--gpus all` for NVENC and `--device /dev/dri` for QSV.)
+On Linux the FFmpeg build must include `--enable-libmfx` / OneVPL for QSV and `--enable-nvenc --enable-cuda-llvm` for NVENC. The `jellyfin/ffmpeg` packages and `BtbN/FFmpeg-Builds` static binaries both ship with the required codecs. The Linux Docker build uses `worker/Dockerfile` with `worker/` as its build context; its Debian runtime installs `jellyfin-ffmpeg7`. Persist the worker configuration under `/data` and pass the required GPU devices through the container configuration.
 
 On first run, the worker will:
 1. Prompt for the server hostname and API key credentials
