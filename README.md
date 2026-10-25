@@ -152,13 +152,10 @@ with `vs_sso_test_`. It does not load application environment files.
 
 The worker uses an interactive first-run setup to configure server connection, API keys, and mTLS.
 
-Use a patched Go toolchain for native and cross-platform builds. `worker/Dockerfile`
-pins Go 1.26.10 on Debian Bookworm for compilation; its runtime image contains the
-static worker binary and FFmpeg, without the Go compiler. Go TLS verification code
-is compiled into that binary, so changing only the runtime CA bundle does not
-replace it. Rebuild and restart existing workers to adopt a toolchain update.
-The `go 1.25.0` directive in `worker/go.mod` is the module language baseline,
-not the recommended security patch level for the compiler.
+`worker/Dockerfile` uses Go 1.26.10 on Debian Bookworm to build the static
+worker binary; the runtime image includes the worker and FFmpeg. The
+`go 1.25.0` directive in `worker/go.mod` specifies the module language baseline.
+For native builds, use one of the Go versions listed in Prerequisites.
 
 ```bash
 cd worker
