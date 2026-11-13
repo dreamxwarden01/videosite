@@ -188,6 +188,9 @@ type dashTmplContext struct {
 // decides the exact segment count and durations per rendition, and the
 // HLS playlist is the only record that reflects those decisions.
 func WriteDASHManifest(outputDir string, variants []Variant, audioName string, audioBitrateKbps int, audioSampleRateHz int, durationSec float64, hasAudio bool) error {
+	if err := validateVariantCodecs(variants); err != nil {
+		return err
+	}
 	reps := make([]dashVideoRep, 0, len(variants))
 	// Track the shortest per-rendition timeline (in ticks) so
 	// mediaPresentationDuration can be clamped down if any rendition
@@ -197,9 +200,6 @@ func WriteDASHManifest(outputDir string, variants []Variant, audioName string, a
 	shortestTicks := -1
 	for _, v := range variants {
 		codecs := v.Codecs
-		if codecs == "" {
-			codecs = "avc1.640028"
-		}
 		frameRate := v.FrameRate
 		if frameRate <= 0 {
 			// Fallback — a missing frameRate attribute is legal but makes

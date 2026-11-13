@@ -51,6 +51,9 @@ type Variant struct {
 // makes Safari reject the master with "invalid HLS" and Shaka log
 // CONTENT_UNSUPPORTED_BY_BROWSER. All three must be gated together.
 func WriteMasterPlaylist(outputDir string, variants []Variant, audioName string, audioBitrateKbps int, hasAudio bool) error {
+	if err := validateVariantCodecs(variants); err != nil {
+		return err
+	}
 	var sb strings.Builder
 	sb.WriteString("#EXTM3U\n")
 	sb.WriteString("#EXT-X-VERSION:7\n")
@@ -69,9 +72,6 @@ func WriteMasterPlaylist(outputDir string, variants []Variant, audioName string,
 			bandwidth += audioBitrateKbps * 1000
 		}
 		codecs := v.Codecs
-		if codecs == "" {
-			codecs = "avc1.640028" // conservative fallback (High@4.0)
-		}
 		if hasAudio {
 			sb.WriteString(fmt.Sprintf(
 				"#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,CODECS=\"%s,mp4a.40.2\",AUDIO=\"audio\"\n",
@@ -86,6 +86,15 @@ func WriteMasterPlaylist(outputDir string, variants []Variant, audioName string,
 
 	masterPath := filepath.Join(outputDir, "master.m3u8")
 	return os.WriteFile(masterPath, []byte(sb.String()), 0644)
+}
+
+func validateVariantCodecs(variants []Variant) error {
+	for _, v := range variants {
+		if strings.TrimSpace(v.Codecs) == "" {
+			return fmt.Errorf("missing codec metadata for variant %q", v.Name)
+		}
+	}
+	return nil
 }
 
 // RewritePlaylistHMAC rewrites a per-profile playlist to include HMAC token variables.

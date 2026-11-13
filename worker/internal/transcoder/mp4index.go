@@ -469,39 +469,46 @@ func readEditList(f io.ReadSeeker, start, end int64, movieTimescale uint32) (med
 // box type and the payload range (header already skipped). Returning true from
 // fn stops the walk.
 func walkBoxes(f io.ReadSeeker, start, end int64, fn func(typ string, payloadStart, payloadEnd int64) (bool, error)) error {
+	if start < 0 || end < start {
+		return fmt.Errorf("%w: invalid box range", ErrNoMP4Index)
+	}
 	pos := start
-	for pos+8 <= end {
-		header := make([]byte, 8)
-		if _, err := readAt(f, pos, header); err != nil {
-			return nil // truncated tail — treat as end of container
+	for pos < end {
+		if end-pos < 8 {
+			return fmt.Errorf("%w: truncated box header", ErrNoMP4Index)
 		}
-		size := int64(binary.BigEndian.Uint32(header[0:4]))
+		var header [8]byte
+		if _, err := readAt(f, pos, header[:]); err != nil {
+			return fmt.Errorf("%w: read box header: %v", ErrNoMP4Index, err)
+		}
+		size := uint64(binary.BigEndian.Uint32(header[0:4]))
 		typ := string(header[4:8])
-		payload := pos + 8
-
-		switch {
-		case size == 1:
-			ext := make([]byte, 8)
-			if _, err := readAt(f, pos+8, ext); err != nil {
-				return nil
+		headerSize := int64(8)
+		if size == 1 {
+			if end-pos < 16 {
+				return fmt.Errorf("%w: truncated extended box header", ErrNoMP4Index)
 			}
-			size = int64(binary.BigEndian.Uint64(ext))
-			payload = pos + 16
-		case size == 0:
-			size = end - pos // extends to the end of the container
+			var ext [8]byte
+			if _, err := readAt(f, pos+8, ext[:]); err != nil {
+				return fmt.Errorf("%w: read extended box header: %v", ErrNoMP4Index, err)
+			}
+			size = binary.BigEndian.Uint64(ext[:])
+			headerSize = 16
+		} else if size == 0 {
+			size = uint64(end - pos)
 		}
-		if size < 8 || pos+size > end {
-			return nil // malformed or truncated — stop rather than misread
+		if size < uint64(headerSize) || size > uint64(end-pos) {
+			return fmt.Errorf("%w: invalid box size", ErrNoMP4Index)
 		}
-
-		stop, err := fn(typ, payload, pos+size)
+		boxEnd := pos + int64(size) // size is bounded by end-pos above.
+		stop, err := fn(typ, pos+headerSize, boxEnd)
 		if err != nil {
 			return err
 		}
 		if stop {
 			return nil
 		}
-		pos += size
+		pos = boxEnd
 	}
 	return nil
 }

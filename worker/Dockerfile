@@ -18,6 +18,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . ./
+# Run metadata and segmentation regressions on the builder's native platform.
+RUN CGO_ENABLED=0 go test ./...
 # CGO_ENABLED=0 → fully static binary, no glibc dep. trimpath + -s -w strip
 # absolute paths and DWARF debug info; the linux-amd64 binary lands ~13 MB.
 # Linux-only build tags (*_linux.go) select the right platform files; the

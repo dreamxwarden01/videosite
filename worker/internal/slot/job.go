@@ -854,10 +854,10 @@ func (j *Job) extractPoster(duration float64) {
 
 // GOP decision constants. All in seconds.
 const (
-	gopToleranceSec   = 0.1 // ±100ms inter-IDR variance is still "constant"
-	maxRemuxGOPSec    = 2.0 // source GOPs > this force re-encode at defaultGOPSec
-	defaultGOPSec     = 2.0 // when not adopting source cadence
-	defaultTargetSeg  = 6.0 // fallback target if profiles don't supply one
+	gopToleranceSec  = 0.1 // ±100ms inter-IDR variance is still "constant"
+	maxRemuxGOPSec   = 2.0 // source GOPs > this force re-encode at defaultGOPSec
+	defaultGOPSec    = 2.0 // when not adopting source cadence
+	defaultTargetSeg = 6.0 // fallback target if profiles don't supply one
 )
 
 // computeGOPDecision scans the source's GOP cadence and picks the per-job
@@ -1181,6 +1181,7 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 //   - Returns (failed tasks, anyForbidden, first non-cancellation error).
 //   - Concurrency is bounded by a DynamicGate reading config.Get().ConcurrentUploads
 //     live, so a reload mid-upload applies to subsequent acquires.
+//
 // totalFiles is kept in the signature for symmetry with the call sites
 // (and in case we ever surface "X of N files" again), but it is no longer
 // used to compute the progress percentage — bytesUploaded / totalBytes is
@@ -1558,8 +1559,8 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 	defer egCancel()
 
 	var (
-		wg      sync.WaitGroup
-		errMu   sync.Mutex
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
 		firstErr error
 	)
 	recordErr := func(err error) {
@@ -1748,15 +1749,13 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 	}
 
 	// Build variants by probing each init.mp4 for its RFC 6381 codec string.
-	// A missing string is non-fatal — WriteMasterPlaylist / WriteDASHManifest
-	// fall back to a conservative default so the manifests still validate.
+	// Never publish a guessed profile or level if an init segment is invalid.
 	variants := make([]transcoder.Variant, 0, len(profiles))
 	for _, p := range profiles {
 		initPath := filepath.Join(j.outputDir, "video", p.Name, "init.mp4")
 		codecStr, err := transcoder.ProbeCodecString(initPath)
 		if err != nil {
-			j.UI.Logf("[%s] WARN: could not probe codec for %s: %v", j.JobID, p.Name, err)
-			codecStr = ""
+			return fmt.Errorf("read codec metadata for %s: %w", p.Name, err)
 		}
 		outFps := int(probe.FrameRate + 0.5)
 		if outFps <= 0 {
