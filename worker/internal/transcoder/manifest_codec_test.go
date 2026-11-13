@@ -20,8 +20,13 @@ func TestManifestsPreserveActualCodecMetadata(t *testing.T) {
 		if err := os.MkdirAll(path, 0755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(path, "playlist.m3u8"), []byte("#EXTM3U\n#EXTINF:6.000000,\nsegment_0000.m4s\n#EXTINF:2.000000,\nsegment_0001.m4s\n#EXT-X-ENDLIST\n"), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(path, "playlist.m3u8"), []byte("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.000000,\nsegment_0000.m4s\n#EXTINF:2.000000,\nsegment_0001.m4s\n#EXT-X-ENDLIST\n"), 0644); err != nil {
 			t.Fatal(err)
+		}
+		for _, name := range []string{"segment_0000.m4s", "segment_0001.m4s"} {
+			if err := os.WriteFile(filepath.Join(path, name), []byte{1, 2, 3}, 0644); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	if err := WriteMasterPlaylist(dir, variants, "aac_192k", 192, true); err != nil {

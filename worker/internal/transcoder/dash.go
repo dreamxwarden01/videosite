@@ -1,7 +1,6 @@
 package transcoder
 
 import (
-	"bufio"
 	"fmt"
 	"math"
 	"os"
@@ -25,7 +24,7 @@ import (
 // = 7.8078078...s, the ms-form rounds to 7808 and accumulates ~0.2ms/seg
 // of declared-vs-actual drift; on multi-hour content that's visible as
 // scrub-bar jitter. timescale=1000000 reduces the per-segment drift to
-// <1 μs, eliminating accumulation under any realistic content length.
+// <1 μs. Uniform addressing additionally checks cumulative boundary error.
 //
 // Why per-Representation duration: fps-cap downsampling makes the encoder
 // snap forced IDRs to the output's frame grid, which differs from the
@@ -61,16 +60,18 @@ import (
 // EXT-X-DEFINE mechanism — so this template is deliberately free of any
 // HMAC substitution. The audio AdaptationSet is gated by {{if .HasAudio}}
 // so no-audio sources emit a video-only MPD.
+const dashMinBufferTimeSeconds = 2.0
+
 const dashMPDTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
      type="static"
      mediaPresentationDuration="{{.DurationISO}}"
-     minBufferTime="PT2S"
+     minBufferTime="{{.MinBufferTimeISO}}"
      profiles="urn:mpeg:dash:profile:isoff-live:2011">
   <Period>
     <AdaptationSet contentType="video" mimeType="video/mp4" startWithSAP="1">
 {{- range .VideoReps}}
-      <Representation id="{{.Name}}" codecs="{{.Codecs}}" bandwidth="{{.Bandwidth}}" width="{{.Width}}" height="{{.Height}}" frameRate="{{.FrameRate}}">
+      <Representation id="{{.Name}}" codecs="{{.Codecs}}" bandwidth="{{.Bandwidth}}" width="{{.Width}}" height="{{.Height}}"{{if .FrameRate}} frameRate="{{.FrameRate}}"{{end}}>
 {{- if .Uniform}}
         <SegmentTemplate media="video/{{.Name}}/segment_$Number%04d$.m4s" initialization="video/{{.Name}}/init.mp4" timescale="{{$.Timescale}}" startNumber="0" duration="{{.SegmentDurationTicks}}"/>
 {{- else}}
@@ -128,10 +129,10 @@ type dashSegmentRun struct {
 type dashVideoRep struct {
 	Name                 string
 	Codecs               string
-	Bandwidth            int // bits/sec
+	Bandwidth            int64 // bits/sec
 	Width                int
 	Height               int
-	FrameRate            int
+	FrameRate            string
 	Uniform              bool
 	SegmentDurationTicks int
 	Timeline             []dashSegmentRun
@@ -142,14 +143,15 @@ type dashVideoRep struct {
 // HasAudio gates the entire audio AdaptationSet. When false, every audio*
 // field is unused.
 type dashTmplContext struct {
-	DurationISO string
-	Timescale   int // shared timescale for both AdaptationSets
+	DurationISO      string
+	MinBufferTimeISO string
+	Timescale        int // shared timescale for both AdaptationSets
 
 	VideoReps []dashVideoRep
 
 	HasAudio                  bool
 	AudioName                 string
-	AudioBandwidth            int
+	AudioBandwidth            int64
 	AudioSampleRate           int // Hz, as encoded — NOT a fixed constant
 	AudioUniform              bool
 	AudioSegmentDurationTicks int              // when AudioUniform
@@ -161,7 +163,8 @@ type dashTmplContext struct {
 // variants describe the video renditions (shared with WriteMasterPlaylistCMAF
 // so Codecs/FrameRate/Bandwidth stay consistent across the HLS and DASH
 // manifests). audioName is the audio folder name under audio/ (e.g.
-// "aac_192k"); audioBitrateKbps feeds the DASH bandwidth attribute.
+// "aac_192k"). Encoder target arguments are retained for callers; bandwidth
+// declarations are measured from the completed local media artifacts.
 //
 // audioSampleRateHz must be the rate that was actually encoded, not a
 // site-wide constant. The audio encoder keeps whatever rate the source had
@@ -191,7 +194,12 @@ func WriteDASHManifest(outputDir string, variants []Variant, audioName string, a
 	if err := validateVariantCodecs(variants); err != nil {
 		return err
 	}
+	sourceTicks, err := durationSecondsTicks(durationSec)
+	if err != nil {
+		return fmt.Errorf("source duration: %w", err)
+	}
 	reps := make([]dashVideoRep, 0, len(variants))
+	videoDurations := make([][]int, 0, len(variants))
 	// Track the shortest per-rendition timeline (in ticks) so
 	// mediaPresentationDuration can be clamped down if any rendition
 	// undershoots the ffprobe duration — a player that sees a longer
@@ -200,12 +208,17 @@ func WriteDASHManifest(outputDir string, variants []Variant, audioName string, a
 	shortestTicks := -1
 	for _, v := range variants {
 		codecs := v.Codecs
-		frameRate := v.FrameRate
-		if frameRate <= 0 {
-			// Fallback — a missing frameRate attribute is legal but makes
-			// some parsers unhappy. Default to 30 which is the plan's
-			// site-wide profile default.
-			frameRate = 30
+		frameRate := ""
+		if v.FrameRateNum > 0 && v.FrameRateDen > 0 {
+			n, d := v.FrameRateNum, v.FrameRateDen
+			g := gcd(n, d)
+			n, d = n/g, d/g
+			frameRate = strconv.Itoa(n)
+			if d != 1 {
+				frameRate += "/" + strconv.Itoa(d)
+			}
+		} else if v.FrameRate > 0 {
+			frameRate = strconv.Itoa(v.FrameRate)
 		}
 
 		playlistPath := filepath.Join(outputDir, "video", v.Name, "playlist.m3u8")
@@ -224,25 +237,25 @@ func WriteDASHManifest(outputDir string, variants []Variant, audioName string, a
 			shortestTicks = sumTicks
 		}
 
-		modalTicks, uniform := segmentDurationIfUniform(durs)
+		rates, err := MeasureRenditionBandwidth(playlistPath, dashMinBufferTimeSeconds)
+		if err != nil {
+			return fmt.Errorf("measure DASH video bandwidth %s: %w", v.Name, err)
+		}
 		rep := dashVideoRep{
 			Name:      v.Name,
 			Codecs:    codecs,
-			Bandwidth: v.VideoBitrateKbps * 1000,
+			Bandwidth: rates.DASH,
 			Width:     v.Width,
 			Height:    v.Height,
 			FrameRate: frameRate,
-			Uniform:   uniform,
-		}
-		if uniform {
-			rep.SegmentDurationTicks = modalTicks
-		} else {
-			rep.Timeline = compressToSegmentRuns(durs)
 		}
 		reps = append(reps, rep)
+		videoDurations = append(videoDurations, durs)
 	}
 
+	var audioBandwidth int64
 	var audioRuns []dashSegmentRun
+	var audioDurations []int
 	audioUniform := false
 	audioSegTicks := 0
 	if hasAudio {
@@ -261,10 +274,12 @@ func WriteDASHManifest(outputDir string, variants []Variant, audioName string, a
 		if shortestTicks < 0 || sumTicks < shortestTicks {
 			shortestTicks = sumTicks
 		}
-		audioSegTicks, audioUniform = segmentDurationIfUniform(durs)
-		if !audioUniform {
-			audioRuns = compressToSegmentRuns(durs)
+		rates, err := MeasureRenditionBandwidth(audioPlaylist, dashMinBufferTimeSeconds)
+		if err != nil {
+			return fmt.Errorf("measure DASH audio bandwidth: %w", err)
 		}
+		audioBandwidth = rates.DASH
+		audioDurations = durs
 	}
 
 	// mediaPresentationDuration should not exceed what every rendition can
@@ -272,21 +287,33 @@ func WriteDASHManifest(outputDir string, variants []Variant, audioName string, a
 	// longer than what FFmpeg's HLS muxer emits (e.g. a dangling partial
 	// frame the muxer drops); using the shortest timeline here keeps the
 	// header honest.
-	effectiveDurationSec := durationSec
-	if shortestTicks > 0 {
-		timelineSec := float64(shortestTicks) / float64(dashTimescale)
-		if timelineSec < effectiveDurationSec {
-			effectiveDurationSec = timelineSec
+	effectiveTicks := sourceTicks
+	if shortestTicks > 0 && shortestTicks < effectiveTicks {
+		effectiveTicks = shortestTicks
+	}
+	// The final period cap participates in simple addressing: ceil(period / d)
+	// must name exactly the artifacts we have, including the trailing partial.
+	for i := range reps {
+		reps[i].SegmentDurationTicks, reps[i].Uniform = compactDurationForPeriod(videoDurations[i], effectiveTicks)
+		if !reps[i].Uniform {
+			reps[i].Timeline = compressToSegmentRuns(videoDurations[i])
+		}
+	}
+	if hasAudio {
+		audioSegTicks, audioUniform = compactDurationForPeriod(audioDurations, effectiveTicks)
+		if !audioUniform {
+			audioRuns = compressToSegmentRuns(audioDurations)
 		}
 	}
 
 	ctx := dashTmplContext{
-		DurationISO:               formatISODuration(effectiveDurationSec),
+		DurationISO:               formatISODurationTicks(effectiveTicks),
+		MinBufferTimeISO:          formatISODuration(dashMinBufferTimeSeconds),
 		Timescale:                 dashTimescale,
 		VideoReps:                 reps,
 		HasAudio:                  hasAudio,
 		AudioName:                 audioName,
-		AudioBandwidth:            audioBitrateKbps * 1000,
+		AudioBandwidth:            audioBandwidth,
 		AudioSampleRate:           audioSampleRateHz,
 		AudioUniform:              audioUniform,
 		AudioSegmentDurationTicks: audioSegTicks,
@@ -307,113 +334,117 @@ func WriteDASHManifest(outputDir string, variants []Variant, audioName string, a
 	return os.WriteFile(mpdPath, []byte(sb.String()), 0644)
 }
 
-// dashUniformToleranceTicks is the per-segment deviation budget for
-// declaring a Representation "uniform-duration", in dashTimescale ticks
-// (μs). 100ms = 100000 μs covers fractional-fps drift (23.976fps + 2s GOP →
-// real 2.002s) and ffmpeg muxer rounding while staying well under typical
-// ABR switching granularity. Matches gopToleranceSec in slot/job.go.
-const dashUniformToleranceTicks = 100 * 1000 // 100ms in μs
+// dashUniformToleranceTicks bounds both individual duration deviation and every
+// absolute cumulative boundary error, in microseconds. The final partial is
+// excluded from fitting and checked against the effective period separately.
+const dashUniformToleranceTicks = 100 * 1000
 
-// segmentDurationIfUniform returns (modalTicks, true) when the given
-// segment-duration sequence (excluding the trailing partial) is uniform
-// within ±dashUniformToleranceTicks of its modal value, else (0, false).
-// Used for both video and audio renditions — each gets its own uniformity
-// verdict so fps-cap and AAC quirks can be handled independently.
 func segmentDurationIfUniform(durs []int) (int, bool) {
-	// Need at least 2 segments to make sense of "ignore the last" — for
-	// very short videos with a single segment, skip uniformity and take
-	// the SegmentTimeline path so the manifest is honest about what the
-	// muxer emitted.
 	if len(durs) < 2 {
 		return 0, false
 	}
-	return uniformModalTicks(durs[:len(durs)-1])
+	return uniformDurationTicks(durs[:len(durs)-1])
 }
 
-// uniformModalTicks is the uniformity test itself, over a sequence that
-// contains no trailing partial segment.
-//
-// Split out from segmentDurationIfUniform so the remux eligibility check can
-// ask the same question of a *predicted* playlist before any encoding happens
-// (see RemuxSegmentsWouldBeUniform). The prediction and the manifest decision
-// have to agree, and the only way to guarantee that is to run the same code.
-func uniformModalTicks(durs []int) (int, bool) {
-	if len(durs) == 0 {
+// uniformDurationTicks tries the deterministic mode first, then the rounded
+// measured mean. Both must pass the same local and whole-file prefix checks.
+// Remux simulation uses this same test for predicted full segments.
+func uniformDurationTicks(durs []int) (int, bool) {
+	modal, mean, ok := uniformDurationCandidates(durs)
+	if !ok {
 		return 0, false
 	}
-	// Modal value. AAC quantization typically produces one of two adjacent
-	// durations; fps-cap renditions produce a single value with ±1 frame
-	// jitter. Either way, mode + tolerance handles it.
-	counts := make(map[int]int)
-	for _, d := range durs {
-		counts[d]++
-	}
-	var modal, modalCount int
-	for d, c := range counts {
-		if c > modalCount {
-			modal = d
-			modalCount = c
+	for _, candidate := range []int{modal, mean} {
+		if durationCandidateFits(durs, candidate) {
+			return candidate, true
 		}
 	}
-	for _, d := range durs {
-		dev := d - modal
-		if dev < 0 {
-			dev = -dev
-		}
-		if dev > dashUniformToleranceTicks {
-			return 0, false
-		}
-	}
-	return modal, true
+	return 0, false
 }
 
-// readPlaylistSegmentDurationsTicks parses an HLS playlist and returns each
-// segment's duration in dashTimescale ticks (μs), in playlist order. Only
-// #EXTINF lines are considered; comments and segment URIs are ignored. The
-// HMAC-rewritten playlists produced by RewritePlaylistHMAC preserve
-// #EXTINF lines verbatim, so this works regardless of whether the caller
-// has already rewritten the playlist for edge verification.
-//
-// EXTINF format (RFC 8216 §4.4.4.1): "#EXTINF:<duration>,[<title>]". The
-// fractional-second form (e.g. "#EXTINF:9.9833,") is the one FFmpeg emits
-// for CMAF segments; we scale to dashTimescale (μs) and round.
-func readPlaylistSegmentDurationsTicks(playlistPath string) ([]int, error) {
-	f, err := os.Open(playlistPath)
-	if err != nil {
-		return nil, err
+// compactDurationForPeriod checks each candidate against the complete final
+// period before selecting it. A locally valid mode may imply the wrong final
+// segment count while the measured mean still permits compact addressing.
+func compactDurationForPeriod(durs []int, effective int) (int, bool) {
+	if len(durs) < 2 {
+		return 0, false
 	}
-	defer f.Close()
+	full := durs[:len(durs)-1]
+	modal, mean, ok := uniformDurationCandidates(full)
+	if !ok {
+		return 0, false
+	}
+	for _, candidate := range []int{modal, mean} {
+		if durationCandidateFits(full, candidate) && compactDurationCovers(durs, candidate, effective) {
+			return candidate, true
+		}
+	}
+	return 0, false
+}
 
-	var durs []int
-	scanner := bufio.NewScanner(f)
-	// Allow long lines: segment URIs can be long after HMAC rewrite adds
-	// "?verify={$verify}" tokens, and some muxers emit long titles.
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(line, "#EXTINF:") {
-			continue
-		}
-		rest := strings.TrimPrefix(line, "#EXTINF:")
-		// Strip any trailing title after the comma.
-		if comma := strings.IndexByte(rest, ','); comma >= 0 {
-			rest = rest[:comma]
-		}
-		rest = strings.TrimSpace(rest)
-		secs, parseErr := strconv.ParseFloat(rest, 64)
-		if parseErr != nil || secs <= 0 {
-			continue
-		}
-		durs = append(durs, int(math.Round(secs*float64(dashTimescale))))
+func uniformDurationCandidates(durs []int) (modal, mean int, ok bool) {
+	if len(durs) == 0 {
+		return 0, 0, false
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
+	counts := make(map[int]int)
+	total, modalCount := 0, 0
+	for _, d := range durs {
+		if d <= 0 || d > int(^uint(0)>>1)-total {
+			return 0, 0, false
+		}
+		total += d
+		counts[d]++
+		if counts[d] > modalCount || (counts[d] == modalCount && d < modal) {
+			modal, modalCount = d, counts[d]
+		}
 	}
-	return durs, nil
+	mean = total / len(durs)
+	if total%len(durs) >= len(durs)/2+len(durs)%2 {
+		mean++
+	}
+	return modal, mean, true
+}
+
+func durationCandidateFits(durs []int, nominal int) bool {
+	if nominal <= 0 {
+		return false
+	}
+	prefixError := 0
+	for _, d := range durs {
+		deviation := d - nominal
+		if d <= 0 || deviation < -dashUniformToleranceTicks || deviation > dashUniformToleranceTicks {
+			return false
+		}
+		// This stays in [-200ms, 200ms], avoiding large sums/products.
+		prefixError += deviation
+		if prefixError < -dashUniformToleranceTicks || prefixError > dashUniformToleranceTicks {
+			return false
+		}
+	}
+	return true
+}
+
+func compactDurationCovers(durs []int, nominal, effective int) bool {
+	if nominal <= 0 || effective <= 0 || len(durs) == 0 {
+		return false
+	}
+	// ceil without effective+nominal-1 overflow.
+	if (effective-1)/nominal+1 != len(durs) {
+		return false
+	}
+	total := 0
+	for _, d := range durs {
+		if d <= 0 || d > int(^uint(0)>>1)-total {
+			return false
+		}
+		total += d
+	}
+	// The actual final artifact must cover the end of the advertised period.
+	return effective <= total && effective > total-durs[len(durs)-1]
 }
 
 // compressToSegmentRuns run-length-encodes a sequence of per-segment
-// durations (in ms) into DASH <S> runs. Consecutive equal durations
+// durations (in μs) into DASH <S> runs. Consecutive equal durations
 // collapse into a single run with Repeat = count - 1 (matching the DASH
 // @r semantics). A trailing partial segment — common because FFmpeg
 // rarely lands the source duration exactly on a segment boundary — ends
@@ -434,22 +465,24 @@ func compressToSegmentRuns(durs []int) []dashSegmentRun {
 	return runs
 }
 
-// formatISODuration formats a duration in seconds as an ISO-8601 PT spec
-// suitable for the MPD mediaPresentationDuration attribute. Handles hours,
-// minutes, and fractional seconds; strips zero components (e.g. 63 seconds
-// → "PT1M3S", not "PT0H1M3S").
-//
-// Seconds carry one decimal place of precision — ffprobe reports durations
-// like 123.45; rounding down to an integer loses the tail segment's true
-// length on short clips.
-func formatISODuration(sec float64) string {
-	if sec < 0 {
-		sec = 0
+// durationSecondsTicks converts the source ffprobe value once. The bound is
+// exclusive because float64(maxInt) rounds upward on 64-bit platforms.
+func durationSecondsTicks(sec float64) (int, error) {
+	if math.IsNaN(sec) || math.IsInf(sec, 0) || sec <= 0 {
+		return 0, fmt.Errorf("duration must be finite and positive")
 	}
-	hours := int(sec) / 3600
-	mins := (int(sec) % 3600) / 60
-	secs := sec - float64(hours*3600) - float64(mins*60)
+	rounded := math.Round(sec * dashTimescale)
+	if rounded < 1 || rounded >= float64(int(^uint(0)>>1)) {
+		return 0, fmt.Errorf("duration overflows or rounds below one microsecond")
+	}
+	return int(rounded), nil
+}
 
+// formatISODurationTicks uses exact integer carries and at most six decimal
+// places, so rounding can never produce an invalid seconds component of 60.
+func formatISODurationTicks(ticks int) string {
+	whole, fraction := ticks/dashTimescale, ticks%dashTimescale
+	hours, mins, secs := whole/3600, (whole%3600)/60, whole%60
 	var sb strings.Builder
 	sb.WriteString("PT")
 	if hours > 0 {
@@ -458,11 +491,22 @@ func formatISODuration(sec float64) string {
 	if mins > 0 {
 		fmt.Fprintf(&sb, "%dM", mins)
 	}
-	if secs > 0 || (hours == 0 && mins == 0) {
-		// Trim trailing zero on fractional part ("PT12S" not "PT12.0S").
-		formatted := fmt.Sprintf("%.1f", secs)
-		formatted = strings.TrimSuffix(formatted, ".0")
-		fmt.Fprintf(&sb, "%sS", formatted)
+	if secs > 0 || fraction > 0 || (hours == 0 && mins == 0) {
+		fmt.Fprintf(&sb, "%d", secs)
+		if fraction > 0 {
+			fmt.Fprintf(&sb, ".%s", strings.TrimRight(fmt.Sprintf("%06d", fraction), "0"))
+		}
+		sb.WriteString("S")
 	}
 	return sb.String()
+}
+
+// formatISODuration remains a seconds-based convenience for callers/tests;
+// the writer uses the already-converted integer value directly.
+func formatISODuration(sec float64) string {
+	ticks, err := durationSecondsTicks(sec)
+	if err != nil {
+		return "PT0S"
+	}
+	return formatISODurationTicks(ticks)
 }

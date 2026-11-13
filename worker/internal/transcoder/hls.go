@@ -2,6 +2,7 @@ package transcoder
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,15 +15,17 @@ import (
 // Codecs is the full RFC 6381 string pulled from the produced init.mp4 via
 // ProbeCodecString — e.g. "avc1.64001F". The master.m3u8 CODECS attribute
 // and DASH Representation codecs attribute both require this exact form
-// (NOT just "avc1"). FrameRate is the integer fps (after any -r cap) used
-// to emit the DASH frameRate attribute; HLS doesn't need it.
+// (NOT just "avc1"). Rational frame-rate fields describe the output grid.
+// VideoBitrateKbps remains an encoding target; manifests measure their rates.
 type Variant struct {
 	Name             string
 	Width            int
 	Height           int
 	VideoBitrateKbps int
 	Codecs           string
-	FrameRate        int
+	FrameRate        int // legacy whole-number input; rational fields take precedence
+	FrameRateNum     int
+	FrameRateDen     int
 }
 
 // WriteMasterPlaylist writes a master.m3u8 that references one fMP4 video
@@ -54,6 +57,14 @@ func WriteMasterPlaylist(outputDir string, variants []Variant, audioName string,
 	if err := validateVariantCodecs(variants); err != nil {
 		return err
 	}
+	var audioRates RenditionBandwidth
+	if hasAudio {
+		var err error
+		audioRates, err = MeasureRenditionBandwidth(filepath.Join(outputDir, "audio", audioName, "playlist.m3u8"), dashMinBufferTimeSeconds)
+		if err != nil {
+			return fmt.Errorf("measure audio bandwidth: %w", err)
+		}
+	}
 	var sb strings.Builder
 	sb.WriteString("#EXTM3U\n")
 	sb.WriteString("#EXT-X-VERSION:7\n")
@@ -67,19 +78,23 @@ func WriteMasterPlaylist(outputDir string, variants []Variant, audioName string,
 	}
 
 	for _, v := range variants {
-		bandwidth := v.VideoBitrateKbps * 1000
-		if hasAudio {
-			bandwidth += audioBitrateKbps * 1000
+		rates, err := MeasureRenditionBandwidth(filepath.Join(outputDir, "video", v.Name, "playlist.m3u8"), dashMinBufferTimeSeconds)
+		if err != nil {
+			return fmt.Errorf("measure video bandwidth %s: %w", v.Name, err)
 		}
+		if rates.Peak > math.MaxInt64-audioRates.Peak || rates.Average > math.MaxInt64-audioRates.Average {
+			return fmt.Errorf("combined bandwidth overflow")
+		}
+		bandwidth, average := rates.Peak+audioRates.Peak, rates.Average+audioRates.Average
 		codecs := v.Codecs
 		if hasAudio {
 			sb.WriteString(fmt.Sprintf(
-				"#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,CODECS=\"%s,mp4a.40.2\",AUDIO=\"audio\"\n",
-				bandwidth, v.Width, v.Height, codecs))
+				"#EXT-X-STREAM-INF:BANDWIDTH=%d,AVERAGE-BANDWIDTH=%d,RESOLUTION=%dx%d,CODECS=\"%s,mp4a.40.2\",AUDIO=\"audio\"\n",
+				bandwidth, average, v.Width, v.Height, codecs))
 		} else {
 			sb.WriteString(fmt.Sprintf(
-				"#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,CODECS=\"%s\"\n",
-				bandwidth, v.Width, v.Height, codecs))
+				"#EXT-X-STREAM-INF:BANDWIDTH=%d,AVERAGE-BANDWIDTH=%d,RESOLUTION=%dx%d,CODECS=\"%s\"\n",
+				bandwidth, average, v.Width, v.Height, codecs))
 		}
 		sb.WriteString(fmt.Sprintf("video/%s/playlist.m3u8?verify={$verify}\n", v.Name))
 	}
@@ -113,6 +128,34 @@ func RewritePlaylistHMAC(playlistPath string) error {
 	}
 
 	lines := strings.Split(string(data), "\n")
+	// FFmpeg can round a sub-half-second file's TARGETDURATION down to zero.
+	// Our finalized playlists require a positive target; normalize this edge case only
+	// when every EXTINF is positive and also rounds to zero. Keep the shared
+	// parser strict so arbitrary zero targets are never accepted by our pipeline.
+	normalizeZeroTarget := false
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "#EXT-X-TARGETDURATION:0" {
+			normalizeZeroTarget = true
+		}
+	}
+	if normalizeZeroTarget {
+		segments := 0
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if !strings.HasPrefix(trimmed, "#EXTINF:") {
+				continue
+			}
+			value, _, hasSeparator := strings.Cut(strings.TrimPrefix(trimmed, "#EXTINF:"), ",")
+			ticks, durationErr := decimalDurationTicks(value)
+			if !hasSeparator || durationErr != nil || ticks >= 500000 {
+				return fmt.Errorf("cannot normalize zero HLS target with invalid or non-short segment duration")
+			}
+			segments++
+		}
+		if segments == 0 {
+			return fmt.Errorf("cannot normalize zero HLS target without media durations")
+		}
+	}
 	var sb strings.Builder
 
 	wroteVersion := false
@@ -120,6 +163,9 @@ func RewritePlaylistHMAC(playlistPath string) error {
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
+		if normalizeZeroTarget && trimmed == "#EXT-X-TARGETDURATION:0" {
+			line, trimmed = "#EXT-X-TARGETDURATION:1", "#EXT-X-TARGETDURATION:1"
+		}
 
 		if strings.HasPrefix(trimmed, "#EXT-X-VERSION:") {
 			sb.WriteString("#EXT-X-VERSION:11\n")

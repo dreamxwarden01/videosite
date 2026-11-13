@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -60,6 +61,7 @@ type GOPScan struct {
 	Source    string
 	MeanSec   float64
 	MaxDevSec float64
+	Cadence   CadenceInfo
 }
 
 // Count returns the number of IDRs found.
@@ -82,21 +84,29 @@ func (g *GOPScan) Count() int { return len(g.IDRTimes) }
 //
 // Sources with fewer than 3 IDRs are "indeterminate" — the caller falls back
 // to the default GOP. Same for the ffprobe-missing case.
-func ScanGOP(filePath string) (*GOPScan, error) {
+func ScanGOP(filePath string, hints ...*ProbeResult) (*GOPScan, error) {
+	var hint *ProbeResult
+	if len(hints) > 0 {
+		hint = hints[0]
+	}
 	scan := &GOPScan{Source: "moov"}
 
-	times, err := ReadKeyframeTimes(filePath)
+	times, cadence, err := readSourceIndex(filePath, hint)
 	if err != nil {
 		if !errors.Is(err, ErrNoMP4Index) {
 			return nil, err
 		}
 		scan.Source = "ffprobe"
-		times, err = probeKeyframeTimesFFprobe(filePath)
+		if hint == nil {
+			hint, _ = Probe(filePath)
+		}
+		times, cadence, err = probeSourceTimelineFFprobe(filePath, hint)
 		if err != nil {
 			return nil, err
 		}
 	}
 	scan.IDRTimes = times
+	scan.Cadence = cadence
 
 	if len(times) < 3 {
 		return scan, nil
@@ -138,50 +148,88 @@ func ScanGOP(filePath string) (*GOPScan, error) {
 // cost a couple of hundred MB per job, multiplied by the number of concurrent
 // slots. Only the keyframe timestamps are retained.
 func probeKeyframeTimesFFprobe(filePath string) ([]float64, error) {
+	times, _, err := probeSourceTimelineFFprobe(filePath, nil)
+	return times, err
+}
+
+func probeSourceTimelineFFprobe(filePath string, hints *ProbeResult) ([]float64, CadenceInfo, error) {
 	cmd := exec.Command(ffprobePath,
 		"-v", "error",
 		"-select_streams", "v:0",
-		"-show_entries", "packet=pts_time,flags",
+		"-show_entries", "packet=pts,pts_time,flags",
 		"-of", "csv=p=0",
 		filePath,
 	)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("ffprobe gop scan pipe: %w", err)
+		return nil, CadenceInfo{}, fmt.Errorf("ffprobe gop scan pipe: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
 		if isExecMissing(err) {
-			return nil, fmt.Errorf("%w: %v", ErrFFmpegMissing, err)
+			return nil, CadenceInfo{}, fmt.Errorf("%w: %v", ErrFFmpegMissing, err)
 		}
-		return nil, fmt.Errorf("ffprobe gop scan: %w", err)
+		return nil, CadenceInfo{}, fmt.Errorf("ffprobe gop scan: %w", err)
 	}
 
-	// Each line is "<pts_time>,<flags>"; ffprobe marks keyframes by setting the
+	// Each line is "<pts>,<pts_time>,<flags>"; ffprobe marks keyframes by setting the
 	// first character of flags to 'K' (e.g. "K_" or "K__"). A packet with no
 	// timestamp prints "N/A" and is skipped.
 	var idrTimes []float64
+	scale, tick := int64(1_000_000), int64(1)
+	if hints != nil && hints.TimeBaseNum > 0 && hints.TimeBaseDen > 0 {
+		scale = int64(hints.TimeBaseDen)
+		tick = int64(hints.TimeBaseNum)
+	}
+	var pts []int64
+	var count int64
+	incomplete := false
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
-		line := sc.Text()
-		comma := strings.IndexByte(line, ',')
-		if comma < 0 || comma+1 >= len(line) || line[comma+1] != 'K' {
+		columns := strings.Split(sc.Text(), ",")
+		if len(columns) < 3 {
+			incomplete = true
 			continue
 		}
-		t, ferr := strconv.ParseFloat(line[:comma], 64)
-		if ferr != nil {
+		count++
+		t, ferr := strconv.ParseFloat(columns[1], 64)
+		if ferr != nil || math.IsNaN(t) || math.IsInf(t, 0) {
+			incomplete = true
 			continue
 		}
-		idrTimes = append(idrTimes, t)
+		if len(columns[2]) > 0 && columns[2][0] == 'K' {
+			idrTimes = append(idrTimes, t)
+		}
+		if count <= cadenceFrameCap {
+			// Integer pts preserves the container clock exactly; pts_time is
+			// decimal text rounded by ffprobe and cannot prove nanosecond grids.
+			if hints == nil || hints.TimeBaseNum <= 0 || hints.TimeBaseDen <= 0 {
+				incomplete = true
+				continue
+			}
+			raw, e := strconv.ParseInt(columns[0], 10, 64)
+			if e != nil || raw > math.MaxInt64/tick || raw < math.MinInt64/tick {
+				incomplete = true
+				continue
+			}
+			pts = append(pts, raw*tick)
+		}
 	}
 	scanErr := sc.Err()
+	if scanErr != nil {
+		_ = cmd.Process.Kill()
+	}
 	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("ffprobe gop scan: %w", err)
+		return nil, CadenceInfo{}, fmt.Errorf("ffprobe gop scan: %w", err)
 	}
 	if scanErr != nil {
-		return nil, fmt.Errorf("read ffprobe packets: %w", scanErr)
+		return nil, CadenceInfo{}, fmt.Errorf("read ffprobe packets: %w", scanErr)
 	}
-	return idrTimes, nil
+	cadence := unknownCadence(count, "missing packet timestamps or cadence memory cap exceeded")
+	if !incomplete && count <= cadenceFrameCap {
+		cadence = cadenceFromPTSWithTick(pts, scale, tick, hints)
+	}
+	return idrTimes, cadence, nil
 }
 
 // ProbeResult holds the results from probing a source file.
@@ -214,6 +262,10 @@ type ProbeResult struct {
 	FrameRate        float64
 	FrameRateNum     int
 	FrameRateDen     int
+	AvgFrameRateNum  int
+	AvgFrameRateDen  int
+	TimeBaseNum      int
+	TimeBaseDen      int
 	AudioCodec       string
 	AudioStreamCount int
 	AudioSampleRate  int
@@ -226,13 +278,15 @@ type ffprobeOutput struct {
 }
 
 type ffprobeStream struct {
-	CodecType  string `json:"codec_type"`
-	CodecName  string `json:"codec_name"`
-	Width      int    `json:"width"`
-	Height     int    `json:"height"`
-	RFrameRate string `json:"r_frame_rate"`
-	BitRate    string `json:"bit_rate"`
-	SampleRate string `json:"sample_rate"`
+	CodecType    string `json:"codec_type"`
+	CodecName    string `json:"codec_name"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
+	RFrameRate   string `json:"r_frame_rate"`
+	AvgFrameRate string `json:"avg_frame_rate"`
+	TimeBase     string `json:"time_base"`
+	BitRate      string `json:"bit_rate"`
+	SampleRate   string `json:"sample_rate"`
 }
 
 type ffprobeFormat struct {
@@ -266,8 +320,10 @@ func Probe(filePath string) (*ProbeResult, error) {
 	result := &ProbeResult{}
 
 	// Find video stream
+	videoSeen := false
 	for _, s := range probe.Streams {
-		if s.CodecType == "video" {
+		if s.CodecType == "video" && !videoSeen {
+			videoSeen = true
 			result.Width = s.Width
 			result.Height = s.Height
 			result.Codec = s.CodecName
@@ -278,6 +334,22 @@ func Probe(filePath string) (*ProbeResult, error) {
 				}
 			}
 
+			if parts := strings.Split(s.TimeBase, "/"); len(parts) == 2 {
+				num, en := strconv.Atoi(parts[0])
+				den, ed := strconv.Atoi(parts[1])
+				if en == nil && ed == nil && num > 0 && den > 0 {
+					result.TimeBaseNum = num
+					result.TimeBaseDen = den
+				}
+			}
+			if parts := strings.Split(s.AvgFrameRate, "/"); len(parts) == 2 {
+				num, en := strconv.Atoi(parts[0])
+				den, ed := strconv.Atoi(parts[1])
+				if en == nil && ed == nil && num > 0 && den > 0 {
+					result.AvgFrameRateNum = num
+					result.AvgFrameRateDen = den
+				}
+			}
 			// Parse frame rate (e.g., "30/1" or "24000/1001"). Both the exact
 			// rational and its float quotient are kept: the rational drives
 			// frame-count segment maths, the float stays for the existing

@@ -157,6 +157,7 @@ type Job struct {
 	// committing to one (see transcoder.RemuxSegmentsWouldBeUniform). Empty
 	// when the scan failed or the container had no usable index.
 	sourceIDRTimes []float64
+	sourceCadence  transcoder.CadenceInfo
 
 	// Current status for the batched /tasks/status reporter. Read by
 	// Manager.SnapshotStatuses every 2 s; written by the job goroutine on
@@ -801,9 +802,9 @@ func (j *Job) probe() (*transcoder.ProbeResult, error) {
 	j.duration = probe.DurationSeconds
 	j.UI.Logf("[%s] probe complete: %dx%d, %.1fs, %s", j.JobID, probe.Width, probe.Height, probe.DurationSeconds, probe.Codec)
 
-	// GOP probe — sample first 60s of packets to decide whether to adopt the
-	// source's cadence for the whole job. Failure here is non-fatal: we just
-	// fall back to the default 2s GOP / 6s segments.
+	// Full-file keyframe and presentation-grid scan. Failure is non-fatal: we
+	// disable remux and normalize the output to an explicit CFR grid, using the
+	// default 2s GOP and configured segment target.
 	j.computeGOPDecision(sourcePath, probe)
 
 	// Stage is picked up by the next /tasks/status tick (worker status loop
@@ -882,9 +883,18 @@ func (j *Job) computeGOPDecision(sourcePath string, probe *transcoder.ProbeResul
 	}
 	j.targetSegSec = targetSeg
 
-	scan, err := transcoder.ScanGOP(sourcePath)
+	scan, err := transcoder.ScanGOP(sourcePath, probe)
 	if err != nil {
 		j.UI.Logf("[%s] gop scan failed: %v — falling back to default %.1fs GOP", j.JobID, err, defaultGOPSec)
+	}
+	j.sourceCadence = transcoder.CadenceInfo{Kind: transcoder.CadenceUnknown}
+	if err == nil && scan != nil {
+		j.sourceCadence = scan.Cadence
+		if scan.Cadence.Kind == transcoder.CadenceCFR && probe != nil {
+			probe.FrameRateNum, probe.FrameRateDen = scan.Cadence.RateNum, scan.Cadence.RateDen
+			probe.FrameRate = float64(probe.FrameRateNum) / float64(probe.FrameRateDen)
+		}
+		j.UI.Logf("[%s] source cadence: %s (%s)", j.JobID, scan.Cadence.Kind, scan.Cadence.Reason)
 	}
 
 	// Stash the scanned mean whenever it produced a usable number, even if we
@@ -897,7 +907,11 @@ func (j *Job) computeGOPDecision(sourcePath string, probe *transcoder.ProbeResul
 		j.sourceIDRTimes = scan.IDRTimes
 	}
 
-	if scanUsable && scan.MaxDevSec <= gopToleranceSec && scan.MeanSec <= maxRemuxGOPSec {
+	remuxCeiling := maxRemuxGOPSec
+	if probe != nil && probe.FrameRate > 0 {
+		remuxCeiling = math.Max(remuxCeiling, 1/probe.FrameRate)
+	}
+	if j.sourceCadence.Kind == transcoder.CadenceCFR && scanUsable && scan.MaxDevSec <= gopToleranceSec && scan.MeanSec <= remuxCeiling {
 		// Snap the adopted cadence onto the source frame grid so it names a
 		// whole number of frames rather than a measured average.
 		snapped := scan.MeanSec
@@ -924,6 +938,8 @@ func (j *Job) computeGOPDecision(sourcePath string, probe *transcoder.ProbeResul
 		switch {
 		case err != nil:
 			reason = "scan failed"
+		case j.sourceCadence.Kind != transcoder.CadenceCFR:
+			reason = "source cadence requires explicit CFR normalization"
 		case scan == nil || scan.Count() < 3:
 			n := 0
 			if scan != nil {
@@ -932,8 +948,8 @@ func (j *Job) computeGOPDecision(sourcePath string, probe *transcoder.ProbeResul
 			reason = fmt.Sprintf("only %d IDRs in file", n)
 		case scan.MaxDevSec > gopToleranceSec:
 			reason = fmt.Sprintf("max dev %.4fs > %.3fs", scan.MaxDevSec, gopToleranceSec)
-		case scan.MeanSec > maxRemuxGOPSec:
-			reason = fmt.Sprintf("gop %.3fs > %.1fs ceiling", scan.MeanSec, maxRemuxGOPSec)
+		case scan.MeanSec > remuxCeiling:
+			reason = fmt.Sprintf("gop %.3fs > %.3fs ceiling", scan.MeanSec, remuxCeiling)
 		}
 		j.UI.Logf("[%s] gop: %s — default %.1fs GOP, target seg=%.3fs", j.JobID, reason, j.chosenGOPSec, j.chosenSegSec)
 	}
@@ -1414,15 +1430,6 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 	// Runs BEFORE ApplyBitrateCaps so the cap logic sees post-flip CanRemux
 	// and reads the final per-profile GOPSeconds (used by the GOP-tightening
 	// bitrate boost inside ApplyBitrateCaps).
-	fpsNum, fpsDen := probe.FrameRateNum, probe.FrameRateDen
-	if fpsNum <= 0 || fpsDen <= 0 {
-		// NewSegmentPlan falls back to a nominal rate, but the encoder will
-		// still run at whatever the source actually is, so the frame counts
-		// below describe a grid the output may not land on. Worth saying out
-		// loud rather than silently producing a playlist that fails the DASH
-		// uniformity check later.
-		j.UI.Logf("[%s] WARN: source frame rate is not a usable rational (r_frame_rate unparsed); segment plan falls back to a nominal rate and segments may not be uniform", j.JobID)
-	}
 	for i := range profiles {
 		p := &profiles[i]
 
@@ -1432,12 +1439,8 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 			p.CanRemux = false
 		}
 
-		// Effective output rate for this rendition: an fps cap replaces the
-		// source rational with an exact integer rate.
-		planNum, planDen := fpsNum, fpsDen
-		if p.FpsLimit > 0 && probe.FrameRate > 0 && float64(p.FpsLimit) < probe.FrameRate {
-			planNum, planDen = p.FpsLimit, 1
-		}
+		planNum, planDen, rateReason := transcoder.OutputFrameRate(probe, j.sourceCadence, p.FpsLimit)
+		j.UI.Logf("[%s] output cadence %s: %d/%d fps (%s)", j.JobID, p.Name, planNum, planDen, rateReason)
 
 		p.Plan = transcoder.NewSegmentPlan(planNum, planDen, targetGOP, j.targetSegSec)
 		p.GOPSeconds = p.Plan.GOPSeconds()
@@ -1757,20 +1760,14 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 		if err != nil {
 			return fmt.Errorf("read codec metadata for %s: %w", p.Name, err)
 		}
-		outFps := int(probe.FrameRate + 0.5)
-		if outFps <= 0 {
-			outFps = 30
-		}
-		if p.FpsLimit > 0 && outFps > p.FpsLimit {
-			outFps = p.FpsLimit
-		}
 		variants = append(variants, transcoder.Variant{
 			Name:             p.Name,
 			Width:            p.OutW,
 			Height:           p.OutH,
 			VideoBitrateKbps: p.VideoBitrateKbps,
 			Codecs:           codecStr,
-			FrameRate:        outFps,
+			FrameRateNum:     p.Plan.FPSNum,
+			FrameRateDen:     p.Plan.FPSDen,
 		})
 	}
 

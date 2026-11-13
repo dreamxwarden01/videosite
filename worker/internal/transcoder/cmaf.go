@@ -25,11 +25,8 @@ import (
 // Output is never encrypted (we rely on the R2 private-bucket + HMAC edge
 // validation posture, not at-rest encryption — see plan doc).
 //
-// When srcFrameRate > profile.FpsLimit we append `-r fps_limit` to force
-// frame-rate downsampling; the flag is a global output option that works on
-// every HW path (NVENC/QSV/VT) and software. plan is built on the resulting
-// effective rate, so its frame counts describe the frames the encoder actually
-// emits rather than the source's.
+// Every re-encode explicitly realizes the plan's rational CFR grid. This keeps
+// frame-count GOPs meaningful for VFR inputs as well as profile FPS caps.
 //
 // progressCh and errCh behave exactly like RunFFmpegWithProgress — callers
 // drain progressCh until close and then read a single error from errCh.
@@ -51,12 +48,6 @@ func TranscodeVideo(ctx context.Context, sourcePath, outputDir string, profile c
 
 	// Encoder-specific options.
 	args = applyEncoderOpts(args, encoder, ffmpegEncoder, profile)
-
-	// FPS downsample: only applies when the source exceeds the profile's cap.
-	// Placed before the output file so ffmpeg treats it as output-level.
-	if profile.FpsLimit > 0 && srcFrameRate > float64(profile.FpsLimit)+0.01 {
-		args = insertBeforeLast(args, "-r", fmt.Sprintf("%d", profile.FpsLimit))
-	}
 
 	return RunFFmpegWithProgress(ctx, duration, logFile, args...)
 }
@@ -346,6 +337,8 @@ func buildBaseVideoArgs(hwArgs []string, sourcePath, outputDir string, profile c
 		"-bufsize", fmt.Sprintf("%dk", profile.VideoBitrateKbps*2),
 		"-vf", vfFilter,
 		"-profile:v", profile.Profile,
+		"-r", fmt.Sprintf("%d/%d", plan.FPSNum, plan.FPSDen),
+		"-fps_mode", "cfr",
 		"-an",
 		// -g and -force_key_frames state the same frame count two ways: -g is
 		// the encoder's own GOP ceiling, the expression pins each IDR to a

@@ -17,13 +17,10 @@ import (
 // early. That is a single odd segment in an otherwise uniform playlist, which
 // is enough to fail the DASH uniformity check and force SegmentTimeline.
 //
-// A frame count removes the possibility rather than shrinking it. The GOP and
-// the segment are both integer frame counts, the segment is a whole number of
-// GOPs, and the resulting duration is converted back to time through the exact
-// frame-rate rational — so `hls_time` is precisely what the encoder emits and
-// the threshold tracks the media forever. This is the same choice Cloudflare
-// Stream makes (4.000 s at 15 fps = 60 frames, published as
-// `duration="60000" timescale="15000"`).
+// Whole-frame GOPs keep segment cuts on the output frame grid. Common rates
+// also permit an exact microsecond hls_time. For unusual rationals, exact
+// alignment may require excessively long segments; the plan bounds that
+// adjustment and finalization validates the measured output timeline instead.
 //
 // The plan is resolved once per rendition and then passed to FFmpeg verbatim.
 // Nothing downstream re-derives it from seconds.
@@ -50,8 +47,8 @@ const defaultPlanFPSNum, defaultPlanFPSDen = 30, 1
 // makes its duration a whole number of microseconds — see
 // microsecondAlignedGOPs. In every frame rate this project has encountered the
 // natural choice is already aligned and no adjustment happens; the step exists
-// so an unusual rate degrades into a slightly longer segment instead of into
-// accumulating drift.
+// so an unusual rate degrades into a bounded adjustment. If exact alignment would make segments too long,
+// retain the frame grid and verify the measured output timeline instead.
 func NewSegmentPlan(fpsNum, fpsDen int, targetGOPSec, targetSegSec float64) SegmentPlan {
 	if fpsNum <= 0 || fpsDen <= 0 {
 		fpsNum, fpsDen = defaultPlanFPSNum, defaultPlanFPSDen
@@ -69,7 +66,13 @@ func NewSegmentPlan(fpsNum, fpsDen int, targetGOPSec, targetSegSec float64) Segm
 		gops = 1
 	}
 	if step := microsecondAlignedGOPs(fpsNum, fpsDen, gopFrames); step > 1 {
-		gops = ((gops + step - 1) / step) * step
+		aligned := ((gops + step - 1) / step) * step
+		// Rare rational rates can require thousands of GOPs for exact µs.
+		// Keep the normal segment scale; final manifest timing is measured.
+		budget := math.Max(targetSegSec*2, targetSegSec+gopSec)
+		if float64(aligned)*gopSec <= budget {
+			gops = aligned
+		}
 	}
 
 	return SegmentPlan{
@@ -152,7 +155,7 @@ func (p SegmentPlan) SegmentMicros() (int64, bool) {
 
 // HLSTimeArg formats the -hls_time value for a transcode.
 //
-// No safety margin is subtracted. The encoder is pinned to this exact frame
+// No arbitrary safety margin is subtracted. The encoder is pinned to this frame
 // grid by -force_key_frames on the frame number, so the threshold and the
 // keyframe coincide on every segment and `>=` is satisfied at the intended
 // cut. Subtracting a margin here is what previously produced one short segment
@@ -183,7 +186,7 @@ func (p SegmentPlan) String() string {
 	us, exact := p.SegmentMicros()
 	note := ""
 	if !exact {
-		note = " (segment not µs-exact; hls_time rounded)"
+		note = " (segment not µs-exact; hls_time floored, output timeline checked)"
 	}
 	return fmt.Sprintf("%d/%d fps, GOP %d frames (%.6fs), segment %d frames (%.6fs = %dµs)%s",
 		p.FPSNum, p.FPSDen, p.GOPFrames, p.GOPSeconds(), p.SegmentFrames, p.SegmentSeconds(), us, note)
@@ -296,9 +299,9 @@ func RemuxSegmentsWouldBeUniform(idrTimes []float64, plan SegmentPlan) (bool, st
 	for i, s := range segs {
 		ticks[i] = int(math.Round(s * float64(dashTimescale)))
 	}
-	modal, ok := uniformModalTicks(ticks)
+	nominal, ok := uniformDurationTicks(ticks)
 	if ok {
-		return true, fmt.Sprintf("%d segments, all within tolerance of %.6fs", len(segs), float64(modal)/float64(dashTimescale))
+		return true, fmt.Sprintf("%d predicted full segments, durations and cumulative boundaries within 100ms of %.6fs", len(segs), float64(nominal)/float64(dashTimescale))
 	}
 
 	// Report the worst offender — it is the number an operator wants when
@@ -314,7 +317,7 @@ func RemuxSegmentsWouldBeUniform(idrTimes []float64, plan SegmentPlan) (bool, st
 			worstIdx, worstDev = i, dev
 		}
 	}
-	return false, fmt.Sprintf("%d segments, worst deviation %.0fms at segment %d (modal %.6fs)",
+	return false, fmt.Sprintf("%d predicted full segments fail duration/cumulative-boundary tolerance; worst local deviation %.0fms at segment %d (modal %.6fs)",
 		len(segs), float64(worstDev)/1000, worstIdx, float64(best)/float64(dashTimescale))
 }
 
@@ -324,7 +327,7 @@ func modalOf(v []int) (int, int) {
 	var modal, modalCount int
 	for _, x := range v {
 		counts[x]++
-		if counts[x] > modalCount {
+		if counts[x] > modalCount || (counts[x] == modalCount && x < modal) {
 			modal, modalCount = x, counts[x]
 		}
 	}
