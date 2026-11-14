@@ -21,8 +21,8 @@ import (
 // ProbeCodecString takes for the video codec string, and it cannot drift from
 // what shipped.
 //
-// Returns 0 with an error if the init segment has no audio stream or an
-// unparseable rate; the caller falls back to the rate it asked for.
+// Returns an error if the init has no parseable audio rate. Finalization must
+// verify the artifact matches the selected native rate.
 func ProbeAudioSampleRate(mp4Path string) (int, error) {
 	cmd := exec.Command(ffprobePath,
 		"-v", "error",
@@ -245,8 +245,8 @@ func probeSourceTimelineFFprobe(filePath string, hints *ProbeResult) ([]float64,
 //
 // AudioSampleRate is the rate of the first audio stream. The audio encoder
 // keeps this rate rather than resampling to a fixed one — see TranscodeAudio.
-// 0 means unknown (no audio, or an unparseable rate), and the caller falls
-// back to defaultAudioSampleRate.
+// 0 means unknown; audio processing rejects unknown or unsupported native rates
+// rather than silently resampling.
 //
 // FrameRateNum/FrameRateDen carry the source frame rate as the exact rational
 // ffprobe reported (e.g. 24000/1001), not just its float quotient. Segment and
@@ -269,6 +269,10 @@ type ProbeResult struct {
 	AudioCodec       string
 	AudioStreamCount int
 	AudioSampleRate  int
+	// AudioBitrateBps sums positive audio-stream bit_rate metadata only.
+	// Zero means absent/incomplete/invalid metadata and requires measurement
+	// before using a source bitrate ceiling. It never uses format.bit_rate.
+	AudioBitrateBps int64
 }
 
 // ffprobeOutput holds the raw ffprobe JSON output.
@@ -311,7 +315,10 @@ func Probe(filePath string) (*ProbeResult, error) {
 		}
 		return nil, fmt.Errorf("ffprobe failed: %w", err)
 	}
+	return parseProbeOutput(out, filePath)
+}
 
+func parseProbeOutput(out []byte, filePath string) (*ProbeResult, error) {
 	var probe ffprobeOutput
 	if err := json.Unmarshal(out, &probe); err != nil {
 		return nil, fmt.Errorf("parse ffprobe output: %w", err)
@@ -321,6 +328,7 @@ func Probe(filePath string) (*ProbeResult, error) {
 
 	// Find video stream
 	videoSeen := false
+	audioBitrateKnown := true
 	for _, s := range probe.Streams {
 		if s.CodecType == "video" && !videoSeen {
 			videoSeen = true
@@ -373,6 +381,12 @@ func Probe(filePath string) (*ProbeResult, error) {
 			}
 		}
 		if s.CodecType == "audio" {
+			br, err := strconv.ParseInt(s.BitRate, 10, 64)
+			if err != nil || br <= 0 || br > math.MaxInt64-result.AudioBitrateBps {
+				audioBitrateKnown = false
+			} else if audioBitrateKnown {
+				result.AudioBitrateBps += br
+			}
 			// AudioCodec must reflect the first audio stream (track 0) — it's
 			// the one we -map in the single-track path and it's the first
 			// input into amix in the multi-track path. Previous code
@@ -386,6 +400,9 @@ func Probe(filePath string) (*ProbeResult, error) {
 			}
 			result.AudioStreamCount++
 		}
+	}
+	if !audioBitrateKnown {
+		result.AudioBitrateBps = 0
 	}
 
 	// Parse duration

@@ -38,8 +38,9 @@ type Variant struct {
 //	video/<variant.Name>/playlist.m3u8     ← referenced via STREAM-INF
 //	audio/<audioName>/playlist.m3u8        ← referenced via EXT-X-MEDIA  (hasAudio only)
 //
-// #EXT-X-VERSION:7 is required for fMP4 segments. QUERYPARAM="verify" is the
-// Safari-native mechanism for passing the HMAC token (set by the watch page)
+// #EXT-X-VERSION:11 is required for EXT-X-DEFINE with QUERYPARAM in both
+// master and media playlists. QUERYPARAM="verify" is the Safari-native
+// mechanism for passing the HMAC token (set by the watch page)
 // into every child playlist request; the per-profile playlists already have
 // {$verify} substitution in segment + EXT-X-MAP URIs (see RewritePlaylistHMAC).
 //
@@ -67,7 +68,7 @@ func WriteMasterPlaylist(outputDir string, variants []Variant, audioName string,
 	}
 	var sb strings.Builder
 	sb.WriteString("#EXTM3U\n")
-	sb.WriteString("#EXT-X-VERSION:7\n")
+	sb.WriteString("#EXT-X-VERSION:11\n")
 	sb.WriteString("#EXT-X-DEFINE:QUERYPARAM=\"verify\"\n")
 
 	if hasAudio {

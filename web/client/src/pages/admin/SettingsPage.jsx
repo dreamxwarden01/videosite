@@ -659,7 +659,7 @@ export default function SettingsPage() {
 
       <label className="vs-label" style={{ marginBottom: 4 }}>Audio settings</label>
       <div className="vs-field" style={{ maxWidth: 280, marginTop: 8 }}>
-        <label className="vs-label">Audio bitrate (kbps)</label>
+        <label className="vs-label">Audio bitrate limit (kbps)</label>
         <input type="text" inputMode="numeric" className={'vs-input' + (transcodingTouched.audioBitrateKbps && transcodingErrors.audioBitrateKbps ? ' err' : '')}
           value={audioBitrateKbps} onChange={e => setAudioBitrateKbps(e.target.value.replace(/\D/g, ''))} onKeyDown={handleDigitOnly} onPaste={handleDigitPaste(setAudioBitrateKbps)}
           onBlur={() => {
@@ -668,7 +668,7 @@ export default function SettingsPage() {
             setTranscodingErrors(e => { const n = { ...e }; if (!Number.isInteger(v) || v < 128 || v > 320) n.audioBitrateKbps = 'Must be an integer between 128 and 320'; else delete n.audioBitrateKbps; return n; });
           }} />
         <p className={'vs-hint' + (transcodingTouched.audioBitrateKbps && transcodingErrors.audioBitrateKbps ? ' err' : '')}>
-          {transcodingTouched.audioBitrateKbps && transcodingErrors.audioBitrateKbps ? transcodingErrors.audioBitrateKbps : 'Site-wide AAC-LC bitrate for all transcoded videos. Range 128–320.'}
+          {transcodingTouched.audioBitrateKbps && transcodingErrors.audioBitrateKbps ? transcodingErrors.audioBitrateKbps : 'Maximum AAC-LC encoding target. Actual bitrate varies with content and may be lower. Range 128–320.'}
         </p>
       </div>
       <p className="vs-set-sub" style={{ margin: '10px 0 8px' }}>Audio normalization is enabled by default for new courses. Individual courses can disable it.</p>

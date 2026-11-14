@@ -979,7 +979,7 @@ func (j *Job) analyzeLoudness(probe *transcoder.ProbeResult, progressCb func(pct
 	// won't apply to the signal the encoder ends up processing. Plumbing
 	// the same value through both calls is how "merge before normalize"
 	// becomes automatic for multi-track sources.
-	stats, err := transcoder.AnalyzeLoudness(j.ctx, sourcePath, probe.AudioStreamCount, probe.DurationSeconds, progressCb)
+	stats, err := transcoder.AnalyzeLoudness(j.ctx, sourcePath, probe.AudioStreamCount, probe.AudioSampleRate, probe.DurationSeconds, progressCb)
 	if err != nil {
 		if j.ctx.Err() != nil {
 			return "", fmt.Errorf("aborted: %w", j.ctx.Err())
@@ -989,7 +989,7 @@ func (j *Job) analyzeLoudness(probe *transcoder.ProbeResult, progressCb func(pct
 		return "", nil
 	}
 	if stats == nil {
-		j.UI.Logf("[%s] audio normalization: no audio detected by loudnorm, skipping", j.JobID)
+		j.UI.Logf("[%s] audio normalization: no measurable loudness, preserving samples", j.JobID)
 		return "", nil
 	}
 
@@ -1470,7 +1470,19 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 	profiles = transcoder.ApplyBitrateCaps(j.JobID, profiles, probe.Height, probe.VideoBitrateKbps, j.sourceGOPSec)
 
 	sourcePath := filepath.Join(j.tempDir, "source.mp4")
-	audioName := fmt.Sprintf("aac_%dk", j.AudioBitrateKbps)
+	audioTargetBps := int64(0)
+	if probe.AudioStreamCount > 0 {
+		if err := transcoder.ValidateAudioTranscode(probe.AudioStreamCount, probe.AudioSampleRate, profiles[0].SegmentDuration, probe.DurationSeconds); err != nil {
+			return fmt.Errorf("audio preflight: %w", err)
+		}
+		var err error
+		audioTargetBps, err = transcoder.AudioTargetBitrate(j.AudioBitrateKbps)
+		if err != nil {
+			return err
+		}
+		j.UI.Logf("[%s] audio encoder target %d bps (source-reported aggregate %d bps)", j.JobID, audioTargetBps, probe.AudioBitrateBps)
+	}
+	audioName := "aac"
 	audioDir := filepath.Join(j.outputDir, "audio", audioName)
 
 	// hasAudio drives four intertwined decisions (keep them in sync):
@@ -1710,7 +1722,7 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 			segDur := profiles[0].SegmentDuration
 			err = transcoder.TranscodeAudio(
 				egCtx, sourcePath, audioDir,
-				j.AudioBitrateKbps, segDur, probe.AudioSampleRate, loudnormFilter,
+				audioTargetBps, segDur, probe.AudioSampleRate, loudnormFilter,
 				probe.AudioStreamCount,
 				probe.DurationSeconds, encodeProgress, logFile,
 			)
@@ -1776,16 +1788,17 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 	}
 	// WriteDASHManifest now decides per-Representation uniformity from the
 	// modal value of each rendition's playlist — no global hint needed.
-	// The MPD has to declare the rate that was actually encoded. Read it back
-	// off the produced init segment rather than assuming, since the encoder
-	// keeps the source's rate; fall back to the rate we asked for if the probe
-	// fails, which is still right in every case except a broken encode.
+	// Read the produced rate back and require the selected native rate before
+	// publishing either manifest.
 	audioSampleRate := transcoder.AACSampleRate(probe.AudioSampleRate)
 	if hasAudio {
 		if rate, err := transcoder.ProbeAudioSampleRate(filepath.Join(audioDir, "init.mp4")); err == nil {
 			audioSampleRate = rate
 		} else {
-			j.UI.Logf("[%s] WARN: could not read audio sample rate from init.mp4, declaring %d Hz: %v", j.JobID, audioSampleRate, err)
+			return fmt.Errorf("read encoded audio sample rate: %w", err)
+		}
+		if audioSampleRate != probe.AudioSampleRate {
+			return fmt.Errorf("encoded audio sample rate changed unexpectedly")
 		}
 	}
 

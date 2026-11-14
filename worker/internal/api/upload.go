@@ -115,7 +115,7 @@ func UploadFile(ctx context.Context, filePath, presignedURL string) error {
 // init segment), .m4s (CMAF media segment). All are served cache-immutable.
 //
 // For .mp4 / .m4s we branch on whether the path sits under an /audio/
-// directory — init.mp4 and segment_*.m4s under `audio/aac_192k/` get
+// directory — init.mp4 and segment_*.m4s under `audio/aac/` get
 // `audio/mp4`, everything else gets `video/mp4`. Players don't actually
 // consume this header (Safari reads the fMP4 box structure, Shaka trusts
 // the AdaptationSet's mimeType), but the R2 object metadata is otherwise
@@ -135,7 +135,7 @@ func contentTypeForFile(filePath string) string {
 	case strings.HasSuffix(lower, ".mpd"):
 		return "application/dash+xml"
 	case strings.HasSuffix(lower, ".mp4"), strings.HasSuffix(lower, ".m4s"):
-		// Prepend a leading "/" so relative paths ("audio/aac_192k/init.mp4")
+		// Prepend a leading "/" so relative paths ("audio/aac/init.mp4")
 		// and absolute paths ("/tmp/foo/audio/...") both match the same way.
 		// The worker passes absolute local filesystem paths; the server
 		// passes job-relative paths. Both forms need to resolve to the same

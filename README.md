@@ -21,7 +21,8 @@ A private video course platform with hardware-accelerated distributed transcodin
 - Source keyframes and presentation timestamps are checked across the full file. MP4 inputs use their sample index; other containers fall back to a packet scan.
 - Verified constant frame rates retain their rational rate, subject to the profile limit. Variable or unverified rates are converted to an explicit constant frame rate; this can duplicate or drop frames.
 - GOPs and segments are planned in whole frames. Stream copy is used only when the source cadence and predicted segment boundaries fit the output plan; otherwise the worker re-encodes with forced IDRs.
-- Audio retains its source sample rate when AAC-LC supports it, with segment targets aligned to AAC frames.
+- Audio retains the first track’s native AAC-supported sample rate. A shared clock-repair and mixing graph preserves stream offsets and gaps through loudness analysis and encoding; segment targets use integer AAC sample counts with a checked microsecond boundary schedule.
+- A single AAC-LC rendition is stored under `audio/aac/`. Its configurable bitrate is an encoding target; actual bitrate varies with content. Loudness processing and mixing require re-encoding.
 - Compact DASH duration templates are checked against individual segments, cumulative boundary error, and the final period length. Irregular outputs use a compressed `SegmentTimeline`; playlist timing is retained at microsecond precision.
 - Manifest bandwidth comes from completed segment sizes and durations. HLS reports average and peak-window rates; DASH uses a segment-level estimate with its declared startup buffer, bounded below by the average rate.
 

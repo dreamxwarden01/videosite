@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -30,53 +31,15 @@ type loudnormJSON struct {
 // loudnormJSONRe matches the loudnorm JSON block in ffmpeg stderr output.
 var loudnormJSONRe = regexp.MustCompile(`(?s)\{[^{}]*"input_i"[^{}]*\}`)
 
-// AnalyzeLoudness runs a first-pass loudnorm analysis on the audio of sourcePath.
-// It decodes the full audio stream, computes EBU R128 loudness statistics, and
-// returns them for use in BuildLoudnormFilter.
-//
-// progressFn is called with an integer percentage (0-100) as FFmpeg processes
-// the audio. Pass nil to skip progress reporting. The percentage is derived from
-// out_time_ms / (duration * 1e6) and is for console display only — it does not
-// affect the global job progress reported to the server.
-//
-// audioStreamCount must match the encode pass — pass-1 and pass-2 have to see
-// the same merged signal or loudnorm's measured values don't apply. When ≥ 2,
-// the audio inputs are merged with amix before loudnorm (see
-// buildAudioFilterChain in cmaf.go). When ≤ 1, the original `-af loudnorm=...`
-// form is used unchanged so single-track sources stay on the pre-change path.
-//
-// Returns (nil, nil) if the loudnorm JSON block is not found in ffmpeg output,
-// which indicates no audio stream or an unsupported format — callers should
-// skip normalization gracefully in this case.
-func AnalyzeLoudness(ctx context.Context, sourcePath string, audioStreamCount int, duration float64, progressFn func(pct int)) (*LoudnessStats, error) {
-	// Pass 1: decode audio through loudnorm with print_format=json.
-	// -vn skips video decode overhead. -f null - discards output.
-	// loudnorm prints its JSON block to stderr before ffmpeg exits.
-	//
-	// When duration is known and progressFn is set, we add -progress pipe:1
-	// -nostats so FFmpeg writes out_time_ms to stdout. We read stdout in a
-	// goroutine and call progressFn; stderr is still captured for the JSON.
-	//
-	// Multi-track branch uses the shared buildAudioFilterChain so pass 1 and
-	// pass 2 build IDENTICAL graphs for the merge — only the trailing filter
-	// differs (print_format=json here, measured_* fields in pass 2). If the
-	// two graphs diverge, loudnorm's measured values wouldn't apply to the
-	// same signal the encoder sees.
-	//
-	// padForEnd=false is mandatory here: this pass has no -t cap (it runs
-	// the entire audio to measure R128 stats), and apad generates infinite
-	// silence — ffmpeg would never exit. The encode pass owns the length
-	// cap and is the only place where padForEnd=true is allowed.
-	filterComplex, mapTarget, useFilterComplex := buildAudioFilterChain(audioStreamCount, "loudnorm=print_format=json", false)
-	args := []string{"-i", sourcePath, "-vn"}
-	if useFilterComplex {
-		args = append(args, "-filter_complex", filterComplex, "-map", mapTarget)
-	} else {
-		args = append(args,
-			"-af", "loudnorm=print_format=json",
-		)
+// AnalyzeLoudness measures exactly the same clock-repaired, mixed, padded
+// and trimmed PCM window used by TranscodeAudio. The shared graph bounds apad
+// with atrim before loudnorm, so neither pass can create unbounded silence.
+func AnalyzeLoudness(ctx context.Context, sourcePath string, audioStreamCount, sampleRate int, duration float64, progressFn func(pct int)) (*LoudnessStats, error) {
+	graph, err := buildAudioFilterGraph(audioStreamCount, sampleRate, "loudnorm=print_format=json", duration)
+	if err != nil {
+		return nil, err
 	}
-	args = append(args, "-f", "null", "-")
+	args := []string{"-i", sourcePath, "-vn", "-filter_complex", graph, "-map", "[mix]", "-f", "null", "-"}
 
 	if duration > 0 && progressFn != nil {
 		stderr, err := runFFmpegCaptureStderrWithProgress(ctx, duration, progressFn, args...)
@@ -168,7 +131,7 @@ func parseLoudnessStats(stderr string, ffmpegErr error) (*LoudnessStats, error) 
 			return nil, fmt.Errorf("loudness analysis failed: %w", ffmpegErr)
 		}
 		// No JSON and no error: file has no audio stream.
-		return nil, nil
+		return nil, fmt.Errorf("loudness analysis produced no statistics")
 	}
 
 	var raw loudnormJSON
@@ -190,6 +153,14 @@ func parseLoudnessStats(stderr string, ffmpegErr error) (*LoudnessStats, error) 
 	if stats.InputThresh, parseErr = strconv.ParseFloat(raw.InputThresh, 64); parseErr != nil {
 		return nil, fmt.Errorf("parse input_thresh %q: %w", raw.InputThresh, parseErr)
 	}
+	for _, value := range []float64{stats.InputI, stats.InputLRA, stats.InputTP, stats.InputThresh} {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return nil, nil
+		}
+	}
+	if stats.InputI < -70 {
+		return nil, nil
+	}
 
 	return stats, nil
 }
@@ -210,6 +181,9 @@ func parseLoudnessStats(stderr string, ffmpegErr error) (*LoudnessStats, error) 
 // rather than dynamic compression when the measured values allow it — the
 // result is artifact-free for classroom speech content.
 func BuildLoudnormFilter(stats *LoudnessStats, targetI, peakTP, maxGain float64) string {
+	if stats == nil {
+		return ""
+	}
 	effectiveTarget := targetI
 	gainRequired := targetI - stats.InputI
 

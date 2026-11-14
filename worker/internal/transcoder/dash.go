@@ -163,7 +163,7 @@ type dashTmplContext struct {
 // variants describe the video renditions (shared with WriteMasterPlaylistCMAF
 // so Codecs/FrameRate/Bandwidth stay consistent across the HLS and DASH
 // manifests). audioName is the audio folder name under audio/ (e.g.
-// "aac_192k"). Encoder target arguments are retained for callers; bandwidth
+// "aac"). Encoder target arguments are retained for callers; bandwidth
 // declarations are measured from the completed local media artifacts.
 //
 // audioSampleRateHz must be the rate that was actually encoded, not a
