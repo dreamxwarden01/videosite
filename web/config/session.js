@@ -1,6 +1,20 @@
 const crypto = require('crypto');
 const { getPool, idBuf } = require('./database');
 const sessionCache = require('../services/cache/sessionCache');
+const { transaction } = require('../services/ssoCatalogStore');
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function canonicalSsoSid(value) {
+    if (typeof value !== 'string' || !UUID.test(value)) throw new Error('invalid_sso_session');
+    return value.toLowerCase();
+}
+async function lockSsoSession(db, ssoSid, userId) {
+    await db.execute(`INSERT INTO sso_session_state(sso_sid,subject_id) VALUES(?,?)
+        ON DUPLICATE KEY UPDATE sso_sid=VALUES(sso_sid)`, [ssoSid, idBuf(userId)]);
+    const [[state]] = await db.execute('SELECT subject_id,revoked FROM sso_session_state WHERE sso_sid=? FOR UPDATE', [ssoSid]);
+    if (!state || state.subject_id !== userId) throw new Error('sso_session_binding_mismatch');
+    return state;
+}
 
 function generateSessionId() {
     return crypto.randomBytes(64).toString('base64url');
@@ -28,11 +42,19 @@ async function createSession(userId, userAgent, ipAddress, ssoSid = null, ssoExp
     // Audit row in the sessions table; admin-view UI reads this and overlays
     // live values from Redis. sso_expires_at = the SSO session's absolute expiry
     // (from the id_token's sess_exp) — enforced in isSessionValid.
-    await pool.execute(
+    if (ssoSid !== null) ssoSid = canonicalSsoSid(ssoSid);
+    const insert = db => db.execute(
         `INSERT INTO sessions (session_id, user_id, last_seen, last_sign_in, user_agent, ip_address, sso_sid, sso_expires_at,sso_role_generation)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [sessionId, idBuf(userId), now, now, userAgent || null, ipAddress || null, ssoSid, ssoExpiresAt, roleGeneration]
     );
+    if (ssoSid) {
+        await transaction(pool, async db => {
+            const state = await lockSsoSession(db, ssoSid, userId);
+            if (state.revoked) throw new Error('sso_session_revoked');
+            await insert(db);
+        });
+    } else await insert(pool);
 
     const ttl = await getInactivityTtlSeconds();
     await sessionCache.createSession(sessionId, {
@@ -66,6 +88,25 @@ async function deleteSessionsBySsoSid(ssoSid) {
     return rows.length;
 }
 
+// Final SSO logout differs from normal login replacement above. The persistent
+// terminal row serializes with callback insertion; normal replacement never
+// clears it. Retain it until an explicit, separately reviewed GC policy exists.
+async function revokeSessionsBySsoSid(ssoSid, subject) {
+    ssoSid = canonicalSsoSid(ssoSid);
+    if (typeof subject !== 'string' || !UUID.test(subject)) throw new Error('invalid_sso_subject');
+    const userId = subject.replace(/-/g, '').toLowerCase(), pool = getPool();
+    const rows = await transaction(pool, async db => {
+        await lockSsoSession(db, ssoSid, userId);
+        const [current] = await db.execute('SELECT session_id,user_id FROM sessions WHERE sso_sid=? FOR UPDATE', [ssoSid]);
+        if (current.some(row => row.user_id !== userId)) throw new Error('sso_session_binding_mismatch');
+        await db.execute('UPDATE sso_session_state SET revoked=1 WHERE sso_sid=?', [ssoSid]);
+        await db.execute('DELETE FROM sessions WHERE sso_sid=?', [ssoSid]);
+        return current;
+    });
+    for (const row of rows) await sessionCache.deleteSession(row.session_id, row.user_id);
+    return rows.length;
+}
+
 // SQL owns session membership and immutable authentication fields on every read.
 // Redis only supplies live activity: a read begun before deletion may refill its
 // cache afterward, but that SQL-less entry must never authorize a later request.
@@ -75,11 +116,13 @@ async function getSession(sessionId) {
     const pool = getPool();
     const [rows] = await pool.execute(
         `SELECT session_id, user_id, last_seen, last_sign_in, user_agent, ip_address, sso_expires_at, sso_sid,
-                CAST(sso_role_generation AS CHAR) AS sso_role_generation
+                CAST(sso_role_generation AS CHAR) AS sso_role_generation,
+                EXISTS(SELECT 1 FROM sso_session_state state WHERE state.sso_sid=CONVERT(LOWER(sessions.sso_sid) USING ascii) COLLATE ascii_bin
+                    AND (state.revoked=1 OR state.subject_id<>sessions.user_id)) AS sso_revoked
          FROM sessions WHERE session_id = ?`,
         [sessionId]
     );
-    if (rows.length === 0) {
+    if (rows.length === 0 || rows[0].sso_revoked) {
         await sessionCache.deleteSession(sessionId, cached?.user_id);
         return null;
     }
@@ -133,7 +176,9 @@ async function getSession(sessionId) {
 async function getSessionById(sessionId) {
     const pool = getPool();
     const [rows] = await pool.execute(
-        'SELECT session_id, user_id FROM sessions WHERE session_id = ?',
+        `SELECT session_id, user_id FROM sessions WHERE session_id = ? AND NOT EXISTS(
+            SELECT 1 FROM sso_session_state state WHERE state.sso_sid=CONVERT(LOWER(sessions.sso_sid) USING ascii) COLLATE ascii_bin
+            AND (state.revoked=1 OR state.subject_id<>sessions.user_id))`,
         [sessionId]
     );
     return rows[0] || null;
@@ -306,6 +351,7 @@ module.exports = {
     updateSessionActivity,
     deleteSession,
     deleteSessionsBySsoSid,
+    revokeSessionsBySsoSid,
     deleteUserSessions,
     getUserSessions,
     isSessionValid,

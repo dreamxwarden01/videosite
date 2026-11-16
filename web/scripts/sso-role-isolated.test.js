@@ -25,6 +25,8 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
             last_sign_in DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),sso_expires_at DATETIME(6) NULL)`);
         await require('../db/ssoRoleMigration').migrateSsoRoles(pool);
         await require('../db/ssoRoleMigration').migrateSsoRoles(pool);
+        await require('../db/ssoAccountStatusMigration').migrateSsoAccountStatus(pool);
+        await require('../db/ssoAccountStatusMigration').migrateSsoAccountStatus(pool);
         await pool.execute("INSERT INTO roles VALUES(0,'Root',0,1),(2,'Member',10,1)");
         await pool.execute("INSERT INTO site_settings VALUES('registration_default_role','0'),('site_name','Fixture')");
         const dbModule = require('../config/database'); dbModule.getPool = () => pool;
@@ -391,6 +393,56 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
             response={...response,accountStatus:'active',allowed:true};const restored=await reader.applyLogin(token);
             assert.equal(restored.blocked,0);assert.equal(restored.session_generation,denied.session_generation);
             assert.equal(require('../lib/ssoRoleProtocol').sessionPermitted(restored,'0'),false);
+        });
+        await t.test('versioned non-active account status closes sessions; positive events cannot clear it',async()=>{
+            const cache=require('../services/cache/sessionCache');
+            const uid=crypto.randomUUID(),local=uid.replace(/-/g,'');await pool.execute('INSERT INTO users VALUES(?,2)',[Buffer.from(local,'hex')]);
+            const statusEvent=(status,revision)=>({id:crypto.randomUUID(),payload:{sub:uid,role_id:2,authority_epoch:epoch,authority_revision:revision,account_status:status}});
+            let response={roleId:2,version:{epoch,revision:'22'},accountStatus:'active',allowed:true};
+            const reader=createAuthorityService({pool,updateUser:users.updateUser,invalidateUser:users.invalidateUserCaches,
+                deleteUserSessions:sessions.deleteUserSessions,fetchAccessState:async()=>response});
+            await reader.processEvent(statusEvent('active','20'));
+            await pool.execute('INSERT INTO sessions(session_id,user_id) VALUES(?,?)',['status-session',Buffer.from(local,'hex')]);
+            await cache.createSession('status-session',{userId:local,lastSignIn:Date.now(),lastSeen:Date.now(),roleGeneration:'0'},60);
+            await reader.processEvent(statusEvent('disabled','21'));
+            const denied=await reader.read(uid);assert.equal(denied.account_status,'disabled');assert.equal(denied.blocked,1);assert.equal(denied.session_generation,'1');
+            assert.equal(Number((await pool.execute('SELECT COUNT(*) AS n FROM sessions WHERE session_id=?',['status-session']))[0][0].n),0);
+            assert.equal(await cache.getSession('status-session'),null);
+            await reader.processEvent(statusEvent('active','21'));
+            let state=await reader.read(uid);assert.equal(state.blocked,1);assert.equal(state.account_status,'disabled');
+            await reader.processEvent(statusEvent('active','22'));
+            state=await reader.read(uid);assert.equal(state.account_status,'active');assert.equal(state.blocked,1);assert.equal(state.session_generation,'1');
+            await reader.refresh(uid);state=await reader.read(uid);assert.equal(state.blocked,0);assert.equal(state.session_generation,'1');
+            await reader.processEvent(statusEvent('disabled','20'));assert.equal((await reader.read(uid)).blocked,0);
+            response={...response,accountStatus:'disabled',allowed:false};await reader.refresh(uid);
+            state=await reader.read(uid);assert.equal(state.blocked,1);assert.equal(state.account_status,'disabled');
+            response={...response,accountStatus:'active',allowed:true};await reader.refresh(uid);
+            state=await reader.read(uid);assert.equal(state.blocked,0);assert.equal(state.account_status,'active');
+        });
+        await t.test('confirmed disabled pulls settle urgent work without repeating cache/session effects and can reactivate freshly',async()=>{
+            const uid=crypto.randomUUID(),local=uid.replace(/-/g,'');await pool.execute('INSERT INTO users VALUES(?,2)',[Buffer.from(local,'hex')]);
+            let invalidations=0,deletions=0;
+            let response={roleId:2,version:{epoch,revision:'41'},accountStatus:'disabled',allowed:false};
+            const reader=createAuthorityService({pool,updateUser:users.updateUser,
+                invalidateUser:async id=>{invalidations++;await users.invalidateUserCaches(id);},
+                deleteUserSessions:async id=>{deletions++;await sessions.deleteUserSessions(id);},fetchAccessState:async()=>response});
+            const event=(status,revision)=>({id:crypto.randomUUID(),payload:{sub:uid,role_id:2,authority_epoch:epoch,authority_revision:revision,account_status:status}});
+            await reader.processEvent(event('active','40'));await reader.processEvent(event('disabled','41'));
+            assert.equal((await reader.read(uid)).refresh_pending,1);
+            await reader.refresh(uid);const confirmed=await reader.read(uid);
+            assert.equal(confirmed.blocked,1);assert.equal(confirmed.refresh_pending,0);assert.equal(confirmed.effects_pending,0);
+            const effects={invalidations,deletions};
+            for(let i=0;i<3;i++)await reader.refresh(uid);
+            const stable=await reader.read(uid);
+            assert.equal(stable.blocked,1);assert.equal(stable.refresh_pending,0);assert.equal(stable.effects_pending,0);
+            assert.equal(stable.session_generation,confirmed.session_generation);
+            assert.ok(BigInt(stable.generation)>BigInt(confirmed.generation),'fresh observations still fence older in-flight queries');
+            assert.deepEqual({invalidations,deletions},effects);
+            const [[scheduled]]=await pool.execute('SELECT TIMESTAMPDIFF(SECOND,NOW(6),refresh_after) AS delay FROM sso_role_authority WHERE subject_id=?',[uid]);
+            assert.ok(scheduled.delay>60 && scheduled.delay<=300,'confirmation uses routine delay, not urgent tick');
+            response={...response,accountStatus:'active',allowed:true};await reader.refresh(uid);
+            const restored=await reader.read(uid);assert.equal(restored.blocked,0);assert.equal(restored.account_status,'active');
+            assert.equal(restored.refresh_pending,0);assert.equal(restored.session_generation,confirmed.session_generation);
         });
     } finally { await pool.end(); await redis.quit(); }
 });

@@ -70,3 +70,14 @@ test('invalid local display names cannot become permanently rejected immutable j
         await assert.rejects(readCatalog(siteDb),/invalid_catalog_name/);
     }
 });
+test('signed status contradictions conflict only at the same source version; legacy pulls can update status',()=>{
+    const stored={authority_epoch:epoch,authority_revision:'7',role_id:0,account_status:'active'};
+    const disabled=p.observation({sub,role_id:0,authority_epoch:epoch,authority_revision:'7',account_status:'disabled'});
+    assert.equal(p.compare(stored,disabled),'conflict');
+    assert.equal(p.compare(stored,{...disabled,source:'pull'}),'same');
+    assert.equal(p.compare(stored,{...disabled,version:{epoch,revision:'6'}}),'stale');
+    assert.equal(p.compare(stored,{...disabled,version:{epoch,revision:'8'}}),'apply');
+    assert.equal(p.compare(stored,incoming(0)),'same','legacy omission is not an active assertion');
+    assert.equal(p.compare({...stored,account_status:null},disabled),'same');
+    for(const account_status of [null,false,'unknown',1])assert.throws(()=>p.observation({sub,role_id:0,account_status}),/invalid_account_status/);
+});

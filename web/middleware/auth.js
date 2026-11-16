@@ -70,7 +70,7 @@ async function loadUser(req, res, next) {
         // path. Deliberately NOT awaited — it must never add latency here — which
         // also means it escapes the try/catch below, hence the explicit .catch().
         require('../services/ssoActivity')
-            .reportActivity(sessionId, session.sso_sid, session.last_seen)
+            .reportActivity(sessionId, session.sso_sid, session.last_seen, session.user_id)
             .catch((e) => console.error('activity report failed:', e.message));
 
         // Resolve permissions + permission_level in one cached bundle (2 Redis GETs).

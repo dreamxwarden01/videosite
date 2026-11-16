@@ -36,8 +36,10 @@ function canonical(value) {
 const digest = value => createHash('sha256').update(canonical(value)).digest('hex');
 function observation(payload, source = 'event') {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('invalid_role_event');
+    const accountStatus = payload.account_status;
+    if (accountStatus !== undefined && !['active', 'disabled', 'locked', 'deleted', 'not_found'].includes(accountStatus)) throw new Error('invalid_account_status');
     return { sub: subject(payload.sub), roleId: roleId(payload.role_id),
-        version: version(payload.authority_epoch, payload.authority_revision), source };
+        version: version(payload.authority_epoch, payload.authority_revision), source, accountStatus };
 }
 /** Transport time and event IDs never participate in authority ordering. */
 function compare(stored, incoming) {
@@ -47,7 +49,13 @@ function compare(stored, incoming) {
     const a = BigInt(incoming.version.revision), b = BigInt(stored.authority_revision);
     if (a < b) return 'stale';
     if (a > b) return 'apply';
-    return stored.role_id === incoming.roleId ? 'same' : 'conflict';
+    if (stored.role_id !== incoming.roleId) return 'conflict';
+    // Only new signed events promise that status changes advance the source
+    // revision. Legacy current pulls can change status at an unchanged role
+    // revision and remain fenced by the local observation generation.
+    if (incoming.source === 'event' && incoming.accountStatus !== undefined && stored.account_status != null
+        && stored.account_status !== incoming.accountStatus) return 'conflict';
+    return 'same';
 }
 function sessionPermitted(authority, capturedGeneration = '0') {
     return !authority || (!authority.blocked && !authority.effects_pending

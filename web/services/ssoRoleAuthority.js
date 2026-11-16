@@ -3,7 +3,7 @@ const backgroundTasks = require('../lib/backgroundTasks');
 const { observation, compare, subject, digest, UUID } = require('../lib/ssoRoleProtocol');
 const { transaction } = require('./ssoCatalogStore');
 const columns = `subject_id,authority_epoch,CAST(authority_revision AS CHAR) AS authority_revision,
-    role_id,CAST(generation AS CHAR) AS generation,CAST(session_generation AS CHAR) AS session_generation,blocked,effects_pending,refresh_pending`;
+    role_id,account_status,CAST(generation AS CHAR) AS generation,CAST(session_generation AS CHAR) AS session_generation,blocked,effects_pending,refresh_pending`;
 const hex = sub => sub.replace(/-/g, '');
 const dashed = id => id.includes('-') ? subject(id) : subject(id.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5'));
 
@@ -42,9 +42,9 @@ function createAuthorityService({ pool, updateUser, invalidateUser, deleteUserSe
             if (source === 'pull' && !incoming.version && input.denied === true
                 && ['disabled','locked','deleted','not_found'].includes(input.account_status)) {
                 const revoke = row.blocked ? 0 : 1;
-                await db.execute(`UPDATE sso_role_authority SET blocked=1,generation=generation+1,
+                await db.execute(`UPDATE sso_role_authority SET account_status=?,blocked=1,generation=generation+1,
                     session_generation=session_generation+?,effects_pending=IF(?=1,1,effects_pending),updated_at=NOW(6)
-                    WHERE subject_id=?`, [revoke, revoke, incoming.sub]);
+                    WHERE subject_id=?`, [incoming.accountStatus, revoke, revoke, incoming.sub]);
                 observationGeneration = (BigInt(row.generation) + 1n).toString();
                 return 'applied';
             }
@@ -61,6 +61,8 @@ function createAuthorityService({ pool, updateUser, invalidateUser, deleteUserSe
             // A fresh same-lineage read may resolve a conflicting event at the
             // same revision. A foreign epoch always requires explicit recovery.
             const authoritative = incoming.source === 'pull';
+            const accountStatus = incoming.accountStatus ?? row.account_status ?? null;
+            const explicitAccountDenial = incoming.accountStatus !== undefined && incoming.accountStatus !== 'active';
             const settlingConflict = authoritative && row.blocked && row.refresh_pending;
             const conflict = decision === 'epoch' || (decision === 'conflict' && !settlingConflict)
                 || (!authoritative && decision === 'same' && row.blocked && row.refresh_pending);
@@ -68,9 +70,9 @@ function createAuthorityService({ pool, updateUser, invalidateUser, deleteUserSe
             // A role revision does not supersede a separately confirmed account
             // denial. Only a fresh allowed account query may remove that block.
             const heldGrant = !authoritative && !!row.blocked && !!known;
-            const blocked = conflict || heldGrant || incoming.roleId === null || !known || (authoritative && input.denied === true);
-            const refresh = conflict || heldGrant || (incoming.roleId !== null && !known);
-            if (decision === 'same' && !authoritative && (known || incoming.roleId === null || (row.blocked && row.refresh_pending))) {
+            const blocked = conflict || heldGrant || explicitAccountDenial || incoming.roleId === null || !known || (authoritative && input.denied === true);
+            const refresh = conflict || heldGrant || (explicitAccountDenial && !authoritative) || (incoming.roleId !== null && !known);
+            if (decision === 'same' && !authoritative && !explicitAccountDenial && (known || incoming.roleId === null || (row.blocked && row.refresh_pending))) {
                 if (row.blocked && row.refresh_pending) return 'conflict';
                 if (incoming.source === 'login' && !row.blocked && known) {
                     // An event may pin an unknown subject before JIT creation.
@@ -78,6 +80,8 @@ function createAuthorityService({ pool, updateUser, invalidateUser, deleteUserSe
                     // authority version or revocation generation.
                     const repaired = await repairProjection(db, incoming.sub, incoming.roleId);
                     await db.execute('UPDATE sso_role_authority SET generation=generation+1,effects_pending=IF(?,1,effects_pending) WHERE subject_id=?', [repaired ? 1 : 0, incoming.sub]);
+                } else if (incoming.accountStatus !== undefined && row.account_status == null) {
+                    await db.execute('UPDATE sso_role_authority SET account_status=?,generation=generation+1 WHERE subject_id=?', [accountStatus, incoming.sub]);
                 }
                 return 'same';
             }
@@ -86,17 +90,17 @@ function createAuthorityService({ pool, updateUser, invalidateUser, deleteUserSe
                 // Even an unchanged accepted observation fences older in-flight
                 // reads. This is a local generation, not an SSO state revision.
                 const repaired = known && !blocked ? await repairProjection(db, incoming.sub, incoming.roleId) : false;
-                await db.execute('UPDATE sso_role_authority SET generation=generation+1,effects_pending=IF(?,1,effects_pending),updated_at=NOW(6) WHERE subject_id=?', [repaired ? 1 : 0, incoming.sub]);
+                await db.execute('UPDATE sso_role_authority SET account_status=?,generation=generation+1,effects_pending=IF(?,1,effects_pending),updated_at=NOW(6) WHERE subject_id=?', [accountStatus, repaired ? 1 : 0, incoming.sub]);
                 observationGeneration = (BigInt(row.generation) + 1n).toString();
                 return 'same';
             }
             const revokeGeneration = blocked && !row.blocked ? 1 : 0;
             if (!conflict) {
                 if (known) await updateUser(hex(incoming.sub), { role_id: incoming.roleId }, { connection: db, invalidate: false });
-                await db.execute(`UPDATE sso_role_authority SET authority_epoch=?,authority_revision=?,role_id=?,blocked=?,
+                await db.execute(`UPDATE sso_role_authority SET authority_epoch=?,authority_revision=?,role_id=?,account_status=?,blocked=?,
                     generation=generation+1,session_generation=session_generation+?,effects_pending=1,refresh_pending=?,refresh_after=NOW(6),updated_at=NOW(6)
                     WHERE subject_id=?`, [incoming.version?.epoch || null, incoming.version?.revision || null,
-                    incoming.roleId, blocked ? 1 : 0, revokeGeneration, refresh ? 1 : 0, incoming.sub]);
+                    incoming.roleId, accountStatus, blocked ? 1 : 0, revokeGeneration, refresh ? 1 : 0, incoming.sub]);
             } else {
                 await db.execute(`UPDATE sso_role_authority SET blocked=1,generation=generation+1,session_generation=session_generation+?,effects_pending=1,
                     refresh_pending=1,refresh_after=NOW(6),updated_at=NOW(6) WHERE subject_id=?`, [revokeGeneration, incoming.sub]);

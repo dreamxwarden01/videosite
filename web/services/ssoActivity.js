@@ -49,7 +49,7 @@ let warnedMissingSsoSid = false;
 
 // Report activity for one session. Returns quietly on every path — the caller
 // attaches a .catch() but this should rarely reject.
-async function reportActivity(sessionId, ssoSid, lastSeenMs) {
+async function reportActivity(sessionId, ssoSid, lastSeenMs, userId) {
     if (!sessionId) return;
     // A missing sso_sid is a ROLLOUT-window condition, not a steady state: every
     // login stores one (routes/auth.js takes it from the id_token `sid`, which the
@@ -74,7 +74,7 @@ async function reportActivity(sessionId, ssoSid, lastSeenMs) {
 
     let r;
     try {
-        const assertion = await oidc.signClientAssertion();
+        const assertion = await oidc.signClientAssertion('/internal/session-activity');
         r = await s2sFetch(oidc.ssoActivityUrl(), {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
@@ -114,8 +114,12 @@ async function reportActivity(sessionId, ssoSid, lastSeenMs) {
         }
         if (verdict.status !== 'invalid' || verdict.sid !== ssoSid) return;
         // Kill every local session bound to that SSO session (usually just ours).
-        const { deleteSessionsBySsoSid } = require('../config/session');
-        await deleteSessionsBySsoSid(ssoSid);
+        // The owner is captured from the SQL-authorized request, not rediscovery
+        // through a row that another logout may already have removed.
+        if (typeof userId !== 'string' || !/^[a-f0-9]{32}$/i.test(userId)) throw new Error('invalid_session_owner');
+        const { revokeSessionsBySsoSid } = require('../config/session');
+        const subject = userId.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5');
+        await revokeSessionsBySsoSid(ssoSid, subject);
         await redis.del(lockKey(sessionId));
         return;
     }

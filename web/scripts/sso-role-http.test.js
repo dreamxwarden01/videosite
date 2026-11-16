@@ -25,13 +25,13 @@ test('event form parser accepts full JWT bound before global parser without rais
 });
 test('the real backchannel route validates every role payload before mixed-batch effects',async()=>{
     const oidc=require('../lib/oidc'),sessions=require('../config/session'),redis=require('../services/redis'),authority=require('../services/ssoRoleAuthority');
-    const original={verify:oidc.verifyEventToken,logout:sessions.deleteSessionsBySsoSid,redis:redis.getClient,authority:authority.service};
+    const original={verify:oidc.verifyEventToken,logout:sessions.revokeSessionsBySsoSid,redis:redis.getClient,authority:authority.service};
     const sub=crypto.randomUUID();let roles=0,logouts=0;
-    const events=[{id:crypto.randomUUID(),type:'logout',payload:{sub,sid:'synthetic-session'}},
+    const events=[{id:crypto.randomUUID(),type:'logout',payload:{sub,sid:crypto.randomUUID()}},
         {id:crypto.randomUUID(),type:'account.roles_change',payload:{sub,role_id:0}},
         {id:crypto.randomUUID(),type:'account.roles_change',payload:{sub,role_id:'0'}}];
-    oidc.verifyEventToken=async()=>({events});sessions.deleteSessionsBySsoSid=async()=>{logouts++;};
-    redis.getClient=()=>({set:async()=> 'OK',del:async()=>1});authority.service=()=>({processEvent:async()=>{roles++;}});
+    oidc.verifyEventToken=async()=>({events});sessions.revokeSessionsBySsoSid=async()=>{logouts++;};
+    redis.getClient=()=>({get:async()=>null,set:async()=> 'OK',del:async()=>1});authority.service=()=>({processEvent:async()=>{roles++;}});
     const routePath=require.resolve('../routes/backchannel');delete require.cache[routePath];
     const app=express();app.use('/backchannel/events',eventFormParser());app.use(require('../routes/backchannel'));
     const server=app.listen(0,'127.0.0.1');await new Promise((resolve,reject)=>{server.once('listening',resolve);server.once('error',reject);});
@@ -42,7 +42,7 @@ test('the real backchannel route validates every role payload before mixed-batch
         events[2].payload.role_id=null;assert.equal((await post()).status,204);assert.equal(roles,2);assert.equal(logouts,1);
     }finally{
         await new Promise((resolve,reject)=>server.close(error=>error?reject(error):resolve()));
-        oidc.verifyEventToken=original.verify;sessions.deleteSessionsBySsoSid=original.logout;redis.getClient=original.redis;authority.service=original.authority;
+        oidc.verifyEventToken=original.verify;sessions.revokeSessionsBySsoSid=original.logout;redis.getClient=original.redis;authority.service=original.authority;
         delete require.cache[routePath];
     }
 });

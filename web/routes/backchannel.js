@@ -7,7 +7,7 @@
 const express = require('express');
 const router = express.Router();
 const oidc = require('../lib/oidc');
-const { deleteSessionsBySsoSid } = require('../config/session');
+const { revokeSessionsBySsoSid } = require('../config/session');
 const { getClient } = require('../services/redis');
 const ssoEvents = require('../services/ssoEvents');
 const roleProtocol = require('../lib/ssoRoleProtocol');
@@ -46,6 +46,11 @@ router.post('/backchannel/events', eventFormParser(), async (req, res) => {
     // runtime failures still use per-event receipts; the batch is not atomic.
     for (const ev of events) {
         if (!ev || typeof ev.id !== 'string' || !ev.id) return res.status(400).json({ error: 'invalid_event_id' });
+        if (ev.type === 'logout' && (!roleProtocol.UUID.test(ev.id)
+            || typeof ev.payload?.sid !== 'string' || !roleProtocol.UUID.test(ev.payload.sid)
+            || typeof ev.payload?.sub !== 'string' || !roleProtocol.UUID.test(ev.payload.sub))) {
+            return res.status(400).json({ error: 'invalid_logout_event' });
+        }
         if (ev.type === 'account.roles_change') {
             try {
                 roleProtocol.observation(ev.payload);
@@ -69,14 +74,14 @@ router.post('/backchannel/events', eventFormParser(), async (req, res) => {
             continue;
         }
 
-        const fresh = redis ? await redis.set(`sso:evt:seen:${id}`, '1', 'EX', SEEN_TTL, 'NX') : 'OK';
-        if (!fresh) continue; // retry redelivery — already processed
-
         try {
+            // Old seen keys were written before effects; they are not completion
+            // receipts. Concurrent deliveries may repeat these idempotent effects,
+            // but neither can acknowledge merely because another one started.
+            const completed = `sso:evt:completed:v2:${roleProtocol.UUID.test(id) ? id.toLowerCase() : id}`;
+            if (redis && await redis.get(completed)) continue;
             if (type === 'logout') {
-                if (ev.payload && typeof ev.payload.sid === 'string') {
-                    await deleteSessionsBySsoSid(ev.payload.sid);
-                }
+                await revokeSessionsBySsoSid(ev.payload.sid, ev.payload.sub);
             } else if (type === 'roles.sync_request') {
                 await ssoEvents.reportRoles();
             } else if (type === 'org.settings') {
@@ -100,9 +105,9 @@ router.post('/backchannel/events', eventFormParser(), async (req, res) => {
             } else {
                 console.log(`sso events: acked unknown type '${type}'`);
             }
+            if (redis) await redis.set(completed, '1', 'EX', SEEN_TTL);
         } catch (err) {
             console.error(`sso events: ${type} failed:`, err.message);
-            if (redis) await redis.del(`sso:evt:seen:${id}`).catch(() => {});
             return res.status(500).json({ error: 'server_error' });
         }
     }

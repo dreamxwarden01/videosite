@@ -44,15 +44,33 @@ test('VideoSite session SQL authority with real production typecast and Redis', 
     const redis = new Redis(redisUrl.toString(), { keyPrefix: namespace, maxRetriesPerRequest: 1 });
     const table = 'a04_sessions_' + crypto.randomBytes(8).toString('hex');
     // A private table prevents interaction with the role suite's simpler schema.
-    const fixturePool = { execute: (sql, args) => pool.execute(sql.replace(/\bsessions\b/g, table), args) };
+    const stateTable = table + '_state';
+    const mapSql = sql => sql.replace(/\bsso_session_state\b/g, stateTable).replace(/\bsessions\b/g, table);
+    let creationGate;
+    const wrap = db => ({
+        execute: async (sql, args) => {
+            if (creationGate && /^INSERT INTO sessions /.test(sql.trim())) { const gate = creationGate; creationGate = null; gate.arrive(); await gate.released; }
+            return db.execute(mapSql(sql), args);
+        },
+        query: (sql, args) => db.query(mapSql(sql), args),
+        beginTransaction: () => db.beginTransaction(), commit: () => db.commit(), rollback: () => db.rollback(), release: () => db.release(),
+    });
+    const membershipQueries = [];
+    const fixturePool = { execute: (sql, args) => {
+        if (/^\s*SELECT session_id/.test(sql)) membershipQueries.push({ sql, args });
+        return pool.execute(mapSql(sql), args);
+    }, getConnection: async () => wrap(await pool.getConnection()) };
     let settingsGate, created = false;
     const settings = { async getSetting(key, fallback) {
         if (settingsGate) { const gate = settingsGate; settingsGate = null; gate.arrive(); await gate.released; }
         return ({ session_inactivity_days: '1', session_max_days: '3' })[key] ?? fallback;
     } };
     const cache = load('services/cache/sessionCache.js', { '../redis': { getClient: () => redis } });
-    const sessions = load('config/session.js', { crypto, './database': { getPool: () => fixturePool, idBuf: database.idBuf },
-        '../services/cache/sessionCache': cache, '../services/cache/settingsCache': settings });
+    const protocol = load('lib/ssoRoleProtocol.js', { 'node:crypto': crypto });
+    const catalog = load('services/ssoCatalogStore.js', { 'node:crypto': crypto, '../lib/ssoRoleProtocol': protocol });
+    const reload = () => load('config/session.js', { crypto, './database': { getPool: () => fixturePool, idBuf: database.idBuf },
+        '../services/cache/sessionCache': cache, '../services/cache/settingsCache': settings, '../services/ssoCatalogStore': catalog });
+    const sessions = reload();
     const user = crypto.randomBytes(16).toString('hex'), ssoSid = crypto.randomUUID(), generation = '9007199254740993';
     const make = () => sessions.createSession(user, 'fixture', '127.0.0.1', ssoSid, new Date(Date.now() + 3600000), generation);
     try {
@@ -60,9 +78,11 @@ test('VideoSite session SQL authority with real production typecast and Redis', 
         await pool.query(`CREATE TABLE ${table} (
             session_id VARCHAR(128) PRIMARY KEY, user_id BINARY(16) NOT NULL,
             last_seen DATETIME NOT NULL, last_sign_in DATETIME NOT NULL,
-            user_agent VARCHAR(255), ip_address VARCHAR(45), sso_sid VARCHAR(64), sso_expires_at DATETIME,
+            user_agent VARCHAR(255), ip_address VARCHAR(45), sso_sid VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci, sso_expires_at DATETIME,
             sso_role_generation BIGINT NOT NULL DEFAULT 0, stepup_at DATETIME, stepup_method VARCHAR(16))`);
         created = true;
+        const migration = load('db/ssoSessionMigration.js', {});
+        await migration.migrateSsoSessions(fixturePool); await migration.migrateSsoSessions(fixturePool);
         await t.test('warm cache preserves SQL typecast identity, bigint generation and SQL expiry', async () => {
             const id = await make(), session = await sessions.getSession(id);
             assert.equal(typeof session.user_id, 'string'); assert.equal(session.user_id, user);
@@ -97,9 +117,69 @@ test('VideoSite session SQL authority with real production typecast and Redis', 
             assert.equal(current.sso_sid, ssoSid); assert.equal(current.sso_role_generation, generation);
             assert.equal(await sessions.isSessionValid(current), true);
         });
+        await t.test('terminal logout serializes behind an admitted callback, and later/restarted callbacks stay rejected', async () => {
+            const master = crypto.randomUUID(), subject = user.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5');
+            const gate = barrier(); creationGate = gate;
+            const create = sessions.createSession(user, null, null, master, new Date(Date.now() + 3600000), generation);
+            await gate.entered;
+            const revoke = sessions.revokeSessionsBySsoSid(master, subject);
+            gate.release(); const id = await create; await revoke;
+            assert.equal(await sessions.getSession(id), null);
+            const restarted = reload();
+            await assert.rejects(restarted.createSession(user, null, null, master), /sso_session_revoked/);
+            await assert.rejects(restarted.revokeSessionsBySsoSid(master, crypto.randomUUID()), /sso_session_binding_mismatch/);
+            const [[state]] = await pool.execute(`SELECT revoked FROM ${stateTable} WHERE sso_sid=?`, [master]);
+            assert.equal(state.revoked, 1);
+        });
+        await t.test('terminal logout before any local callback persists even without a session/index', async () => {
+            const master = crypto.randomUUID(), subject = user.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5');
+            assert.equal(await sessions.revokeSessionsBySsoSid(master, subject), 0);
+            await assert.rejects(reload().createSession(user, null, null, master), /sso_session_revoked/);
+        });
+        await t.test('actual session membership queries use indexed terminal SID lookups across utf8mb4/ascii charsets', async () => {
+            const master='abcdefab-cdef-4abc-8def-abcdefabcdef';
+            const id=await sessions.createSession(user,null,null,master,new Date(Date.now()+3600000),generation),values=[],parameters=[];
+            for (let n=0;n<2048;n++) { values.push('(?,?,0)'); parameters.push(crypto.randomUUID(),Buffer.from(user,'hex')); }
+            await pool.execute(`INSERT INTO ${stateTable}(sso_sid,subject_id,revoked) VALUES ${values.join(',')}`,parameters);
+            await pool.query(`ANALYZE TABLE ${stateTable}`);
+            const [[outer]]=await pool.execute(`SELECT sso_sid FROM ${table} WHERE session_id=?`,[id]);
+            const [[target]]=await pool.execute(`SELECT sso_sid FROM ${stateTable} WHERE sso_sid=?`,[master]);
+            assert.equal(outer.sso_sid,master);assert.equal(target.sso_sid,master);
+            const [probe]=await pool.execute(`EXPLAIN SELECT sso_sid FROM ${stateTable} WHERE sso_sid=?`,[master]);
+            assert.ok(probe.some(row=>row.key==='PRIMARY'&&['const','eq_ref','ref'].includes(row.type)));
+            membershipQueries.length=0;assert.ok(await sessions.getSession(id));assert.ok(await sessions.getSessionById(id));
+            assert.equal(membershipQueries.length,2);
+            function extra(value) {
+                if(/no matching row in const table/i.test(value||''))return 'no matching row in const table';
+                if(/impossible where.*const tables/i.test(value||''))return 'Impossible WHERE after const tables';
+                if(/using where/i.test(value||''))return 'Using where';
+                if(/using index/i.test(value||''))return 'Using index';
+                return value?'other':'';
+            }
+            const compact=plan=>plan.map(row=>({table:row.table,access_type:row.type,key:row.key,rows:row.rows,ref:row.ref,extra:extra(row.Extra)}));
+            for(const [number,query] of membershipQueries.entries()) {
+                const legacy=query.sql.replace(/state\.sso_sid=CONVERT\(LOWER\(sessions\.sso_sid\) USING ascii\) COLLATE ascii_bin/g,'state.sso_sid=sessions.sso_sid');
+                const [actualPlan]=await pool.execute('EXPLAIN '+mapSql(query.sql),query.args),[legacyPlan]=await pool.execute('EXPLAIN '+mapSql(legacy),query.args);
+                const actual=compact(actualPlan),reference=compact(legacyPlan);
+                console.log(JSON.stringify({fixture:'terminal-sid-plan',query:number===0?'getSession':'getSessionById',actual,legacyReference:reference}));
+                const stateRows=actual.filter(row=>row.table==='state');
+                if(stateRows.length)assert.ok(stateRows.some(row=>row.key==='PRIMARY'&&['const','eq_ref','ref'].includes(row.access_type)),JSON.stringify(actual));
+                else assert.ok(actual.some(row=>row.table===null&&['no matching row in const table','Impossible WHERE after const tables'].includes(row.extra)),JSON.stringify(actual));
+                // Nonempty equal results and the direct PRIMARY probe above prove
+                // a missing state EXPLAIN row is predicate constant-folding, not
+                // an absent outer session or absent terminal-state key.
+                const [actualRows]=await pool.execute(mapSql(query.sql),query.args),[legacyRows]=await pool.execute(mapSql(legacy),query.args);
+                assert.equal(actualRows.length,1);assert.equal(legacyRows.length,1);assert.deepEqual(actualRows,legacyRows);
+            }
+            await pool.execute(`UPDATE ${stateTable} SET revoked=1 WHERE sso_sid=?`,[master]);
+            assert.equal(await sessions.getSession(id),null);assert.equal(await sessions.getSessionById(id),null);
+            await pool.execute(`UPDATE ${table} SET sso_sid=UPPER(sso_sid) WHERE session_id=?`,[id]);
+            assert.equal(await sessions.getSession(id),null,'legacy uppercase SID must match canonical terminal state');
+            assert.equal(await sessions.getSessionById(id),null);
+        });
     } finally {
         try {
-            if (created) await pool.query(`DROP TABLE ${table}`);
+            if (created) { await pool.query(`DROP TABLE IF EXISTS ${stateTable}`); await pool.query(`DROP TABLE ${table}`); }
             const keys = await redis.keys('*');
             const unprefixed = keys.filter(key => key.startsWith(namespace)).map(key => key.slice(namespace.length));
             if (unprefixed.length) await redis.del(...unprefixed);

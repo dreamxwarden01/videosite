@@ -1205,6 +1205,14 @@ async function runMigrations({ strict = false } = {}) {
                 id: '051_staged_client_signing_key',
                 up: async () => require('./clientSigningKeyMigration').migrateClientSigningKeys(pool),
             },
+            {
+                id: '052_terminal_sso_sessions',
+                up: async () => require('./ssoSessionMigration').migrateSsoSessions(pool),
+            },
+            {
+                id: '053_sso_account_status',
+                up: async () => require('./ssoAccountStatusMigration').migrateSsoAccountStatus(pool),
+            },
         ];
 
         for (const migration of migrations) {

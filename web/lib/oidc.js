@@ -159,11 +159,12 @@ function authorizeUrl({ challenge, state, nonce, extra = {} }) {
 // private_key_jwt client assertion (RFC 7523) — our credential for the SSO's
 // /token and /internal/* endpoints. iss=sub=CLIENT_ID, aud=ISSUER, 60s life.
 // One definition, three callers (/token, /internal/avatar, /internal/session-activity).
-async function signClientAssertion() {
+async function signClientAssertion(path) {
+  if (typeof path !== 'string' || !/^\/[A-Za-z0-9_/-]+$/.test(path) || path.includes('//')) throw new Error('invalid_assertion_path');
   const { SignJWT } = await jose();
   const {kid,key} = await clientKey();
   const now = Math.floor(Date.now() / 1000);
-  return new SignJWT({})
+  return new SignJWT({ method: 'POST', path })
     .setProtectedHeader({ alg: 'EdDSA', kid })
     .setIssuer(CLIENT_ID).setSubject(CLIENT_ID).setAudience(ISSUER)
     .setIssuedAt(now).setExpirationTime(now + 60).setJti(crypto.randomUUID())
@@ -172,7 +173,7 @@ async function signClientAssertion() {
 
 // Authorization-code -> tokens, authenticating with private_key_jwt (RFC 7523).
 async function exchangeCode(code, verifier) {
-  const assertion = await signClientAssertion();
+  const assertion = await signClientAssertion('/token');
 
   const r = await s2sFetch(INTERNAL + '/token', {
     method: 'POST',
@@ -305,7 +306,7 @@ function ssoActivityUrl() { return INTERNAL + '/internal/session-activity'; }
 // Fetch avatar bytes from the SSO's internal endpoint (client assertion —
 // same private_key_jwt material as /token). Returns a Buffer or null.
 async function fetchInternalAvatar(file) {
-  const assertion = await signClientAssertion();
+  const assertion = await signClientAssertion('/internal/avatar');
   const r = await s2sFetch(INTERNAL + '/internal/avatar', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

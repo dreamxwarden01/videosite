@@ -55,8 +55,8 @@ function redisFixture() {
     return redis;
 }
 function fixture() {
-    const now = Date.now(), redis = redisFixture(), rows = new Map();
-    const uid = '00000000000000000000000000000001', sid = 'synthetic-local-session', ssoSid = 'synthetic-sso-session';
+    const now = Date.now(), redis = redisFixture(), rows = new Map(), states = new Map();
+    const uid = '00000000000000000000000000000001', sid = 'synthetic-local-session', ssoSid = '00000000-0000-4000-8000-000000000010';
     const row = { session_id: sid, user_id: uid, last_seen: new Date(now), last_sign_in: new Date(now),
         ip_address: '127.0.0.1', user_agent: 'fixture', sso_sid: ssoSid, sso_expires_at: new Date(now + 3600000),
         sso_role_generation: '0', stepup_at: null, stepup_method: null };
@@ -67,13 +67,15 @@ function fixture() {
         const sql = input.replace(/\s+/g, ' ').trim();
         if (sqlFailure) throw new Error('synthetic_sql_unavailable');
         if (sql.startsWith('SELECT session_id, user_id, last_seen,')) {
-            membershipReads++; return [rows.has(args[0]) ? [{ ...rows.get(args[0]) }] : []];
+            membershipReads++; const row = rows.get(args[0]), state = row && states.get(row.sso_sid);
+            return [row ? [{ ...row, sso_revoked: !!state && (state.revoked || state.subject_id !== row.user_id) }] : []];
         }
-        if (sql === 'SELECT session_id, user_id FROM sessions WHERE sso_sid = ?') {
+        if (sql === 'SELECT session_id, user_id FROM sessions WHERE sso_sid = ?' || sql === 'SELECT session_id,user_id FROM sessions WHERE sso_sid=? FOR UPDATE') {
             return [[...rows.values()].filter(r => r.sso_sid === args[0]).map(r => ({ session_id: r.session_id, user_id: r.user_id }))];
         }
-        if (sql === 'SELECT session_id, user_id FROM sessions WHERE session_id = ?') {
-            membershipReads++; const r = rows.get(args[0]); return [r ? [{ session_id: r.session_id, user_id: r.user_id }] : []];
+        if (sql.startsWith('SELECT session_id, user_id FROM sessions WHERE session_id = ?')) {
+            membershipReads++; const r = rows.get(args[0]), state = r && states.get(r.sso_sid);
+            return [r && !state?.revoked ? [{ session_id: r.session_id, user_id: r.user_id }] : []];
         }
         if (sql === 'SELECT user_id FROM sessions WHERE session_id = ?') {
             const r = rows.get(args[0]); return [r ? [{ user_id: r.user_id }] : []];
@@ -88,6 +90,12 @@ function fixture() {
             }
             return [{ affectedRows: 1 }];
         }
+        if (sql.startsWith('INSERT INTO sso_session_state')) {
+            if (!states.has(args[0])) states.set(args[0], { subject_id: args[1].toString('hex'), revoked: 0 });
+            return [{ affectedRows: 1 }];
+        }
+        if (sql === 'SELECT subject_id,revoked FROM sso_session_state WHERE sso_sid=? FOR UPDATE') return [[{ ...states.get(args[0]) }]];
+        if (sql === 'UPDATE sso_session_state SET revoked=1 WHERE sso_sid=?') { states.get(args[0]).revoked = 1; return [{ affectedRows: 1 }]; }
         if (sql.startsWith('INSERT INTO sessions ')) {
             const [id, user, seen, signIn, agent, ip, sso, expires, generation] = args;
             rows.set(id, { session_id: id, user_id: user.toString('hex'), last_seen: seen, last_sign_in: signIn,
@@ -104,11 +112,14 @@ function fixture() {
         if (settingsBarrier) { const gate = settingsBarrier; settingsBarrier = null; gate.arrive(); await gate.released; }
         return ({ session_inactivity_days: '1', session_max_days: '3' })[key] ?? fallback;
     } };
-    const cache = load('services/cache/sessionCache.js', { '../redis': { getClient: () => redis } });
-    const sessions = load('config/session.js', { crypto, './database': { getPool: () => pool, idBuf: id => Buffer.from(id, 'hex') },
-        '../services/cache/sessionCache': cache, '../services/cache/settingsCache': settings });
-    const authority = { subject_id: '00000000-0000-4000-8000-000000000001', role_id: 2, blocked: 0, effects_pending: 0, session_generation: '0' };
+    Object.assign(pool, { getConnection: async () => pool, query: async () => [], beginTransaction: async () => {}, commit: async () => {}, rollback: async () => {}, release() {} });
     const protocol = load('lib/ssoRoleProtocol.js', { 'node:crypto': crypto });
+    const catalog = load('services/ssoCatalogStore.js', { 'node:crypto': crypto, '../lib/ssoRoleProtocol': protocol });
+    const cache = load('services/cache/sessionCache.js', { '../redis': { getClient: () => redis } });
+    const reloadSessions = () => load('config/session.js', { crypto, './database': { getPool: () => pool, idBuf: id => Buffer.from(id, 'hex') },
+        '../services/cache/sessionCache': cache, '../services/cache/settingsCache': settings, '../services/ssoCatalogStore': catalog });
+    const sessions = reloadSessions();
+    const authority = { subject_id: '00000000-0000-4000-8000-000000000001', role_id: 2, blocked: 0, effects_pending: 0, session_generation: '0' };
     const auth = load('middleware/auth.js', {
         '../config/session': sessions,
         '../services/permissionService': { resolveAuthBundle: async () => ({ role_id: 2, permission_level: 10, permissions: { fixtureRead: true } }) },
@@ -117,7 +128,7 @@ function fixture() {
         '../lib/ssoRoleProtocol': protocol, '../services/ssoActivity': { reportActivity: async () => {} },
         '../services/userService': { invalidateUserCaches: async () => {} },
     });
-    return { now, uid, sid, ssoSid, row, rows, redis, cache, sessions, authority,
+    return { now, uid, sid, ssoSid, row, rows, states, redis, cache, sessions, authority, reloadSessions,
         settingsGate() { settingsBarrier = barrier(); return settingsBarrier; },
         deletionGate() { deletionBarrier = barrier(); return deletionBarrier; },
         failSql() { sqlFailure = true; }, membershipReads: () => membershipReads,
@@ -227,4 +238,33 @@ test('live cached activity still prevents stale SQL flush timestamps from expiri
     f.redis.hashes.get('session:user:' + f.sid).last_seen = String(f.now);
     assert.equal(await f.sessions.isSessionValid(await f.sessions.getSession(f.sid)), true);
     f.redis.hashes.clear(); assert.equal(await f.sessions.isSessionValid(await f.sessions.getSession(f.sid)), false);
+});
+
+test('terminal SID logout blocks a late callback and survives a fresh module instance without blocking normal replacement', async () => {
+    const f = fixture(), subject = f.uid.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5');
+    await f.seedCache();
+    await f.sessions.revokeSessionsBySsoSid(f.ssoSid, subject);
+    const restarted = f.reloadSessions();
+    await assert.rejects(restarted.createSession(f.uid, 'fixture', null, f.ssoSid, new Date(f.now + 3600000)), /sso_session_revoked/);
+    assert.equal(await restarted.getSession(f.sid), null);
+    // A different live SSO session still supports ordinary local replacement.
+    const live = '00000000-0000-4000-8000-000000000020';
+    const first = await restarted.createSession(f.uid, null, null, live);
+    await restarted.deleteSessionsBySsoSid(live);
+    const replacement = await restarted.createSession(f.uid, null, null, live);
+    assert.notEqual(first, replacement); assert.ok(await restarted.getSession(replacement));
+});
+test('callback insertion before terminal logout is deleted, and a retained SQL/cache row is denied by terminal state', async () => {
+    const f = fixture(), subject = f.uid.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5');
+    const inserted = await f.sessions.createSession(f.uid, null, null, f.ssoSid);
+    await f.sessions.revokeSessionsBySsoSid(f.ssoSid, subject);
+    assert.equal(await f.sessions.getSession(inserted), null);
+    f.rows.set(f.sid, f.row); await f.seedCache();
+    assert.equal(await f.sessions.getSession(f.sid), null);
+    assert.equal(await f.sessions.getSessionById(f.sid), null);
+});
+test('a signed logout subject cannot revoke a SID already bound to a different subject', async () => {
+    const f = fixture(); await f.sessions.createSession(f.uid, null, null, f.ssoSid);
+    await assert.rejects(f.sessions.revokeSessionsBySsoSid(f.ssoSid, '00000000-0000-4000-8000-000000000099'), /sso_session_binding_mismatch/);
+    assert.equal(f.states.get(f.ssoSid).revoked, 0);
 });

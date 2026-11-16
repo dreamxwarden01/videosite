@@ -145,6 +145,14 @@ behind a durable access gate, and restoring access does not revive sessions from
 before a denial. Keep the database's lineage and generation tables with backups;
 restoring an older database is an explicit recovery operation, not a revision reset.
 
+Terminal SSO-session revocations are stored durably and serialized with local
+session creation. A late callback cannot reopen a revoked SSO session; ordinary
+same-session replacement remains supported. Logout receipts are recorded only after
+the effect completes. Account-status events share the role watermark and immediately
+restrict access; a later positive event alone does not clear a confirmed block.
+Migrations `052_terminal_sso_sessions` and `053_sso_account_status` add these records
+without changing the frozen baseline. Keep them with database backups.
+
 Run `npm run test:sso-roles` in `web` for protocol and HTTP boundary checks. The
 SQL/Redis test is skipped unless `VS_SSO_ISOLATED_TEST=1`, `VS_TEST_DB_URI`, and
 `VS_TEST_REDIS_URI` name disposable loopback fixtures; the database name must start
