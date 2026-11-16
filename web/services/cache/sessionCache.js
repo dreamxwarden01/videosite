@@ -5,7 +5,8 @@
 //   user:sessions:{user_id}  set   member = sid (one entry per active session)
 //   dirty:session:user       set   member = sid (drained by Phase 5 flusher)
 //
-// The DB `sessions` table stays as the audit / admin-view backing store.
+// The DB `sessions` table owns membership and authentication fields. Consumers
+// must use config/session rather than treating a cached hash as proof of login.
 // Writes that change session lifecycle (create / delete / terminate) hit
 // both stores immediately; per-request `last_seen` updates only land in
 // Redis until the periodic flusher picks them up.

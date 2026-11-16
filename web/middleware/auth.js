@@ -15,9 +15,8 @@ function getClientIp(req) {
     return req.socket.remoteAddress || null;
 }
 
-// Load user from session cookie on every request. The full hot path is now
-// 1 Redis GET (session) + 1 Redis GET (user_meta) + 2 Redis GETs (perms) on
-// cache hit; previously it was 1 DB JOIN + 2 DB queries + 1 DB query.
+// Load user from the cookie. Session resolution always checks SQL membership;
+// cached activity, user metadata and permissions cannot revive a deleted row.
 async function loadUser(req, res, next) {
     res.locals.user = null;
 

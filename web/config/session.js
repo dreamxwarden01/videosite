@@ -66,22 +66,12 @@ async function deleteSessionsBySsoSid(ssoSid) {
     return rows.length;
 }
 
-// Read the session record. Tries Redis first; on miss, falls back to the DB
-// audit row and repopulates Redis. Returns just the session fields — the
-// caller (middleware/auth) is responsible for fetching user metadata via
-// userCache.
-//
-// Returns null when the session doesn't exist anywhere or has expired past
-// the absolute max-days window.
+// SQL owns session membership and immutable authentication fields on every read.
+// Redis only supplies live activity: a read begun before deletion may refill its
+// cache afterward, but that SQL-less entry must never authorize a later request.
+// The caller still checks expiry and current user/role authority.
 async function getSession(sessionId) {
     const cached = await sessionCache.getSession(sessionId);
-    if (cached) {
-        cached.session_id = sessionId;
-        return cached;
-    }
-
-    // Cache miss — try DB. Either the session is older than its idle TTL
-    // (Redis expired it) and is invalid, or Redis was cold-restarted.
     const pool = getPool();
     const [rows] = await pool.execute(
         `SELECT session_id, user_id, last_seen, last_sign_in, user_agent, ip_address, sso_expires_at, sso_sid,
@@ -89,30 +79,37 @@ async function getSession(sessionId) {
          FROM sessions WHERE session_id = ?`,
         [sessionId]
     );
-    if (rows.length === 0) return null;
+    if (rows.length === 0) {
+        await sessionCache.deleteSession(sessionId, cached?.user_id);
+        return null;
+    }
 
     const row = rows[0];
-    const lastSeenMs = new Date(row.last_seen).getTime();
     const lastSignInMs = new Date(row.last_sign_in).getTime();
     const ssoExpMs = row.sso_expires_at ? new Date(row.sso_expires_at).getTime() : null;
+    const cacheMatches = cached && cached.user_id === row.user_id
+        && cached.sso_sid === (row.sso_sid || null)
+        && cached.sso_role_generation === row.sso_role_generation;
+    const lastSeenMs = Math.max(new Date(row.last_seen).getTime(),
+        cacheMatches && Number.isFinite(cached.last_seen) ? cached.last_seen : 0);
+    const session = {
+        session_id: row.session_id,
+        user_id: row.user_id,
+        last_sign_in: lastSignInMs,
+        last_seen: lastSeenMs,
+        ip_address: cacheMatches ? cached.ip_address : row.ip_address,
+        user_agent: cacheMatches ? cached.user_agent : row.user_agent,
+        sso_expires_at: ssoExpMs,
+        sso_sid: row.sso_sid || null,
+        sso_role_generation: row.sso_role_generation,
+    };
+    if (cacheMatches) return session;
 
-    // If DB row is itself past idle threshold, treat as expired — don't
-    // repopulate Redis, let isSessionValid drive the cleanup.
+    // A cold/mismatched cache must not revive an idle-expired SQL session.
     const { inactivityDays } = await getSessionLimits();
     const inactivityMs = inactivityDays * 24 * 60 * 60 * 1000;
     if (Date.now() - lastSeenMs > inactivityMs) {
-        return {
-            session_id: row.session_id,
-            user_id: row.user_id,
-            last_sign_in: lastSignInMs,
-            last_seen: lastSeenMs,
-            ip_address: row.ip_address,
-            user_agent: row.user_agent,
-            sso_expires_at: ssoExpMs,
-            sso_sid: row.sso_sid || null,
-            sso_role_generation: row.sso_role_generation,
-            _stale: true,
-        };
+        return { ...session, _stale: true };
     }
 
     // Repopulate Redis with remaining TTL
@@ -128,25 +125,12 @@ async function getSession(sessionId) {
         roleGeneration: row.sso_role_generation,
     }, remainingTtl);
 
-    return {
-        session_id: row.session_id,
-        user_id: row.user_id,
-        last_sign_in: lastSignInMs,
-        last_seen: lastSeenMs,
-        ip_address: row.ip_address,
-        user_agent: row.user_agent,
-        sso_expires_at: ssoExpMs,
-        sso_sid: row.sso_sid || null,
-        sso_role_generation: row.sso_role_generation,
-    };
+    return session;
 }
 
 // Lightweight existence check (used where we only need to know "does this sid
 // exist", not full session data).
 async function getSessionById(sessionId) {
-    const cached = await sessionCache.getSession(sessionId);
-    if (cached) return { session_id: sessionId, user_id: cached.user_id };
-
     const pool = getPool();
     const [rows] = await pool.execute(
         'SELECT session_id, user_id FROM sessions WHERE session_id = ?',
