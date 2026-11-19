@@ -8,14 +8,14 @@ const path = require('node:path');
 const vm = require('node:vm');
 const crypto = require('node:crypto');
 
-function load(relative, dependencies) {
+function load(relative, dependencies, globals = {}) {
     const file = path.join(__dirname, '..', relative), module = { exports: {} };
     const requireFixture = name => {
         if (!Object.hasOwn(dependencies, name)) throw new Error('unexpected_import:' + name);
         return dependencies[name];
     };
     vm.runInNewContext('(function(require,module,exports){\n' + fs.readFileSync(file, 'utf8') + '\n})',
-        { Buffer, Date, AbortSignal, URLSearchParams, console: { log() {}, warn() {}, error() {} } },
+        { Buffer, Date, AbortSignal, URLSearchParams, console: { log() {}, warn() {}, error() {} }, ...globals },
         { filename: file })(requireFixture, module, module.exports);
     return module.exports;
 }
@@ -61,7 +61,8 @@ function fixture() {
         ip_address: '127.0.0.1', user_agent: 'fixture', sso_sid: ssoSid, sso_expires_at: new Date(now + 3600000),
         sso_role_generation: '0', stepup_at: null, stepup_method: null };
     rows.set(sid, row);
-    let settingsBarrier, deletionBarrier, sqlFailure = false, membershipReads = 0;
+    let settingsBarrier, deletionBarrier, stepupLockBarrier, sqlFailure = false, membershipReads = 0, clockOffset = 0;
+    const sessionClock = new Proxy(Date, { get(target, key) { return key === 'now' ? () => now + clockOffset : Reflect.get(target, key); } });
     const sameUser = (value, id) => value === (Buffer.isBuffer(id) ? id.toString('hex') : id);
     const pool = { async execute(input, args) {
         const sql = input.replace(/\s+/g, ' ').trim();
@@ -94,7 +95,10 @@ function fixture() {
             if (!states.has(args[0])) states.set(args[0], { subject_id: args[1].toString('hex'), revoked: 0 });
             return [{ affectedRows: 1 }];
         }
-        if (sql === 'SELECT subject_id,revoked FROM sso_session_state WHERE sso_sid=? FOR UPDATE') return [[{ ...states.get(args[0]) }]];
+        if (sql === 'SELECT subject_id,revoked FROM sso_session_state WHERE sso_sid=? FOR UPDATE') {
+            if (stepupLockBarrier) { const gate = stepupLockBarrier; stepupLockBarrier = null; gate.arrive(); await gate.released; }
+            return [[{ ...states.get(args[0]) }]];
+        }
         if (sql === 'UPDATE sso_session_state SET revoked=1 WHERE sso_sid=?') { states.get(args[0]).revoked = 1; return [{ affectedRows: 1 }]; }
         if (sql.startsWith('INSERT INTO sessions ')) {
             const [id, user, seen, signIn, agent, ip, sso, expires, generation] = args;
@@ -102,6 +106,12 @@ function fixture() {
                 user_agent: agent, ip_address: ip, sso_sid: sso, sso_expires_at: expires,
                 sso_role_generation: String(generation), stepup_at: null, stepup_method: null });
             return [{ affectedRows: 1 }];
+        }
+        if (sql.startsWith('UPDATE sessions SET stepup_at = ?, stepup_method = ?')) {
+            const [at, method, id, user, sso] = args, r = rows.get(id);
+            const matched = r && sameUser(r.user_id, user) && r.sso_sid === sso;
+            if (matched) { r.stepup_at = at; r.stepup_method = method; }
+            return [{ affectedRows: matched ? 1 : 0 }];
         }
         if (sql === 'SELECT stepup_at, stepup_method FROM sessions WHERE session_id = ?') {
             const r = rows.get(args[0]); return [r ? [{ stepup_at: r.stepup_at, stepup_method: r.stepup_method }] : []];
@@ -117,7 +127,7 @@ function fixture() {
     const catalog = load('services/ssoCatalogStore.js', { 'node:crypto': crypto, '../lib/ssoRoleProtocol': protocol });
     const cache = load('services/cache/sessionCache.js', { '../redis': { getClient: () => redis } });
     const reloadSessions = () => load('config/session.js', { crypto, './database': { getPool: () => pool, idBuf: id => Buffer.from(id, 'hex') },
-        '../services/cache/sessionCache': cache, '../services/cache/settingsCache': settings, '../services/ssoCatalogStore': catalog });
+        '../services/cache/sessionCache': cache, '../services/cache/settingsCache': settings, '../services/ssoCatalogStore': catalog }, { Date: sessionClock });
     const sessions = reloadSessions();
     const authority = { subject_id: '00000000-0000-4000-8000-000000000001', role_id: 2, blocked: 0, effects_pending: 0, session_generation: '0' };
     const auth = load('middleware/auth.js', {
@@ -131,6 +141,8 @@ function fixture() {
     return { now, uid, sid, ssoSid, row, rows, states, redis, cache, sessions, authority, reloadSessions,
         settingsGate() { settingsBarrier = barrier(); return settingsBarrier; },
         deletionGate() { deletionBarrier = barrier(); return deletionBarrier; },
+        stepupLockGate() { stepupLockBarrier = barrier(); return stepupLockBarrier; },
+        advanceClock(ms) { clockOffset += ms; },
         failSql() { sqlFailure = true; }, membershipReads: () => membershipReads,
         async seedCache(id = sid, data = row) {
             await cache.createSession(id, { userId: data.user_id, lastSignIn: data.last_sign_in, lastSeen: data.last_seen,
@@ -267,4 +279,48 @@ test('a signed logout subject cannot revoke a SID already bound to a different s
     const f = fixture(); await f.sessions.createSession(f.uid, null, null, f.ssoSid);
     await assert.rejects(f.sessions.revokeSessionsBySsoSid(f.ssoSid, '00000000-0000-4000-8000-000000000099'), /sso_session_binding_mismatch/);
     assert.equal(f.states.get(f.ssoSid).revoked, 0);
+});
+
+// Actual stamp helper shares the existing terminal-session lock, and its SQL
+// update predicates cannot move proof onto a different local/SSO session.
+function stepupBinding(f) {
+    return { userId: f.uid, ssoSid: f.ssoSid, authenticatedAt: new Date(f.now - 5000), expiresAt: f.now + 600000 };
+}
+test('bound step-up stamps the verified factor time on only the original row', async () => {
+    const f = fixture(), binding = stepupBinding(f);
+    assert.equal(await f.sessions.stampSessionStepup(f.sid, 'passkey', binding), true);
+    assert.equal(f.row.stepup_at.getTime(), binding.authenticatedAt.getTime());
+    assert.equal(f.row.stepup_method, 'passkey');
+    assert.equal(f.states.get(f.ssoSid).revoked, 0);
+});
+test('bound step-up cannot stamp a deleted original or its same-user replacement', async () => {
+    const f = fixture();
+    await f.sessions.deleteSessionsBySsoSid(f.ssoSid);
+    const replacement = await f.sessions.createSession(f.uid, null, null, f.ssoSid);
+    assert.equal(await f.sessions.stampSessionStepup(f.sid, 'passkey', stepupBinding(f)), false);
+    assert.equal(f.rows.get(replacement).stepup_at, null);
+});
+test('bound step-up cannot stamp a row rebound to another master or subject', async () => {
+    const f = fixture(); f.row.sso_sid = '00000000-0000-4000-8000-000000000020';
+    assert.equal(await f.sessions.stampSessionStepup(f.sid, 'passkey', stepupBinding(f)), false);
+    f.row.sso_sid = f.ssoSid; f.row.user_id = '00000000000000000000000000000002';
+    assert.equal(await f.sessions.stampSessionStepup(f.sid, 'passkey', stepupBinding(f)), false);
+    assert.equal(f.row.stepup_at, null);
+});
+test('terminal state blocks bound stamp even if a SQL row is retained', async () => {
+    const f = fixture(); f.states.set(f.ssoSid, { subject_id: f.uid, revoked: 1 });
+    assert.equal(await f.reloadSessions().stampSessionStepup(f.sid, 'passkey', stepupBinding(f)), false);
+    assert.equal(f.row.stepup_at, null);
+});
+test('original master subject mismatch rejects bound stamp', async () => {
+    const f = fixture(); f.states.set(f.ssoSid, { subject_id: '00000000000000000000000000000002', revoked: 0 });
+    await assert.rejects(f.sessions.stampSessionStepup(f.sid, 'passkey', stepupBinding(f)), /sso_session_binding_mismatch/);
+    assert.equal(f.row.stepup_at, null);
+});
+test('expired flow cannot stamp after waiting for the terminal-state lock', async () => {
+    const f = fixture(), binding = stepupBinding(f), gate = f.stepupLockGate();
+    const pending = f.sessions.stampSessionStepup(f.sid, 'passkey', binding);
+    await gate.entered; f.advanceClock(600000); gate.release();
+    assert.equal(await pending, false);
+    assert.equal(f.row.stepup_at, null);
 });

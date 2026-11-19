@@ -17,7 +17,7 @@
     "test:jwks": "node --test scripts/jwks-http.test.js scripts/client-signing-keys.test.js",
     "test:shutdown": "node --test scripts/graceful-shutdown.test.js",
     "test:sso-roles:db": "node scripts/run-sso-role-tests.mjs",
-    "test:sessions": "node --test scripts/session-revocation.test.js scripts/logout-receiver.test.js scripts/assertion-issuer.test.js"
+    "test:sessions": "node --test scripts/session-revocation.test.js scripts/logout-receiver.test.js scripts/assertion-issuer.test.js scripts/stepup-callback.test.js"
   },
   "keywords": [],
   "author": "",

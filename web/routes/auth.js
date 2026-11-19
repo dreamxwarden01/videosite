@@ -7,7 +7,7 @@
 const express = require('express');
 const router = express.Router();
 const oidc = require('../lib/oidc');
-const { createSession, deleteSession, deleteSessionsBySsoSid, getSessionMaxDays, stampSessionStepup } = require('../config/session');
+const { createSession, deleteSession, deleteSessionsBySsoSid, getSessionMaxDays, getSession, isSessionValid, stampSessionStepup } = require('../config/session');
 const { STEPUP_METHODS, STEPUP_PRECHECK_BUFFER_MS, STEPUP_WINDOW_MS, stepupState, scenarioPolicy, stepupMethodsForLevel, windowSecondsFor } = require('../middleware/stepup');
 const { SESSION_COOKIE, getClientIp } = require('../middleware/auth');
 const { findOrCreateBySub } = require('../services/userService');
@@ -37,6 +37,23 @@ const cookieSecure = process.env.OIDC_COOKIE_SECURE !== 'false';
 const FLOW_COOKIE_PREFIX = 'oidc_flow_';
 const MAX_CONCURRENT_FLOWS = 5;
 const FLOW_TTL_MS = 10 * 60 * 1000;
+// NumericDate claims have second precision; allow bounded issuer clock skew.
+const STEPUP_CLOCK_SKEW_MS = 30 * 1000;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function subjectId(value) {
+  if (typeof value !== 'string') return null;
+  const id = value.replace(/-/g, '').toLowerCase();
+  return /^[0-9a-f]{32}$/.test(id) ? id : null;
+}
+function ssoSid(value) { return typeof value === 'string' && UUID.test(value) ? value.toLowerCase() : null; }
+function stepupTimeCurrent(flow, authTime, now) {
+  return Number.isSafeInteger(flow.startedAt) && flow.startedAt > 0
+    && now - flow.startedAt >= -STEPUP_CLOCK_SKEW_MS
+    && now - flow.startedAt < FLOW_TTL_MS
+    && Number.isSafeInteger(authTime) && authTime > 0
+    && authTime * 1000 >= flow.startedAt - STEPUP_CLOCK_SKEW_MS
+    && authTime * 1000 <= now + STEPUP_CLOCK_SKEW_MS;
+}
 
 // State is base64url from crypto.randomBytes, so it is already a valid cookie
 // name character set; validate anyway before using it to build a name.
@@ -134,7 +151,7 @@ router.get('/auth/login', (req, res) => {
 // accepted method set + the id_token hint. The flow cookie carries purpose+required
 // so the shared /auth/callback records and enforces it. The client saved its draft
 // (sessionStorage) before navigating here.
-router.get('/auth/stepup/start', (req, res) => {
+router.get('/auth/stepup/start', async (req, res) => {
   const returnTo = sanitizeReturnTo(req.query.returnTo);
   if (!res.locals.user) {
     // No live session -> the page they land on will bounce through /auth/login.
@@ -146,8 +163,25 @@ router.get('/auth/stepup/start', (req, res) => {
   const reqParam = typeof req.query.required === 'string' ? req.query.required : '';
   const whitelisted = reqParam.split(',').map((s) => s.trim()).filter((m) => m === 'totp' || m === 'passkey');
   const required = whitelisted.length ? whitelisted : STEPUP_METHODS;
+  // Capture the original SQL-backed local/SSO session, rather than relying on an
+  // id_token hint (which is only a hint). A later login by the same user must not
+  // receive this flow's proof.
+  const current = res.locals.user;
+  let session;
+  try {
+    session = await getSession(current.session_id);
+    if (!session || !(await isSessionValid(session)) || !ssoSid(session.sso_sid) || !subjectId(current.user_id)
+        || subjectId(session.user_id) !== subjectId(current.user_id)) {
+      return res.redirect(stepupReturn({ returnTo }, 'failed'));
+    }
+  } catch (err) {
+    console.error('step-up start failed:', err.message);
+    return res.redirect(stepupReturn({ returnTo }, 'error'));
+  }
   const { verifier, challenge, state, nonce } = oidc.beginFlow();
-  pushFlow(req, res, { verifier, state, nonce, returnTo, purpose: 'stepup', required });
+  pushFlow(req, res, { verifier, state, nonce, returnTo, purpose: 'stepup', required,
+    sessionId: current.session_id, subjectId: subjectId(session.user_id),
+    ssoSid: ssoSid(session.sso_sid), startedAt: Date.now() });
   const extra = { stepup: required.join(',') };
   const idt = req.cookies['oidc_idt'];
   if (idt) extra.id_token_hint = idt; // OIDC hint: "this should be the same subject"
@@ -203,17 +237,26 @@ function stepupReturn(flow, outcome) {
 // session — the user keeps the one they have; we only record the fresh factor.
 async function handleStepupCallback(req, res, flow) {
   try {
+    const current = res.locals.user;
+    // Old unbound flows, logout, and any local-session replacement fail closed.
+    // Do not exchange a proof intended for another browser login.
+    if (!current || !flow.sessionId || current.session_id !== flow.sessionId
+        || req.cookies[SESSION_COOKIE] !== flow.sessionId
+        || !flow.subjectId || subjectId(current.user_id) !== flow.subjectId
+        || !ssoSid(flow.ssoSid)) {
+      return res.redirect(stepupReturn(flow, 'failed'));
+    }
     const tok = await oidc.exchangeCode(String(req.query.code), flow.verifier);
     const claims = await oidc.verifyIdToken(tok.id_token, flow.nonce);
 
-    const current = res.locals.user;
-    // Session vanished during the round-trip -> let the page bounce to /auth/login.
-    if (!current) return res.redirect(sanitizeReturnTo(flow.returnTo));
-
-    // Bind identity: the returned subject MUST be this session's user. A mid-flight
-    // account switch at the SSO is caught here, not by trusting the SSO session.
-    const claimSub = String(claims.sub || '').replace(/-/g, '').toLowerCase();
-    if (!claimSub || claimSub !== String(current.user_id).toLowerCase()) {
+    // Re-read after the network round-trip: loadUser may have run before logout
+    // or revocation. getSession includes the persistent terminal-SID fence.
+    const session = await getSession(flow.sessionId);
+    if (!session || !(await isSessionValid(session))
+        || subjectId(session.user_id) !== flow.subjectId
+        || ssoSid(session.sso_sid) !== flow.ssoSid
+        || subjectId(claims.sub) !== flow.subjectId
+        || ssoSid(claims.sid) !== flow.ssoSid) {
       return res.redirect(stepupReturn(flow, 'account'));
     }
 
@@ -235,8 +278,15 @@ async function handleStepupCallback(req, res, flow) {
     const want = Array.isArray(flow.required) ? flow.required : STEPUP_METHODS;
     if (!want.includes(method)) return res.redirect(stepupReturn(flow, 'failed'));
 
-    await stampSessionStepup(current.session_id, method);
-    return res.redirect(stepupReturn(flow, 'done'));
+    // Check after all awaited reads, and preserve the factor's actual proof time:
+    // leaving a callback open must not restart a full sudo window on receipt.
+    const now = Date.now();
+    if (!stepupTimeCurrent(flow, claims.auth_time, now)) return res.redirect(stepupReturn(flow, 'failed'));
+    const stamped = await stampSessionStepup(flow.sessionId, method, {
+      userId: flow.subjectId, ssoSid: flow.ssoSid, expiresAt: flow.startedAt + FLOW_TTL_MS,
+      authenticatedAt: new Date(Math.min(claims.auth_time * 1000, now)),
+    });
+    return res.redirect(stepupReturn(flow, stamped ? 'done' : 'failed'));
   } catch (err) {
     console.error('step-up callback failed:', err.message, err.detail || '');
     return res.redirect(stepupReturn(flow, 'error'));

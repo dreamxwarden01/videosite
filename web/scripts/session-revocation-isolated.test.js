@@ -8,14 +8,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-function load(relative, dependencies) {
+function load(relative, dependencies, globals = {}) {
     const file = path.join(__dirname, '..', relative), module = { exports: {} };
     const requireFixture = name => {
         if (!Object.hasOwn(dependencies, name)) throw new Error('unexpected_import:' + name);
         return dependencies[name];
     };
     vm.runInNewContext('(function(require,module,exports){\n' + fs.readFileSync(file, 'utf8') + '\n})',
-        { Buffer, Date, process: { env: {} }, console: { log() {}, warn() {}, error() {} } },
+        { Buffer, Date, process: { env: {} }, console: { log() {}, warn() {}, error() {} }, ...globals },
         { filename: file })(requireFixture, module, module.exports);
     return module.exports;
 }
@@ -46,10 +46,16 @@ test('VideoSite session SQL authority with real production typecast and Redis', 
     // A private table prevents interaction with the role suite's simpler schema.
     const stateTable = table + '_state';
     const mapSql = sql => sql.replace(/\bsso_session_state\b/g, stateTable).replace(/\bsessions\b/g, table);
-    let creationGate;
+    let creationGate, stampLockAttempt, stampUpdateAttempt;
     const wrap = db => ({
         execute: async (sql, args) => {
             if (creationGate && /^INSERT INTO sessions /.test(sql.trim())) { const gate = creationGate; creationGate = null; gate.arrive(); await gate.released; }
+            if (stampLockAttempt && /^INSERT INTO sso_session_state\b/.test(sql.trim())) {
+                const gate = stampLockAttempt; stampLockAttempt = null; gate.arrive();
+            }
+            if (stampUpdateAttempt && /^UPDATE sessions SET stepup_at\b/.test(sql.trim())) {
+                const gate = stampUpdateAttempt; stampUpdateAttempt = null; gate.arrive();
+            }
             return db.execute(mapSql(sql), args);
         },
         query: (sql, args) => db.query(mapSql(sql), args),
@@ -68,8 +74,8 @@ test('VideoSite session SQL authority with real production typecast and Redis', 
     const cache = load('services/cache/sessionCache.js', { '../redis': { getClient: () => redis } });
     const protocol = load('lib/ssoRoleProtocol.js', { 'node:crypto': crypto });
     const catalog = load('services/ssoCatalogStore.js', { 'node:crypto': crypto, '../lib/ssoRoleProtocol': protocol });
-    const reload = () => load('config/session.js', { crypto, './database': { getPool: () => fixturePool, idBuf: database.idBuf },
-        '../services/cache/sessionCache': cache, '../services/cache/settingsCache': settings, '../services/ssoCatalogStore': catalog });
+    const reload = (clock = Date) => load('config/session.js', { crypto, './database': { getPool: () => fixturePool, idBuf: database.idBuf },
+        '../services/cache/sessionCache': cache, '../services/cache/settingsCache': settings, '../services/ssoCatalogStore': catalog }, { Date: clock });
     const sessions = reload();
     const user = crypto.randomBytes(16).toString('hex'), ssoSid = crypto.randomUUID(), generation = '9007199254740993';
     const make = () => sessions.createSession(user, 'fixture', '127.0.0.1', ssoSid, new Date(Date.now() + 3600000), generation);
@@ -116,6 +122,98 @@ test('VideoSite session SQL authority with real production typecast and Redis', 
             const current = await sessions.getSession(replacement);
             assert.equal(current.sso_sid, ssoSid); assert.equal(current.sso_role_generation, generation);
             assert.equal(await sessions.isSessionValid(current), true);
+        });
+        await t.test('bound step-up persists the supplied proof time using real Date/BINARY types and SQL affected rows', async () => {
+            const id = await make(), proofTime = Math.floor(Date.now() / 1000) * 1000 - 45000;
+            const binding = { userId: user, ssoSid, authenticatedAt: new Date(proofTime), expiresAt: Date.now() + 600000 };
+            assert.equal(await sessions.stampSessionStepup(id, 'passkey', binding), true);
+            const proof = await sessions.getSessionStepup(id);
+            // Whole-second input matches the production DATETIME precision. The
+            // 45-second gap distinguishes issuer proof time from receipt time.
+            assert.equal(proof.stepupAt, proofTime); assert.equal(proof.method, 'passkey');
+            const [[stored]] = await fixturePool.execute('SELECT user_id,stepup_at FROM sessions WHERE session_id=?', [id]);
+            assert.equal(stored.user_id, user); assert.ok(stored.stepup_at instanceof Date);
+            assert.equal(stored.stepup_at.getTime(), proofTime);
+            // An idempotent concurrent ceremony still matches one SQL row.
+            assert.equal(await sessions.stampSessionStepup(id, 'passkey', binding), true);
+            assert.equal(await sessions.stampSessionStepup('missing-fixture-session', 'totp', binding), false);
+            const otherMaster = crypto.randomUUID();
+            assert.equal(await sessions.stampSessionStepup(id, 'totp', { ...binding, ssoSid: otherMaster }), false);
+            const otherUser = crypto.randomBytes(16).toString('hex');
+            await fixturePool.execute('UPDATE sessions SET user_id=? WHERE session_id=?', [database.idBuf(otherUser), id]);
+            assert.equal(await sessions.stampSessionStepup(id, 'totp', binding), false);
+            const unchanged = await sessions.getSessionStepup(id);
+            assert.equal(unchanged.stepupAt, proofTime); assert.equal(unchanged.method, 'passkey');
+        });
+        await t.test('terminal marker prevents bound SQL stamp even if its original session row is retained', async () => {
+            const master = crypto.randomUUID();
+            const id = await sessions.createSession(user, null, null, master, new Date(Date.now() + 3600000), generation);
+            await pool.execute(`UPDATE ${stateTable} SET revoked=1 WHERE sso_sid=?`, [master]);
+            assert.equal(await reload().stampSessionStepup(id, 'passkey', {
+                userId: user, ssoSid: master, authenticatedAt: new Date(Math.floor(Date.now() / 1000) * 1000), expiresAt: Date.now() + 600000,
+            }), false);
+            const proof = await sessions.getSessionStepup(id);
+            assert.equal(proof.stepupAt, null); assert.equal(proof.method, null);
+        });
+        await t.test('bound SQL stamp rechecks flow expiry after an actual terminal-row lock wait', async () => {
+            const master = crypto.randomUUID();
+            const id = await sessions.createSession(user, null, null, master, new Date(Date.now() + 3600000), generation);
+            let clockNow = Date.now();
+            const clock = new Proxy(Date, { get(target, key) { return key === 'now' ? () => clockNow : Reflect.get(target, key); } });
+            const clockSessions = reload(clock), blocker = await pool.getConnection();
+            let pending;
+            try {
+                await blocker.beginTransaction();
+                await blocker.execute(`SELECT revoked FROM ${stateTable} WHERE sso_sid=? FOR UPDATE`, [master]);
+                const gate = barrier(); stampLockAttempt = gate;
+                pending = clockSessions.stampSessionStepup(id, 'passkey', {
+                    userId: user, ssoSid: master, authenticatedAt: new Date(Math.floor(clockNow / 1000) * 1000), expiresAt: clockNow + 600000,
+                });
+                // The actual helper has reached its INSERT/ON DUPLICATE KEY lock,
+                // which cannot complete while blocker owns this same state row.
+                await gate.entered; clockNow += 600000;
+                await blocker.commit();
+                assert.equal(await pending, false);
+                const proof = await sessions.getSessionStepup(id);
+                assert.equal(proof.stepupAt, null); assert.equal(proof.method, null);
+            } finally {
+                stampLockAttempt = null;
+                try { await blocker.rollback(); } finally { blocker.release(); }
+                if (pending) await pending.catch(() => {});
+            }
+        });
+        await t.test('expired step-up rolls back its UPDATE after waiting on the original local-session row', async () => {
+            const master = crypto.randomUUID();
+            const id = await sessions.createSession(user, null, null, master, new Date(Date.now() + 3600000), generation);
+            const previousTime = Math.floor(Date.now() / 1000) * 1000 - 60000;
+            await fixturePool.execute('UPDATE sessions SET stepup_at=?,stepup_method=? WHERE session_id=?',
+                [new Date(previousTime), 'totp', id]);
+            let clockNow = Date.now();
+            const clock = new Proxy(Date, { get(target, key) { return key === 'now' ? () => clockNow : Reflect.get(target, key); } });
+            const clockSessions = reload(clock), blocker = await pool.getConnection();
+            let pending;
+            try {
+                await blocker.beginTransaction();
+                await blocker.execute(`SELECT session_id FROM ${table} WHERE session_id=? FOR UPDATE`, [id]);
+                const gate = barrier(); stampUpdateAttempt = gate;
+                pending = clockSessions.stampSessionStepup(id, 'passkey', {
+                    userId: user, ssoSid: master, authenticatedAt: new Date(Math.floor(clockNow / 1000) * 1000), expiresAt: clockNow + 600000,
+                });
+                // The terminal-SID lock and first expiry check have completed.
+                // UPDATE now waits on blocker's independent local-session lock.
+                await gate.entered; clockNow += 600000;
+                await blocker.commit();
+                assert.equal(await pending, false);
+                const proof = await sessions.getSessionStepup(id);
+                // Returning false after committing the UPDATE would still grant
+                // passkey proof. Rollback must preserve the previous timestamp AND
+                // method, even though the SQL UPDATE matched the correct row.
+                assert.equal(proof.stepupAt, previousTime); assert.equal(proof.method, 'totp');
+            } finally {
+                stampUpdateAttempt = null;
+                try { await blocker.rollback(); } finally { blocker.release(); }
+                if (pending) await pending.catch(() => {});
+            }
         });
         await t.test('terminal logout serializes behind an admitted callback, and later/restarted callbacks stay rejected', async () => {
             const master = crypto.randomUUID(), subject = user.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5');

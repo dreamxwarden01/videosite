@@ -14,6 +14,12 @@ password reset) lives in the SSO; videosite keeps its own **roles, permissions, 
   `/.well-known/jwks.json`; the SSO fetches it (no key handoff). Roles are re-checked here on every
   request — the SSO federates *who you are*, not *what you can do* in the app.
 - Step-up for sensitive admin actions is delegated to the SSO (redirect takeover).
+  Each challenge is bound to the initiating local session, user and original SSO
+  session. Logging out or replacing that local session requires a new challenge.
+  The callback checks the returned subject, SSO session, factor and authentication
+  time within the ten-minute flow lifetime, allowing 30 seconds of issuer clock
+  skew. The sudo window starts at the factor's authentication time. Restart any
+  in-flight step-up begun before these session bindings were introduced.
 
 Role catalogs use persistent versions and immutable delivery records. Signed role
 events, login claims and access-state queries are checked against each subject's
@@ -42,6 +48,7 @@ signs in and lands as videosite's superadmin.
 Role-sync regressions can be run independently of an installed application:
 
 ```sh
+npm run test:sessions        # Session authority, logout and step-up callback tests
 npm run test:sso-roles       # Protocol and HTTP tests; database tests require a fixture
 npm run test:sso-roles:db    # Complete suite with disposable MariaDB and Redis
 ```

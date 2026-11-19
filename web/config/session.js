@@ -307,15 +307,34 @@ async function getSessionMaxDays() {
 // read it straight from the DB — it's deliberately NOT mirrored into the Redis
 // session cache (the few gated actions tolerate one extra read, and this avoids a
 // cache-coherence surface on a security-sensitive value).
-async function stampSessionStepup(sessionId, method) {
-    const pool = getPool();
-    // Bind the timestamp as a JS Date (like createSession's last_seen) rather than
-    // SQL NOW(), so freshness is measured against the same clock the gate uses
-    // (Date.now()) — no dependency on the DB session time_zone matching Node's.
-    await pool.execute(
-        'UPDATE sessions SET stepup_at = ?, stepup_method = ? WHERE session_id = ?',
-        [new Date(), method, sessionId]
-    );
+async function stampSessionStepup(sessionId, method, { userId, ssoSid, authenticatedAt, expiresAt }) {
+    ssoSid = canonicalSsoSid(ssoSid);
+    if (typeof userId !== 'string' || !/^[0-9a-f]{32}$/.test(userId)
+        || !(authenticatedAt instanceof Date) || !Number.isFinite(authenticatedAt.getTime())
+        || !Number.isSafeInteger(expiresAt)) {
+        throw new Error('invalid_stepup_binding');
+    }
+    // Same lock order as final logout/session creation. Revocation cannot land
+    // between the SID check and stamp, and a deleted/replaced row is never added.
+    const expired = new Error('stepup_flow_expired');
+    try {
+        return await transaction(getPool(), async db => {
+            const state = await lockSsoSession(db, ssoSid, userId);
+            if (state.revoked || Date.now() >= expiresAt) return false;
+            const [result] = await db.execute(
+                `UPDATE sessions SET stepup_at = ?, stepup_method = ?
+                 WHERE session_id = ? AND user_id = ? AND sso_sid = ?`,
+                [authenticatedAt, method, sessionId, idBuf(userId), ssoSid]
+            );
+            // UPDATE can itself wait on the local-session row. Throw so the
+            // transaction rolls back its stamp before reporting expiry.
+            if (Date.now() >= expiresAt) throw expired;
+            return result.affectedRows > 0;
+        });
+    } catch (error) {
+        if (error === expired) return false;
+        throw error;
+    }
 }
 
 // Burn a session's step-up window (reuse:'one-time' scenarios clear it after a
