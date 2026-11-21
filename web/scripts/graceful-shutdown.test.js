@@ -127,6 +127,7 @@ function serverFixture(options = {}) {
         './config/session': { cleanExpiredSessions: async () => {} },
         './lib/backgroundTasks': backgroundTasks,
         './routes/publicJwks': { publicJwksRouter: noOp },
+        './routes/fonts': { fontsRouter: noOp },
         './middleware/ssoEventBody': { eventFormParser: noOp },
         './middleware/installer': { checkInstalled: noOp, InstallStateUnknownError: class extends Error {},
             resolveInstallState: () => options.install?.promise || Promise.resolve(true) },
