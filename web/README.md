@@ -29,16 +29,19 @@ preserve synchronization metadata with database backups.
 
 ## Fonts
 
-UI text uses self-hosted Geist, with Geist Mono in existing code fields. Noto
+UI text uses self-hosted Inter with automatic optical sizing, while existing
+code fields keep Geist Mono. Noto
 Sans SC supplies the default CJK fallback; explicit `zh-Hant`, `zh-TW`, `zh-HK`
 and `zh-MO` language tags select Noto Sans TC. The upstream unicode ranges keep
 CJK downloads limited to the glyph shards a page needs. Uncovered glyphs use
 system fallback. Player subtitle settings and icon families retain their own
 font choices.
 
-The shared kit lives in `client/public/fonts/ui-f62459131c009479`; its
-`FONT_MANIFEST.json` records source versions, integrity and individual file
-hashes. All three OFL license files ship with it. The `/fonts` namespace is
+The active kit lives in `client/public/fonts/ui-inter-32b1c1d253ef89d7`;
+its `FONT_MANIFEST.json` records the pinned Inter file and license plus reused
+Geist Mono/Noto URLs and hashes. Keep `ui-f62459131c009479` and its OFL notices:
+the new stylesheet references those immutable font files directly, avoiding
+duplicate CJK downloads. The old kit is retained unchanged. The `/fonts` namespace is
 available before installation and authentication, allows GET/HEAD only, and
 returns real 404s for missing assets. Its content-versioned URLs are immutable;
 font or stylesheet changes need a new directory digest and updated HTML links.

@@ -1,7 +1,7 @@
 /* Same-origin font kit supplies the faces; these low-specificity tokens also
    keep readable system fallback if that stylesheet cannot be reached. */
 :where(:root) {
-    --font-ui: 'Geist', 'Noto Sans SC Variable', system-ui, sans-serif;
+    --font-ui: 'Inter', 'Noto Sans SC Variable', system-ui, sans-serif;
     --font-mono: 'Geist Mono', 'Noto Sans SC Variable', ui-monospace, monospace;
 }
 

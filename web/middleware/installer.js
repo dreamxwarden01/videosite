@@ -86,7 +86,7 @@ function serveUnavailable(req, res) {
     res.status(503).type('html').send(
         '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">' +
         '<meta name="viewport" content="width=device-width, initial-scale=1">' +
-        '<title>Service unavailable</title><link rel="stylesheet" href="/fonts/ui-f62459131c009479/fonts.css" /><style>' +
+        '<title>Service unavailable</title><link rel="stylesheet" href="/fonts/ui-inter-32b1c1d253ef89d7/fonts.css" /><style>' +
         "*{box-sizing:border-box}html,body{margin:0}" +
         "body{font-family:var(--font-ui,system-ui,sans-serif);" +
         'background:#f0f2f5;color:#333;font-size:14px;line-height:1.5;min-height:100vh;' +

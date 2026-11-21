@@ -127,7 +127,7 @@ function esc(s) {
 function renderAuthErrorPage(code, detail) {
   return `<!DOCTYPE html><meta charset="utf-8"><title>Sign-in failed</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<link rel="stylesheet" href="/fonts/ui-f62459131c009479/fonts.css" />
+<link rel="stylesheet" href="/fonts/ui-inter-32b1c1d253ef89d7/fonts.css" />
 <body style="font-family:var(--font-ui,system-ui,sans-serif);max-width:520px;margin:12vh auto;padding:0 20px;color:#1f2330">
   <h1 style="font-size:20px;margin-bottom:4px">Couldn't sign you in</h1>
   <p style="color:#5b6472">Something went wrong while completing sign-in. You can try again.</p>
