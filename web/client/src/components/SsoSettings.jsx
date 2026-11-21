@@ -264,13 +264,13 @@ export default function SsoSettings() {
                         <option value="https">https://</option>
                         <option value="http">http://</option>
                       </select>
-                      <input className={'vs-input' + bad} style={{ borderRadius: '0 8px 8px 0', borderLeft: 'none', fontFamily: 'monospace', fontSize: 12.5 }}
+                      <input className={'vs-input' + bad} style={{ borderRadius: '0 8px 8px 0', borderLeft: 'none', fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 12.5 }}
                         value={host} placeholder="sso.yourdomain.com"
                         onChange={(e) => setConfig({ ...config, [f.k]: joinHostUrl(protocol, stripToHost(e.target.value)) })} />
                     </div>
                   );
                 })() : (
-                  <input className={'vs-input' + bad} style={{ fontFamily: 'monospace', fontSize: 12.5 }} value={config[f.k] || ''}
+                  <input className={'vs-input' + bad} style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 12.5 }} value={config[f.k] || ''}
                     onChange={(e) => setConfig({ ...config, [f.k]: e.target.value.replace(/\s+/g, '') })} />
                 )}
                 {errors[f.k] && <p className="vs-hint err">{errors[f.k]}</p>}
@@ -286,7 +286,7 @@ export default function SsoSettings() {
             <div className="vs-field" style={{ maxWidth: 560 }} key={f.k}>
               <label className="vs-label">{f.label}</label>
               <div style={{ display: 'flex', gap: 8 }}>
-                <input className="vs-input" readOnly value={config[f.k] || ''} onClick={(e) => e.target.select()} style={{ fontFamily: 'monospace', fontSize: 12 }} />
+                <input className="vs-input" readOnly value={config[f.k] || ''} onClick={(e) => e.target.select()} style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 12 }} />
                 <button type="button" className="vs-btn" onClick={() => copy(config[f.k], f.k)}>{copiedKey === f.k ? 'Copied!' : 'Copy'}</button>
               </div>
             </div>
@@ -296,7 +296,7 @@ export default function SsoSettings() {
           <div className="vs-field" style={{ maxWidth: 560 }}>
             <label className="vs-label">Current key{config.client_key?.rotated_at ? ` (rotated ${fmtTs(config.client_key.rotated_at)})` : ''}</label>
             <div style={{ display: 'flex', gap: 8 }}>
-              <input className="vs-input" readOnly value={config.client_key?.kid || '—'} style={{ fontFamily: 'monospace', fontSize: 12 }} />
+              <input className="vs-input" readOnly value={config.client_key?.kid || '—'} style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 12 }} />
               <button type="button" className="vs-btn vs-btn-primary" style={{ minWidth: 112, whiteSpace: 'nowrap' }} disabled={rotating || !!pendingKey || !keyChecked || isDirty} onClick={() => guardAction(rotateKey)}>{rotating ? 'Scheduling…' : pendingKey ? 'Scheduled' : 'Rotate'}</button>
             </div>
             <p className="vs-hint" style={{ marginTop: 8 }}>
@@ -386,7 +386,7 @@ export default function SsoSettings() {
                 <>
                   <div className="vs-field" style={{ maxWidth: 420 }}>
                     <label className="vs-label">Common name (optional)</label>
-                    <input className="vs-input" style={{ fontFamily: 'monospace', fontSize: 12.5 }} value={cn}
+                    <input className="vs-input" style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 12.5 }} value={cn}
                       onChange={(e) => setCn(e.target.value)} placeholder="Leave blank to auto-generate" />
                   </div>
                   <button className="vs-btn vs-btn-primary" disabled={genBusy}

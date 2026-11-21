@@ -758,7 +758,7 @@ export default function SettingsPage() {
           const status = wk.status || 'active';
           return (
             <div className="vs-st-tr" key={wk.key_id}>
-              <span style={{ flex: '1.2', minWidth: 0, fontFamily: 'monospace', fontSize: 12, color: '#6b7280', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{wk.key_id}</span>
+              <span style={{ flex: '1.2', minWidth: 0, fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 12, color: '#6b7280', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{wk.key_id}</span>
               <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{wk.label || '—'}</span>
               <span style={{ flex: '0 0 84px' }}>{wkStatus(status)}</span>
               <span style={{ flex: 1, color: '#6b7280' }}>{wk.last_used_at ? new Date(wk.last_used_at).toLocaleString() : 'Never'}</span>
@@ -850,7 +850,7 @@ export default function SettingsPage() {
               <div className="vs-field">
                 <label className="vs-label">HMAC secret key</label>
                 <div style={{ display: 'flex', gap: 8 }}>
-                  <input type="text" className="vs-input" readOnly value={generatedHmacKey} onClick={e => e.target.select()} style={{ fontFamily: 'monospace', fontSize: 12 }} />
+                  <input type="text" className="vs-input" readOnly value={generatedHmacKey} onClick={e => e.target.select()} style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 12 }} />
                   <button type="button" className="vs-btn" onClick={handleCopyHmacKey}>{hmacKeyCopyLabel}</button>
                 </div>
               </div>
@@ -936,14 +936,14 @@ export default function SettingsPage() {
               <div className="vs-field">
                 <label className="vs-label">Key ID</label>
                 <div style={{ display: 'flex', gap: 8 }}>
-                  <input type="text" className="vs-input" readOnly value={newWorkerKey.keyId} style={{ fontFamily: 'monospace', fontSize: 12 }} />
+                  <input type="text" className="vs-input" readOnly value={newWorkerKey.keyId} style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 12 }} />
                   <button type="button" className="vs-btn" onClick={() => copyField(newWorkerKey.keyId, setWkKeyIdCopyLabel)}>{wkKeyIdCopyLabel}</button>
                 </div>
               </div>
               <div className="vs-field">
                 <label className="vs-label">Secret</label>
                 <div style={{ display: 'flex', gap: 8 }}>
-                  <input type="text" className="vs-input" readOnly value={newWorkerKey.secret} style={{ fontFamily: 'monospace', fontSize: 12 }} />
+                  <input type="text" className="vs-input" readOnly value={newWorkerKey.secret} style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 12 }} />
                   <button type="button" className="vs-btn" onClick={() => copyField(newWorkerKey.secret, setWkSecretCopyLabel)}>{wkSecretCopyLabel}</button>
                 </div>
               </div>

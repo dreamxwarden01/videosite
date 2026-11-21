@@ -1,3 +1,10 @@
+/* Same-origin font kit supplies the faces; these low-specificity tokens also
+   keep readable system fallback if that stylesheet cannot be reached. */
+:where(:root) {
+    --font-ui: 'Geist', 'Noto Sans SC Variable', system-ui, sans-serif;
+    --font-mono: 'Geist Mono', 'Noto Sans SC Variable', ui-monospace, monospace;
+}
+
 /* === Reset & Base === */
 *, *::before, *::after {
     box-sizing: border-box;
@@ -12,7 +19,7 @@ html {
     overscroll-behavior: none;
 }
 body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+    font-family:var(--font-ui, system-ui, sans-serif);
     background: #f0f2f5;
     color: #333;
     height: 100%;
@@ -591,7 +598,7 @@ textarea.form-control {
 }
 .wk-field-row input {
     flex: 1;
-    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    font-family:var(--font-mono, ui-monospace, monospace);
     font-size: 13px;
     padding: 8px 10px;
     border: 1px solid #d1d5db;
@@ -1928,13 +1935,13 @@ tr.clickable-row:hover { background-color: #f9fafb; }
 .sso-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 18px; }
 .sso-full { grid-column: 1 / -1; }
 .sso-hint { color: #9ca3af; font-weight: 400; }
-.sso-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+.sso-mono { font-family:var(--font-mono, ui-monospace, monospace); font-size: 12.5px; }
 .sso-bad { border-color: #dc2626 !important; }
 .sso-certinfo { border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden; }
 .sso-certinfo .r { display: flex; justify-content: space-between; padding: 9px 14px; border-top: 1px solid #eef0f2; font-size: 13px; }
 .sso-certinfo .r:first-child { border-top: 0; }
 .sso-certinfo .r .k { color: #6b7280; }
-.sso-certinfo .r .v { font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; color: #1f2937; word-break: break-all; }
+.sso-certinfo .r .v { font-family:var(--font-mono, ui-monospace, monospace); font-size: 12.5px; color: #1f2937; word-break: break-all; }
 .sso-toggle { display: flex; align-items: center; gap: 12px; padding: 14px 16px; background: #f8f9fa; border: 1px solid #e5e7eb; border-radius: 8px; margin: 16px 0; }
 .sso-toggle .lbl { flex: 1; } .sso-toggle .lbl .sub { font-size: 12.5px; color: #6b7280; margin: 0; }
 .sso-switch { position: relative; display: inline-block; width: 44px; height: 24px; flex-shrink: 0; }
@@ -1947,7 +1954,7 @@ tr.clickable-row:hover { background-color: #f9fafb; }
 .sso-actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
 .sso-subhead { font-size: 13px; font-weight: 600; color: #374151; margin: 22px 0 10px; }
 .sso-ro { display: flex; align-items: stretch; border: 1px solid #e5e7eb; border-radius: 6px; background: #f8f9fa; overflow: hidden; max-width: 520px; }
-.sso-ro code { flex: 1; min-width: 0; align-self: center; font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; padding: 8px 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #1f2937; }
+.sso-ro code { flex: 1; min-width: 0; align-self: center; font-family:var(--font-mono, ui-monospace, monospace); font-size: 12.5px; padding: 8px 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #1f2937; }
 .sso-ro .btn { border-radius: 0; border: 0; border-left: 1px solid #e5e7eb; flex-shrink: 0; }
 @media (max-width: 640px) { .sso-grid { grid-template-columns: 1fr; } }
 
@@ -2384,7 +2391,7 @@ tr.clickable-row:hover { background-color: #f9fafb; }
 .vs-perm-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 10px 0; border-top: 1px solid #f4f5f6; }
 .vs-perm-mn { min-width: 0; }
 .vs-perm-name { font-size: 13.5px; color: #1f2937; }
-.vs-perm-key { font-size: 11px; color: #9ca3af; font-family: ui-monospace, Menlo, monospace; margin-top: 1px; }
+.vs-perm-key { font-size: 11px; color: #9ca3af; font-family:var(--font-mono, ui-monospace, monospace); margin-top: 1px; }
 .vs-perm-row.locked { opacity: .5; }
 .vs-perm-row.changed .vs-perm-name { font-weight: 500; }
 .vs-perm-row.changed { position: relative; }
@@ -2522,7 +2529,7 @@ tr.clickable-row:hover { background-color: #f9fafb; }
 /* Amber advisory banner (the vs- language ships only red inline warnings). */
 .vs-warn { margin: 0 0 16px; padding: 10px 12px; border-radius: 8px; background: #fef7e0; border: 1px solid #fde293; color: #7c4a00; font-size: 12.5px; line-height: 1.5; }
 .vs-select-sm { padding: 5px 8px; font-size: 12.5px; }
-.vs-mono-area { font-family: monospace; font-size: 12px; background: #f9fafb; resize: vertical; }
+.vs-mono-area { font-family:var(--font-mono, ui-monospace, monospace); font-size: 12px; background: #f9fafb; resize: vertical; }
 .vs-copylink { color: #9ca3af; font-size: 13px; cursor: pointer; }
 .vs-copylink:hover { color: #6b7280; }
 .vs-modal-warn { margin: 10px 0 0; font-size: 12.5px; color: #c5221f; font-weight: 500; }
@@ -2694,7 +2701,7 @@ tr.clickable-row:hover { background-color: #f9fafb; }
 .vs-tc-toprow { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .vs-tc-title { font-size: 14px; font-weight: 500; color: #1f2937; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .vs-tc-meta { font-size: 12px; color: #6b7280; margin-top: 2px; line-height: 1.55; word-break: break-word; }
-.vs-tc-jid { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #9ca3af; }
+.vs-tc-jid { font-family:var(--font-mono, ui-monospace, monospace); font-size: 11px; color: #9ca3af; }
 .vs-tc-err { font-size: 12px; color: #c5221f; margin-top: 5px; word-break: break-word; }
 .vs-tc-pbar { height: 4px; background: #eceef1; border-radius: 3px; margin-top: 8px; overflow: hidden; max-width: 420px; }
 .vs-tc-pfill { height: 100%; background: #1a73e8; border-radius: 3px; transition: width .3s ease; }

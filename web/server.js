@@ -86,15 +86,17 @@ app.use('/assets', express.static(path.join(__dirname, 'client', 'dist', 'assets
 }));
 app.use('/favicon.ico', express.static(path.join(__dirname, 'client', 'dist', 'favicon.ico')));
 
-// Shaka Player, vendored from npm into a version-stamped directory at build
-// time (see client/vite.config.js). The version is in the PATH rather than a
-// content hash because these files are copied verbatim and Vite never hashes
-// them — immutable on an unversioned URL would make an upgrade unreachable for
-// a year. A new version is a new directory, so the old one simply stops being
-// requested.
+// Shaka Player, vendored from npm into a version/content-stamped directory
+// (see client/vite.config.js). Local UI-font transforms change its CSS bytes,
+// so both dependency upgrades and transform changes must get a fresh URL
+// rather than reusing a response already cached as immutable.
 app.use('/vendor', express.static(path.join(__dirname, 'client', 'dist', 'vendor'), {
     maxAge: '1y', immutable: true,
 }));
+
+// Content-versioned UI font assets must also work before installation/auth.
+// The dedicated router rejects non-reads and missing files before SPA routing.
+app.use('/fonts', require('./routes/fonts').fontsRouter());
 
 // Installation check middleware
 const { checkInstalled } = require('./middleware/installer');

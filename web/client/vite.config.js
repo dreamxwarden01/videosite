@@ -3,6 +3,7 @@ import react from '@vitejs/plugin-react';
 import path from 'path';
 import fs from 'fs';
 import { createRequire } from 'module';
+import { createHash } from 'node:crypto';
 
 const require = createRequire(import.meta.url);
 
@@ -18,12 +19,6 @@ const require = createRequire(import.meta.url);
 const SHAKA_VERSION = require('shaka-player/package.json').version;
 const SHAKA_DIR = path.dirname(require.resolve('shaka-player/package.json'));
 
-// Version in the PATH, not a content hash: these files are copied verbatim, so
-// Vite never hashes them. Serving an unhashed URL with immutable + 1y would make
-// a Shaka upgrade unreachable for a year; a versioned directory makes the
-// upgrade a new URL and lets the old one age out on its own.
-const shakaBase = `vendor/shaka-${SHAKA_VERSION}`;
-
 // The compiled UI build and its stylesheet. The trailing sourceMappingURL is
 // stripped rather than shipping ~2.8 MB of maps we would never read — without
 // it devtools 404s on every page load.
@@ -34,21 +29,36 @@ const SHAKA_FILES = [
 
 function readShakaAsset(rel) {
   const src = fs.readFileSync(path.join(SHAKA_DIR, rel), 'utf8');
-  return src.replace(/\r?\n?\/\/# sourceMappingURL=.*$/, '')
-            .replace(/\r?\n?\/\*# sourceMappingURL=.*?\*\/\s*$/, '');
+  let asset = src.replace(/\r?\n?\/\/# sourceMappingURL=.*$/, '')
+                 .replace(/\r?\n?\/\*# sourceMappingURL=.*?\*\/\s*$/, '');
+  if (rel.endsWith('.css')) {
+    // Shaka's UI stylesheet bundles a remote Roboto face. Only its UI font is
+    // replaced; icon families and subtitle/cue preference rules stay intact.
+    asset = asset.replace(/@font-face\s*\{(?=[^{}]*font-family:\s*["']?Roboto["']?\s*;)(?=[^{}]*src:\s*url\(["']?https:\/\/fonts\.gstatic\.com\/)[^{}]*\}/gi, '')
+      .replace(/--shaka-font-family:roboto,sans-serif/g, '--shaka-font-family:var(--font-ui)')
+      .replace(/font-family:roboto,sans-serif/g, 'font-family:var(--font-ui)')
+      .replace(/font-family:monospace/g, 'font-family:var(--font-mono)');
+  }
+  return asset;
 }
+
+// Include the exact transformed bytes in the URL. Package version alone would
+// reuse an already immutable controls.css when local font handling changes.
+const shakaDigest = createHash('sha256');
+for (const file of SHAKA_FILES) shakaDigest.update(file.to + '\0' + readShakaAsset(file.from));
+const shakaBase = `vendor/shaka-${SHAKA_VERSION}-${shakaDigest.digest('hex').slice(0, 12)}`;
 
 function shakaVendorPlugin() {
   return {
     name: 'vendor-shaka',
-    // Build: emit into dist/vendor/shaka-<version>/ alongside the bundle.
+    // Build: emit into the version/content-stamped vendor directory.
     generateBundle() {
       for (const f of SHAKA_FILES) {
         this.emitFile({ type: 'asset', fileName: `${shakaBase}/${f.to}`, source: readShakaAsset(f.from) });
       }
     },
-    // Dev server: same URLs, served straight out of node_modules so the watch
-    // page behaves identically under `vite` as it does in a built image.
+    // Dev server: the same URLs and transformations from node_modules, so
+    // the watch page matches the production image.
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
         const hit = SHAKA_FILES.find((f) => req.url && req.url.split('?')[0] === `/${shakaBase}/${f.to}`);

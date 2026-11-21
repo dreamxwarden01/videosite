@@ -44,9 +44,9 @@
     // (.card, .btn, .note…) can never collide with style.css.
     // ========================================================================
     var CSS = `
-#install-root{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,sans-serif;font-size:14px;line-height:1.5;color:#333;background:#f0f2f5;min-height:100vh;display:flex;justify-content:center;padding:32px 24px 70px}
+#install-root{font-family:var(--font-ui, system-ui, sans-serif);font-size:14px;line-height:1.5;color:#333;background:#f0f2f5;min-height:100vh;display:flex;justify-content:center;padding:32px 24px 70px}
 #install-root *{box-sizing:border-box}
-#install-root .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+#install-root .mono{font-family:var(--font-mono, ui-monospace, monospace)}
 #install-root .wrap{width:100%;max-width:560px}
 #install-root .eyebrow{display:flex;align-items:center;justify-content:center;gap:7px;margin:0 0 14px;font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:#9ca3af}
 #install-root .eyebrow svg{width:13px;height:13px}
@@ -94,11 +94,11 @@
 #install-root .card input::placeholder,#install-root .card textarea::placeholder{color:#9ca3af}
 #install-root .card select{appearance:none;padding-right:30px;background-repeat:no-repeat;background-position:right 9px center;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' stroke='%236b7280' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m4 6 4 4 4-4'/%3E%3C/svg%3E")}
 /* textareas hold PEM blocks — genuinely mono content (.vs-mono-area). */
-#install-root .card textarea{font-family:monospace;font-size:12px;background:#f9fafb;min-height:104px;white-space:pre;overflow-x:auto;resize:vertical;line-height:1.5}
-#install-root .card input.mono,#install-root .card .cv{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+#install-root .card textarea{font-family:var(--font-mono, ui-monospace, monospace);font-size:12px;background:#f9fafb;min-height:104px;white-space:pre;overflow-x:auto;resize:vertical;line-height:1.5}
+#install-root .card input.mono,#install-root .card .cv{font-family:var(--font-mono, ui-monospace, monospace)}
 #install-root .hint{font-size:11.5px;color:#6b7280;margin:5px 0 0;line-height:1.45}
 #install-root .hint b{color:#374151;font-weight:500}
-#install-root .hint code{font-family:ui-monospace,Menlo,monospace;font-size:11px;background:#f1f3f4;padding:1px 4px;border-radius:4px;color:#5f6368}
+#install-root .hint code{font-family:var(--font-mono, ui-monospace, monospace);font-size:11px;background:#f1f3f4;padding:1px 4px;border-radius:4px;color:#5f6368}
 #install-root .hint-c{text-align:center;margin-top:12px}
 #install-root .field-err{display:none;font-size:12px;color:#c5221f;margin-top:5px;line-height:1.45}
 #install-root .grp-f.bad .field-err{display:block}
@@ -121,7 +121,7 @@
 /* notes — neutral #f8f9fa; warn = .vs-warn; info from the accent pill pair. */
 #install-root .note{border:1px solid #eef0f2;background:#f8f9fa;border-radius:8px;padding:10px 12px;font-size:12.5px;color:#6b7280;line-height:1.5;margin:14px 0 0}
 #install-root .note b{color:#374151;font-weight:500}
-#install-root .note code{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:#f1f3f4;padding:1px 4px;border-radius:4px;color:#5f6368}
+#install-root .note code{font-family:var(--font-mono, ui-monospace, monospace);font-size:11.5px;background:#f1f3f4;padding:1px 4px;border-radius:4px;color:#5f6368}
 #install-root .note.warn{background:#fef7e0;border-color:#fde293;color:#7c4a00}
 #install-root .note.warn b,#install-root .note.warn code{color:#7c4a00}
 #install-root .note.warn code{background:#fdf0cd}
@@ -161,9 +161,9 @@
 #install-root .chk-ico.wait{background:#f1f3f4}
 #install-root .chk-body{min-width:0;flex:1}
 #install-root .chk-name{font-size:14px;font-weight:500;color:#1f2937}
-#install-root .chk-val{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:#6b7280;word-break:break-all;margin-top:2px}
+#install-root .chk-val{font-family:var(--font-mono, ui-monospace, monospace);font-size:11.5px;color:#6b7280;word-break:break-all;margin-top:2px}
 #install-root .chk-note{font-size:11.5px;color:#9ca3af;margin-top:3px;line-height:1.5}
-#install-root .chk-note code{font-family:ui-monospace,Menlo,monospace;background:#f1f3f4;padding:1px 4px;border-radius:4px}
+#install-root .chk-note code{font-family:var(--font-mono, ui-monospace, monospace);background:#f1f3f4;padding:1px 4px;border-radius:4px}
 
 /* live ticker (step 1) */
 #install-root .tick{margin:2px 0 0;padding:0;list-style:none}
@@ -178,7 +178,7 @@
 #install-root .tick li.bad{color:#c5221f}
 #install-root .tick li.bad .ti{background:#fce8e6}
 #install-root .tick .ti svg{width:11px;height:11px}
-#install-root .tick .sub2{display:block;font-size:11px;color:#9ca3af;font-family:ui-monospace,Menlo,monospace;word-break:break-all;margin-top:2px}
+#install-root .tick .sub2{display:block;font-size:11px;color:#9ca3af;font-family:var(--font-mono, ui-monospace, monospace);word-break:break-all;margin-top:2px}
 @keyframes vsi-spin{to{transform:rotate(360deg)}}
 
 /* derived table + paste sheet — flat card, #eef0f2 hairlines. */
@@ -188,7 +188,7 @@
 #install-root .drow{display:flex;align-items:center;gap:10px;padding:9px 12px;border-top:1px solid #eef0f2}
 #install-root .drow:first-child{border-top:0}
 #install-root .drow .k{flex:0 0 116px;font-size:12px;color:#6b7280}
-#install-root .drow .v{flex:1;min-width:0;font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:#1f2937;word-break:break-all}
+#install-root .drow .v{flex:1;min-width:0;font-family:var(--font-mono, ui-monospace, monospace);font-size:12.5px;color:#1f2937;word-break:break-all}
 #install-root .drow .v.muted{color:#6b7280;font-family:inherit;font-size:12px;line-height:1.45}
 #install-root .crow{display:flex;align-items:center;gap:10px;padding:9px 12px;border-top:1px solid #eef0f2;background:#fff}
 #install-root .crow:first-child{border-top:0}
@@ -241,7 +241,7 @@
 #install-root .rung>i{grid-row:1/3;width:18px;height:18px;border-radius:50%;background:#f1f3f4;margin-top:1px;display:flex;align-items:center;justify-content:center}
 #install-root .rung>i svg{width:11px;height:11px}
 #install-root .rung>b{font-size:14px;font-weight:500;color:#1f2937}
-#install-root .rung>span{font-size:12px;color:#6b7280;font-family:ui-monospace,Menlo,monospace;word-break:break-all}
+#install-root .rung>span{font-size:12px;color:#6b7280;font-family:var(--font-mono, ui-monospace, monospace);word-break:break-all}
 #install-root .rung.idle>b,#install-root .rung.idle>span{color:#9ca3af}
 #install-root .rung.run>i{background:#e8f0fe;animation:vsi-pulse 1.1s ease-in-out infinite}
 #install-root .rung.ok>i{background:#e6f4ea}
@@ -258,13 +258,13 @@
 #install-root .diag-h>span:first-child{flex:1 1 auto;min-width:0;overflow-wrap:break-word}
 #install-root .diag.amber .diag-h{color:#7c4a00}
 #install-root .diag-h .codes{display:flex;gap:5px;flex:0 0 auto}
-#install-root .diag-h code{font-size:10.5px;padding:2px 8px;border-radius:20px;background:#fff;color:#c5221f;font-family:ui-monospace,Menlo,monospace;font-weight:500}
+#install-root .diag-h code{font-size:10.5px;padding:2px 8px;border-radius:20px;background:#fff;color:#c5221f;font-family:var(--font-mono, ui-monospace, monospace);font-weight:500}
 #install-root .diag.amber .diag-h code{color:#7c4a00}
 #install-root .diag p{margin:0;font-size:12.5px;line-height:1.5;color:#5f6368}
 #install-root .diag.amber p{color:#7c4a00}
 #install-root .diag p b{color:#1f2937;font-weight:500}
 #install-root .diag.amber p b{color:#7c4a00}
-#install-root .diag p code,#install-root .diag li code{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:#fff;padding:1px 5px;border-radius:4px;color:#5f6368}
+#install-root .diag p code,#install-root .diag li code{font-family:var(--font-mono, ui-monospace, monospace);font-size:11.5px;background:#fff;padding:1px 5px;border-radius:4px;color:#5f6368}
 #install-root .fix{counter-reset:f;list-style:none;margin:11px 0 0;padding:0}
 #install-root .fix li{counter-increment:f;position:relative;padding:0 0 9px 26px;font-size:12.5px;color:#5f6368;line-height:1.55}
 #install-root .fix li b{color:#1f2937;font-weight:500}
@@ -273,7 +273,7 @@
 #install-root .fix li::before{content:counter(f);position:absolute;left:0;top:1px;width:18px;height:18px;border-radius:50%;background:#fff;color:#c5221f;font-size:10.5px;font-weight:500;display:flex;align-items:center;justify-content:center}
 #install-root .diag.amber .fix li::before{color:#7c4a00}
 #install-root .fix .inl{display:flex;align-items:center;gap:6px;margin-top:6px}
-#install-root .fix .inl input{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;padding:6px 9px;border-radius:8px;background:#fff}
+#install-root .fix .inl input{font-family:var(--font-mono, ui-monospace, monospace);font-size:11.5px;padding:6px 9px;border-radius:8px;background:#fff}
 #install-root .diag-a{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:12px}
 #install-root .diag details{margin-top:10px}
 #install-root .diag summary{cursor:pointer;font-size:12px;color:#5f6368;list-style:none}
@@ -281,7 +281,7 @@
 #install-root .diag summary::-webkit-details-marker{display:none}
 #install-root .diag summary::before{content:'\\25B8  '}
 #install-root .diag details[open] summary::before{content:'\\25BE  '}
-#install-root .diag pre{margin:8px 0 0;padding:10px 12px;background:#f9fafb;border:1px solid #eef0f2;border-radius:8px;font-family:monospace;font-size:11.5px;color:#5f6368;overflow-x:auto;line-height:1.55;white-space:pre}
+#install-root .diag pre{margin:8px 0 0;padding:10px 12px;background:#f9fafb;border:1px solid #eef0f2;border-radius:8px;font-family:var(--font-mono, ui-monospace, monospace);font-size:11.5px;color:#5f6368;overflow-x:auto;line-height:1.55;white-space:pre}
 #install-root .subchk{margin:11px 0 0;padding:0;list-style:none;border:1px solid #eef0f2;border-radius:8px;overflow:hidden;background:#fff}
 #install-root .subchk li{display:flex;align-items:flex-start;gap:9px;padding:9px 12px;font-size:12.5px;border-top:1px solid #f1f3f4;color:#6b7280}
 #install-root .subchk li:first-child{border-top:0}

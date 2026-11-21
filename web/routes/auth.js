@@ -127,7 +127,8 @@ function esc(s) {
 function renderAuthErrorPage(code, detail) {
   return `<!DOCTYPE html><meta charset="utf-8"><title>Sign-in failed</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<body style="font-family:system-ui,-apple-system,sans-serif;max-width:520px;margin:12vh auto;padding:0 20px;color:#1f2330">
+<link rel="stylesheet" href="/fonts/ui-f62459131c009479/fonts.css" />
+<body style="font-family:var(--font-ui,system-ui,sans-serif);max-width:520px;margin:12vh auto;padding:0 20px;color:#1f2330">
   <h1 style="font-size:20px;margin-bottom:4px">Couldn't sign you in</h1>
   <p style="color:#5b6472">Something went wrong while completing sign-in. You can try again.</p>
   <pre style="background:#f4f5f7;border:1px solid #e3e6ea;border-radius:8px;padding:12px;white-space:pre-wrap;word-break:break-word;color:#7a2230;font-size:13px">${esc(code || 'unknown')}${detail ? '\n' + esc(detail) : ''}</pre>
