@@ -53,127 +53,162 @@ async function updateCourse(courseId, updates) {
 }
 
 /**
- * Delete a course with 404-based worker abort + queued R2 cleanup for all
- * its videos and attachments.
- *
- * Flow:
- * 1. Pre-fetch video info (hashed IDs + status + r2_source_key)
- * 2. Pre-fetch active processing jobs (for stale-timer clearance) and
- *    in-flight upload sessions (for multipart abort)
- * 3. Abort in-flight multipart uploads (fire-and-forget; R2's 24h
- *    lifecycle catches stragglers)
- * 4. Clear stale timers + heartbeat cache so workers detect the abort
- * 5. DELETE course (FK cascade removes videos, processing_queue,
- *    upload_sessions, course_materials → workers get 404)
- * 6. Enqueue R2 cleanup rows in pending_deletes:
- *    - Source prefix per video — immediate
- *    - Output prefix per video — 2-min delay if mid-processing, else immediate
- *    - Attachments prefix for the course — immediate
+ * Delete the course and persist its complete R2 cleanup plan atomically.
+ * The parent lock fences new FK children; locking reads capture existing
+ * source/output/upload targets before the cascade can erase them. Remote
+ * effects happen after commit; an uncertain commit invalidates read-through
+ * metadata only, without aborting writers or discarding buffered progress.
  */
 async function deleteCourse(courseId) {
     const pool = getPool();
-    const { clearStaleTimer } = require('./processingService');
-    const { abortMultipartUpload } = require('./uploadService');
     const deletionService = require('./deletionService');
-    const uploadHeartbeatCache = require('./cache/uploadHeartbeatCache');
-
-    // 1. Get all videos (need hashed IDs, source key, and status for R2 cleanup planning)
-    const [videos] = await pool.execute(
-        'SELECT video_id, hashed_video_id, r2_source_key, status FROM videos WHERE course_id = ?',
-        [courseId]
-    );
-
-    // 2a. Get active jobs for stale-timer clearance
-    const [activeJobs] = await pool.execute(
-        `SELECT pq.job_id FROM processing_queue pq
-         JOIN videos v ON pq.video_id = v.video_id
-         WHERE v.course_id = ? AND pq.status IN ('leased', 'processing') AND pq.job_id IS NOT NULL`,
-        [courseId]
-    );
-
-    // 2b. Get in-flight upload sessions (both videos and attachments)
-    const [inflightSessions] = await pool.execute(
-        `SELECT upload_id, type, object_key, r2_upload_id FROM upload_sessions
-         WHERE course_id = ? AND status IN ('active', 'completing')`,
-        [courseId]
-    );
-
-    // 3. Cancel each in-flight session. Videos use S3 AbortMultipartUpload
-    //    (fire-and-forget; R2's 24h lifecycle covers stragglers).
-    //    Attachments are single-PUT — enqueue an R2 key delete with a
-    //    60s buffer (same "wait for in-flight PUT to settle" idea as
-    //    the stale-detection path). The FK cascade below will delete
-    //    the upload_sessions rows themselves.
-    const ATTACHMENT_BUFFER_MS = 60 * 1000;
-    for (const session of inflightSessions) {
-        if (session.type === 'video') {
-            abortMultipartUpload(session.object_key, session.r2_upload_id).catch(err => {
-                console.error(`R2 multipart abort failed for upload ${session.r2_upload_id}:`, err.message);
-            });
-        } else {
-            await deletionService.enqueueKey(session.object_key, {
-                source: 'course_delete',
-                execute_at: new Date(Date.now() + ATTACHMENT_BUFFER_MS),
-            });
-        }
-        // Drop Redis cache for the upload so a stale heartbeat from the
-        // client gets a 404 immediately (the 24h TTL is a safety net,
-        // not the primary cleanup path).
-        await uploadHeartbeatCache.clearHeartbeat(session.upload_id);
-    }
-
-    // 4. Clear stale timers + heartbeat cache so workers' next status ping
-    //    detects the abort cleanly (avoids the 2-minute stale-timeout wait).
-    for (const job of activeJobs) {
-        clearStaleTimer(job.job_id);
-    }
-    await require('./cache/transcodeProgressCache').clearJobs(activeJobs.map(j => j.job_id));
-
-    // 5. Delete course record — FK cascade deletes videos, processing_queue,
-    //    upload_sessions, course_materials, watch_progress, enrollments,
-    //    transcoding_profiles → workers get 404 on next API call
-    await pool.execute('DELETE FROM courses WHERE course_id = ?', [courseId]);
-
-    // Invalidate caches for every cascade-deleted video + the course itself.
-    const videoIds = videos.map(v => v.video_id);
-    await videoCache.invalidateMany(videoIds);
-    await courseCache.invalidate(courseId);
-    await courseListCache.invalidate();
-    await require('./cache/watchProgressCache').clearForVideos(videoIds);
-
-    // 6. Enqueue R2 cleanup. All durable — reaper retries on transient
-    //    R2 failures, survives server restarts.
-    const processingStatuses = ['worker_downloading', 'processing', 'worker_uploading'];
-    const now = new Date();
-    const delayedAt = new Date(Date.now() + 2 * 60 * 1000); // +2 min for in-flight workers
-
-    for (const video of videos) {
-        // Source: always immediate (worker has already downloaded what it needs).
-        if (video.r2_source_key) {
-            const sourceDir = video.r2_source_key.substring(0, video.r2_source_key.lastIndexOf('/') + 1);
-            await deletionService.enqueuePrefix(sourceDir, { source: 'course_delete' });
-        }
-
-        // Output: 2-min delay if mid-processing (let worker finish its upload),
-        // immediate otherwise. Hash collision check at video creation time
-        // closes the race with new uploads picking the same hash.
-        const isProcessing = processingStatuses.includes(video.status);
-        await deletionService.enqueuePrefix(`${video.hashed_video_id}/`, {
-            hashed_video_id: video.hashed_video_id,
-            execute_at: isProcessing ? delayedAt : now,
-            source: 'course_delete',
+    const connection = await pool.getConnection();
+    let reusable = true, commitStarted = false, alreadyAbsent = false;
+    let transactionError;
+    let videos = [], activeJobs = [], inflightSessions = [];
+    let deletedCourseId = Number.isSafeInteger(Number(courseId)) ? Number(courseId) : courseId;
+    const reportEffectFailure = (effect, error) => {
+        const code = String(error?.code || error?.name || 'unknown');
+        console.error('Course deletion follow-up effect failed:', {
+            course_id: deletedCourseId, effect,
+            error_code: /^[A-Za-z0-9_-]{1,64}$/.test(code) ? code : 'unknown',
         });
+    };
+    const bestEffort = async (effect, run) => {
+        try { await run(); }
+        catch (error) { reportEffectFailure(effect, error); }
+    };
+    // These caches can be refilled from SQL if a COMMIT did not take effect.
+    // Liveness markers and unflushed watch deltas are deliberately excluded.
+    const invalidateReadCaches = async () => {
+        const effects = [
+            ['course_cache', () => courseCache.invalidate(deletedCourseId)],
+            ['course_list_cache', () => courseListCache.invalidate()],
+        ];
+        if (videos.length) effects.push(['video_cache', () => videoCache.invalidateMany(videos.map(video => video.video_id))]);
+        await Promise.all(effects.map(([name, run]) => bestEffort(name, run)));
+    };
+    try {
+        await connection.beginTransaction();
+        const [courses] = await connection.execute(
+            'SELECT course_id FROM courses WHERE course_id = ? FOR UPDATE', [courseId]
+        );
+        if (courses.length === 0) {
+            alreadyAbsent = true;
+        } else {
+            // Use the canonical database ID in object prefixes, not a route string.
+            deletedCourseId = courses[0].course_id;
+            [videos] = await connection.execute(
+                `SELECT video_id, hashed_video_id, r2_source_key, status
+                 FROM videos WHERE course_id = ? FOR UPDATE`, [deletedCourseId]
+            );
+            const [jobs] = await connection.execute(
+                `SELECT pq.video_id, pq.job_id, pq.status FROM processing_queue pq
+                 JOIN videos v ON pq.video_id = v.video_id
+                 WHERE v.course_id = ? FOR UPDATE`, [deletedCourseId]
+            );
+            // Lock queued/pending rows too: a lease must not appear between the
+            // cleanup snapshot and cascade while only active rows were protected.
+            activeJobs = jobs.filter(job => ['leased', 'processing'].includes(job.status) && job.job_id != null);
+            [inflightSessions] = await connection.execute(
+                `SELECT upload_id, type, object_key, r2_upload_id FROM upload_sessions
+                 WHERE course_id = ? AND status IN ('active', 'completing') FOR UPDATE`,
+                [deletedCourseId]
+            );
+
+            const now = new Date();
+            const delayedAt = new Date(now.getTime() + 2 * 60 * 1000);
+            const attachmentAt = new Date(now.getTime() + 60 * 1000);
+            const activeVideoIds = new Set(activeJobs.map(job => String(job.video_id)));
+            const processingStatuses = new Set(['worker_downloading', 'processing', 'worker_uploading']);
+            const plan = new Map();
+            const add = (mode, target, executeAt, hash = null) => {
+                const id = `${mode}:${target}`;
+                const previous = plan.get(id);
+                // Overlapping intent must keep the longer in-flight-write buffer.
+                if (!previous || previous.executeAt < executeAt) {
+                    plan.set(id, { mode, target, executeAt, hash });
+                }
+            };
+            const invalidTarget = () => Object.assign(
+                new Error('Cannot delete course: unsupported cleanup target'),
+                { code: 'invalid_cleanup_target' }
+            );
+            for (const video of videos) {
+                if (video.r2_source_key) {
+                    // New and replacement uploads use one base62 upload directory.
+                    // Never turn an unknown/legacy key into a broader parent sweep.
+                    const match = /^source\/([A-Za-z0-9]{12})\/source\.[^/]+$/.exec(video.r2_source_key);
+                    if (!match) throw invalidTarget();
+                    add('prefix', `source/${match[1]}/`, now);
+                }
+                if (!/^[A-Za-z0-9]{64}$/.test(video.hashed_video_id)) throw invalidTarget();
+                const inFlight = processingStatuses.has(video.status) || activeVideoIds.has(String(video.video_id));
+                add('prefix', `${video.hashed_video_id}/`, inFlight ? delayedAt : now, video.hashed_video_id);
+            }
+            for (const session of inflightSessions) {
+                if (session.type === 'attachment') {
+                    const prefix = `attachments/${deletedCourseId}/`;
+                    if (!session.object_key.startsWith(prefix) || session.object_key.length === prefix.length) {
+                        throw invalidTarget();
+                    }
+                    add('key', session.object_key, attachmentAt);
+                }
+            }
+            add('prefix', `attachments/${deletedCourseId}/`, now);
+            add('prefix', `posters/${deletedCourseId}/`, now);
+
+            // All INSERTs and the destructive cascade use the same transaction.
+            // The reaper cannot observe these intents until the delete commits.
+            for (const item of plan.values()) {
+                const opts = { connection, source: 'course_delete', execute_at: item.executeAt };
+                if (item.hash) opts.hashed_video_id = item.hash;
+                if (item.mode === 'key') await deletionService.enqueueKey(item.target, opts);
+                else await deletionService.enqueuePrefix(item.target, opts);
+            }
+            await connection.execute('DELETE FROM courses WHERE course_id = ?', [deletedCourseId]);
+        }
+        commitStarted = true;
+        await connection.commit();
+    } catch (error) {
+        // A lost COMMIT response is ambiguous. The DB still commits course
+        // and cleanup plan together; invalidate safe metadata after releasing
+        // the connection, without claiming the rollback proved an outcome.
+        try { await connection.rollback(); }
+        catch { reusable = false; connection.destroy(); }
+        transactionError = error;
+    } finally {
+        if (reusable) connection.release();
+    }
+    if (transactionError) {
+        if (commitStarted) await invalidateReadCaches();
+        throw transactionError;
+    }
+    if (alreadyAbsent) {
+        // A retry after a lost response can still remove stale course/list
+        // metadata even though the original child IDs are no longer in SQL.
+        await invalidateReadCaches();
+        return;
     }
 
-    // Attachments: one prefix for all course materials.
-    // DB rows are gone via FK CASCADE on course_materials.course_id.
-    await deletionService.enqueuePrefix(`attachments/${courseId}/`, { source: 'course_delete' });
-
-    // Per-course posters: one prefix sweeps every video's poster in one go.
-    // Posters live at `posters/{course_id}/{video_id}.jpg` outside the
-    // per-video hash prefixes above, so this is the only path that catches
-    // them at course-delete time.
-    await deletionService.enqueuePrefix(`posters/${courseId}/`, { source: 'course_delete' });
+    const videoIds = videos.map(video => video.video_id);
+    const effects = [
+        ['video_cache', () => videoCache.invalidateMany(videoIds)],
+        ['course_cache', () => courseCache.invalidate(deletedCourseId)],
+        ['course_list_cache', () => courseListCache.invalidate()],
+        ['watch_progress_cache', () => require('./cache/watchProgressCache').clearForVideos(videoIds)],
+        ['transcode_cache', () => require('./cache/transcodeProgressCache').clearJobs(activeJobs.map(job => job.job_id))],
+    ];
+    for (const job of activeJobs) effects.push(['stale_timer', () => require('./processingService').clearStaleTimer(job.job_id)]);
+    for (const session of inflightSessions) {
+        effects.push(['upload_heartbeat', () => require('./cache/uploadHeartbeatCache').clearHeartbeat(session.upload_id)]);
+        if (session.type === 'video') {
+            // Preserve nonblocking multipart cancellation, after the SQL
+            // decision is durable. Failures are visible without undoing it.
+            void bestEffort('multipart_abort', () => require('./uploadService').abortMultipartUpload(session.object_key, session.r2_upload_id));
+        }
+    }
+    await Promise.all(effects.map(([name, run]) => bestEffort(name, run)));
 }
 
 async function listCourses(page = 1, limit = 10) {

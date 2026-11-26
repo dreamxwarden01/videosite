@@ -14,16 +14,16 @@ const backgroundTasks = require('../lib/backgroundTasks');
 //       SELECT … WHERE execute_at <= NOW() ORDER BY execute_at LIMIT 1
 //   - Up to 5 attempts per row per turn with backoff [0, 250, 500, 1000, 2000] ms.
 //   - Empty ListObjectsV2 result = success (idempotent retry-safe).
-//   - 4xx errors (incl. 404) are terminal — counted as success, not retried.
+//   - Only explicit NoSuchKey is idempotent success; other failures stay queued.
 //   - On success: hard-delete the row.
-//   - On all 5 attempts failing: persist attempts += 5, last_error,
-//     last_attempt_at; abort the turn (R2 presumed unhealthy, don't waste
-//     effort on the rest of the queue).
-//   - Next turn picks up where this turn left off.
+//   - Failure is persisted with the actual row attempt count and a next-run
+//     delay (60s transient, 5min permanent). No failed cleanup is discarded.
+//   - Abort this turn; other due rows may run at the next tick.
 
 const { ListObjectsV2Command, DeleteObjectCommand, DeleteObjectsCommand } = require('@aws-sdk/client-s3');
 const { getPool } = require('../config/database');
 const { getR2Client, getR2BucketName } = require('../config/r2');
+const { sendR2Request, errorCode, errorSummary, hash, emit } = require('../lib/r2RequestLog');
 
 // --- Tunables ---
 const MAX_ATTEMPTS_PER_TURN = 5;
@@ -39,15 +39,17 @@ const REAPER_INTERVAL_MS = parseInt(process.env.DELETION_REAPER_INTERVAL_MS || '
  * Enqueue a single R2 object key for deletion.
  * `opts.execute_at` is a Date (default: now). `opts.source` is an
  * operator-visible tag for diagnostics (e.g. 'material_delete').
+ * `opts.connection` optionally joins the caller's SQL transaction.
  */
 async function enqueueKey(key, opts = {}) {
     if (!key) throw new Error('enqueueKey: key is required');
-    const pool = getPool();
+    const pool = opts.connection || getPool();
     const executeAt = opts.execute_at instanceof Date ? opts.execute_at : new Date();
+    if (!Number.isFinite(executeAt.getTime())) throw new TypeError('Invalid deletion time');
     await pool.execute(
         `INSERT INTO pending_deletes (mode, target, execute_at, source)
-         VALUES ('key', ?, ?, ?)`,
-        [key, executeAt, opts.source || null]
+         VALUES ('key', ?, FROM_UNIXTIME(?), ?)`,
+        [key, executeAt.getTime() / 1000, opts.source || null]
     );
 }
 
@@ -59,12 +61,13 @@ async function enqueueKey(key, opts = {}) {
  */
 async function enqueuePrefix(prefix, opts = {}) {
     if (!prefix) throw new Error('enqueuePrefix: prefix is required');
-    const pool = getPool();
+    const pool = opts.connection || getPool();
     const executeAt = opts.execute_at instanceof Date ? opts.execute_at : new Date();
+    if (!Number.isFinite(executeAt.getTime())) throw new TypeError('Invalid deletion time');
     await pool.execute(
         `INSERT INTO pending_deletes (mode, target, hashed_video_id, execute_at, source)
-         VALUES ('prefix', ?, ?, ?, ?)`,
-        [prefix, opts.hashed_video_id || null, executeAt, opts.source || null]
+         VALUES ('prefix', ?, ?, FROM_UNIXTIME(?), ?)`,
+        [prefix, opts.hashed_video_id || null, executeAt.getTime() / 1000, opts.source || null]
     );
 }
 
@@ -87,37 +90,37 @@ async function hasPendingForHash(hashedVideoId) {
 
 /**
  * Delete a single object. Returns true on success.
- * 4xx (including 404 / NoSuchKey) is treated as success: the object is gone
- * either way, and S3 DeleteObject is a no-op on missing keys anyway.
+ * Only an explicit NoSuchKey is treated as absent. A generic 404 can mean
+ * NoSuchBucket/configuration failure and must not discard the cleanup intent.
  */
-async function deleteOneObject(bucket, key) {
+async function deleteOneObject(bucket, key, context) {
     const r2 = getR2Client();
     try {
-        await r2.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+        await sendR2Request(r2, new DeleteObjectCommand({ Bucket: bucket, Key: key }), context);
         return true;
     } catch (err) {
-        const status = err.$metadata?.httpStatusCode;
-        if (status && status >= 400 && status < 500) return true; // gone is fine
+        if (errorCode(err) === 'NoSuchKey') return true;
         throw err;
     }
 }
 
 /**
- * List + batch-delete everything under the prefix. Repeats until the prefix
- * is empty. Empty list on the first call = idempotent success.
+ * Walk the prefix and check every batch result. Failed batches remain queued;
+ * a later sweep lists surviving keys instead of replaying successful keys.
  *
  * Throws on R2 failure (caller's retry/backoff loop handles it).
  */
-async function deletePrefixSweep(bucket, prefix) {
+async function deletePrefixSweep(bucket, prefix, context) {
     const r2 = getR2Client();
     let continuationToken;
+    const seenTokens = new Set();
     do {
         if (backgroundTasks.stopping) return false;
-        const listResult = await r2.send(new ListObjectsV2Command({
+        const listResult = await sendR2Request(r2, new ListObjectsV2Command({
             Bucket: bucket,
             Prefix: prefix,
             ContinuationToken: continuationToken,
-        }));
+        }), context);
 
         const contents = listResult.Contents || [];
         if (contents.length > 0) {
@@ -125,19 +128,56 @@ async function deletePrefixSweep(bucket, prefix) {
             for (let i = 0; i < contents.length; i += DELETE_BATCH_SIZE) {
                 if (backgroundTasks.stopping) return false;
                 const batch = contents.slice(i, i + DELETE_BATCH_SIZE);
-                await r2.send(new DeleteObjectsCommand({
+                const result = await sendR2Request(r2, new DeleteObjectsCommand({
                     Bucket: bucket,
                     Delete: {
                         Objects: batch.map(obj => ({ Key: obj.Key })),
                         Quiet: true,
                     },
-                }));
+                }), context);
+                const failures = (result.Errors || []).filter(error => errorCode(error) !== 'NoSuchKey');
+                if (failures.length) {
+                    const error = new Error(`Batch deletion failed for ${failures.length} objects`);
+                    error.name = 'R2BatchDeleteError';
+                    error.objectErrors = errorSummary(failures);
+                    error.retryable = failures.every(item => isTransientCode(errorCode(item)));
+                    error.throttled = failures.some(item => isThrottleCode(errorCode(item)));
+                    throw error;
+                }
             }
         }
 
         continuationToken = listResult.IsTruncated ? listResult.NextContinuationToken : undefined;
+        if (listResult.IsTruncated) {
+            if (typeof continuationToken !== 'string' || !continuationToken || seenTokens.has(continuationToken)) {
+                const error = new Error('Invalid R2 listing continuation');
+                error.name = 'R2PaginationError';
+                throw error;
+            }
+            seenTokens.add(continuationToken);
+        }
     } while (continuationToken);
+    if (backgroundTasks.stopping) return false;
+    const remaining = await sendR2Request(r2, new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, MaxKeys: 1 }), context);
+    if (remaining.Contents?.length || remaining.IsTruncated) {
+        const error = new Error('R2 prefix still contains objects');
+        error.name = 'R2PrefixNotEmpty';
+        error.retryable = true;
+        throw error;
+    }
     return true;
+}
+
+function isThrottleCode(code) { return ['SlowDown', 'TooManyRequests', 'Throttling', 'ThrottlingException', 'RequestLimitExceeded'].includes(code); }
+function isTransientCode(code) {
+    return isThrottleCode(code) || ['InternalError', 'ServiceUnavailable', 'RequestTimeout', 'RequestTimeoutException', 'OperationAborted'].includes(code);
+}
+function retryable(error) {
+    if (typeof error.retryable === 'boolean') return error.retryable;
+    const status = error.$metadata?.httpStatusCode;
+    if (status === 429 || status === 408 || status >= 500 || isTransientCode(errorCode(error))) return true;
+    if (status >= 400 && status < 500) return false;
+    return true; // Network/unclassified failure: keep the bounded retry policy.
 }
 
 // --- Reaper ---
@@ -185,7 +225,7 @@ async function drainReaper() {
             }
         }
     } catch (err) {
-        console.error('Deletion reaper error:', err.message);
+        emit({ component: 'r2_deletion', event: 'reaper_error', phase: 'queue_read', error_code: errorCode(err) });
     } finally {
         reaperRunning = false;
     }
@@ -193,52 +233,77 @@ async function drainReaper() {
 
 /**
  * Run one row through up to MAX_ATTEMPTS_PER_TURN attempts.
- * Returns true on success (row was deleted from DB), false if all attempts
- * failed (row stays, attempts/last_error persisted).
+ * Returns true on success (row was deleted from DB), false on retained failure
+ * or shutdown. Permanent failures stop retries early and remain visible.
  */
 async function processRow(bucket, row) {
     const pool = getPool();
     let lastErr = null;
+    let attempts = 0;
+    let r2Complete = false;
+    let phase = 'r2';
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS_PER_TURN; attempt++) {
         if (attempt > 0 && backgroundTasks.stopping) return false;
-        if (BACKOFF_MS[attempt] > 0) {
-            await new Promise(r => setTimeout(r, BACKOFF_MS[attempt]));
+        const throttled = lastErr && (lastErr.throttled || lastErr.$metadata?.httpStatusCode === 429 || isThrottleCode(errorCode(lastErr)));
+        const wait = attempt > 0 ? Math.max(BACKOFF_MS[attempt], throttled ? 1000 : 0) : 0;
+        if (wait > 0) {
+            emit({ component: 'r2_deletion', event: 'row_retry_wait', row_id: String(row.id), next_attempt: attempt + 1, delay_ms: wait });
+            await new Promise(r => setTimeout(r, wait));
             if (backgroundTasks.stopping) return false;
         }
         try {
+            attempts++;
+            const context = { row_id: row.id, row_attempt: attempts };
             if (row.mode === 'key') {
-                await deleteOneObject(bucket, row.target);
+                await deleteOneObject(bucket, row.target, context);
             } else {
-                if (!(await deletePrefixSweep(bucket, row.target))) return false;
+                if (!(await deletePrefixSweep(bucket, row.target, context))) return false;
             }
-            await pool.execute('DELETE FROM pending_deletes WHERE id = ?', [row.id]);
-            return true;
+            r2Complete = true;
+            break;
         } catch (err) {
             lastErr = err;
-            // 4xx are terminal — if deleteOneObject threw it, the helper
-            // already swallowed 4xx; getting here means it's 5xx or network.
-            // Just retry.
+            if (!retryable(err)) break;
+        }
+    }
+
+    if (r2Complete) {
+        try {
+            await pool.execute('DELETE FROM pending_deletes WHERE id = ?', [row.id]);
+            emit({ component: 'r2_deletion', event: 'row_complete', row_id: String(row.id), mode: row.mode,
+                target_hash: hash(row.target), row_attempts: attempts });
+            return true;
+        } catch (error) {
+            // A DB acknowledgement failure must not replay R2 in this turn.
+            // The durable row can safely be reconciled by a later sweep.
+            lastErr = error;
+            phase = 'db_ack';
         }
     }
 
     if (backgroundTasks.stopping) return false;
 
-    // All MAX_ATTEMPTS_PER_TURN attempts failed. Persist diagnostic state
-    // and signal the reaper to abort the turn.
-    const message = lastErr ? (lastErr.message || String(lastErr)) : 'unknown';
-    console.error(`Pending delete row ${row.id} (${row.mode} ${row.target}) failed after ${MAX_ATTEMPTS_PER_TURN} attempts: ${message}`);
+    // Persist bounded transient or permanent failure and retry eligibility.
+    const message = JSON.stringify({ phase, code: errorCode(lastErr), status: lastErr?.$metadata?.httpStatusCode || null,
+        ...(lastErr?.objectErrors || {}) });
+    const nextDelaySeconds = phase === 'db_ack' || retryable(lastErr || {}) ? 60 : 300;
+    emit({ component: 'r2_deletion', event: 'row_failed', row_id: String(row.id), mode: row.mode,
+        target_hash: hash(row.target), row_attempts: attempts, retry_in_seconds: nextDelaySeconds,
+        phase, error_code: errorCode(lastErr), ...(lastErr?.objectErrors || {}) });
     try {
         await pool.execute(
             `UPDATE pending_deletes
-             SET attempts = attempts + ?, last_attempt_at = NOW(), last_error = ?
+             SET attempts = attempts + ?, last_attempt_at = NOW(), last_error = ?,
+                 execute_at = DATE_ADD(NOW(), INTERVAL ? SECOND)
              WHERE id = ?`,
-            [MAX_ATTEMPTS_PER_TURN, message.slice(0, 4000), row.id]
+            [attempts, message, nextDelaySeconds, row.id]
         );
     } catch (dbErr) {
         // If the DB write itself fails we can't do much — the row remains
         // pending (good); next turn will try again.
-        console.error('Failed to persist pending_deletes failure state:', dbErr.message);
+        emit({ component: 'r2_deletion', event: 'failure_state_persist_error', row_id: String(row.id),
+            phase: 'db_diagnostic', error_code: errorCode(dbErr) });
     }
     return false;
 }

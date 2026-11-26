@@ -27,6 +27,50 @@ stored version so an older response cannot replace newer authorization. Upgrade
 DreamSSO's role-event schema and server before upgrading the relying party, and
 preserve synchronization metadata with database backups.
 
+## R2 deletion and read-only inventory
+
+Course removal commits its storage cleanup plan and the course cascade in one
+MariaDB transaction. Cache invalidation runs after commit; a cache failure does
+not discard the cleanup plan. Unknown source/output layouts fail before deleting
+the course rather than expanding a prefix. Read-through metadata caches are also
+invalidated after an uncertain commit response; worker liveness and upload
+cancellation effects require confirmed commit. Cleanup deadlines are serialized
+as Unix timestamps and converted by the database, so app/database timezone
+differences do not change the intended buffer.
+
+The serial deletion reaper checks per-object errors even when a batch returns
+HTTP 200, and confirms a prefix is empty before settling its task. Explicit
+`NoSuchKey` is idempotent success; other failures stay queued. Transient failures
+receive up to five row attempts, then retry after 60 seconds. Permanent failures
+stop early and retry after five minutes. A failed row stops the current drain;
+other due rows can proceed at the next tick. A failed database acknowledgement
+does not replay R2 within that turn. SDK retries remain separate from row attempts.
+
+Structured `r2_deletion` logs record List/Delete attempt duration, HTTP status,
+R2 request ID, SDK retry spacing and totals, batch size and per-object error-code
+counts. `call_id` joins SDK attempts; `row_id` joins queue attempts. Keys, prefixes
+and batches are represented by hashes; request bodies, credentials, signed URLs
+and raw provider messages are excluded. These hashes are correlatable pseudonyms,
+not anonymization; retain normal access controls on operational logs.
+`row_complete` follows database settlement; `phase: db_ack` identifies failed
+database acknowledgement separately from an R2 failure.
+These logs do not cover the separate Go worker's upload traffic.
+
+`node scripts/r2-orphan-audit.js --help` describes a prefix-only inventory tool.
+Supply a complete consistent database snapshot, an explicit temporary read-only
+S3 credential file and the intended R2 endpoint/bucket. It only issues paginated
+`ListObjectsV2` requests with a delimiter; there is no delete/apply mode. Capture
+a second database snapshot after scanning and use `--verify-report` to detect
+ownership changes without querying R2 again. Reports distinguish referenced,
+active-upload, pending-cleanup, unknown and orphan-candidate prefixes. Candidates
+are **not** deletion authorization. Course-level attachment/poster checks do not
+identify stale individual files inside an otherwise valid course, and video
+prefix checks do not establish segment or job completeness.
+
+Run `npm run test:deletion` for request/retry, queue, transaction and inventory
+unit tests. `npm run test:deletion:db` creates and removes a disposable local
+MariaDB fixture; `VS_TEST_DOCKER_CONTEXT` defaults to `orbstack` (CI uses `default`).
+
 ## Fonts
 
 UI text uses self-hosted Inter with automatic optical sizing, while existing

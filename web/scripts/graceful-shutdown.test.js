@@ -7,6 +7,7 @@ const vm = require('node:vm');
 const http = require('node:http');
 const net = require('node:net');
 const { createBackgroundTasks } = require('../lib/backgroundTasks');
+const deletionRequestLog = { ...require('../lib/r2RequestLog'), sendR2Request: (client, command) => client.send(command), emit() {} };
 
 function deferred() {
     let resolve, reject;
@@ -363,6 +364,7 @@ test('deletion shutdown awaits its current row and leaves subsequent durable row
     const Command = class {};
     const service = load('services/deletionService.js', {
         '../lib/backgroundTasks': tasks,
+        '../lib/r2RequestLog': deletionRequestLog,
         '@aws-sdk/client-s3': { ListObjectsV2Command: Command, DeleteObjectCommand: Command, DeleteObjectsCommand: Command },
         '../config/database': { getPool: () => pool },
         '../config/r2': { getR2BucketName: () => 'synthetic', getR2Client: () => ({ send: () => deletion.promise }) },
@@ -385,6 +387,7 @@ test('stopping a failed delete attempt skips retries/backoff and leaves the dura
     const Command = class {};
     const service = load('services/deletionService.js', {
         '../lib/backgroundTasks': tasks,
+        '../lib/r2RequestLog': deletionRequestLog,
         '@aws-sdk/client-s3': { ListObjectsV2Command: Command, DeleteObjectCommand: Command, DeleteObjectsCommand: Command },
         '../config/database': { getPool: () => pool },
         '../config/r2': { getR2BucketName: () => 'synthetic', getR2Client: () => ({ send() { sends++; return deletion.promise; } }) },
@@ -404,6 +407,7 @@ test('stopping a prefix sweep between list and delete never falsely completes th
     const Command = class {};
     const service = load('services/deletionService.js', {
         '../lib/backgroundTasks': tasks,
+        '../lib/r2RequestLog': deletionRequestLog,
         '@aws-sdk/client-s3': { ListObjectsV2Command: Command, DeleteObjectCommand: Command, DeleteObjectsCommand: Command },
         '../config/database': { getPool: () => pool },
         '../config/r2': { getR2BucketName: () => 'synthetic', getR2Client: () => ({ send() { sends++; return listing.promise; } }) },

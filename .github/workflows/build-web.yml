@@ -30,6 +30,10 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run test:jwks
       - run: npm run test:shutdown
+      - run: npm run test:deletion
+      - run: npm run test:deletion:db
+        env:
+          VS_TEST_DOCKER_CONTEXT: default
       - run: npm run test:sessions
       - run: npm run check:db
       - run: npm run test:sso-roles:db

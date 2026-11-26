@@ -17,7 +17,9 @@
     "test:jwks": "node --test scripts/jwks-http.test.js scripts/client-signing-keys.test.js",
     "test:shutdown": "node --test scripts/graceful-shutdown.test.js",
     "test:sso-roles:db": "node scripts/run-sso-role-tests.mjs",
-    "test:sessions": "node --test scripts/session-revocation.test.js scripts/logout-receiver.test.js scripts/assertion-issuer.test.js scripts/stepup-callback.test.js"
+    "test:sessions": "node --test scripts/session-revocation.test.js scripts/logout-receiver.test.js scripts/assertion-issuer.test.js scripts/stepup-callback.test.js",
+    "test:deletion": "node --test scripts/deletion-reaper.test.js scripts/r2-request-log.test.js scripts/course-delete-atomic.test.js scripts/r2-orphan-audit.test.js",
+    "test:deletion:db": "node scripts/run-deletion-tests.mjs"
   },
   "keywords": [],
   "author": "",
