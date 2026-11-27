@@ -6,6 +6,24 @@ const { readCatalog } = require('../services/ssoCatalogStore');
 const epoch = '11111111-1111-4111-8111-111111111111';
 const sub = '22222222-2222-4222-8222-222222222222';
 const incoming = (role, rev = '7', e = epoch) => p.observation({ sub, role_id: role, authority_epoch: e, authority_revision: rev });
+test('profile seeds enforce complete scope groups and subject-owned avatar names', () => {
+    const profile = { preferred_username:'student', name:'Student', picture:sub+'-0123456789abcdef.webp', email:'student@example.test', email_verified:true };
+    const event = { sub, role_id:2, account_status:'active', authority_epoch:epoch, authority_revision:'1', profile };
+    assert.deepEqual(p.observation(event).profile, profile);
+    assert.equal(p.observation({...event,profile:{...profile,name:'🙂'.repeat(100)}}).profile.name,'🙂'.repeat(100));
+    assert.deepEqual(p.profileSeed({},sub),{});
+    assert.deepEqual(p.profileSeed({email:null,email_verified:false},sub),{email:null,email_verified:false});
+    for (const value of [null, [], 'profile', {name:'Student'}, {...profile,preferred_username:'x'.repeat(21)},
+        {...profile,name:'x'.repeat(101)}, {...profile,picture:epoch+'-0123456789abcdef.webp'},
+        {...profile,email:'x'.repeat(255)}, {...profile,email_verified:1}, {...profile,extra:'secret'},
+        {...profile,name:'🙂'.repeat(101)}, {...profile,name:'  '}, {...profile,name:'a\u0000b'},
+        {...profile,name:'a\u007fb'}, {...profile,name:'a\ud800b'}]) {
+        assert.throws(() => p.observation({...event,profile:value}), /invalid_profile_seed/);
+    }
+    for (const patch of [{role_id:null},{account_status:'disabled'},{account_status:undefined},
+        {authority_epoch:undefined,authority_revision:undefined}]) assert.throws(() => p.observation({...event,...patch}), /invalid_profile_seed/);
+    assert.throws(() => p.observation(event,'login'), /invalid_profile_seed/);
+});
 test('null and role zero remain distinct; coercible values are invalid', () => {
     assert.equal(p.roleId(null), null); assert.equal(p.roleId(0), 0);
     for (const value of [undefined, false, '', '0', [], {}, NaN, 2147483648, -2147483649]) assert.throws(() => p.roleId(value));

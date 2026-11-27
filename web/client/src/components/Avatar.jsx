@@ -13,10 +13,9 @@ export function initials(name) {
 // the uploaded image when `user.avatar` is set, otherwise an initials fallback.
 // `name` wins as the label; falls back to the user's display_name/username.
 //
-// The videosite's /api/avatar/:file route only serves the CALLER's own avatar
-// (it mirrors just the signed-in user's picture from the SSO). A row for anyone
-// else therefore 404s — so we degrade to initials on image error rather than
-// showing a broken glyph. The current user's own row still shows their photo.
+// The avatar route permits the caller's own picture and authorized admin
+// directory views, and fetches missing bytes from SSO on demand. Fall back to
+// initials if the current picture is unavailable or access is denied.
 export default function Avatar({ user, name, className }) {
   const label = name ?? user?.display_name ?? user?.username ?? '';
   const [failed, setFailed] = useState(false);

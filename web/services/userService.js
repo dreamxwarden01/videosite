@@ -1,6 +1,107 @@
 const { getPool, idBuf } = require('../config/database');
 const permCache = require('./cache/permissionCache');
 const userCache = require('./cache/userCache');
+const { subject, profileText } = require('../lib/ssoRoleProtocol');
+const { randomBytes } = require('node:crypto');
+
+// A subject is the identity. Names and email are mirrors, and a stale mirror
+// belonging to another subject must never make us merge or overwrite that row.
+// The caller can include this insert in the authority/inbox transaction.
+async function createMissingBySub(sub, profile, roleId, { connection = null } = {}) {
+    sub = subject(sub);
+    const hexId = sub.replace(/-/g, '');
+    const db = connection || getPool();
+    const id = idBuf(hexId);
+    const read = async () => {
+        const [[row]] = await db.execute('SELECT * FROM users WHERE user_id=? FOR UPDATE', [id]);
+        return row;
+    };
+    // A nonlocking first read avoids locking an absent PK gap while another
+    // first-login transaction is creating the same subject.
+    const [[existing]] = await db.execute('SELECT * FROM users WHERE user_id=?', [id]);
+    if (existing) return { user: existing, created: false };
+    const fallback = 'u_' + hexId;
+    let username = profileText(profile.preferred_username, 50) ? profile.preferred_username : fallback;
+    let usedStableFallback = username === fallback;
+    const displayName = profileText(profile.name, 100) ? profile.name : username;
+    let email = profileText(profile.email, 254) ? profile.email : null;
+    const picture = typeof profile.picture === 'string'
+        && new RegExp('^' + sub + '-[0-9a-f]{16}\\.webp$').test(profile.picture) ? profile.picture : null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+            await db.execute(`INSERT INTO users(user_id,username,display_name,email,sso_avatar,role_id)
+                VALUES(?,?,?,?,?,?)`, [id, username, displayName, email, picture, roleId]);
+            return { user: await read(), created: true };
+        } catch (error) {
+            if (error.code !== 'ER_DUP_ENTRY') throw error;
+            // Locking reads see a concurrent winner even under REPEATABLE READ.
+            const winner = await read();
+            if (winner) return { user: winner, created: false };
+            let changed = false;
+            const [[otherUsername]] = await db.execute('SELECT user_id FROM users WHERE username=? FOR UPDATE', [username]);
+            if (otherUsername) {
+                // Legacy data may already own even the subject-derived name.
+                // Keep the UUID identity and choose another local mirror name;
+                // 34 + 1 + 14 = 49 characters, within users.username's limit.
+                username = usedStableFallback ? fallback + '_' + randomBytes(7).toString('hex') : fallback;
+                usedStableFallback = true;
+                changed = true;
+            }
+            if (email !== null) {
+                const [[other]] = await db.execute('SELECT user_id FROM users WHERE email=? FOR UPDATE', [email]);
+                if (other) { email = null; changed = true; }
+            }
+            if (!changed) throw error;
+        }
+    }
+    throw new Error('user_mirror_conflict');
+}
+
+// The authority record is the access state; do not maintain another mutable
+// active flag on users. Legacy users without a confirmed observation are unknown.
+const ACCESS_JOIN = `LEFT JOIN sso_role_authority a ON a.subject_id=LOWER(CONCAT(
+    SUBSTR(HEX(u.user_id),1,8),'-',SUBSTR(HEX(u.user_id),9,4),'-',SUBSTR(HEX(u.user_id),13,4),'-',
+    SUBSTR(HEX(u.user_id),17,4),'-',SUBSTR(HEX(u.user_id),21,12)))`;
+const ACCESS_STATUS = `CASE
+    WHEN a.account_status IN ('disabled','locked','deleted') THEN a.account_status
+    WHEN a.account_status='not_found' THEN 'deleted'
+    WHEN a.refresh_pending=1 OR a.effects_pending=1 THEN 'pending'
+    WHEN a.blocked=1 THEN 'no_access'
+    WHEN a.authority_epoch IS NOT NULL AND a.role_id IS NOT NULL THEN 'active'
+    ELSE 'unknown' END AS access_status`;
+
+async function refreshLoginProfile(pool, hexId, claims, user) {
+    // Only an authenticated login refreshes an existing profile. In particular,
+    // this also runs when an older event seed wins a first-login insert race.
+    const displayName = profileText(claims.name, 100) ? claims.name : user.display_name;
+    let email = profileText(claims.email, 254) ? claims.email : user.email;
+    if (displayName === user.display_name && email === user.email) return user;
+    try {
+        await pool.execute('UPDATE users SET display_name = ?, email = ? WHERE user_id = ?',
+            [displayName, email, idBuf(hexId)]);
+    } catch (error) {
+        // This statement updates no other unique field. A stale email mirror
+        // on another subject is not an identity link and must never merge rows.
+        // Still refresh the name, and leave the conflicting email unclaimed.
+        if (error.code !== 'ER_DUP_ENTRY' || email === null) {
+            console.warn('sso_login_profile_refresh_failed');
+            return user;
+        }
+        email = null;
+        try {
+            await pool.execute('UPDATE users SET display_name = ?, email = ? WHERE user_id = ?',
+                [displayName, email, idBuf(hexId)]);
+        } catch {
+            console.warn('sso_login_profile_refresh_failed');
+            return user;
+        }
+        console.warn('sso_login_profile_email_conflict');
+    }
+    user.display_name = displayName;
+    user.email = email;
+    await userCache.invalidate(hexId).catch(() => console.warn('sso_login_profile_cache_refresh_failed'));
+    return user;
+}
 
 // Resolve the local user for an OIDC subject, or JIT-create on first login.
 // user_id is BINARY(16) holding the UUIDv7 `sub`; the canonical JS form is the
@@ -9,67 +110,33 @@ const userCache = require('./cache/userCache');
 // new SSO identities hit the INSERT.
 async function findOrCreateBySub(claims) {
     const pool = getPool();
-    const sub = String(claims.sub || '');
+    const sub = subject(claims.sub);
     const hexId = sub.replace(/-/g, '').toLowerCase();
-    if (hexId.length !== 32 || /[^0-9a-f]/.test(hexId)) {
-        throw new Error('invalid sub: ' + sub);
-    }
 
     const [rows] = await pool.execute('SELECT * FROM users WHERE user_id = ?', [idBuf(hexId)]);
     if (rows[0]) {
-        // Profile is read-only under SSO: refresh the mirrored display_name/email
-        // from the claims each login so the SSO stays the source of truth. A refresh
-        // failure (e.g. an email UNIQUE clash) must never block login.
-        const dn = claims.name || rows[0].display_name;
-        const em = claims.email != null ? claims.email : rows[0].email;
-        if (dn !== rows[0].display_name || em !== rows[0].email) {
-            try {
-                await pool.execute(
-                    'UPDATE users SET display_name = ?, email = ? WHERE user_id = ?',
-                    [dn, em, idBuf(hexId)]
-                );
-                await userCache.invalidate(hexId);
-                rows[0].display_name = dn;
-                rows[0].email = em;
-            } catch (e) {
-                console.error('Claim refresh skipped for', hexId, '-', e.message);
-            }
-        }
-        return rows[0];
+        return refreshLoginProfile(pool, hexId, claims, rows[0]);
     }
 
     // JIT-create. The placeholder role is immediately overwritten by the
     // app_role claim the callback applies (the SSO refuses sign-in entirely
     // for No-access users, so a JIT user always arrives with a role claim).
     // username/display_name fall back when a claim is absent; a username
-    // clash retries with a sub-derived suffix.
-    const username = claims.preferred_username || ('u_' + hexId.slice(0, 8));
-    const displayName = claims.name || username;
-    const email = claims.email || null;
+    // clash uses a bounded subject-derived name instead of changing identity.
     const [[fallbackRole]] = await pool.execute(
         'SELECT role_id FROM roles ORDER BY permission_level DESC LIMIT 1'
     );
-    const insertSql =
-        `INSERT INTO users (user_id, username, display_name, email, role_id)
-         VALUES (?, ?, ?, ?, ?)`;
-    try {
-        await pool.execute(insertSql, [idBuf(hexId), username, displayName, email, fallbackRole.role_id]);
-    } catch (e) {
-        if (e.code === 'ER_DUP_ENTRY') {
-            await pool.execute(insertSql,
-                [idBuf(hexId), username + '_' + hexId.slice(0, 6), displayName, email, fallbackRole.role_id]);
-        } else throw e;
-    }
-
-    const [created] = await pool.execute('SELECT * FROM users WHERE user_id = ?', [idBuf(hexId)]);
-    return created[0];
+    if (!fallbackRole) throw new Error('role_out_of_sync');
+    const result = await createMissingBySub(sub, claims, fallbackRole.role_id);
+    return refreshLoginProfile(pool, hexId, claims, result.user);
 }
 
 async function getUserById(userId) {
     const pool = getPool();
     const [rows] = await pool.execute(
-        `SELECT u.*, u.sso_avatar AS avatar, r.role_name, r.permission_level
+        `SELECT u.*, u.sso_avatar AS avatar, r.role_name, r.permission_level, ${ACCESS_STATUS}
          FROM users u JOIN roles r ON u.role_id = r.role_id
+         ${ACCESS_JOIN}
          WHERE u.user_id = ?`,
         [idBuf(userId)]
     );
@@ -147,8 +214,9 @@ async function listUsers(actingUserLevel, page = 1, limit = 10, dir = 'DESC', se
     const [rows] = await pool.execute(
         `SELECT u.user_id, u.username, u.display_name, u.email, u.role_id, u.created_at,
                 u.sso_avatar AS avatar,
-                r.role_name, r.permission_level
+                r.role_name, r.permission_level, ${ACCESS_STATUS}
          FROM users u JOIN roles r ON u.role_id = r.role_id
+         ${ACCESS_JOIN}
          WHERE r.permission_level >= ?${searchSql}
          ORDER BY r.permission_level ${orderDir},
                   u.display_name ${orderDir},
@@ -166,6 +234,7 @@ async function listUsers(actingUserLevel, page = 1, limit = 10, dir = 'DESC', se
 }
 
 module.exports = {
+    createMissingBySub,
     findOrCreateBySub,
     getUserById,
     updateUser,

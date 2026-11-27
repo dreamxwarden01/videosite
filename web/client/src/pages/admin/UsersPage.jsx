@@ -10,6 +10,7 @@ import SortMenu from '../../components/SortMenu';
 import Avatar from '../../components/Avatar';
 import useStepupGuard from '../../hooks/useStepupGuard';
 import StepUpBlock from '../../components/StepUpBlock';
+import UserAccessStatus from '../../components/UserAccessStatus';
 
 // 'admin:'-prefixed flat keys, matching CoursesPage's page/sort memory.
 const PAGE_KEY = 'admin:users:page';
@@ -187,12 +188,13 @@ export default function UsersPage() {
                 <Avatar user={u} name={u.display_name || u.username} className="vs-cv-av" />
                 <div className="vs-cv-rmn">
                   <p className="vs-cv-rt">{u.display_name || u.username}{me && <span className="vs-you">you</span>}</p>
-                  <p className="vs-cv-rs">
-                    <span>{u.username}</span>
+                  <p className="vs-cv-rs vs-user-summary">
+                    <span className="vs-user-handle">{u.username}</span>
                     <span className="vs-cv-dot">·</span>
                     <span>{u.role_name || 'no role'}</span>
                   </p>
                 </div>
+                <UserAccessStatus status={u.access_status} hideActive />
                 {editable && <span className="vs-cv-chev"><ChevronR /></span>}
               </div>
             );

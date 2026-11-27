@@ -7,7 +7,7 @@ const columns = `subject_id,authority_epoch,CAST(authority_revision AS CHAR) AS 
 const hex = sub => sub.replace(/-/g, '');
 const dashed = id => id.includes('-') ? subject(id) : subject(id.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5'));
 
-function createAuthorityService({ pool, updateUser, invalidateUser, deleteUserSessions, fetchAccessState }) {
+function createAuthorityService({ pool, updateUser, invalidateUser, deleteUserSessions, fetchAccessState, createUser }) {
     async function repairProjection(db, sub, role) {
         const [[user]] = await db.execute('SELECT role_id FROM users WHERE user_id=?', [Buffer.from(hex(sub), 'hex')]);
         if (!user || user.role_id === role) return false;
@@ -61,7 +61,11 @@ function createAuthorityService({ pool, updateUser, invalidateUser, deleteUserSe
             // A fresh same-lineage read may resolve a conflicting event at the
             // same revision. A foreign epoch always requires explicit recovery.
             const authoritative = incoming.source === 'pull';
-            const accountStatus = incoming.accountStatus ?? row.account_status ?? null;
+            // A token that is held behind an existing denial is not itself a
+            // current account-state query. Keep the confirmed status until the
+            // pull succeeds; otherwise an outage would turn Disabled into Pending.
+            const accountStatus = incoming.source === 'login' && row.blocked
+                ? row.account_status : incoming.accountStatus ?? row.account_status ?? null;
             const explicitAccountDenial = incoming.accountStatus !== undefined && incoming.accountStatus !== 'active';
             const settlingConflict = authoritative && row.blocked && row.refresh_pending;
             const conflict = decision === 'epoch' || (decision === 'conflict' && !settlingConflict)
@@ -72,6 +76,15 @@ function createAuthorityService({ pool, updateUser, invalidateUser, deleteUserSe
             const heldGrant = !authoritative && !!row.blocked && !!known;
             const blocked = conflict || heldGrant || explicitAccountDenial || incoming.roleId === null || !known || (authoritative && input.denied === true);
             const refresh = conflict || heldGrant || (explicitAccountDenial && !authoritative) || (incoming.roleId !== null && !known);
+            // A current grant can seed the directory before first login. A
+            // previous denial may still hold access pending a current pull;
+            // creating the row neither clears that hold nor creates a session.
+            // Delayed grants never overwrite an existing profile.
+            let provisioned = false;
+            if (incoming.profile !== undefined && !conflict && known && !explicitAccountDenial) {
+                if (typeof createUser !== 'function') throw new Error('user_provisioning_unavailable');
+                provisioned = (await createUser(incoming.sub, incoming.profile, incoming.roleId, { connection: db })).created;
+            }
             if (decision === 'same' && !authoritative && !explicitAccountDenial && (known || incoming.roleId === null || (row.blocked && row.refresh_pending))) {
                 if (row.blocked && row.refresh_pending) return 'conflict';
                 if (incoming.source === 'login' && !row.blocked && known) {
@@ -79,7 +92,9 @@ function createAuthorityService({ pool, updateUser, invalidateUser, deleteUserSe
                     // Repair that new user's placeholder without changing the
                     // authority version or revocation generation.
                     const repaired = await repairProjection(db, incoming.sub, incoming.roleId);
-                    await db.execute('UPDATE sso_role_authority SET generation=generation+1,effects_pending=IF(?,1,effects_pending) WHERE subject_id=?', [repaired ? 1 : 0, incoming.sub]);
+                    await db.execute('UPDATE sso_role_authority SET account_status=?,generation=generation+1,effects_pending=IF(?,1,effects_pending) WHERE subject_id=?', [accountStatus, repaired ? 1 : 0, incoming.sub]);
+                } else if (provisioned) {
+                    await db.execute('UPDATE sso_role_authority SET account_status=?,generation=generation+1,effects_pending=1 WHERE subject_id=?', [accountStatus, incoming.sub]);
                 } else if (incoming.accountStatus !== undefined && row.account_status == null) {
                     await db.execute('UPDATE sso_role_authority SET account_status=?,generation=generation+1 WHERE subject_id=?', [accountStatus, incoming.sub]);
                 }
@@ -119,7 +134,7 @@ function createAuthorityService({ pool, updateUser, invalidateUser, deleteUserSe
         // sessions or create an authority row as a side effect of failed login.
         if (claims.app_role === undefined) throw new Error('role_out_of_sync');
         const result = await apply({ sub: claims.sub, role_id: claims.app_role ?? null,
-            authority_epoch: claims.app_role_epoch, authority_revision: claims.app_role_revision }, { source: 'login' });
+            account_status: 'active', authority_epoch: claims.app_role_epoch, authority_revision: claims.app_role_revision }, { source: 'login' });
         const permitted = value => value && ['applied','same'].includes(value.outcome)
             && value.state && !value.state.blocked && !value.state.effects_pending;
         if (permitted(result)) return result.state;
@@ -185,6 +200,7 @@ function service() {
     if (!singleton) singleton = createAuthorityService({
         pool: require('../config/database').getPool(),
         updateUser: (...args) => require('./userService').updateUser(...args),
+        createUser: (...args) => require('./userService').createMissingBySub(...args),
         invalidateUser: userId => require('./userService').invalidateUserCaches(userId),
         deleteUserSessions: userId => require('../config/session').deleteUserSessions(userId),
         fetchAccessState: sub => require('../lib/oidc').fetchAccessState(sub),

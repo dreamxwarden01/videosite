@@ -34,12 +34,40 @@ function canonical(value) {
     return visit(value, 0);
 }
 const digest = value => createHash('sha256').update(canonical(value)).digest('hex');
+function profileText(value, max) {
+    if (typeof value !== 'string' || !value.trim() || /[\u0000-\u001f\u007f]/.test(value)) return false;
+    const points = Array.from(value);
+    return points.length <= max && !points.some(point => point.length === 1
+        && point.charCodeAt(0) >= 0xd800 && point.charCodeAt(0) <= 0xdfff);
+}
+// An optional creation seed, not a profile-update event. Scope groups are
+// complete or absent so a missing claim never implies permission to disclose it.
+function profileSeed(value, sub) {
+    if (value === undefined) return undefined;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_profile_seed');
+    const allowed = new Set(['preferred_username', 'name', 'picture', 'email', 'email_verified']);
+    if (Object.keys(value).some(key => !allowed.has(key))) throw new Error('invalid_profile_seed');
+    const has = key => Object.prototype.hasOwnProperty.call(value, key);
+    const group = ['preferred_username', 'name', 'picture'];
+    if (group.some(has) && (!group.every(has) || !profileText(value.preferred_username, 20)
+        || !profileText(value.name, 100) || !(value.picture === null || (typeof value.picture === 'string'
+            && new RegExp('^' + subject(sub) + '-[0-9a-f]{16}\\.webp$').test(value.picture))))) throw new Error('invalid_profile_seed');
+    const email = ['email', 'email_verified'];
+    if (email.some(has) && (!email.every(has) || !(value.email === null || profileText(value.email, 254))
+        || typeof value.email_verified !== 'boolean')) throw new Error('invalid_profile_seed');
+    return { ...value };
+}
 function observation(payload, source = 'event') {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('invalid_role_event');
     const accountStatus = payload.account_status;
     if (accountStatus !== undefined && !['active', 'disabled', 'locked', 'deleted', 'not_found'].includes(accountStatus)) throw new Error('invalid_account_status');
-    return { sub: subject(payload.sub), roleId: roleId(payload.role_id),
+    const result = { sub: subject(payload.sub), roleId: roleId(payload.role_id),
         version: version(payload.authority_epoch, payload.authority_revision), source, accountStatus };
+    if (payload.profile !== undefined) {
+        if (source !== 'event' || accountStatus !== 'active' || result.roleId === null || !result.version) throw new Error('invalid_profile_seed');
+        result.profile = profileSeed(payload.profile, result.sub);
+    }
+    return result;
 }
 /** Transport time and event IDs never participate in authority ordering. */
 function compare(stored, incoming) {
@@ -61,4 +89,4 @@ function sessionPermitted(authority, capturedGeneration = '0') {
     return !authority || (!authority.blocked && !authority.effects_pending
         && authority.session_generation === capturedGeneration);
 }
-module.exports = { UUID, MAX_REVISION, EVENT_TOKEN_LIMIT, EVENT_FORM_LIMIT, revision, version, roleId, subject, canonical, digest, observation, compare, sessionPermitted };
+module.exports = { UUID, MAX_REVISION, EVENT_TOKEN_LIMIT, EVENT_FORM_LIMIT, revision, version, roleId, subject, canonical, digest, profileText, profileSeed, observation, compare, sessionPermitted };

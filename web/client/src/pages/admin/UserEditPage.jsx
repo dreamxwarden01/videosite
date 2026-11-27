@@ -14,6 +14,7 @@ import { prereqViolations, lockedPrereqs } from '../../utils/permissionPrereqs';
 import PermSelector from '../../components/PermSelector';
 import { fmtWatch, fmtClock } from '../../utils/timeFormat';
 import TimeAgo from '../../components/TimeAgo';
+import UserAccessStatus from '../../components/UserAccessStatus';
 
 const TRI_OPTIONS = [
   { value: 0, label: 'Inherit', tone: 'inherit' },
@@ -332,16 +333,17 @@ export default function UserEditPage() {
               {activeTab === 'details' && (
                 <>
                   <div className="vs-pane-h">User details</div>
-                  <p className="vs-pane-sub">Identity and role for this user. These are read-only here.</p>
+                  <p className="vs-pane-sub">Identity, role and access. These are read-only here.</p>
 
                   <RoField label="Display name">{targetUser.display_name || '—'}</RoField>
                   <RoField label="Username">{targetUser.username}</RoField>
                   <RoField label="Email">{targetUser.email || '—'}</RoField>
                   <RoField label="Role">{targetUser.role_name || 'No role'}</RoField>
+                  <RoField label="Access"><UserAccessStatus status={targetUser.access_status} /></RoField>
                   <RoField label="Created">{targetUser.created_at ? new Date(targetUser.created_at).toLocaleString() : '—'}</RoField>
 
                   <p className="vs-pane-sub" style={{ marginTop: '18px', marginBottom: 0 }}>
-                    Identity (name, email, password, MFA) and role are managed at the SSO.
+                    Identity (name, email, password, MFA), role and access are managed at the SSO.
                     {accountPortal && (
                       <>
                         {' '}

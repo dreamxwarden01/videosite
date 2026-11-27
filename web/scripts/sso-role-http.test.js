@@ -40,6 +40,10 @@ test('the real backchannel route validates every role payload before mixed-batch
             headers:{'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({event_token:'synthetic-token'})});
         assert.equal((await post()).status,400);assert.equal(roles,0);assert.equal(logouts,0);
         events[2].payload.role_id=null;assert.equal((await post()).status,204);assert.equal(roles,2);assert.equal(logouts,1);
+        events[2].payload={sub,role_id:2,account_status:'active',authority_epoch:crypto.randomUUID(),authority_revision:'1',profile:{name:'incomplete'}};
+        assert.equal((await post()).status,400);assert.equal(roles,2);assert.equal(logouts,1);
+        events[2].payload.profile={preferred_username:'student',name:'Student',picture:null};
+        assert.equal((await post()).status,204);assert.equal(roles,4);assert.equal(logouts,2);
     }finally{
         await new Promise((resolve,reject)=>server.close(error=>error?reject(error):resolve()));
         oidc.verifyEventToken=original.verify;sessions.revokeSessionsBySsoSid=original.logout;redis.getClient=original.redis;authority.service=original.authority;

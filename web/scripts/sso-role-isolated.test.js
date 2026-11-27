@@ -20,7 +20,10 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
         await redis.ping();
         await pool.execute(`CREATE TABLE roles(role_id INT PRIMARY KEY,role_name VARCHAR(100),permission_level INT,is_system TINYINT)`);
         await pool.execute(`CREATE TABLE site_settings(setting_key VARCHAR(50) PRIMARY KEY,setting_value TEXT)`);
-        await pool.execute(`CREATE TABLE users(user_id BINARY(16) PRIMARY KEY,role_id INT)`);
+        await pool.execute(`CREATE TABLE users(user_id BINARY(16) PRIMARY KEY,role_id INT,
+            username VARCHAR(50) NULL UNIQUE,display_name VARCHAR(100),email VARCHAR(255) NULL UNIQUE,
+            sso_avatar VARCHAR(80),created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`);
         await pool.execute(`CREATE TABLE sessions(session_id VARCHAR(128) PRIMARY KEY,user_id BINARY(16),
             last_sign_in DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),sso_expires_at DATETIME(6) NULL)`);
         await require('../db/ssoRoleMigration').migrateSsoRoles(pool);
@@ -37,7 +40,7 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
         const { createAuthorityService } = require('../services/ssoRoleAuthority');
         const store = createCatalogStore(pool);
         const epoch = crypto.randomUUID(), sub = crypto.randomUUID(), hex = sub.replace(/-/g, '');
-        await pool.execute('INSERT INTO users VALUES(?,2)', [Buffer.from(hex, 'hex')]);
+        await pool.execute('INSERT INTO users(user_id,role_id) VALUES(?,2)', [Buffer.from(hex, 'hex')]);
         let failEffects = false;
         const authority = createAuthorityService({ pool, updateUser: users.updateUser,
             invalidateUser: async uid => { if (failEffects) throw new Error('synthetic_redis_failure'); await users.invalidateUserCaches(uid); },
@@ -105,7 +108,7 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
             await authority.processEvent({ id:crypto.randomUUID(),payload:{sub:unknown,role_id:0,authority_epoch:epoch,authority_revision:'1'} });
             assert.equal((await authority.read(unknown)).authority_revision,'1');
             const [[count]] = await pool.execute('SELECT COUNT(*) AS n FROM users'); assert.equal(Number(count.n),1);
-            await pool.execute('INSERT INTO users VALUES(?,2)',[Buffer.from(unknown.replace(/-/g,''),'hex')]);
+            await pool.execute('INSERT INTO users(user_id,role_id) VALUES(?,2)',[Buffer.from(unknown.replace(/-/g,''),'hex')]);
             await authority.applyLogin({sub:unknown,app_role:0,app_role_epoch:epoch,app_role_revision:'1'});
             const [[created]]=await pool.execute('SELECT role_id FROM users WHERE user_id=?',[Buffer.from(unknown.replace(/-/g,''),'hex')]);
             assert.equal(created.role_id,0);
@@ -169,7 +172,7 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
             const current=await store.snapshot();assert.equal(current.payload.roles[0].name,'Renamed');assert.equal(current.payload.default_role,2);
         });
         await t.test('same-version login rechecks disabled state and restores only after an allowed current pull',async()=>{
-            const uid=crypto.randomUUID();await pool.execute('INSERT INTO users VALUES(?,2)',[Buffer.from(uid.replace(/-/g,''),'hex')]);
+            const uid=crypto.randomUUID();await pool.execute('INSERT INTO users(user_id,role_id) VALUES(?,2)',[Buffer.from(uid.replace(/-/g,''),'hex')]);
             let allowed=false,pulls=0;
             const reader=createAuthorityService({pool,updateUser:users.updateUser,invalidateUser:users.invalidateUserCaches,
                 deleteUserSessions:sessions.deleteUserSessions,
@@ -185,7 +188,7 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
             assert.equal(require('../lib/ssoRoleProtocol').sessionPermitted(restored,'0'),false);
         });
         await t.test('an old disabled pull cannot overwrite an unchanged newer pull or accepted login',async()=>{
-            const uid=crypto.randomUUID();await pool.execute('INSERT INTO users VALUES(?,2)',[Buffer.from(uid.replace(/-/g,''),'hex')]);
+            const uid=crypto.randomUUID();await pool.execute('INSERT INTO users(user_id,role_id) VALUES(?,2)',[Buffer.from(uid.replace(/-/g,''),'hex')]);
             const claims={sub:uid,app_role:2,app_role_epoch:epoch,app_role_revision:'5'};
             await authority.applyLogin(claims);
             for(const newer of ['pull','login']){
@@ -206,7 +209,7 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
             }
         });
         await t.test('login refresh cannot cross a pinned foreign authority epoch',async()=>{
-            const uid=crypto.randomUUID();await pool.execute('INSERT INTO users VALUES(?,2)',[Buffer.from(uid.replace(/-/g,''),'hex')]);
+            const uid=crypto.randomUUID();await pool.execute('INSERT INTO users(user_id,role_id) VALUES(?,2)',[Buffer.from(uid.replace(/-/g,''),'hex')]);
             await authority.applyLogin({sub:uid,app_role:2,app_role_epoch:epoch,app_role_revision:'4'});
             const foreign=crypto.randomUUID();
             const reader=createAuthorityService({pool,updateUser:users.updateUser,invalidateUser:users.invalidateUserCaches,
@@ -217,7 +220,7 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
         });
         await t.test('same-version login rechecks that its local role still exists',async()=>{
             const uid=crypto.randomUUID();await pool.execute("INSERT INTO roles VALUES(99,'Temporary',20,0)");
-            await pool.execute('INSERT INTO users VALUES(?,2)',[Buffer.from(uid.replace(/-/g,''),'hex')]);
+            await pool.execute('INSERT INTO users(user_id,role_id) VALUES(?,2)',[Buffer.from(uid.replace(/-/g,''),'hex')]);
             const reader=createAuthorityService({pool,updateUser:users.updateUser,invalidateUser:users.invalidateUserCaches,
                 deleteUserSessions:sessions.deleteUserSessions,
                 fetchAccessState:async()=>({roleId:99,version:{epoch,revision:'1'},allowed:true})});
@@ -258,7 +261,7 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
                 deleteUserSessions:sessions.deleteUserSessions,
                 fetchAccessState:async()=>({roleId:0,version:{epoch,revision:'5'},allowed:true})});
             await reader.processEvent({id:crypto.randomUUID(),payload:{sub:uid,role_id:0,authority_epoch:epoch,authority_revision:'5'}});
-            await pool.execute('INSERT INTO users VALUES(?,2)',[local]);
+            await pool.execute('INSERT INTO users(user_id,role_id) VALUES(?,2)',[local]);
             const accepted=await reader.applyLogin({sub:uid,app_role:2,app_role_epoch:epoch,app_role_revision:'4'});
             assert.equal(accepted.role_id,0);assert.equal(accepted.effects_pending,0);
             assert.equal((await pool.execute('SELECT role_id FROM users WHERE user_id=?',[local]))[0][0].role_id,0);
@@ -271,7 +274,7 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
             assert.deepEqual(await authority.read(uid),before);
         });
         await t.test('harmless concurrent observations preserve both login session generations',async()=>{
-            const uid=crypto.randomUUID();await pool.execute('INSERT INTO users VALUES(?,2)',[Buffer.from(uid.replace(/-/g,''),'hex')]);
+            const uid=crypto.randomUUID();await pool.execute('INSERT INTO users(user_id,role_id) VALUES(?,2)',[Buffer.from(uid.replace(/-/g,''),'hex')]);
             const claims={sub:uid,app_role:2,app_role_epoch:epoch,app_role_revision:'1'};
             const [first,second]=await Promise.all([authority.applyLogin(claims),authority.applyLogin(claims)]);
             const current=await authority.read(uid),gate=require('../lib/ssoRoleProtocol').sessionPermitted;
@@ -283,7 +286,7 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
             const routine=[];
             for(let i=0;i<105;i++){
                 const uid=crypto.randomUUID();routine.push(uid);const local=Buffer.from(uid.replace(/-/g,''),'hex');
-                await pool.execute('INSERT INTO users VALUES(?,2)',[local]);
+                await pool.execute('INSERT INTO users(user_id,role_id) VALUES(?,2)',[local]);
                 await pool.execute('INSERT INTO sessions(session_id,user_id) VALUES(?,?)',['routine-'+uid,local]);
                 await pool.execute(`INSERT INTO sso_role_authority(subject_id,authority_epoch,authority_revision,role_id,refresh_after)
                     VALUES(?,?,1,2,DATE_SUB(NOW(6),INTERVAL 1 HOUR))`,[uid,epoch]);
@@ -304,7 +307,7 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
             assert.equal(seen.includes(unknown),false);
         });
         await t.test('first same-revision contradictory pull denies; a later fresh pull resolves the quarantine',async()=>{
-            const uid=crypto.randomUUID(),local=Buffer.from(uid.replace(/-/g,''),'hex');await pool.execute('INSERT INTO users VALUES(?,2)',[local]);
+            const uid=crypto.randomUUID(),local=Buffer.from(uid.replace(/-/g,''),'hex');await pool.execute('INSERT INTO users(user_id,role_id) VALUES(?,2)',[local]);
             const reader=createAuthorityService({pool,updateUser:users.updateUser,invalidateUser:users.invalidateUserCaches,
                 deleteUserSessions:sessions.deleteUserSessions,
                 fetchAccessState:async()=>({roleId:0,version:{epoch,revision:'1'},allowed:true})});
@@ -342,7 +345,7 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
             const finalLease=await store.claim();assert.equal(finalLease.event.id,final.id);await store.finish(finalLease,true);
         });
         await t.test('fresh headerless non-active account denial preserves the pinned role and is idempotent',async()=>{
-            const uid=crypto.randomUUID(),local=Buffer.from(uid.replace(/-/g,''),'hex');await pool.execute('INSERT INTO users VALUES(?,2)',[local]);
+            const uid=crypto.randomUUID(),local=Buffer.from(uid.replace(/-/g,''),'hex');await pool.execute('INSERT INTO users(user_id,role_id) VALUES(?,2)',[local]);
             await authority.applyLogin({sub:uid,app_role:2,app_role_epoch:epoch,app_role_revision:'7'});
             await pool.execute('INSERT INTO sessions(session_id,user_id) VALUES(?,?)',['headerless-session',local]);
             await redis.sadd('user:sessions:'+uid.replace(/-/g,''),'headerless-session');await redis.hset('session:user:headerless-session','user_id',uid.replace(/-/g,''));
@@ -366,7 +369,7 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
             assert.equal(preserved.role_id,conflict.role_id);assert.equal(preserved.authority_revision,conflict.authority_revision);assert.equal(preserved.session_generation,conflict.session_generation);
         });
         await t.test('late headerless denial and failed queries cannot revoke a newer accepted login',async()=>{
-            const uid=crypto.randomUUID();await pool.execute('INSERT INTO users VALUES(?,2)',[Buffer.from(uid.replace(/-/g,''),'hex')]);
+            const uid=crypto.randomUUID();await pool.execute('INSERT INTO users(user_id,role_id) VALUES(?,2)',[Buffer.from(uid.replace(/-/g,''),'hex')]);
             const claims={sub:uid,app_role:2,app_role_epoch:epoch,app_role_revision:'10'};await authority.applyLogin(claims);
             let release,arrived;const barrier=new Promise(resolve=>{release=resolve;});const entered=new Promise(resolve=>{arrived=resolve;});
             const reader=createAuthorityService({pool,updateUser:users.updateUser,invalidateUser:users.invalidateUserCaches,
@@ -379,7 +382,7 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
             await assert.rejects(offline.refresh(uid),/synthetic_network_failure/);assert.deepEqual(await authority.read(uid),before);
         });
         await t.test('a delayed newer role grant and pre-denial token cannot clear a confirmed account block',async()=>{
-            const uid=crypto.randomUUID();await pool.execute('INSERT INTO users VALUES(?,2)',[Buffer.from(uid.replace(/-/g,''),'hex')]);
+            const uid=crypto.randomUUID();await pool.execute('INSERT INTO users(user_id,role_id) VALUES(?,2)',[Buffer.from(uid.replace(/-/g,''),'hex')]);
             await authority.applyLogin({sub:uid,app_role:2,app_role_epoch:epoch,app_role_revision:'7'});
             let response={roleId:null,version:null,accountStatus:'disabled',allowed:false};
             const reader=createAuthorityService({pool,updateUser:users.updateUser,invalidateUser:users.invalidateUserCaches,
@@ -390,13 +393,19 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
             response={roleId:0,version:{epoch,revision:'8'},accountStatus:'disabled',allowed:false};
             const token={sub:uid,app_role:0,app_role_epoch:epoch,app_role_revision:'8'};
             await assert.rejects(reader.applyLogin(token),/role_out_of_sync/);assert.equal((await reader.read(uid)).session_generation,denied.session_generation);
+            const offline=createAuthorityService({pool,updateUser:users.updateUser,invalidateUser:users.invalidateUserCaches,
+                deleteUserSessions:sessions.deleteUserSessions,fetchAccessState:async()=>{throw new Error('synthetic_offline');}});
+            await assert.rejects(offline.applyLogin({...token,app_role_revision:'9'}),/role_out_of_sync/);
+            assert.equal((await reader.read(uid)).account_status,'disabled');
+            assert.equal((await users.getUserById(uid.replace(/-/g,''))).access_status,'disabled');
+            response={...response,version:{epoch,revision:'9'}};
             response={...response,accountStatus:'active',allowed:true};const restored=await reader.applyLogin(token);
             assert.equal(restored.blocked,0);assert.equal(restored.session_generation,denied.session_generation);
             assert.equal(require('../lib/ssoRoleProtocol').sessionPermitted(restored,'0'),false);
         });
         await t.test('versioned non-active account status closes sessions; positive events cannot clear it',async()=>{
             const cache=require('../services/cache/sessionCache');
-            const uid=crypto.randomUUID(),local=uid.replace(/-/g,'');await pool.execute('INSERT INTO users VALUES(?,2)',[Buffer.from(local,'hex')]);
+            const uid=crypto.randomUUID(),local=uid.replace(/-/g,'');await pool.execute('INSERT INTO users(user_id,role_id) VALUES(?,2)',[Buffer.from(local,'hex')]);
             const statusEvent=(status,revision)=>({id:crypto.randomUUID(),payload:{sub:uid,role_id:2,authority_epoch:epoch,authority_revision:revision,account_status:status}});
             let response={roleId:2,version:{epoch,revision:'22'},accountStatus:'active',allowed:true};
             const reader=createAuthorityService({pool,updateUser:users.updateUser,invalidateUser:users.invalidateUserCaches,
@@ -420,7 +429,7 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
             state=await reader.read(uid);assert.equal(state.blocked,0);assert.equal(state.account_status,'active');
         });
         await t.test('confirmed disabled pulls settle urgent work without repeating cache/session effects and can reactivate freshly',async()=>{
-            const uid=crypto.randomUUID(),local=uid.replace(/-/g,'');await pool.execute('INSERT INTO users VALUES(?,2)',[Buffer.from(local,'hex')]);
+            const uid=crypto.randomUUID(),local=uid.replace(/-/g,'');await pool.execute('INSERT INTO users(user_id,role_id) VALUES(?,2)',[Buffer.from(local,'hex')]);
             let invalidations=0,deletions=0;
             let response={roleId:2,version:{epoch,revision:'41'},accountStatus:'disabled',allowed:false};
             const reader=createAuthorityService({pool,updateUser:users.updateUser,
@@ -443,6 +452,183 @@ test('VideoSite SQL outbox and authority/cache/session integration', { skip: !en
             response={...response,accountStatus:'active',allowed:true};await reader.refresh(uid);
             const restored=await reader.read(uid);assert.equal(restored.blocked,0);assert.equal(restored.account_status,'active');
             assert.equal(restored.refresh_pending,0);assert.equal(restored.session_generation,confirmed.session_generation);
+        });
+        const seed = uid => ({preferred_username:'seed_'+uid.slice(0,8),name:'Seeded Student',
+            picture:uid+'-0123456789abcdef.webp',email:uid+'@example.test',email_verified:true});
+        const provisionEvent = (uid, revision='1', profile=seed(uid), role=2, lineage=epoch) => ({id:crypto.randomUUID(),type:'account.roles_change',
+            payload:{sub:uid,role_id:role,account_status:'active',authority_epoch:lineage,authority_revision:revision,...(profile===undefined?{}:{profile})}});
+        const makeProvisioner = (extra={}) => createAuthorityService({pool,updateUser:users.updateUser,createUser:users.createMissingBySub,
+            invalidateUser:users.invalidateUserCaches,deleteUserSessions:sessions.deleteUserSessions,
+            fetchAccessState:async()=>({roleId:2,version:{epoch,revision:'2'},accountStatus:'active',allowed:true}),...extra});
+        const rowFor = async uid => (await pool.execute('SELECT * FROM users WHERE user_id=?',[Buffer.from(uid.replace(/-/g,''),'hex')]))[0][0];
+        await t.test('active seed creates a directory user and enrollment candidate before first login',async()=>{
+            await pool.execute('CREATE TABLE role_permissions(role_id INT,permission_key VARCHAR(80),granted TINYINT)');
+            await pool.execute('CREATE TABLE user_permission_overrides(user_id BINARY(16),permission_key VARCHAR(80),override_value INT)');
+            const uid=crypto.randomUUID(),profile=seed(uid),reader=makeProvisioner(),ev=provisionEvent(uid);
+            await reader.processEvent(ev);await reader.processEvent(ev);
+            const row=await rowFor(uid);assert.equal(row.username,profile.preferred_username);assert.equal(row.display_name,profile.name);
+            assert.equal(row.email,profile.email);assert.equal(row.sso_avatar,profile.picture);assert.equal(row.role_id,2);
+            const listed=await users.listUsers(0,1,60,'ASC',profile.preferred_username);
+            assert.equal(Number(listed.total),1);assert.equal(listed.users[0].access_status,'active');
+            const candidates=await require('../services/enrollmentService').getEnrollableStudents(0);
+            assert.ok(candidates.some(value=>value.user_id.equals(Buffer.from(uid.replace(/-/g,''),'hex'))));
+            const [[sessionsRow]]=await pool.execute('SELECT COUNT(*) n FROM sessions WHERE user_id=?',[row.user_id]);assert.equal(Number(sessionsRow.n),0);
+        });
+        await t.test('seeded revocation preserves directory, avatar, enrollment and progress; late seed cannot overwrite login',async()=>{
+            await pool.execute('CREATE TABLE enrollments(user_id BINARY(16),course_id INT,PRIMARY KEY(user_id,course_id))');
+            await pool.execute('CREATE TABLE watch_progress(user_id BINARY(16),video_id INT,PRIMARY KEY(user_id,video_id))');
+            const uid=crypto.randomUUID(),reader=makeProvisioner(),ev=provisionEvent(uid),id=Buffer.from(uid.replace(/-/g,''),'hex');
+            await reader.processEvent(ev);
+            await users.findOrCreateBySub({sub:uid,name:'New login name',email:'new-'+uid+'@example.test'});
+            await reader.applyLogin({sub:uid,app_role:2,app_role_epoch:epoch,app_role_revision:'1'});
+            await reader.processEvent({...ev,id:crypto.randomUUID()});assert.equal((await rowFor(uid)).display_name,'New login name');
+            await pool.execute('INSERT INTO enrollments VALUES(?,7)',[id]);await pool.execute('INSERT INTO watch_progress VALUES(?,9)',[id]);
+            await pool.execute("INSERT INTO sessions(session_id,user_id) VALUES(?,?)",['seed-session-'+uid,id]);
+            await reader.processEvent({id:crypto.randomUUID(),payload:{sub:uid,role_id:null,account_status:'active',authority_epoch:epoch,authority_revision:'2'}});
+            await reader.processEvent({...ev,id:crypto.randomUUID()});
+            const row=await rowFor(uid);assert.equal(row.display_name,'New login name');assert.equal(row.sso_avatar,seed(uid).picture);
+            const [[enrollment]]=await pool.execute('SELECT COUNT(*) n FROM enrollments WHERE user_id=?',[id]);assert.equal(Number(enrollment.n),1);
+            const [[progress]]=await pool.execute('SELECT COUNT(*) n FROM watch_progress WHERE user_id=?',[id]);assert.equal(Number(progress.n),1);
+            const [[session]]=await pool.execute('SELECT COUNT(*) n FROM sessions WHERE user_id=?',[id]);assert.equal(Number(session.n),0);
+            assert.equal((await users.getUserById(uid.replace(/-/g,''))).access_status,'no_access');
+        });
+        await t.test('stale, contradictory and foreign-lineage seeds never create users',async()=>{
+            for(const mode of ['stale','conflict','foreign']){
+                const uid=crypto.randomUUID(),reader=makeProvisioner();
+                await reader.processEvent({id:crypto.randomUUID(),payload:{sub:uid,role_id:null,account_status:'active',authority_epoch:epoch,authority_revision:'2'}});
+                const ev=provisionEvent(uid,mode==='stale'?'1':'2',seed(uid),2,mode==='foreign'?crypto.randomUUID():epoch);
+                await reader.processEvent(ev);assert.equal(await rowFor(uid),undefined);assert.equal((await reader.read(uid)).blocked,1);
+            }
+        });
+        await t.test('new grant after a tombstone seeds data but remains pending until a fresh allowed pull',async()=>{
+            const uid=crypto.randomUUID();let allowed=false;
+            const reader=makeProvisioner({fetchAccessState:async()=>({roleId:2,version:{epoch,revision:'2'},accountStatus:'active',allowed})});
+            await reader.processEvent({id:crypto.randomUUID(),payload:{sub:uid,role_id:null,account_status:'active',authority_epoch:epoch,authority_revision:'1'}});
+            const generation=(await reader.read(uid)).session_generation;
+            await reader.processEvent(provisionEvent(uid,'2'));
+            assert.ok(await rowFor(uid));assert.equal((await reader.read(uid)).blocked,1);
+            assert.equal((await users.getUserById(uid.replace(/-/g,''))).access_status,'pending');
+            const token={sub:uid,app_role:2,app_role_epoch:epoch,app_role_revision:'2'};
+            await assert.rejects(reader.applyLogin(token),/role_out_of_sync/);assert.equal((await reader.read(uid)).blocked,1);
+            allowed=true;const state=await reader.applyLogin(token);assert.equal(state.blocked,0);assert.equal(state.account_status,'active');
+            assert.equal(state.session_generation,generation);assert.equal((await users.getUserById(uid.replace(/-/g,''))).access_status,'active');
+        });
+        await t.test('profile seeding rolls back with authority/inbox and retries after cache failure',async()=>{
+            const uid=crypto.randomUUID(),ev=provisionEvent(uid);
+            const broken=makeProvisioner({updateUser:async()=>{throw new Error('synthetic_after_seed');}});
+            await assert.rejects(broken.processEvent(ev),/synthetic_after_seed/);assert.equal(await rowFor(uid),undefined);assert.equal(await broken.read(uid),null);
+            const [[receipt]]=await pool.execute('SELECT COUNT(*) n FROM sso_role_inbox WHERE event_id=?',[ev.id]);assert.equal(Number(receipt.n),0);
+            let fail=true;const reader=makeProvisioner({invalidateUser:async id=>{if(fail)throw new Error('synthetic_seed_cache');await users.invalidateUserCaches(id);}});
+            await assert.rejects(reader.processEvent(ev),/synthetic_seed_cache/);assert.ok(await rowFor(uid));assert.equal((await reader.read(uid)).effects_pending,1);
+            fail=false;await reader.processEvent(ev);assert.equal((await reader.read(uid)).effects_pending,0);
+            const [[count]]=await pool.execute('SELECT COUNT(*) n FROM users WHERE user_id=?',[Buffer.from(uid.replace(/-/g,''),'hex')]);assert.equal(Number(count.n),1);
+        });
+        await t.test('username and stale email collisions keep distinct subject identities',async()=>{
+            const old=crypto.randomUUID(),fresh=crypto.randomUUID(),profile=seed(old),reader=makeProvisioner();
+            await reader.processEvent(provisionEvent(old));
+            await reader.processEvent(provisionEvent(fresh,'1',{...profile,picture:null,name:'Different Student'}));
+            const original=await rowFor(old),created=await rowFor(fresh);
+            assert.equal(original.username,profile.preferred_username);assert.equal(original.email,profile.email);
+            assert.equal(created.username,'u_'+fresh.replace(/-/g,''));assert.equal(created.email,null);assert.equal(created.display_name,'Different Student');
+            assert.notDeepEqual(created.user_id,original.user_id);
+        });
+        await t.test('legacy natural and UUID-name collisions cannot strand a seed before a following revocation',async()=>{
+            const naturalOwner=crypto.randomUUID(),fallbackOwner=crypto.randomUUID(),fresh=crypto.randomUUID();
+            const reader=makeProvisioner(),profile=seed(naturalOwner),fallback='u_'+fresh.replace(/-/g,'');
+            await reader.processEvent(provisionEvent(naturalOwner));
+            await users.createMissingBySub(fallbackOwner,{preferred_username:fallback,name:'Legacy fallback owner'},2);
+            const oldNatural=await rowFor(naturalOwner),oldFallback=await rowFor(fallbackOwner);
+            await pool.execute('INSERT INTO sessions(session_id,user_id) VALUES(?,?)',['collision-revoke-'+naturalOwner,oldNatural.user_id]);
+            const grant=provisionEvent(fresh,'1',{...profile,name:'New distinct subject',picture:null});
+            const revoke={id:crypto.randomUUID(),type:'account.roles_change',payload:{sub:naturalOwner,role_id:null,
+                account_status:'active',authority_epoch:epoch,authority_revision:'2'}};
+            // Same ordered dispatch as the real receiver; a poison seed would
+            // throw here and leave the following revocation unapplied.
+            for(const ev of [grant,revoke])await reader.processEvent(ev);
+            const created=await rowFor(fresh);
+            assert.match(created.username,new RegExp('^'+fallback+'_[0-9a-f]{14}$'));
+            assert.equal(created.username.length,49);assert.equal(created.email,null);
+            assert.equal(created.display_name,'New distinct subject');assert.notDeepEqual(created.user_id,oldNatural.user_id);
+            assert.notDeepEqual(created.user_id,oldFallback.user_id);
+            assert.equal((await rowFor(naturalOwner)).username,oldNatural.username);assert.equal((await rowFor(naturalOwner)).email,oldNatural.email);
+            assert.equal((await rowFor(fallbackOwner)).username,oldFallback.username);
+            assert.equal((await reader.read(naturalOwner)).blocked,1);
+            assert.equal((await pool.execute('SELECT 1 FROM sessions WHERE user_id=?',[oldNatural.user_id]))[0].length,0);
+            const [[receipts]]=await pool.execute('SELECT COUNT(*) n FROM sso_role_inbox WHERE event_id IN (?,?)',[grant.id,revoke.id]);
+            assert.equal(Number(receipts.n),2);
+        });
+        await t.test('scope-free seeds repair a same-version missing directory row without disclosing profile fields',async()=>{
+            const uid=crypto.randomUUID(),reader=makeProvisioner(),ev=provisionEvent(uid);delete ev.payload.profile;
+            await reader.processEvent(ev);assert.equal(await rowFor(uid),undefined);
+            await reader.processEvent(provisionEvent(uid,'1',{}));const row=await rowFor(uid);
+            assert.equal(row.username,'u_'+uid.replace(/-/g,''));assert.equal(row.email,null);assert.equal(row.sso_avatar,null);
+            assert.equal(row.role_id,2);assert.equal((await users.getUserById(uid.replace(/-/g,''))).access_status,'active');
+            const other=crypto.randomUUID(),profile={...seed(other),preferred_username:'🙂'.repeat(20),name:'🙂'.repeat(100)};
+            await reader.processEvent(provisionEvent(other,'1',profile));
+            assert.equal((await rowFor(other)).display_name,profile.name);assert.equal((await rowFor(other)).username,profile.preferred_username);
+        });
+        await t.test('admin access status distinguishes explicit account states from unconfirmed legacy users',async()=>{
+            const uid=crypto.randomUUID(),reader=makeProvisioner();await reader.processEvent(provisionEvent(uid));
+            for (const [index,status] of ['disabled','locked','deleted','not_found'].entries()) {
+                await reader.processEvent({id:crypto.randomUUID(),payload:{sub:uid,role_id:2,account_status:status,authority_epoch:epoch,authority_revision:String(index+2)}});
+                assert.equal((await users.getUserById(uid.replace(/-/g,''))).access_status,status==='not_found'?'deleted':status);
+            }
+            const legacy=crypto.randomUUID();await users.createMissingBySub(legacy,{},2);
+            assert.equal((await users.getUserById(legacy.replace(/-/g,''))).access_status,'unknown');
+        });
+        await t.test('concurrent creation and first login converge on one canonical subject',async()=>{
+            const uid=crypto.randomUUID(),profile=seed(uid);let arrived=0,release;
+            const ready=new Promise(resolve=>{release=resolve;});
+            const db={execute:async(sql,args)=>{const result=await pool.execute(sql,args);if(sql==='SELECT * FROM users WHERE user_id=?'){
+                if(++arrived===2)release();await ready;}return result;}};
+            const results=await Promise.all([users.createMissingBySub(uid,profile,2,{connection:db}),users.createMissingBySub(uid,profile,2,{connection:db})]);
+            assert.equal(results.filter(result=>result.created).length,1);
+            const reader=makeProvisioner();
+            await Promise.all([reader.processEvent(provisionEvent(uid)),users.findOrCreateBySub({sub:uid,...profile})]);
+            await reader.applyLogin({sub:uid,app_role:2,app_role_epoch:epoch,app_role_revision:'1'});
+            const [[count]]=await pool.execute('SELECT COUNT(*) n FROM users WHERE user_id=?',[Buffer.from(uid.replace(/-/g,''),'hex')]);assert.equal(Number(count.n),1);
+            assert.equal((await rowFor(uid)).role_id,2);assert.equal((await reader.read(uid)).blocked,0);
+        });
+        await t.test('current login refreshes an older event seed that wins after its initial lookup misses',async()=>{
+            const uid=crypto.randomUUID(),profile=seed(uid),reader=makeProvisioner();
+            const local=Buffer.from(uid.replace(/-/g,''),'hex');
+            const claims={sub:uid,...profile,name:'Current login name',email:'current-'+uid+'@example.test'};
+            let release,arrived;
+            const gate=new Promise(resolve=>{release=resolve;}),entered=new Promise(resolve=>{arrived=resolve;});
+            const execute=pool.execute;
+            pool.execute=async function(sql,args){
+                const result=await execute.call(this,sql,args);
+                if(sql==='SELECT * FROM users WHERE user_id = ?'&&Buffer.isBuffer(args?.[0])&&args[0].equals(local)){
+                    assert.equal(result[0].length,0);arrived();await gate;
+                }
+                return result;
+            };
+            const login=users.findOrCreateBySub(claims);
+            try{
+                await Promise.race([entered,login.then(()=>{throw new Error('login completed before barrier');})]);
+                await reader.processEvent(provisionEvent(uid,'1',profile));
+                assert.equal((await rowFor(uid)).display_name,profile.name);
+                release();const user=await login;
+                assert.equal(user.display_name,claims.name);assert.equal(user.email,claims.email);
+            }finally{release();pool.execute=execute;await login.catch(()=>{});}
+            const row=await rowFor(uid);assert.equal(row.display_name,claims.name);assert.equal(row.email,claims.email);
+            await reader.processEvent(provisionEvent(uid,'1',profile));
+            assert.equal((await rowFor(uid)).display_name,claims.name);
+            const [[count]]=await pool.execute('SELECT COUNT(*) n FROM users WHERE user_id=?',[local]);assert.equal(Number(count.n),1);
+        });
+        await t.test('login email mirror conflicts retain distinct subjects and still refresh the current name without personal diagnostics',async()=>{
+            const old=crypto.randomUUID(),uid=crypto.randomUUID(),reader=makeProvisioner(),occupied=seed(old).email;
+            await reader.processEvent(provisionEvent(old));
+            await reader.processEvent(provisionEvent(uid,'1',{...seed(uid),email:occupied}));
+            const before=await rowFor(old),warnings=[],warn=console.warn;
+            console.warn=(...args)=>warnings.push(args);
+            try{
+                const user=await users.findOrCreateBySub({sub:uid,name:'Current collision name',email:occupied});
+                assert.equal(user.display_name,'Current collision name');assert.equal(user.email,null);
+            }finally{console.warn=warn;}
+            assert.deepEqual(warnings,[['sso_login_profile_email_conflict']]);
+            const row=await rowFor(uid);assert.equal(row.display_name,'Current collision name');assert.equal(row.email,null);
+            assert.deepEqual(await rowFor(old),before);
         });
     } finally { await pool.end(); await redis.quit(); }
 });
