@@ -1763,24 +1763,17 @@ func (j *Job) runTranscode(probe *transcoder.ProbeResult) error {
 		}
 	}
 
-	// Build variants by probing each init.mp4 for its RFC 6381 codec string.
-	// Never publish a guessed profile or level if an init segment is invalid.
+	// Read codec and dimensions from each completed init.mp4. A successful
+	// remux keeps source dimensions, which can differ from the planned scale.
+	// Never publish guessed metadata if an init segment is invalid.
 	variants := make([]transcoder.Variant, 0, len(profiles))
 	for _, p := range profiles {
 		initPath := filepath.Join(j.outputDir, "video", p.Name, "init.mp4")
-		codecStr, err := transcoder.ProbeCodecString(initPath)
+		variant, err := transcoder.VariantFromInit(p, initPath)
 		if err != nil {
-			return fmt.Errorf("read codec metadata for %s: %w", p.Name, err)
+			return fmt.Errorf("read video metadata for %s: %w", p.Name, err)
 		}
-		variants = append(variants, transcoder.Variant{
-			Name:             p.Name,
-			Width:            p.OutW,
-			Height:           p.OutH,
-			VideoBitrateKbps: p.VideoBitrateKbps,
-			Codecs:           codecStr,
-			FrameRateNum:     p.Plan.FPSNum,
-			FrameRateDen:     p.Plan.FPSDen,
-		})
+		variants = append(variants, variant)
 	}
 
 	if err := transcoder.WriteMasterPlaylist(j.outputDir, variants, audioName, j.AudioBitrateKbps, hasAudio); err != nil {

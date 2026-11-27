@@ -23,19 +23,19 @@ const (
 
 // FilteredProfile is an output profile selected for transcoding.
 //
-// OutW / OutH are the actual encoded output dimensions for this profile —
+// OutW / OutH are the planned re-encode dimensions for this profile —
 // derived from the source dims via ActualOutputDims so the configured
 // profile.Width / profile.Height act as a *bounding box*, never as a forced
-// target. They're written into manifests (HLS RESOLUTION, DASH @width/@height)
-// and into the filter chain so output dims match what the manifests advertise.
+// target. The filter chain uses them; manifest dimensions are read from the
+// completed init segment because remux can retain different source dimensions.
 // All renditions of the same source share the same aspect ratio (modulo
 // even-rounding error of ≤ 0.1%), because every profile's OutW/OutH is
 // computed from the same source dims.
 type FilteredProfile struct {
 	config.OutputProfile
 	CanRemux bool // true if source matches this profile's specs
-	OutW     int  // actual encoded output width (≤ profile.Width)
-	OutH     int  // actual encoded output height (≤ profile.Height)
+	OutW     int  // planned re-encode width (≤ profile.Width)
+	OutH     int  // planned re-encode height (≤ profile.Height)
 
 	// Plan is the authoritative segmentation decision for this rendition,
 	// in whole frames. GOPSeconds/SegmentDuration on the embedded

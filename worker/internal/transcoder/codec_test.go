@@ -25,8 +25,14 @@ func codecTestTrack(handler string, entries []byte, count uint32) []byte {
 	binary.BigEndian.PutUint32(sd[4:], count)
 	return codecTestBox("trak", codecTestBox("mdia", codecTestBox("hdlr", h), codecTestBox("minf", codecTestBox("stbl", codecTestBox("stsd", sd, entries)))))
 }
+func codecTestVisual(width, height uint16) []byte {
+	payload := make([]byte, 78)
+	binary.BigEndian.PutUint16(payload[24:26], width)
+	binary.BigEndian.PutUint16(payload[26:28], height)
+	return payload
+}
 func codecTestEntry(tag string, config []byte) []byte {
-	return codecTestBox(tag, make([]byte, 78), codecTestBox("avcC", config))
+	return codecTestBox(tag, codecTestVisual(1280, 720), codecTestBox("avcC", config))
 }
 func codecTestConfig(profile, compat, level byte) []byte {
 	return []byte{1, profile, compat, level, 0xff, 0xe1, 0, 4, 0x67, profile, compat, level, 1, 0, 2, 0x68, 0}
@@ -71,14 +77,14 @@ func TestInitCodecRejectsAmbiguousOrMalformed(t *testing.T) {
 		"two moov":           append(codecTestBox("moov", track), codecTestBox("moov", track)...),
 		"two entries":        codecTestBox("moov", codecTestTrack("vide", append(append([]byte(nil), entry...), entry...), 2)),
 		"count mismatch":     codecTestBox("moov", codecTestTrack("vide", append(append([]byte(nil), entry...), entry...), 1)),
-		"missing avcC":       codecTestBox("moov", codecTestTrack("vide", codecTestBox("avc1", make([]byte, 78)), 1)),
+		"missing avcC":       codecTestBox("moov", codecTestTrack("vide", codecTestBox("avc1", codecTestVisual(1280, 720)), 1)),
 		"short avcC":         codecTestBox("moov", codecTestTrack("vide", codecTestEntry("avc1", cfg[:3]), 1)),
 		"bad version":        codecTestBox("moov", codecTestTrack("vide", codecTestEntry("avc1", badVersion), 1)),
 		"bad SPS length":     codecTestBox("moov", codecTestTrack("vide", codecTestEntry("avc1", badLength), 1)),
 		"short visual entry": codecTestBox("moov", codecTestTrack("vide", codecTestBox("avc1", make([]byte, 77)), 1)),
 		"HEVC unsupported":   codecTestBox("moov", codecTestTrack("vide", codecTestEntry("hvc1", cfg), 1)),
 		"truncated sibling":  codecTestBox("moov", track, []byte{0}),
-		"duplicate avcC":     codecTestBox("moov", codecTestTrack("vide", codecTestBox("avc1", make([]byte, 78), codecTestBox("avcC", cfg), codecTestBox("avcC", cfg)), 1)),
+		"duplicate avcC":     codecTestBox("moov", codecTestTrack("vide", codecTestBox("avc1", codecTestVisual(1280, 720), codecTestBox("avcC", cfg), codecTestBox("avcC", cfg)), 1)),
 	} {
 		t.Run(name, func(t *testing.T) {
 			got, err := readInitCodec(bytes.NewReader(data), int64(len(data)))
@@ -124,7 +130,7 @@ func TestCodecMetadataToleratesUnusedBitsAndSiblingBoxes(t *testing.T) {
 	cfg := codecTestConfig(77, 64, 32)
 	cfg[4] = 3
 	cfg[5] = 1 // Noncanonical reserved bits do not alter the triple.
-	entry := codecTestBox("avc1", make([]byte, 78), codecTestBox("avcC", cfg), codecTestBox("btrt", make([]byte, 12)), codecTestBox("pasp", []byte{0, 0, 0, 1, 0, 0, 0, 1}), codecTestBox("colr", []byte{'n', 'c', 'l', 'x', 0, 1, 0, 1, 0, 1, 0}))
+	entry := codecTestBox("avc1", codecTestVisual(1280, 720), codecTestBox("avcC", cfg), codecTestBox("btrt", make([]byte, 12)), codecTestBox("pasp", []byte{0, 0, 0, 1, 0, 0, 0, 1}), codecTestBox("colr", []byte{'n', 'c', 'l', 'x', 0, 1, 0, 1, 0, 1, 0}))
 	data := codecTestBox("moov", codecTestTrack("vide", entry, 1))
 	got, err := readInitCodec(bytes.NewReader(data), int64(len(data)))
 	if err != nil || got != "avc1.4D4020" {

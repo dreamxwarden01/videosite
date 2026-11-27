@@ -12,24 +12,40 @@ import (
 // from the optional sample-index sentinel used by GOP scan fallbacks.
 var ErrInvalidCodecMetadata = errors.New("invalid codec metadata")
 
-// ProbeCodecString reads the exact AVC sample-entry type and configuration
-// bytes from the produced init segment, without relying on human profile names
-// or ffprobe's sometimes incomplete init-only stream metadata.
-func ProbeCodecString(path string) (string, error) {
+// VideoInitMetadata describes the video sample entry in the produced init
+// segment. Width and Height are the stored video dimensions, without applying
+// a profile's scaling plan, pixel-aspect ratio or track display transform.
+type VideoInitMetadata struct {
+	Codec  string
+	Width  int
+	Height int
+}
+
+// ProbeVideoInit reads codec and dimensions together from the produced AVC
+// sample entry. A missing, ambiguous or invalid entry is an error; callers
+// must not replace it with planned dimensions when publishing manifests.
+func ProbeVideoInit(path string) (VideoInitMetadata, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("open codec init: %w", err)
+		return VideoInitMetadata{}, fmt.Errorf("open video init: %w", err)
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return "", fmt.Errorf("stat codec init: %w", err)
+		return VideoInitMetadata{}, fmt.Errorf("stat video init: %w", err)
 	}
-	codec, err := readInitCodec(f, info.Size())
+	metadata, err := readInitVideoMetadata(f, info.Size())
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrInvalidCodecMetadata, err)
+		return VideoInitMetadata{}, fmt.Errorf("%w: %v", ErrInvalidCodecMetadata, err)
 	}
-	return codec, nil
+	return metadata, nil
+}
+
+// ProbeCodecString retains the codec-only interface using the same validated
+// init metadata reader as manifest dimensions.
+func ProbeCodecString(path string) (string, error) {
+	metadata, err := ProbeVideoInit(path)
+	return metadata.Codec, err
 }
 
 // codecBox requires one direct child and validates all sibling boundaries.
@@ -45,53 +61,58 @@ func codecBox(f io.ReadSeeker, start, end int64, name string) (int64, int64, err
 }
 
 func readInitCodec(f io.ReadSeeker, size int64) (string, error) {
+	metadata, err := readInitVideoMetadata(f, size)
+	return metadata.Codec, err
+}
+
+func readInitVideoMetadata(f io.ReadSeeker, size int64) (VideoInitMetadata, error) {
 	ms, me, err := codecBox(f, 0, size, "moov")
 	if err != nil {
-		return "", err
+		return VideoInitMetadata{}, err
 	}
 	tracks, err := collectBoxes(f, ms, me, "trak")
 	if err != nil {
-		return "", err
+		return VideoInitMetadata{}, err
 	}
-	var result string
+	var result VideoInitMetadata
 	for _, track := range tracks {
 		ds, de, err := codecBox(f, track[0], track[1], "mdia")
 		if err != nil {
-			return "", err
+			return VideoInitMetadata{}, err
 		}
 		hs, he, err := codecBox(f, ds, de, "hdlr")
 		if err != nil {
-			return "", err
+			return VideoInitMetadata{}, err
 		}
 		var handler [12]byte
 		if he-hs < int64(len(handler)) {
-			return "", fmt.Errorf("short hdlr")
+			return VideoInitMetadata{}, fmt.Errorf("short hdlr")
 		}
 		if _, err := readAt(f, hs, handler[:]); err != nil {
-			return "", err
+			return VideoInitMetadata{}, err
 		}
 		if string(handler[8:12]) != "vide" {
 			continue
 		}
-		if result != "" {
-			return "", fmt.Errorf("multiple video tracks")
+		if result.Codec != "" {
+			return VideoInitMetadata{}, fmt.Errorf("multiple video tracks")
 		}
 		ss, se := ds, de
 		for _, name := range []string{"minf", "stbl", "stsd"} {
 			ss, se, err = codecBox(f, ss, se, name)
 			if err != nil {
-				return "", err
+				return VideoInitMetadata{}, err
 			}
 		}
 		var stsd [8]byte
 		if se-ss < int64(len(stsd)) {
-			return "", fmt.Errorf("short stsd")
+			return VideoInitMetadata{}, fmt.Errorf("short stsd")
 		}
 		if _, err := readAt(f, ss, stsd[:]); err != nil {
-			return "", err
+			return VideoInitMetadata{}, err
 		}
 		if binary.BigEndian.Uint32(stsd[:4]) != 0 || binary.BigEndian.Uint32(stsd[4:]) != 1 {
-			return "", fmt.Errorf("unsupported stsd version/flags or sample description count")
+			return VideoInitMetadata{}, fmt.Errorf("unsupported stsd version/flags or sample description count")
 		}
 		count := 0
 		err = walkBoxes(f, ss+8, se, func(tag string, es, ee int64) (bool, error) {
@@ -105,6 +126,17 @@ func readInitCodec(f io.ReadSeeker, size int64) (string, error) {
 			// VisualSampleEntry has 78 bytes after its box header.
 			if ee-es < 78 {
 				return false, fmt.Errorf("short AVC visual sample entry")
+			}
+			// Width and height are unsigned 16-bit fields at offsets 24/26
+			// within VisualSampleEntry's payload, before the codec boxes.
+			var dimensions [4]byte
+			if _, err := readAt(f, es+24, dimensions[:]); err != nil {
+				return false, err
+			}
+			width := int(binary.BigEndian.Uint16(dimensions[:2]))
+			height := int(binary.BigEndian.Uint16(dimensions[2:]))
+			if width == 0 || height == 0 {
+				return false, fmt.Errorf("invalid video dimensions %dx%d", width, height)
 			}
 			cs, ce, err := codecBox(f, es+78, ee, "avcC")
 			if err != nil {
@@ -123,18 +155,22 @@ func readInitCodec(f io.ReadSeeker, size int64) (string, error) {
 			if err := validateAVCParameterSets(f, cs, ce, cfg); err != nil {
 				return false, err
 			}
-			result = fmt.Sprintf("%s.%02X%02X%02X", tag, cfg[1], cfg[2], cfg[3])
+			result = VideoInitMetadata{
+				Codec:  fmt.Sprintf("%s.%02X%02X%02X", tag, cfg[1], cfg[2], cfg[3]),
+				Width:  width,
+				Height: height,
+			}
 			return false, nil
 		})
 		if err != nil {
-			return "", err
+			return VideoInitMetadata{}, err
 		}
 		if count != 1 {
-			return "", fmt.Errorf("missing video sample entry")
+			return VideoInitMetadata{}, fmt.Errorf("missing video sample entry")
 		}
 	}
-	if result == "" {
-		return "", fmt.Errorf("no AVC video track")
+	if result.Codec == "" {
+		return VideoInitMetadata{}, fmt.Errorf("no AVC video track")
 	}
 	return result, nil
 }

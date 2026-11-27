@@ -12,8 +12,8 @@ import (
 // manifest.mpd (DASH). The fields the two formats share live here;
 // WriteMasterPlaylist and WriteDASHManifest consume the same slice.
 //
-// Codecs is the full RFC 6381 string pulled from the produced init.mp4 via
-// ProbeCodecString — e.g. "avc1.64001F". The master.m3u8 CODECS attribute
+// Width, Height and Codecs come from the produced init.mp4 via ProbeVideoInit.
+// Codecs is the full RFC 6381 string — e.g. "avc1.64001F". The master.m3u8 CODECS attribute
 // and DASH Representation codecs attribute both require this exact form
 // (NOT just "avc1"). Rational frame-rate fields describe the output grid.
 // VideoBitrateKbps remains an encoding target; manifests measure their rates.
