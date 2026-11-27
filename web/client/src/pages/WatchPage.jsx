@@ -220,6 +220,7 @@ export default function WatchPage() {
 
   const videoRef = useRef(null);
   const containerRef = useRef(null);
+  const stageRef = useRef(null);
   const playerRef = useRef(null);
   const destroyedRef = useRef(false);
   // Shaka's destroy() is async, and on its way out it unloads MediaSource,
@@ -355,6 +356,7 @@ export default function WatchPage() {
     let flushBeacon = null;
 
     const videoEl = videoRef.current;
+    const stageEl = stageRef.current;
     const player = new shaka.Player();
     playerRef.current = player;
 
@@ -412,6 +414,9 @@ export default function WatchPage() {
         if (appliedRatio && Math.abs(ratio / appliedRatio - 1) < 0.01) return;
         appliedRatio = ratio;
         c.style.aspectRatio = `${videoEl.videoWidth} / ${videoEl.videoHeight}`;
+        // Share the picture's ratio with the normal-mode outer frame. Its
+        // control-width floor can retain padding when the picture is narrow.
+        stageEl?.style.setProperty('--vs-video-ratio', String(ratio));
       };
       // 'loadedmetadata' alone is not enough. Safari reaches HAVE_METADATA as
       // soon as it knows the duration, which can be before the decoder has
@@ -749,6 +754,7 @@ export default function WatchPage() {
       // from the 16:9 CSS placeholder (avoids carrying the previous video's
       // aspect into the new video's initial render).
       if (containerRef.current) containerRef.current.style.aspectRatio = '';
+      stageEl?.style.removeProperty('--vs-video-ratio');
       // Hand the next run something to wait on. ui.destroy() also destroys
       // the player it was constructed with; Shaka makes a second destroy a
       // no-op, and calling it explicitly covers the run where the overlay was
@@ -1079,7 +1085,7 @@ export default function WatchPage() {
         </Link>
       </div>
 
-      <div className="vs-wp-stage">
+      <div className="vs-wp-stage" ref={stageRef}>
         {/* Deliberately NOT tagged data-shaka-player-container. The UI build
             scans the document for that attribute when it loads and auto-builds
             its own Player + Overlay in every container carrying one, injecting

@@ -1010,14 +1010,24 @@ textarea.form-control {
 .vs-wp-back svg { width: 16px; height: 16px; flex-shrink: 0; }
 
 .vs-wp-stage {
+    --vs-player-height-budget: 70vh;
     border-radius: 12px;
     overflow: hidden;
     background: #000;
 }
+/* Fit the picture when space permits, but keep a usable control row for tall
+   videos. 560px leaves room beyond the measured hour-long time display and
+   expanded volume slider; never force a frame wider than the page itself.
+   Skeletons share the same 16:9 fallback. Theater is excluded, and Shaka
+   fullscreens the inner player, independently of this normal-flow frame. */
+body:not(.theater-mode) .vs-wp-stage {
+    width: min(100%, max(560px, calc(var(--vs-player-height-budget) * var(--vs-video-ratio, 1.7777777778))));
+    margin-inline: auto;
+}
 .video-player {
     width: 100%;
     aspect-ratio: 16 / 9;      /* placeholder; overridden inline once metadata loads */
-    max-height: 70vh;
+    max-height: var(--vs-player-height-budget, 70vh);
     background: #000;
     overflow: hidden;
 }
@@ -1058,7 +1068,7 @@ textarea.form-control {
 .vs-wp-skel-stage {
     width: 100%;
     aspect-ratio: 16 / 9;
-    max-height: 70vh;
+    max-height: var(--vs-player-height-budget, 70vh);
     background: linear-gradient(90deg, #dbe1e8 25%, #eaeef2 37%, #dbe1e8 63%);
     background-size: 400% 100%;
     animation: vs-shimmer 1.4s ease infinite;
