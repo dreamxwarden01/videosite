@@ -124,7 +124,7 @@ type Job struct {
 	tempDir        string
 	outputDir      string
 	duration       float64
-	hasPoster      bool         // true if poster.jpg was successfully extracted and queued for upload
+	hasPoster      bool         // extracted successfully; completion also waits for its early upload
 	phase          atomic.Value // current phase: "downloading", "probing", "transcoding", "uploading", "completing"
 
 	// Per-job GOP / segment decisions, populated in probe().
@@ -279,9 +279,9 @@ func (j *Job) Run() error {
 	}
 	j.UI.StartJob(j.JobID, j.LeasedAt, profileNames, j.AudioNormalization)
 
-	defer j.cancel()
 	defer j.Manager.ReleaseSlot(j.JobID)
 	defer j.cleanup()
+	defer j.cancel()
 
 	j.UI.Logf("[%s] job started (video %d, encoder %s device %d)",
 		j.JobID, j.VideoID, j.initialEncoder.EncoderType, j.initialEncoder.DeviceIndex)
@@ -315,12 +315,13 @@ func (j *Job) Run() error {
 		return j.handleError("probe", err)
 	}
 
-	// Best-effort poster extraction. Runs between probe and transcode so
-	// the poster is ready by the time the upload sweep walks outputDir,
-	// and it's available even if transcoding later fails partway (the
-	// course list page can still show something useful). Failures here
-	// do NOT fail the job — we just log and keep going.
+	// Extraction stays best-effort. Once generated, upload the poster while
+	// transcoding proceeds, using the same upload retry/refresh policy as media.
 	j.extractPoster(probe.DurationSeconds)
+	var posterUpload func(context.Context) error
+	if j.hasPoster {
+		posterUpload = j.uploadPoster
+	}
 
 	// 3-6. PROCESSING:
 	//   video goroutine (serial per-profile fMP4 HLS, no audio) ||
@@ -328,8 +329,13 @@ func (j *Job) Run() error {
 	//   → rewrite playlists for HMAC → probe init.mp4 for codecs →
 	//     write master.m3u8 + manifest.mpd (DASH).
 	j.phase.Store("transcoding")
-	if err := j.runTranscode(probe); err != nil {
-		return j.handleError("processing", err)
+	phase, err := runWithEarlyUpload(j.ctx, posterUpload, func() error {
+		return j.runTranscode(probe)
+	})
+	if err != nil {
+		// The helper has already cancelled and joined the poster, before any
+		// terminal reporting, temporary-file cleanup or slot release can run.
+		return j.handleError(phase, err)
 	}
 
 	// 7. UPLOAD
@@ -816,15 +822,14 @@ func (j *Job) probe() (*transcoder.ProbeResult, error) {
 }
 
 // extractPoster picks a representative frame from the source and saves it as
-// poster.jpg at the root of outputDir. The upload sweep later in the
-// pipeline picks it up like any other rendition file, so no separate upload
-// path is needed — the file just shows up at R2 key
-// `{hashed_video_id}/{jobId}/poster.jpg`.
+// poster.jpg at the root of outputDir. A job-owned upload sends it before
+// transcoding finishes; the normal output sweep always excludes this file.
+// The server maps it to `posters/{course_id}/{video_id}/{job_id}.jpg`.
 //
 // Best-effort: any failure (ffmpeg error, missing dir, etc.) is logged but
 // does NOT fail the job. j.hasPoster only flips to true on confirmed
-// success, which controls whether the worker reports has_poster=true at
-// /tasks/complete.
+// extraction success. Run also requires successful PUT and the current-job
+// readiness acknowledgement before it can report completion.
 //
 // duration comes from the probe; if it's ≤0 we skip cleanly.
 func (j *Job) extractPoster(duration float64) {
@@ -1036,6 +1041,11 @@ func (j *Job) upload() error {
 		}
 		relPath, _ := filepath.Rel(j.outputDir, path)
 		relPath = strings.ReplaceAll(relPath, "\\", "/") // normalize separators
+		// The early path owns this file and its complete retry budget. Also
+		// exclude a partial file left by failed best-effort extraction.
+		if relPath == "poster.jpg" {
+			return nil
+		}
 		tasks = append(tasks, uploadTask{relPath: relPath, absPath: path, size: info.Size()})
 		return nil
 	})
@@ -1113,8 +1123,15 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 	// hot path (the actual repaint is 4Hz on the render goroutine), so
 	// quadrupling the rate is essentially free.
 	stopProgress := make(chan struct{})
-	defer close(stopProgress)
+	progressDone := make(chan struct{})
+	var stopOnce sync.Once
+	stopMonitor := func() {
+		stopOnce.Do(func() { close(stopProgress) })
+		<-progressDone
+	}
+	defer stopMonitor()
 	go func() {
+		defer close(progressDone)
 		ticker := time.NewTicker(250 * time.Millisecond)
 		defer ticker.Stop()
 		for {
@@ -1137,56 +1154,57 @@ func (j *Job) doUploadWithMonitoring(ctx context.Context, tasks []uploadTask, al
 		}
 	}()
 
-	// First pass: upload everything
-	failed, anyForbidden, firstErr := j.uploadConcurrent(ctx, tasks, allURLs, totalFiles, &bytesUploaded)
-	if len(failed) == 0 {
-		// Pin to 100% — the 250ms ticker may not have fired since the
-		// last byte landed, so the bar could be sitting at 97-99%.
-		j.UI.UpdateStageProgress(j.JobID, 100)
-		j.Progress.Update(j.JobID, "uploading", 100)
-		j.SetStage("uploading", 100)
+	refreshed, err := j.uploadFiles(ctx, tasks, allURLs, &bytesUploaded)
+	stopMonitor()
+	if err != nil {
+		return err
+	}
+	// Pin completion even when the last bytes landed between ticker updates.
+	j.UI.UpdateStageProgress(j.JobID, 100)
+	j.Progress.Update(j.JobID, "uploading", 100)
+	j.SetStage("uploading", 100)
+	if refreshed {
+		j.UI.Logf("[%s] upload complete (after token refresh)", j.JobID)
+	} else {
 		j.UI.Logf("[%s] upload complete", j.JobID)
-		return nil
 	}
+	return nil
+}
 
-	// Check for job abort
+// uploadFiles is shared by early posters and the final media sweep. It owns
+// the same bounded PUT retry and single 403 refresh policy, but never writes
+// job phase/progress; the final-upload caller owns its progress monitor.
+func (j *Job) uploadFiles(ctx context.Context, tasks []uploadTask, allURLs map[string]string, bytesUploaded *int64) (bool, error) {
+	failed, anyForbidden, firstErr := j.uploadConcurrent(ctx, tasks, allURLs, len(tasks), bytesUploaded)
+	if len(failed) == 0 {
+		return false, nil
+	}
 	if ctx.Err() != nil {
-		return fmt.Errorf("aborted during upload: %w", ctx.Err())
+		return false, fmt.Errorf("aborted during upload: %w", ctx.Err())
 	}
-
-	// If only 5xx errors and no 403, token refresh won't help — fail immediately
 	if !anyForbidden {
-		return fmt.Errorf("upload failed: %w", firstErr)
+		return false, fmt.Errorf("upload failed: %w", firstErr)
 	}
 
-	// Token refresh: fetch new URLs for failed files.
 	j.UI.Logf("[%s] upload token refresh (%d files)", j.JobID, len(failed))
 	newURLs, err := j.fetchUploadURLsBatch(ctx, failed)
 	if err != nil {
-		return fmt.Errorf("refresh upload URLs: %w", err)
+		return false, fmt.Errorf("refresh upload URLs: %w", err)
 	}
 	for k, v := range newURLs {
 		allURLs[k] = v
 	}
-
-	// Second pass: retry failed files with fresh tokens
-	failed2, _, firstErr2 := j.uploadConcurrent(ctx, failed, allURLs, totalFiles, &bytesUploaded)
-
+	failed2, _, firstErr2 := j.uploadConcurrent(ctx, failed, allURLs, len(tasks), bytesUploaded)
 	if ctx.Err() != nil {
-		return fmt.Errorf("aborted during upload retry: %w", ctx.Err())
+		return true, fmt.Errorf("aborted during upload retry: %w", ctx.Err())
 	}
 	if len(failed2) > 0 {
 		if firstErr2 != nil {
-			return fmt.Errorf("upload failed after token refresh: %w", firstErr2)
+			return true, fmt.Errorf("upload failed after token refresh: %w", firstErr2)
 		}
-		return fmt.Errorf("upload failed after token refresh: %d files could not be uploaded", len(failed2))
+		return true, fmt.Errorf("upload failed after token refresh: %d files could not be uploaded", len(failed2))
 	}
-
-	j.UI.UpdateStageProgress(j.JobID, 100)
-	j.Progress.Update(j.JobID, "uploading", 100)
-	j.SetStage("uploading", 100)
-	j.UI.Logf("[%s] upload complete (after token refresh)", j.JobID)
-	return nil
+	return true, nil
 }
 
 // uploadConcurrent uploads a slice of uploadTasks concurrently.

@@ -9,8 +9,7 @@ import useFitHeight from '../hooks/useFitHeight';
 import SortMenu from '../components/SortMenu';
 import VsPager from '../components/VsPager';
 import { prefetchShaka } from '../services/shakaLoader';
-
-const MAX_POSTER_RETRIES = 10;
+import VideoPoster from '../components/VideoPoster';
 
 // Maps a coded 403/404 body onto the scoped "gone" pane state. Reads ONLY
 // data?.code — never the bare status — so a Cloudflare WAF 403 (HTML body,
@@ -156,10 +155,16 @@ export default function CourseView({ tab }) {
   useEffect(() => { setVError(false); }, [courseId]);
   const [r2PublicDomain, setR2PublicDomain] = useState('');
   const [vLoading, setVLoading] = useState(true);
-  const posterUrlsRef = useRef({});
-  const [posterFailed, setPosterFailed] = useState({});
-  const [posterLoaded, setPosterLoaded] = useState({});
-  const [posterRetries, setPosterRetries] = useState({});
+  const [posterList, setPosterList] = useState({ revision: 0, tokens: {} });
+  const listSequence = useRef(0);
+  const acceptedSequence = useRef(0);
+  const listScope = JSON.stringify([courseId, isVideos, page, pageSize, sortField, sortDir]);
+  const currentListScope = useRef(listScope);
+  currentListScope.current = listScope;
+  const acceptPosters = (rows) => setPosterList((previous) => ({
+    revision: previous.revision + 1,
+    tokens: Object.fromEntries(rows.map((v) => [v.video_id, v.posterToken || ''])),
+  }));
 
   // --- materials (fetched once per course, sliced client-side for the pager) ---
   const [materials, setMaterials] = useState(null);
@@ -174,17 +179,22 @@ export default function CourseView({ tab }) {
   useEffect(() => {
     if (!isVideos || !fitReady) return undefined;
     let alive = true;
+    const sequence = ++listSequence.current;
+    const scope = listScope;
     setVLoading(true);
     apiGet(`/api/courses/${courseId}?page=${page}&limit=${pageSize}&sort=${sortField}&dir=${sortDir}`)
       .then(({ data, ok }) => {
-        if (!alive) return;
+        if (!alive || currentListScope.current !== scope) return;
+        if (sequence < acceptedSequence.current) { setVLoading(false); return; }
         // Coded course-gone/forbidden → scoped pane, then stop. Only on
         // data?.code; a WAF 403 (data==null) falls through to the ok-branch/no-op.
         if (markGone(data)) { setVLoading(false); return; }
         if (ok && data) {
+          acceptedSequence.current = sequence;
           setVError(false);
           setCourse(data.course);
           setVideos(data.videos || []);
+          acceptPosters(data.videos || []);
           setVTotal(data.pagination?.total ?? 0);
           setR2PublicDomain(data.r2PublicDomain || '');
           setVLoadedCourse(courseId);
@@ -194,7 +204,11 @@ export default function CourseView({ tab }) {
         }
         setVLoading(false);
       })
-      .catch(() => { if (alive) { setVError(true); showToast('Failed to load videos.'); setVLoading(false); } });
+      .catch(() => {
+        if (!alive || currentListScope.current !== scope) return;
+        if (sequence >= acceptedSequence.current) { setVError(true); showToast('Failed to load videos.'); }
+        setVLoading(false);
+      });
     return () => { alive = false; };
   }, [isVideos, fitReady, courseId, page, pageSize, sortField, sortDir, retry, showToast]);
 
@@ -219,53 +233,44 @@ export default function CourseView({ tab }) {
   useEffect(() => { if (siteName && (headName || headCode)) document.title = `${headName || headCode} - ${siteName}`; }, [siteName, headName, headCode]);
 
   // auto-refresh (silent, in place) while any visible video is still processing
-  const pageRef = useRef(page); pageRef.current = page;
-  const psRef = useRef(pageSize); psRef.current = pageSize;
   useEffect(() => {
     if (!isVideos || gone) return undefined;
     const busy = videos.some((v) => v.status !== 'finished' && v.status !== 'error');
     if (!busy) return undefined;
+    let alive = true;
+    let pending = false;
+    const scope = listScope;
     const timer = setInterval(() => {
-      apiGet(`/api/courses/${courseId}?page=${pageRef.current}&limit=${psRef.current}&sort=${sortField}&dir=${sortDir}`)
+      if (pending) return;
+      pending = true;
+      const sequence = ++listSequence.current;
+      apiGet(`/api/courses/${courseId}?page=${page}&limit=${pageSize}&sort=${sortField}&dir=${sortDir}`)
         .then(({ data, ok }) => {
+          if (!alive || currentListScope.current !== scope || sequence < acceptedSequence.current) return;
           // A course deactivated mid-processing shows the gone pane on the next
           // poll tick rather than waiting for a page/tab change.
           if (markGone(data)) return;
           if (ok && data) {
+            acceptedSequence.current = sequence;
+            setVError(false);
+            setCourse(data.course);
             setVideos(data.videos || []);
+            acceptPosters(data.videos || []);
             setVTotal(data.pagination?.total ?? 0);
             setR2PublicDomain(data.r2PublicDomain || '');
+            setVLoadedCourse(courseId);
           }
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => { pending = false; });
     }, 5000);
-    return () => clearInterval(timer);
-  }, [isVideos, gone, videos, courseId, sortField, sortDir]);
+    return () => { alive = false; clearInterval(timer); };
+  }, [isVideos, gone, videos, listScope]);
 
   const renderPoster = (video) => {
-    const hasPoster = video.posterToken && r2PublicDomain && !posterFailed[video.video_id];
-    if (!hasPoster) return <div className="vs-cv-play"><PlayIcon /></div>;
-    let baseSrc = posterUrlsRef.current[video.video_id];
-    if (!baseSrc) {
-      baseSrc = `https://${r2PublicDomain}/posters/${courseId}/${video.video_id}.jpg?verify=${video.posterToken}`;
-      posterUrlsRef.current[video.video_id] = baseSrc;
-    }
-    const retries = posterRetries[video.video_id] || 0;
-    const src = retries > 0 ? `${baseSrc}&r=${retries}` : baseSrc;
-    const loaded = !!posterLoaded[video.video_id];
-    return (
-      <div className={`vs-cv-thumb${loaded ? '' : ' loading'}`}>
-        <img
-          src={src} alt="" loading="lazy" style={{ opacity: loaded ? 1 : 0 }}
-          onLoad={() => setPosterLoaded((p) => ({ ...p, [video.video_id]: true }))}
-          onError={() => {
-            if (retries >= MAX_POSTER_RETRIES) { setPosterFailed((p) => ({ ...p, [video.video_id]: true })); return; }
-            const delay = 500 + retries * 500;
-            setTimeout(() => setPosterRetries((p) => ({ ...p, [video.video_id]: (p[video.video_id] || 0) + 1 })), delay);
-          }}
-        />
-      </div>
-    );
+    return <VideoPoster courseId={courseId} videoId={video.video_id} domain={r2PublicDomain}
+      ready={video.has_poster === true} path={video.posterPath} token={posterList.tokens[video.video_id] || ''}
+      status={video.status} revision={posterList.revision} />;
   };
 
   const openMaterial = async (materialId, mode) => {

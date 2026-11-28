@@ -34,10 +34,25 @@ func GetUploadURLs(ctx context.Context, jobID string, filenames []string) (map[s
 	if err != nil {
 		return nil, err
 	}
+	// Error JSON must not decode as an empty success map. In particular, a
+	// retired job is terminal; transient API errors belong to the caller's
+	// normal URL-request backoff, before any PUT is attempted.
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, ErrJobNotFound
+		}
+		return nil, fmt.Errorf("upload URLs returned %d", resp.StatusCode)
+	}
 
 	var result UploadURLsResponse
 	if err := decodeJSON(resp, &result); err != nil {
 		return nil, fmt.Errorf("decode upload URLs response: %w", err)
+	}
+	for _, filename := range filenames {
+		if strings.TrimSpace(result.URLs[filename]) == "" {
+			return nil, fmt.Errorf("upload URLs response missing requested file %q", filename)
+		}
 	}
 	return result.URLs, nil
 }
@@ -145,8 +160,7 @@ func contentTypeForFile(filePath string) string {
 		}
 		return "video/mp4"
 	case strings.HasSuffix(lower, ".jpg"), strings.HasSuffix(lower, ".jpeg"):
-		// Per-video poster thumbnail written by the worker alongside the
-		// manifest. Picked up by the normal upload sweep.
+		// Per-video poster thumbnail, uploaded as soon as extraction finishes.
 		return "image/jpeg"
 	default:
 		return "application/octet-stream"

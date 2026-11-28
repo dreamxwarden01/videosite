@@ -18,8 +18,9 @@
     "test:shutdown": "node --test scripts/graceful-shutdown.test.js",
     "test:sso-roles:db": "node scripts/run-sso-role-tests.mjs",
     "test:sessions": "node --test scripts/session-revocation.test.js scripts/logout-receiver.test.js scripts/assertion-issuer.test.js scripts/stepup-callback.test.js",
-    "test:deletion": "node --test scripts/deletion-reaper.test.js scripts/r2-request-log.test.js scripts/course-delete-atomic.test.js scripts/r2-orphan-audit.test.js",
-    "test:deletion:db": "node scripts/run-deletion-tests.mjs"
+    "test:deletion": "node --test scripts/deletion-reaper.test.js scripts/r2-request-log.test.js scripts/course-delete-atomic.test.js scripts/video-delete-atomic.test.js scripts/r2-orphan-audit.test.js",
+    "test:deletion:db": "node scripts/run-deletion-tests.mjs",
+    "test:posters": "node --test scripts/poster-metadata.test.js scripts/poster-state.test.js scripts/poster-token-format.test.js scripts/worker-identity-format.test.js scripts/poster-route-metadata.test.js client/src/services/posterLoader.test.js"
   },
   "keywords": [],
   "author": "",

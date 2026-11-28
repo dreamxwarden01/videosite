@@ -156,7 +156,9 @@ async function deleteCourse(courseId) {
                 }
             }
             add('prefix', `attachments/${deletedCourseId}/`, now);
-            add('prefix', `posters/${deletedCourseId}/`, now);
+            // Posters can exist before completion and while an aborted writer
+            // is cancelling, even when no video currently reports processing.
+            add('prefix', `posters/${deletedCourseId}/`, delayedAt);
 
             // All INSERTs and the destructive cascade use the same transaction.
             // The reaper cannot observe these intents until the delete commits.

@@ -7,7 +7,7 @@ const { getPool, idBuf } = require('../../config/database');
 const { createVideo } = require('../../services/videoService');
 const deletionService = require('../../services/deletionService');
 const { getCourseById } = require('../../services/courseService');
-const { createTask } = require('../../services/processingService');
+const { createTask, replaceVideoSource } = require('../../services/processingService');
 const {
     initiateMultipartUpload,
     getPresignedPartUrls,
@@ -282,24 +282,49 @@ router.post('/upload/:uploadId/complete', requireAuth, checkPermission('uploadVi
         }
 
         const session = await getSession(req.params.uploadId);
-        if (!session || (session.status !== 'active' && session.status !== 'completing')) {
+        if (!session || !['active', 'completing', 'completed'].includes(session.status)) {
             return res.status(404).json({ error: 'Upload session not found or not active' });
         }
         if (session.created_by !== res.locals.user.user_id) {
             return res.status(403).json({ error: 'Not your upload session' });
         }
 
+        // A replacement's completion receipt shares its SQL commit. A lost
+        // response or post-commit cache failure must replay without finalizing
+        // multipart storage again or resetting the accepted new generation.
+        if (session.status === 'completed') {
+            if (!session.video_id || !await replaceVideoSource(session, null, true)) {
+                return res.status(404).json({ error: 'Replacement receipt unavailable' });
+            }
+            await markCompleted(session.upload_id, session.video_id);
+            return res.status(204).end();
+        }
+
         // Mark completing (prevents stale timeout during finalization)
         await markCompleting(session.upload_id);
 
-        // Finalize R2 multipart upload
-        await completeMultipartUpload(session.object_key, session.r2_upload_id, parts);
+        // Multipart completion may have succeeded before a replacement's SQL
+        // transaction failed. Its upload id is then gone on retry. Recover only
+        // that explicit result for this session's unique object, never a generic
+        // storage failure, and prove the assembled object exists outside SQL.
+        let recoveredSize;
+        try {
+            await completeMultipartUpload(session.object_key, session.r2_upload_id, parts);
+        } catch (error) {
+            const missingUpload = [error?.name, error?.Code, error?.code].includes('NoSuchUpload');
+            const status = error?.$metadata?.httpStatusCode;
+            const uniqueSource = typeof session.upload_id === 'string' && /^[A-Za-z0-9]{12}$/.test(session.upload_id)
+                && typeof session.object_key === 'string'
+                && new RegExp(`^source/${session.upload_id}/source\\.[^/]+$`).test(session.object_key);
+            if (!session.video_id || !missingUpload || status != null && status !== 404 || !uniqueSource) throw error;
+            recoveredSize = await getObjectSize(session.object_key, { strict: true });
+        }
 
         // Backstop to the signed per-part content-length: ask R2 what actually
         // assembled rather than trusting the size declared at session-create.
         // Over the cap, the source is dropped instead of being handed to the
         // transcoder and recorded against the video.
-        const actualSize = await getObjectSize(session.object_key);
+        const actualSize = recoveredSize === undefined ? await getObjectSize(session.object_key) : recoveredSize;
         if (actualSize === null) {
             await markAborted(session.upload_id);
             return res.status(422).json({ error: 'Upload not found in storage.' });
@@ -342,58 +367,9 @@ router.post('/upload/:uploadId/complete', requireAuth, checkPermission('uploadVi
             // Replacement — reset video for reprocessing
             videoId = session.video_id;
 
-            // Get current video info for cleanup. Replacement keeps the same
-            // hashed_video_id, so we scope the OLD-output cleanup to the
-            // previous job's subdirectory (`{hash}/{old_job_id}/`) rather
-            // than the whole hash — the new transcode will write under a
-            // fresh job_id and the reaper must not race it. Earlier-retry
-            // orphan tails (if any) sit until video-delete, per design.
-            const [videoRows] = await pool.execute(
-                'SELECT hashed_video_id, r2_source_key, processing_job_id FROM videos WHERE video_id = ?',
-                [videoId]
-            );
-
-            if (videoRows.length > 0) {
-                const { hashed_video_id, r2_source_key, processing_job_id } = videoRows[0];
-
-                // Old source: enqueue immediate prefix delete.
-                if (r2_source_key) {
-                    const oldSourceDir = r2_source_key.substring(0, r2_source_key.lastIndexOf('/') + 1);
-                    await deletionService.enqueuePrefix(oldSourceDir, { source: 'video_replace' });
-                }
-
-                // Old output: only enqueue if we know the previous job_id.
-                if (processing_job_id) {
-                    await deletionService.enqueuePrefix(
-                        `${hashed_video_id}/${processing_job_id}/`,
-                        { source: 'video_replace' }
-                    );
-                }
+            if (!await replaceVideoSource(session, actualSize)) {
+                return res.status(404).json({ error: 'Replacement target is no longer available' });
             }
-
-            // Delete old processing_queue row
-            await pool.execute('DELETE FROM processing_queue WHERE video_id = ?', [videoId]);
-
-            // Update video with new source info and reset state. Replacement
-            // uploads also flip video_type to 'cmaf' — a re-uploaded source
-            // moves onto the new pipeline and drops its old encryption_key
-            // (CMAF rows are unencrypted; /api/keys/:id already 404s on NULL).
-            await pool.execute(
-                `UPDATE videos SET r2_source_key = ?, original_filename = ?, file_size_bytes = ?,
-                 status = 'queued', processing_job_id = NULL, encryption_key = NULL,
-                 processing_progress = 0, processing_error = NULL, duration_seconds = NULL,
-                 video_type = 'cmaf'
-                 WHERE video_id = ?`,
-                [session.object_key, session.original_filename, actualSize, videoId]
-            );
-            await require('../../services/cache/videoCache').invalidate(videoId);
-
-            // Create new processing task
-            await createTask(videoId);
-
-            // Clear stale watch progress (DB + Redis cache)
-            await pool.execute('DELETE FROM watch_progress WHERE video_id = ?', [videoId]);
-            await require('../../services/cache/watchProgressCache').clearForVideo(videoId);
         }
 
         await markCompleted(session.upload_id, videoId);

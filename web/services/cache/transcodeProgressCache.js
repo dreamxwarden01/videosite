@@ -5,8 +5,9 @@
 //   1. The fast write path for /api/worker/tasks/status running heartbeats
 //      (every ~2s per active job).
 //   2. The "is this job still alive?" gate — populated on lease, cleared on
-//      any terminal/abort/delete. The worker's status callback uses the
-//      cache's existence as the ack signal: missing → ack=false → drop job.
+//      any terminal/abort/delete. The status RPC first checks current lease
+//      ownership in one SQL batch. A cache miss can then warm from that snapshot;
+//      an old cache entry alone cannot keep a retired worker attempt alive.
 //
 // Layout:
 //   progress:transcode:{job_id}  hash {queue_status, video_status, progress, stage, last_heartbeat}
@@ -21,8 +22,8 @@ const key = (jobId) => `progress:transcode:${jobId}`;
 // subsequent heartbeats find the job alive without a DB query).
 // hashed_video_id is stored here so generateUploadUrls can build R2 paths
 // without re-fetching the videos JOIN on every upload-URL batch.
-// course_id is stored alongside so the same routine can rewrite the
-// poster.jpg upload key to the per-course layout `posters/{cid}/{vid}.jpg`.
+// course_id is stored alongside for metadata. Poster URL issuance separately
+// checks the current lease in SQL and records its generation-specific key.
 async function initOnLease(jobId, videoId, hashedVideoId, courseId, queueStatus, videoStatus) {
     const redis = getClient();
     await redis.hset(key(jobId), {
@@ -38,7 +39,7 @@ async function initOnLease(jobId, videoId, hashedVideoId, courseId, queueStatus,
 }
 
 // Heartbeat update: returns true if the cache entry exists (job is alive),
-// false if it was cleared (terminal / aborted / video deleted).
+// false if it was cleared. The caller separately checks current SQL authority.
 async function recordHeartbeat(jobId, queueStatus, videoStatus, progress, stage) {
     const redis = getClient();
     const exists = await redis.exists(key(jobId));

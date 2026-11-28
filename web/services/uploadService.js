@@ -60,14 +60,21 @@ async function getPresignedPartUrls(objectKey, uploadId, partNumbers, fileSize) 
 }
 
 // Assembled object size, straight from R2 — the number we didn't take on trust.
-async function getObjectSize(objectKey) {
+async function getObjectSize(objectKey, { strict = false } = {}) {
     try {
         const r = await getR2Client().send(new HeadObjectCommand({
             Bucket: getR2BucketName(),
             Key: objectKey,
         }));
         return r.ContentLength ?? null;
-    } catch {
+    } catch (error) {
+        // Recovery from NoSuchUpload must not turn an authorization failure or
+        // storage outage into apparent absence/success. Existing callers retain
+        // their previous optional-size behavior.
+        const status = error?.$metadata?.httpStatusCode;
+        const missing = status === 404 || status == null
+            && [error?.name, error?.Code, error?.code].some(code => code === 'NotFound' || code === 'NoSuchKey');
+        if (strict && !missing) throw error;
         return null;
     }
 }

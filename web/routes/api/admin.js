@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { posterMetadata } = require('../../services/posterMetadata');
 
 // Canonicalise a user id taken from the path.
 //
@@ -252,18 +253,12 @@ router.get('/admin/courses/:courseId/videos', requireAuth, checkAnyPermission('u
         );
         await require('../../services/cache/transcodeProgressCache').applyLiveOverlayToVideos(videos);
 
-        // Per-video poster signing — mirrors pages.js. The poster path
-        // `/posters/{course_id}/{video_id}.jpg` needs a per-file HMAC token to
-        // clear the WAF file-scope branch; mint one per row up front so the
-        // client reconstructs the URL without a per-image refresh. Mint only
-        // when has_poster=1; otherwise the client falls back to the play glyph.
+        // Return authoritative poster readiness after the existing admin
+        // permission checks. A planned upload key never implies availability.
         const r2PublicDomain = process.env.R2_PUBLIC_DOMAIN || '';
         const out = await Promise.all(videos.map(async (v) => {
             const s = sanitizeAdminVideo(v);
-            if (v.has_poster) {
-                s.posterToken = await generateFileToken(`/posters/${v.course_id}/${v.video_id}.jpg`) || '';
-            }
-            return s;
+            return { ...s, ...await posterMetadata(v, generateFileToken) };
         }));
 
         res.json({

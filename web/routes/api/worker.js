@@ -11,7 +11,7 @@ const { getClientIp } = require('../../middleware/auth');
 const { normalizeIP } = require('../../services/ipHelpers');
 const {
     reserveTasks, leaseTasks, reportJobStatuses,
-    completeTask, generateUploadUrls,
+    completeTask, generateUploadUrls, confirmPosterReady,
 } = require('../../services/processingService');
 
 // Stale-task reset moved to a 60s setInterval in server.js — no longer a
@@ -135,15 +135,35 @@ router.post('/worker/tasks/lease', requireWorkerSession, async (req, res) => {
 router.post('/worker/tasks/status', requireWorkerSession, async (req, res) => {
     try {
         const { jobs } = req.body || {};
-        if (!Array.isArray(jobs)) {
-            return res.status(400).json({ error: 'jobs[] is required' });
+        if (!Array.isArray(jobs) || jobs.length > 256) {
+            return res.status(400).json({ error: 'jobs[] must contain at most 256 entries' });
         }
 
-        const results = await reportJobStatuses(jobs);
+        const results = await reportJobStatuses(jobs, req.worker.keyId);
         res.json({ results });
     } catch (err) {
         console.error('Worker tasks/status error:', err);
         res.status(500).json({ error: 'Failed to update status' });
+    }
+});
+
+// POST /api/worker/tasks/poster-ready — successful PUT acknowledgement.
+// Current authenticated lease owner only; no caller-supplied R2 path is trusted.
+router.post('/worker/tasks/poster-ready', requireWorkerSession, async (req, res) => {
+    const body = req.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).length !== 1 || typeof body.jobId !== 'string'
+        || !/^[A-Za-z0-9]{12}$/.test(body.jobId)) {
+        return res.status(400).json({ error: 'jobId is required' });
+    }
+    try {
+        if (!await confirmPosterReady(body.jobId, req.worker.keyId)) {
+            return res.status(404).json({ error: 'Job not found' });
+        }
+        return res.status(204).end();
+    } catch {
+        console.error('Poster acknowledgement unavailable');
+        return res.status(500).json({ error: 'Failed to confirm poster' });
     }
 });
 
@@ -157,7 +177,7 @@ router.post('/worker/tasks/complete', requireWorkerSession, async (req, res) => 
             return res.status(400).json({ error: 'jobId is required' });
         }
 
-        const found = await completeTask(jobId, durationSeconds || null, hasPoster === true);
+        const found = await completeTask(jobId, durationSeconds || null, hasPoster === true, req.worker.keyId);
         if (!found) {
             return res.status(404).json({ error: 'Job not found' });
         }
@@ -176,7 +196,7 @@ router.post('/worker/tasks/upload-urls', requireWorkerSession, async (req, res) 
             return res.status(400).json({ error: 'jobId and filenames[] are required' });
         }
 
-        const result = await generateUploadUrls(jobId, filenames);
+        const result = await generateUploadUrls(jobId, filenames, req.worker.keyId);
         if (!result) {
             return res.status(404).json({ error: 'Task not found' });
         }

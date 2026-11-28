@@ -296,7 +296,7 @@ async function markCompleting(uploadId) {
 
 async function markCompleted(uploadId, videoId) {
     const pool = getPool();
-    const fields = [`status = 'completed'`, `completed_at = NOW()`];
+    const fields = [`status = 'completed'`, `completed_at = COALESCE(completed_at,NOW())`];
     const values = [];
     if (videoId != null) {
         fields.push('video_id = ?');

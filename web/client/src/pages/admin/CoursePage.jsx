@@ -9,6 +9,7 @@ import { moduleTerm } from '../../utils/moduleLabel';
 import useFitHeight from '../../hooks/useFitHeight';
 import SortMenu from '../../components/SortMenu';
 import VsPager from '../../components/VsPager';
+import VideoPoster from '../../components/VideoPoster';
 import UploadVideoModal from '../../components/UploadVideoModal';
 import UploadMaterialsModal from '../../components/UploadMaterialsModal';
 import EditVideoModal from '../../components/EditVideoModal';
@@ -16,7 +17,6 @@ import EditMaterialModal from '../../components/EditMaterialModal';
 import CourseEditModal from '../../components/CourseEditModal';
 import PlaybackStatsModal from '../../components/PlaybackStatsModal';
 
-const MAX_POSTER_RETRIES = 10;
 
 // First-paint row-height estimates only (real rows are measured after mount).
 // Derived from style.css: a video row's 16:9 100px poster is 100·9/16 ≈ 56px
@@ -220,10 +220,13 @@ export default function CoursePage() {
   const [vLoadedCourse, setVLoadedCourse] = useState(null);
   const [r2PublicDomain, setR2PublicDomain] = useState('');
   const [vLoading, setVLoading] = useState(true);
-  const posterUrlsRef = useRef({});
-  const [posterFailed, setPosterFailed] = useState({});
-  const [posterLoaded, setPosterLoaded] = useState({});
-  const [posterRetries, setPosterRetries] = useState({});
+  const [posterList, setPosterList] = useState({ revision: 0, tokens: {} });
+  const listSequence = useRef(0);
+  const acceptedSequence = useRef(0);
+  const acceptPosters = (rows) => setPosterList((previous) => ({
+    revision: previous.revision + 1,
+    tokens: Object.fromEntries(rows.map((v) => [v.video_id, v.posterToken || ''])),
+  }));
 
   // --- materials (fetched once per course, sorted + sliced client-side) ---
   const [materials, setMaterials] = useState(null);
@@ -252,25 +255,36 @@ export default function CoursePage() {
   // so unlike the primary loads they have no effect-scoped `alive` flag. A request
   // issued for course A / page 1 / dir asc can land after the user switched away;
   // this ref lets a late response recognise itself as stale and drop its result.
-  const currentRef = useRef({ courseId, page, dir: sort.dir, limit: pageSize });
-  currentRef.current = { courseId, page, dir: sort.dir, limit: pageSize };
+  const currentRef = useRef({ courseId, page, dir: sort.dir, limit: pageSize, isVideos });
+  currentRef.current = { courseId, page, dir: sort.dir, limit: pageSize, isVideos };
+  const mountedRef = useRef(true);
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
+  const isCurrentList = (req) => {
+    const cur = currentRef.current;
+    return mountedRef.current && cur.courseId === req.courseId && cur.page === req.page
+      && cur.dir === req.dir && cur.limit === req.limit && cur.isVideos === req.isVideos;
+  };
 
   // Silent video refetch — no skeleton flash. Used by the poll and after mutations.
   const loadVideosSilent = useCallback(async () => {
-    const req = { courseId, page, dir: sort.dir, limit: pageSize };
+    const req = { courseId, page, dir: sort.dir, limit: pageSize, isVideos };
+    const sequence = ++listSequence.current;
     const { data, ok } = await apiGet(`/api/admin/courses/${courseId}/videos?page=${page}&limit=${pageSize}&dir=${sort.dir}`);
     // Drop a stale (superseded) response BEFORE acting on it, so a late
     // forbidden from a course the user already left never blanks the new page.
-    const cur = currentRef.current;
-    if (cur.courseId !== req.courseId || cur.page !== req.page || cur.dir !== req.dir || cur.limit !== req.limit) return;
+    if (!isCurrentList(req) || sequence < acceptedSequence.current) return;
     if (markGone(data)) return;
     if (!ok || !data) return;
+    acceptedSequence.current = sequence;
     setVideos((prev) => mergeRows(prev, data.videos || [], POSTER_PRESENCE_ONLY));
+    // Token values deliberately do not dirty merged rows. Failed poster retries
+    // still need the fresh token and a response tick even when progress is flat.
+    acceptPosters(data.videos || []);
     setVTotal(data.total || 0);
     setR2PublicDomain(data.r2PublicDomain || '');
     setCourse((prev) => mergeCourse(prev, { id: courseId, code: data.course.course_code, name: data.course.course_name, moduleLabel: data.course.module_label }));
     setVLoadedCourse(courseId);
-  }, [courseId, page, pageSize, sort.dir]);
+  }, [courseId, page, pageSize, sort.dir, isVideos]);
 
   // Primary video load (skeleton) on course / page / sort / fit change — but only
   // once the fit has SETTLED (fitReady), so the estimate→measured pageSize never
@@ -280,15 +294,20 @@ export default function CoursePage() {
   useEffect(() => {
     if (!isVideos || !fitReady) return undefined;
     let alive = true;
+    const req = { courseId, page, dir: sort.dir, limit: pageSize, isVideos };
+    const sequence = ++listSequence.current;
     setVLoading(true);
     apiGet(`/api/admin/courses/${courseId}/videos?page=${page}&limit=${pageSize}&dir=${sort.dir}`)
       .then(({ data, ok }) => {
-        if (!alive) return;
+        if (!alive || !isCurrentList(req)) return;
+        if (sequence < acceptedSequence.current) { setVLoading(false); return; }
         // Coded course-gone/forbidden → scoped pane, then stop. Only on
         // data?.code; a WAF 403 (data==null) falls through to the else-toast.
         if (markGone(data)) { setVLoading(false); return; }
         if (ok && data) {
+          acceptedSequence.current = sequence;
           setVideos(data.videos || []);
+          acceptPosters(data.videos || []);
           setVTotal(data.total || 0);
           setR2PublicDomain(data.r2PublicDomain || '');
           setCourse({ id: courseId, code: data.course.course_code, name: data.course.course_name, moduleLabel: data.course.module_label });
@@ -298,7 +317,11 @@ export default function CoursePage() {
         }
         setVLoading(false);
       })
-      .catch(() => { if (alive) { showToast('Failed to load videos.'); setVLoading(false); } });
+      .catch(() => {
+        if (!alive || !isCurrentList(req)) return;
+        if (sequence >= acceptedSequence.current) showToast('Failed to load videos.');
+        setVLoading(false);
+      });
     return () => { alive = false; };
   }, [isVideos, fitReady, courseId, page, pageSize, sort.dir, showToast]);
 
@@ -350,7 +373,12 @@ export default function CoursePage() {
     if (!isVideos) return undefined;
     const busy = videos.some((v) => v.status !== 'finished' && v.status !== 'error');
     if (!busy) return undefined;
-    const timer = setInterval(() => pollRef.current(), 2000);
+    let pending = false;
+    const timer = setInterval(() => {
+      if (pending) return;
+      pending = true;
+      Promise.resolve(pollRef.current()).catch(() => {}).finally(() => { pending = false; });
+    }, 2000);
     return () => clearInterval(timer);
   }, [isVideos, videos]);
 
@@ -479,47 +507,9 @@ export default function CoursePage() {
   }
 
   const renderPoster = (video) => {
-    // The poster URL carries a per-request HMAC token (generateFileToken embeds
-    // Date.now()), so every refetch yields a different `?verify=` string. The
-    // poster itself only changes when the video does, so cache the URL against
-    // the video's identity rather than rebuilding it from whatever token last
-    // arrived — otherwise the 2s processing poll re-downloads every thumbnail.
-    // The key freezes while a video is processing: a re-transcode bumps
-    // updated_at on every progress tick, and the old poster is still the one on
-    // screen. Once it finishes, the fresh updated_at pulls the new poster in.
-    const pkey = `${video.has_poster ? 1 : 0}|${video.status === 'finished' ? (video.updated_at || '') : 'proc'}`;
-    // Load/fail/retry state hangs off the same key, so a regenerated poster
-    // starts clean instead of inheriting the previous image's flags.
-    const pid = `${video.video_id}|${pkey}`;
-
-    const hasPoster = video.posterToken && r2PublicDomain && !posterFailed[pid];
-    if (!hasPoster) return <div className="vs-cv-play"><PlayIcon /></div>;
-
-    const cached = posterUrlsRef.current[video.video_id];
-    let baseSrc;
-    if (cached && cached.key === pkey) {
-      baseSrc = cached.src;
-    } else {
-      baseSrc = `https://${r2PublicDomain}/posters/${courseId}/${video.video_id}.jpg?verify=${video.posterToken}`;
-      posterUrlsRef.current[video.video_id] = { key: pkey, src: baseSrc };
-    }
-
-    const retries = posterRetries[pid] || 0;
-    const src = retries > 0 ? `${baseSrc}&r=${retries}` : baseSrc;
-    const loaded = !!posterLoaded[pid];
-    return (
-      <div className={`vs-cv-thumb${loaded ? '' : ' loading'}`}>
-        <img
-          src={src} alt="" loading="lazy" style={{ opacity: loaded ? 1 : 0 }}
-          onLoad={() => setPosterLoaded((p) => ({ ...p, [pid]: true }))}
-          onError={() => {
-            if (retries >= MAX_POSTER_RETRIES) { setPosterFailed((p) => ({ ...p, [pid]: true })); return; }
-            const delay = 500 + retries * 500;
-            setTimeout(() => setPosterRetries((p) => ({ ...p, [pid]: (p[pid] || 0) + 1 })), delay);
-          }}
-        />
-      </div>
-    );
+    return <VideoPoster courseId={courseId} videoId={video.video_id} domain={r2PublicDomain}
+      ready={video.has_poster === true} path={video.posterPath} token={posterList.tokens[video.video_id] || ''}
+      status={video.status} revision={posterList.revision} />;
   };
 
   const renderVideoRow = (video) => {

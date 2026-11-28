@@ -97,6 +97,7 @@ test('course deletion atomically commits native MariaDB cleanup intents and fenc
             const [rows]=await pool.query('SELECT mode,target,hashed_video_id,TIMESTAMPDIFF(SECOND,(SELECT MIN(execute_at) FROM pending_deletes),execute_at) AS delay FROM pending_deletes');
             assert.equal(rows.find(r=>r.target===hashB+'/').delay,120);
             assert.equal(rows.find(r=>r.mode==='key').delay,60);
+            assert.equal(rows.find(r=>r.target==='posters/12/').delay,120);
             assert.equal(rows.find(r=>r.target===hashA+'/').hashed_video_id,hashA);
         });
         await t.test('parent lock blocks a concurrent FK child insert, which then fails after deletion',async()=>{

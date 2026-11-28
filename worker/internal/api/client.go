@@ -138,7 +138,7 @@ func checkCertPreflight() error {
 //
 // Callers must inspect resp.StatusCode for their own non-auth semantics (204, 404,
 // 4xx validation errors). 404 is NOT turned into ErrJobNotFound at this layer —
-// only CompleteTask interprets 404, and it does so explicitly.
+// CompleteTask and ReportPosterReady interpret job-scoped 404s explicitly.
 func doRequest(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
 	s := activeSession.Load()
 	if s == nil {

@@ -8,18 +8,18 @@ const { getPool } = require('../config/database');
  *   verify={issuedAt}-{base64_mac}
  *
  *   issuedAt   — Unix timestamp (seconds) when the token was issued
- *   base64_mac — HMAC-SHA256 of "{path}{issuedAt}", standard Base64
+ *   base64_mac — HMAC-SHA256 of "{path}{issuedAt}", URL-safe Base64 without padding
  *
  * HMAC message construction (must match WAF rule):
  *   message = path + issuedAt          e.g. "/abc.../def.../123456/1484063787"
  *   (path first, timestamp appended — no separator between them)
  *
  * Validity enforcement:
- *   Cloudflare WAF rule calls is_timed_hmac_valid_v0(..., lifetime_seconds, now, 8)
+ *   Cloudflare WAF validates the timed signature with its configured lifetime
  *   which blocks if now > issuedAt + lifetime_seconds.
  *   The lifetime_seconds is hardcoded in the WAF rule itself.
  *
- * The server stores a configurable "hmac_token_validity" setting (default 10800s / 3 hours)
+ * The server stores a configurable "hmac_token_validity" setting (default 600s / 10 minutes)
  * that is passed to the player client so it can proactively refresh before Cloudflare
  * rejects the token. This value does NOT affect token generation — only client-side
  * refresh timing.

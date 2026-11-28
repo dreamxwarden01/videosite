@@ -93,6 +93,7 @@ test('course deletion commits every cleanup intent before remote effects, includ
     const at=rows[0].at;
     assert.equal(rows.find(r=>r.target===hashB+'/').at-at,120000,'leased jobs retain the writer buffer even before video status advances');
     assert.equal(rows.find(r=>r.mode==='key').at-at,60000);
+    assert.equal(rows.find(r=>r.target==='posters/12/').at-at,120000,'early posters always retain the cancellation grace');
     assert.equal(f.events.filter(x=>x==='enqueue').length,6);
     assert.ok(f.events.lastIndexOf('enqueue')<f.events.indexOf('delete'));
     assert.ok(f.events.indexOf('commit')<f.events.findIndex(x=>x.startsWith('effect:')));

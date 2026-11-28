@@ -3,6 +3,7 @@ const { getClient } = require('../services/redis');
 const { workerSessionKey, WORKER_TTL_SECONDS, DIRTY_WORKER_SESSIONS } = require('../services/workerAuthService');
 const { getClientIp } = require('./auth');
 const { normalizeIP, ipMatchesSession } = require('../services/ipHelpers');
+const { isWorkerKeyId, isWorkerSessionId } = require('../lib/workerIdentity');
 
 // Bearer-token worker session middleware. Looks the token up in Redis first,
 // falls back to the worker_sessions DB row on miss (and warm-loads the cache),
@@ -31,11 +32,22 @@ async function requireWorkerSession(req, res, next) {
         // Hot path: Redis lookup.
         let cached = await redis.hgetall(cacheKey);
         let sessionId, keyId, ipAddress;
+        const identityComplete = () => isWorkerSessionId(sessionId) && isWorkerKeyId(keyId)
+            && typeof ipAddress === 'string' && ipAddress.length > 0 && ipAddress.length <= 64;
+        const rejectIncomplete = async () => {
+            // HSET after an expiry/revocation can leave a partial progress-only
+            // hash. It is not a worker identity and must never reach a nullable
+            // owner query or a DELETE with an absent session_id.
+            try { await redis.multi().del(cacheKey).srem(DIRTY_WORKER_SESSIONS, token).exec(); }
+            catch { console.warn('Incomplete worker session cache cleanup unavailable'); }
+            return res.status(401).json({ error: 'Session requires reauthentication' });
+        };
 
         if (cached && Object.keys(cached).length > 0) {
             sessionId = cached.session_id;
             keyId = cached.worker_key_id;
             ipAddress = cached.ip_address;
+            if (!identityComplete()) return rejectIncomplete();
         } else {
             // Cold path: DB lookup, warm Redis on success.
             const pool = getPool();
@@ -48,17 +60,18 @@ async function requireWorkerSession(req, res, next) {
                 return res.status(401).json({ error: 'Invalid token' });
             }
             const s = rows[0];
+            sessionId = s.session_id;
+            keyId = s.worker_key_id;
+            ipAddress = s.ip_address;
+            if (!identityComplete()) return rejectIncomplete();
             const lastSeenMs = new Date(s.last_seen).getTime();
+            if (!Number.isFinite(lastSeenMs)) return rejectIncomplete();
 
             // 1-hour absolute inactivity check against the DB row.
             if (Number.isFinite(lastSeenMs) && Date.now() - lastSeenMs > WORKER_TTL_SECONDS * 1000) {
                 await pool.execute('DELETE FROM worker_sessions WHERE session_id = ?', [s.session_id]);
                 return res.status(401).json({ error: 'Session expired' });
             }
-
-            sessionId = s.session_id;
-            keyId = s.worker_key_id;
-            ipAddress = s.ip_address;
 
             // Warm cache so the next request short-circuits.
             const remainingTtl = Math.max(60, Math.floor(WORKER_TTL_SECONDS - (Date.now() - lastSeenMs) / 1000));
@@ -105,7 +118,7 @@ async function requireWorkerSession(req, res, next) {
         req.worker = { keyId, sessionId };
         next();
     } catch (err) {
-        console.error('requireWorkerSession error:', err);
+        console.error('Worker authentication unavailable');
         return res.status(500).json({ error: 'Authentication error' });
     }
 }

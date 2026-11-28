@@ -4,6 +4,9 @@ const { getPool } = require('../config/database');
 const videoCache = require('./cache/videoCache');
 const transcodeCache = require('./cache/transcodeProgressCache');
 const queueCache = require('./cache/queueCache');
+const posterLifecycle = require('./posterLifecycle');
+const { legacyPosterKey, jobPosterKey } = require('./posterPaths');
+const { isWorkerKeyId } = require('../lib/workerIdentity');
 
 // Base62 12-char job ID generator (matches hashed_video_id family).
 // Collision probability in a 62^12 space is astronomically low (~10^-14 at
@@ -44,11 +47,19 @@ const STALE_TIMEOUT_MS = 2 * 60 * 1000;
 function startStaleTimer(jobId) {
     clearStaleTimer(jobId);
     const timerId = backgroundTasks.timeout(async () => {
-        staleTimers.delete(jobId);
+        if (staleTimers.get(jobId) !== timerId) return;
+        const stillCurrent = () => staleTimers.get(jobId) === timerId;
+        let retry = false;
         try {
-            await resetSingleStaleTask(jobId);
-        } catch (err) {
-            console.error(`Stale timer reset failed for job ${jobId}:`, err.message);
+            retry = (await resetSingleStaleTask(jobId, stillCurrent)).retry;
+        } catch {
+            retry = true;
+            console.error('Stale task check unavailable; retaining recovery timer');
+        } finally {
+            if (stillCurrent()) {
+                staleTimers.delete(jobId);
+                if (retry) startStaleTimer(jobId);
+            }
         }
     }, STALE_TIMEOUT_MS);
     // Don't let the timer keep the process alive on shutdown
@@ -67,56 +78,23 @@ function clearStaleTimer(jobId) {
 // Timer-triggered: reset a single stale job. Partial R2 segments under
 // `{hashed_video_id}/{job_id}/` are left in place — they'll be swept up at
 // video-delete time via the `{hashed_video_id}/` prefix in pending_deletes.
-// New attempts get a fresh job_id, so the orphaned subdirectory doesn't
-// interfere with playback.
-async function resetSingleStaleTask(jobId) {
-    const pool = getPool();
+// New attempts get a fresh job_id, so the orphaned subdirectory does not
+// interfere with playback. The separate poster key is retired on reset.
+async function readStaleHeartbeat(jobId) {
+    let timeout;
+    try {
+        return await Promise.race([
+            transcodeCache.getProgress(jobId).then(value => ({ available: true, value })),
+            new Promise(resolve => { timeout = setTimeout(() => resolve({ available: false }), 1000); }),
+        ]);
+    } catch { return { available: false }; }
+    finally { clearTimeout(timeout); }
+}
 
-    // Double-check staleness via Redis (the source of truth for live workers).
-    // The in-process timer fires after STALE_TIMEOUT_MS of no in-process
-    // heartbeat, but a late heartbeat could have just landed in Redis between
-    // the timer schedule and now — so we re-read last_heartbeat from cache.
-    const cached = await transcodeCache.getProgress(jobId);
-    if (cached && cached.last_heartbeat && Date.now() - cached.last_heartbeat < STALE_TIMEOUT_MS) {
-        return; // Heartbeat is fresh — not stale.
-    }
-
-    // Get task details
-    const [rows] = await pool.execute(
-        `SELECT pq.video_id, pq.job_id
-         FROM processing_queue pq
-         WHERE pq.job_id = ? AND pq.status IN ('leased', 'processing')`,
-        [jobId]
-    );
-
-    if (rows.length === 0) return; // Already completed/reset
-
-    const task = rows[0];
-
-    const [result] = await pool.execute(
-        `UPDATE processing_queue
-         SET status = 'queued', job_id = NULL, worker_key_id = NULL,
-             leased_at = NULL, last_heartbeat = NULL, pending_until = NULL,
-             progress = 0, error_message = NULL, error_at = NULL
-         WHERE job_id = ? AND status IN ('leased', 'processing')`,
-        [jobId]
-    );
-
-    if (result.affectedRows === 0) return; // Job state changed concurrently.
-
-    console.log(`Stale timer: reset job ${jobId} (video ${task.video_id})`);
-
-    // Reset video status and clear encryption key
-    await pool.execute(
-        `UPDATE videos
-         SET status = 'queued', processing_progress = 0,
-             processing_error = NULL, processing_job_id = NULL, encryption_key = NULL
-         WHERE video_id = ? AND status IN ('worker_downloading', 'processing', 'worker_uploading')`,
-        [task.video_id]
-    );
-    await videoCache.invalidate(task.video_id);
-    await transcodeCache.clearJob(jobId);
-    await queueCache.markHasWork();
+async function resetSingleStaleTask(jobId, timerCurrent) {
+    let retry = false;
+    await resetJob(jobId, { source: 'stale_task', timerCurrent, onUncertain: () => { retry = true; } });
+    return { retry };
 }
 
 async function createTask(videoId) {
@@ -128,179 +106,117 @@ async function createTask(videoId) {
     await queueCache.markHasWork();
 }
 
-async function updateTaskStatus(jobId, status, progress = null, errorMessage = null) {
-    const pool = getPool();
-
-    // Update processing queue
-    const fields = ['status = ?', 'last_heartbeat = NOW()'];
-    const values = [status];
-
-    if (progress !== null) {
-        fields.push('progress = ?');
-        values.push(progress);
-    }
-    if (errorMessage !== null) {
-        fields.push('error_message = ?');
-        values.push(errorMessage);
-    }
-    values.push(jobId);
-
-    // Guard: never downgrade a terminal state (completed / error) back to a
-    // processing state. Stale worker status reports can race with a successful
-    // /tasks/complete when the same worker holds another in-flight job — the
-    // job that just completed may still be in the worker's next /tasks/status
-    // batch because the job goroutine hasn't finished its defer cleanup yet.
-    // Without this guard that batch would flip the row from 'completed' back
-    // to 'processing', re-arm the stale timer, and 2 minutes later the stale
-    // sweep would wipe the already-uploaded HLS output from R2.
-    //
-    // Admin-driven resets (retryFailedVideo, video replace) update the queue
-    // row directly and don't route through updateTaskStatus, so they're
-    // unaffected by this guard.
-    const [result] = await pool.execute(
-        `UPDATE processing_queue SET ${fields.join(', ')}
-         WHERE job_id = ? AND status NOT IN ('completed', 'error')`,
-        values
-    );
-
-    // affectedRows === 0 means either the job_id doesn't exist OR the row is
-    // already in a terminal state. Either way, tell the worker to drop the
-    // job — there's nothing left to update on the server side.
-    if (result.affectedRows === 0) {
-        return { found: false };
-    }
-
-    // Map queue status to video status
-    const statusMap = {
-        'leased': 'worker_downloading',
-        'processing': 'processing',
-        'completed': 'finished',
-        'error': 'error'
-    };
-
-    // Also update video status
-    const [task] = await pool.execute(
-        'SELECT video_id FROM processing_queue WHERE job_id = ?',
-        [jobId]
-    );
-
-    if (task.length > 0) {
-        const videoUpdates = {};
-        if (statusMap[status]) videoUpdates.status = statusMap[status];
-        if (progress !== null) videoUpdates.processing_progress = progress;
-        if (errorMessage !== null) videoUpdates.processing_error = errorMessage;
-
-        const updateFields = [];
-        const updateValues = [];
-        if (videoUpdates.status) { updateFields.push('status = ?'); updateValues.push(videoUpdates.status); }
-        if (videoUpdates.processing_progress !== undefined) { updateFields.push('processing_progress = ?'); updateValues.push(videoUpdates.processing_progress); }
-        if (videoUpdates.processing_error !== undefined) { updateFields.push('processing_error = ?'); updateValues.push(videoUpdates.processing_error); }
-
-        if (updateFields.length > 0) {
-            updateValues.push(task[0].video_id);
-            await pool.execute(
-                `UPDATE videos SET ${updateFields.join(', ')} WHERE video_id = ?`,
-                updateValues
-            );
-        }
-    }
-
-    // Restart or clear stale timer based on status
-    if (status === 'leased' || status === 'processing') {
-        startStaleTimer(jobId);
-    } else {
-        clearStaleTimer(jobId);
-    }
-
-    return { found: true };
+async function finishTaskEffects(videoId, jobId, requeue = false) {
+    if (jobId) clearStaleTimer(jobId);
+    const work = [() => videoCache.invalidate(videoId)];
+    if (jobId) work.push(() => transcodeCache.clearJob(jobId));
+    if (requeue) work.push(() => queueCache.markHasWork());
+    const results = await Promise.allSettled(work.map(run => Promise.resolve().then(run)));
+    const failed = results.find(result => result.status === 'rejected');
+    if (failed) throw failed.reason;
 }
 
-async function completeTask(jobId, durationSeconds = null, hasPoster = false) {
-    clearStaleTimer(jobId);
-    await transcodeCache.clearJob(jobId);
-    const pool = getPool();
+async function updateTaskStatus(jobId, status, progress = null, errorMessage = null, workerKeyId = null) {
+    if (!isWorkerKeyId(workerKeyId)) return { found: false };
+    if (status === 'error') return reportError(jobId, errorMessage || 'Unknown error', workerKeyId);
+    if (!['leased', 'processing'].includes(status)) return { found: false };
+    const result = await posterLifecycle.withCurrentJob(jobId, workerKeyId, async (db, video, job) => {
+        if (!posterLifecycle.ACTIVE.has(job.status) || !posterLifecycle.ACTIVE_VIDEO.has(video.status)) return null;
+        await db.execute(`UPDATE processing_queue SET status=?,last_heartbeat=NOW(),
+            progress=COALESCE(?,progress),error_message=COALESCE(?,error_message) WHERE task_id=?`,
+        [status, progress, errorMessage, job.task_id]);
+        await db.execute(`UPDATE videos SET status=?,processing_progress=COALESCE(?,processing_progress),
+            processing_error=COALESCE(?,processing_error) WHERE video_id=?`,
+        [status === 'leased' ? 'worker_downloading' : 'processing', progress, errorMessage, video.video_id]);
+        return { videoId: video.video_id };
+    });
+    if (result) { await videoCache.invalidate(result.videoId); startStaleTimer(jobId); }
+    return { found: !!result };
+}
 
-    const [result] = await pool.execute(
-        "UPDATE processing_queue SET status = 'completed', progress = 100, last_heartbeat = NOW() WHERE job_id = ?",
-        [jobId]
-    );
-
-    // Job not found — 404 signals abort to worker
-    if (result.affectedRows === 0) {
-        return false;
-    }
-
-    const [task] = await pool.execute(
-        'SELECT video_id FROM processing_queue WHERE job_id = ?',
-        [jobId]
-    );
-
-    if (task.length > 0) {
-        const fields = ["status = 'finished'", 'processing_progress = 100'];
-        const values = [];
-        if (durationSeconds !== null) {
-            fields.push('duration_seconds = ?');
-            values.push(durationSeconds);
-        }
-        // Only flip has_poster on true. Worker omits the field when the
-        // poster step failed; we leave the column at its default 0 so the
-        // list page falls back to the play-icon for that video.
+async function completeTask(jobId, durationSeconds = null, hasPoster = false, workerKeyId = null) {
+    if (!isWorkerKeyId(workerKeyId)) return false;
+    const result = await posterLifecycle.withCurrentJob(jobId, workerKeyId, async (db, video, job) => {
+        if (job.status === 'completed') return video.status === 'finished' ? { videoId: video.video_id } : null;
+        if (!posterLifecycle.ACTIVE.has(job.status) || !posterLifecycle.ACTIVE_VIDEO.has(video.status)) return null;
+        let posterPath = video.poster_path;
         if (hasPoster) {
-            fields.push('has_poster = 1');
+            // Old workers report only at completion. A pre-upgrade signed PUT
+            // has no planned path and therefore used the legacy stable key.
+            posterPath = posterPath || legacyPosterKey(video.course_id, video.video_id);
+            const expected = jobPosterKey(video.course_id, video.video_id, jobId);
+            if (posterPath !== expected && posterPath !== legacyPosterKey(video.course_id, video.video_id)) {
+                throw new Error('invalid_poster_generation');
+            }
         }
-        values.push(task[0].video_id);
-
-        await pool.execute(
-            `UPDATE videos SET ${fields.join(', ')} WHERE video_id = ?`,
-            values
-        );
-
-        // Clean up R2 source file (fire-and-forget — don't block completion)
-        backgroundTasks.track(cleanupSourceFile(task[0].video_id)).catch(err => {
-            console.warn(`R2 source cleanup failed for video ${task[0].video_id} (job ${jobId}):`, err.message);
-        });
-    }
-
+        // Capture source cleanup in this commit. A later replacement must not
+        // have its new source removed by an asynchronous video-id-only lookup.
+        if (video.r2_source_key) {
+            const match = /^source\/([A-Za-z0-9]{12})\/source\.[^/]+$/.exec(video.r2_source_key);
+            if (!match) throw new Error('invalid_source_cleanup_target');
+            await require('./deletionService').enqueuePrefix(`source/${match[1]}/`, {
+                connection: db, source: 'transcode_completed',
+            });
+        }
+        await db.execute(`UPDATE processing_queue SET status='completed',progress=100,last_heartbeat=NOW() WHERE task_id=?`, [job.task_id]);
+        await db.execute(`UPDATE videos SET status='finished',processing_progress=100,
+            duration_seconds=COALESCE(?,duration_seconds),has_poster=IF(?,1,has_poster),
+            poster_path=?,r2_source_key=NULL WHERE video_id=?`,
+        [durationSeconds, hasPoster ? 1 : 0, posterPath, video.video_id]);
+        return { videoId: video.video_id };
+    });
+    if (!result) return false;
+    await finishTaskEffects(result.videoId, jobId);
     return true;
 }
 
-// Enqueue the original source file's prefix for deletion after transcoding
-// completes. The DB pointer is cleared inline; the actual R2 sweep happens
-// in the deletion reaper (retry-capable, survives server restarts).
-async function cleanupSourceFile(videoId) {
-    const pool = getPool();
-    const deletionService = require('./deletionService');
-
-    const [rows] = await pool.execute(
-        `SELECT r2_source_key FROM videos WHERE video_id = ?`,
-        [videoId]
-    );
-
-    if (rows.length === 0 || !rows[0].r2_source_key) {
-        return;
+async function reportError(jobId, errorMessage, workerKeyId = null) {
+    if (!isWorkerKeyId(workerKeyId)) return { found: false };
+    const result = await posterLifecycle.withCurrentJob(jobId, workerKeyId, async (db, video, job) => {
+        if (job.status === 'error') return video.status === 'error' ? { videoId: video.video_id } : null;
+        if (!posterLifecycle.ACTIVE.has(job.status) || !posterLifecycle.ACTIVE_VIDEO.has(video.status)) return null;
+        await posterLifecycle.resetPoster(db, video, 'transcode_failed');
+        await db.execute(`UPDATE processing_queue SET status='error',last_heartbeat=NOW(),
+            error_message=?,error_at=NOW() WHERE task_id=?`, [errorMessage, job.task_id]);
+        await db.execute(`UPDATE videos SET status='error',processing_error=? WHERE video_id=?`, [errorMessage, video.video_id]);
+        return { videoId: video.video_id };
+    });
+    if (result) {
+        await finishTaskEffects(result.videoId, jobId);
     }
-
-    // Derive directory from r2_source_key (e.g. "source/{upload_id}/source.mp4" → "source/{upload_id}/")
-    const sourceKey = rows[0].r2_source_key;
-    const sourceDir = sourceKey.substring(0, sourceKey.lastIndexOf('/') + 1);
-    await deletionService.enqueuePrefix(sourceDir, { source: 'transcode_completed' });
-
-    await pool.execute(
-        'UPDATE videos SET r2_source_key = NULL WHERE video_id = ?',
-        [videoId]
-    );
+    return { found: !!result };
 }
 
-async function reportError(jobId, errorMessage) {
-    const pool = getPool();
-    const result = await updateTaskStatus(jobId, 'error', null, errorMessage);
-    if (!result.found) return { found: false };
-    // Set error_at timestamp for transcoding status page sorting
-    await pool.execute(
-        'UPDATE processing_queue SET error_at = NOW() WHERE job_id = ?',
-        [jobId]
-    );
-    return { found: true };
+async function resetJob(jobId, { workerKeyId = null, source = 'transcode_aborted', timerCurrent = null, onUncertain = null } = {}) {
+    const result = await posterLifecycle.withCurrentJob(jobId, workerKeyId, async (db, video, job) => {
+        if ((!posterLifecycle.ACTIVE.has(job.status) && job.status !== 'aborted') || !posterLifecycle.ACTIVE_VIDEO.has(video.status)) return null;
+        if (source === 'stale_task') {
+            // The only cache read under these locks is strictly bounded. A
+            // heartbeat may have arrived while the SQL lock was unavailable.
+            const check = await readStaleHeartbeat(jobId);
+            if (!check.available) { onUncertain?.(); return null; }
+            if (timerCurrent && !timerCurrent()) return null;
+            const latest = check.value;
+            // Polling lacks a local no-heartbeat proof. A still-current timer
+            // can recover a dead job after Redis lost its marker; a newer local
+            // heartbeat replaces that timer and fences this callback.
+            if (!latest) {
+                if (!timerCurrent || !timerCurrent()) return null;
+            } else if (!Number.isFinite(latest.last_heartbeat) || latest.last_heartbeat <= 0) {
+                onUncertain?.(); return null;
+            } else if (Date.now() - latest.last_heartbeat <= STALE_TIMEOUT_MS) return null;
+        }
+        await posterLifecycle.resetPoster(db, video, source);
+        await db.execute(`UPDATE processing_queue SET status='queued',job_id=NULL,worker_key_id=NULL,
+            leased_at=NULL,last_heartbeat=NULL,pending_until=NULL,progress=0,error_message=NULL,error_at=NULL
+            WHERE task_id=?`, [job.task_id]);
+        await db.execute(`UPDATE videos SET status='queued',processing_progress=0,processing_error=NULL,
+            processing_job_id=NULL,encryption_key=NULL WHERE video_id=?`, [video.video_id]);
+        return { videoId: video.video_id };
+    });
+    if (!result) return false;
+    await finishTaskEffects(result.videoId, jobId, true);
+    return true;
 }
 
 // Reset expired pending tasks (check-then-lease timeout)
@@ -367,57 +283,41 @@ async function reserveTasks(maxCount) {
 // include status: "leased" (full spec), "taken" (lost the race), or "notfound"
 // (videoId not in queue). Called directly and via the batched leaseTasks wrapper.
 async function leaseTask(videoId, workerKeyId) {
+    if (!isWorkerKeyId(workerKeyId)) return { videoId, status: 'notfound' };
     const pool = getPool();
 
     const jobId = await generateJobId();
 
-    // Atomically update pending → leased for this specific video
-    const [result] = await pool.execute(
-        `UPDATE processing_queue
-         SET status = 'leased', job_id = ?, worker_key_id = ?, leased_at = NOW(),
-             last_heartbeat = NOW(), pending_until = NULL
-         WHERE video_id = ? AND status = 'pending'`,
-        [jobId, workerKeyId, videoId]
-    );
-
-    if (result.affectedRows === 0) {
-        // Either the row is not pending (lost the race) or doesn't exist at all.
-        const [existRows] = await pool.execute(
-            'SELECT 1 FROM processing_queue WHERE video_id = ? LIMIT 1',
-            [videoId]
-        );
-        return { videoId, status: existRows.length > 0 ? 'taken' : 'notfound' };
-    }
-
-    // Get task details for download URL generation
-    const [rows] = await pool.execute(
-        `SELECT pq.*, v.course_id, v.hashed_video_id, v.r2_source_key, v.original_filename, v.video_type
-         FROM processing_queue pq
-         JOIN videos v ON pq.video_id = v.video_id
-         WHERE pq.job_id = ?`,
-        [jobId]
-    );
-
-    if (rows.length === 0) {
-        return { isLeaseSuccess: false, jobId: null, downloadUrl: null };
-    }
-
-    const task = rows[0];
-
-    // The worker only processes CMAF jobs now — legacy TS support was removed
-    // when the last in-flight TS job drained. Already-finished video_type='ts'
-    // rows still serve via /api/keys for playback, but no new TS work enters
-    // the pipeline. Clear any stale key column on every lease so the row's
-    // shape matches the unencrypted CMAF output.
-    await pool.execute(
-        "UPDATE videos SET status = 'worker_downloading', processing_job_id = ?, encryption_key = NULL WHERE video_id = ?",
-        [jobId, task.video_id]
-    );
+    const task = await posterLifecycle.withVideo(videoId, async (db, video, jobs) => {
+        if (jobs.length !== 1 || jobs[0].status !== 'pending') return { unavailable: true };
+        const job = jobs[0];
+        await posterLifecycle.resetPoster(db, video, 'poster_lease_reset');
+        await db.execute(`UPDATE processing_queue SET status='leased',job_id=?,worker_key_id=?,
+            leased_at=NOW(),last_heartbeat=NOW(),pending_until=NULL WHERE task_id=?`,
+        [jobId, workerKeyId, job.task_id]);
+        await db.execute(`UPDATE videos SET status='worker_downloading',processing_job_id=?,
+            encryption_key=NULL WHERE video_id=?`, [jobId, video.video_id]);
+        return { ...job, ...video, job_id: jobId, worker_key_id: workerKeyId };
+    });
+    if (!task) return { videoId, status: 'notfound' };
+    if (task.unavailable) return { videoId, status: 'taken' };
+    startStaleTimer(jobId);
     await videoCache.invalidate(task.video_id);
 
-    // Seed the heartbeat cache. Subsequent /worker/tasks/status (running)
-    // hits HEXISTS this key as the "is the job alive" gate — no DB query.
+    // Seed the coalesced progress cache. Status RPCs perform one batched SQL
+    // authority read, then write their running progress only to Redis.
     await transcodeCache.initOnLease(jobId, task.video_id, task.hashed_video_id, task.course_id, 'leased', 'worker_downloading');
+    // A reset/replacement can commit between lease commit and this Redis write.
+    // Recheck after warming: either it clears our marker after this point, or
+    // this check observes retirement and removes the late marker itself.
+    const [stillCurrent] = await pool.execute(`SELECT 1 FROM processing_queue pq JOIN videos v ON v.video_id=pq.video_id
+        WHERE pq.job_id=? AND pq.worker_key_id=? AND pq.status IN ('leased','processing')
+          AND v.processing_job_id=pq.job_id`, [jobId, workerKeyId]);
+    if (!stillCurrent.length) {
+        clearStaleTimer(jobId);
+        await transcodeCache.clearJob(jobId);
+        return { videoId, status: 'notfound' };
+    }
 
     // Generate presigned download URL
     const { GetObjectCommand } = require('@aws-sdk/client-s3');
@@ -500,11 +400,13 @@ async function leaseTasks(videoIds, workerKeyId) {
 // Handle a batched status report from the worker.
 // Each entry is { jobId, status, stage?, progress?, errorMessage? }:
 //   - running  → updateTaskStatus (maps stage → queue/video status)
-//   - failed   → reportError (moves to 'error', increments attempts via existing logic)
+//   - failed   → reportError (moves to 'error' and retires its poster atomically)
 //   - aborted  → abortAndRequeue (requeue without counting as a fault)
 // Returns a parallel array of { jobId, ack } so the worker can drop unknown ids.
-async function reportJobStatuses(jobs) {
+async function reportJobStatuses(jobs, workerKeyId = null) {
+    if (!isWorkerKeyId(workerKeyId)) return Array.isArray(jobs) ? jobs.map(job => ({ jobId: typeof job?.jobId === 'string' ? job.jobId : null, ack: false })) : [];
     if (!Array.isArray(jobs) || jobs.length === 0) return [];
+    if (jobs.length > 256) throw new Error('status_batch_too_large');
 
     // Map stage keyword → (queue_status, video_status)
     const stageMap = {
@@ -514,17 +416,33 @@ async function reportJobStatuses(jobs) {
         uploading:   { queue: 'processing', video: 'worker_uploading' }
     };
 
+    // One authority read per batched RPC. Progress writes remain coalesced in
+    // Redis; a surviving old cache entry cannot keep a retired writer alive.
+    const ids = [...new Set(jobs.map(job => job?.jobId).filter(id => typeof id === 'string' && /^[A-Za-z0-9]{12}$/.test(id)))];
+    const current = new Map();
+    if (ids.length) {
+        const [rows] = await getPool().execute(`SELECT pq.job_id,pq.video_id,pq.status,pq.worker_key_id,
+            v.course_id,v.hashed_video_id,v.status AS video_status FROM processing_queue pq
+            JOIN videos v ON v.video_id=pq.video_id
+            WHERE pq.job_id IN (${ids.map(() => '?').join(',')}) AND v.processing_job_id=pq.job_id
+              AND (? IS NULL OR pq.worker_key_id=?)`, [...ids, workerKeyId, workerKeyId]);
+        for (const row of rows) current.set(row.job_id, current.has(row.job_id) ? null : row);
+    }
     const results = [];
     for (const job of jobs) {
         if (!job || !job.jobId) { results.push({ jobId: null, ack: false }); continue; }
         const { jobId, status } = job;
+        const authoritative = current.get(jobId);
+        if (!authoritative) { results.push({ jobId, ack: false }); continue; }
         let found = false;
         try {
             if (status === 'running') {
-                // Heartbeat hot path: write to Redis only. The cache's
-                // existence (set on lease, cleared on terminal/abort/delete)
-                // is the alive-gate — no DB query per heartbeat. The flusher
-                // drains dirty:transcode every 15 min into processing_queue.
+                if (!posterLifecycle.ACTIVE.has(authoritative.status)
+                    || !posterLifecycle.ACTIVE_VIDEO.has(authoritative.video_status)) {
+                    results.push({ jobId, ack: false }); continue;
+                }
+                // Heartbeat writes remain Redis-only. The batched SQL snapshot
+                // above establishes current lease ownership and attempt identity.
                 const stageKey = (job.stage || '').toLowerCase();
                 const mapped = stageMap[stageKey] || stageMap.processing;
                 const progress = typeof job.progress === 'number' ? job.progress : null;
@@ -533,17 +451,15 @@ async function reportJobStatuses(jobs) {
                     jobId, mapped.queue, mapped.video, progress, stageKey || 'processing'
                 );
 
-                // Cache miss path: Redis may have cold-restarted while a
-                // healthy worker was still running. Re-check the DB; if the
-                // job exists and isn't terminal, warm the cache and proceed.
+                // Warm from this RPC's current-owner snapshot on cache loss.
+                // A reset racing this write is caught by the next authority read;
+                // it cannot keep an old job alive indefinitely through Redis.
                 if (!found) {
-                    const task = await getTaskByJobId(jobId);
-                    if (task && task.status !== 'completed' && task.status !== 'error') {
-                        await transcodeCache.initOnLease(jobId, task.video_id, task.hashed_video_id, task.course_id, mapped.queue, mapped.video);
-                        found = await transcodeCache.recordHeartbeat(
-                            jobId, mapped.queue, mapped.video, progress, stageKey || 'processing'
-                        );
-                    }
+                    await transcodeCache.initOnLease(jobId, authoritative.video_id, authoritative.hashed_video_id,
+                        authoritative.course_id, mapped.queue, mapped.video);
+                    found = await transcodeCache.recordHeartbeat(
+                        jobId, mapped.queue, mapped.video, progress, stageKey || 'processing'
+                    );
                 }
 
                 // Refresh the in-process stale timer so an abandoned worker
@@ -551,12 +467,10 @@ async function reportJobStatuses(jobs) {
                 if (found) startStaleTimer(jobId);
             } else if (status === 'failed') {
                 // Terminal: write DB immediately, drop the cache.
-                const r = await reportError(jobId, job.errorMessage || 'Unknown error');
+                const r = await reportError(jobId, job.errorMessage || 'Unknown error', workerKeyId);
                 found = !!r.found;
-                await transcodeCache.clearJob(jobId);
             } else if (status === 'aborted') {
-                found = await abortAndRequeue(jobId);
-                await transcodeCache.clearJob(jobId);
+                found = await abortAndRequeue(jobId, workerKeyId);
             } else {
                 // Unknown status value — treat as ack:false so worker drops it.
                 found = false;
@@ -610,42 +524,32 @@ function contentTypeForFile(filename) {
     return 'application/octet-stream';
 }
 
-// Generate presigned PUT URLs for uploading HLS output files.
-// Reads hashed_video_id (+ course_id, video_id for the poster rewrite) from
-// the transcode-progress cache (populated by initOnLease) to avoid the JOIN
-// on every upload-URL batch. Falls back to DB on cache miss (e.g. Redis
-// cold-restart before any heartbeat).
+// Generate presigned PUT URLs for uploading HLS output files. Each batch checks
+// the current SQL lease and owner, including media-only batches after the early
+// poster. Signing runs after releasing locks; no storage call is made in SQL.
 //
 // Key layout per filename:
-//   - "poster.jpg" → `posters/{course_id}/{video_id}.jpg` (stable per-video
-//      location so a re-encode overwrites in place, and course delete can
-//      sweep `posters/{course_id}/` as one prefix).
+//   - "poster.jpg" → `posters/{course_id}/{video_id}/{job_id}.jpg`, prepared
+//      under the current-lease lock before a URL is issued. Readiness is separate
+//      from this planned path; late cleanup never targets a newer generation.
 //   - everything else → `{hashed_video_id}/{job_id}/{filename}` (job-scoped
 //      so retries land in a fresh subtree and orphans clear when the parent
 //      hash prefix is reaped).
-async function generateUploadUrls(jobId, filenames) {
-    let hashedVideoId = null;
-    let courseId = null;
-    let videoId = null;
-    const cached = await transcodeCache.getProgress(jobId);
-    if (cached && cached.hashed_video_id) {
-        hashedVideoId = cached.hashed_video_id;
-        courseId = cached.course_id;
-        videoId = cached.video_id;
-    } else {
-        const pool = getPool();
-        const [rows] = await pool.execute(
-            `SELECT v.video_id, v.course_id, v.hashed_video_id
-             FROM processing_queue pq
-             JOIN videos v ON pq.video_id = v.video_id
-             WHERE pq.job_id = ?`,
-            [jobId]
-        );
-        if (rows.length === 0) return null;
-        hashedVideoId = rows[0].hashed_video_id;
-        courseId = rows[0].course_id;
-        videoId = rows[0].video_id;
+async function generateUploadUrls(jobId, filenames, workerKeyId = null) {
+    if (!isWorkerKeyId(workerKeyId)) return null;
+    let poster = null;
+    if (filenames.includes('poster.jpg')) {
+        poster = await posterLifecycle.preparePosterUpload(jobId, workerKeyId);
+        if (!poster) return null;
     }
+    // Redis progress is an overlay, not authority to mint new write URLs. A
+    // stale cache surviving reset must not re-authorize an old attempt.
+    const current = await posterLifecycle.withCurrentJob(jobId, workerKeyId, async (_db, video, job) => {
+        if (!posterLifecycle.ACTIVE.has(job.status) || !posterLifecycle.ACTIVE_VIDEO.has(video.status)) return null;
+        return { hashedVideoId: video.hashed_video_id, courseId: video.course_id, videoId: video.video_id };
+    });
+    if (!current) return null;
+    const { hashedVideoId, courseId, videoId } = current;
 
     const { PutObjectCommand } = require('@aws-sdk/client-s3');
     const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
@@ -656,8 +560,8 @@ async function generateUploadUrls(jobId, filenames) {
     const urls = {};
 
     for (const filename of filenames) {
-        const key = (filename === 'poster.jpg' && courseId != null && videoId != null)
-            ? `posters/${courseId}/${videoId}.jpg`
+        const key = filename === 'poster.jpg'
+            ? poster.key
             : `${hashedVideoId}/${jobId}/${filename}`;
         const contentType = contentTypeForFile(filename);
         const command = new PutObjectCommand({ Bucket: bucket, Key: key, ContentType: contentType, CacheControl: 'public, max-age=31536000, immutable' });
@@ -673,59 +577,19 @@ async function generateUploadUrls(jobId, filenames) {
 // to its own subdirectory. Orphans get swept at video-delete time via the
 // hash-prefix entry in pending_deletes.
 async function retryFailedVideo(videoId) {
-    const pool = getPool();
-
-    // Get video info — must be in error status to retry
-    const [videoRows] = await pool.execute(
-        `SELECT processing_job_id, hashed_video_id
-         FROM videos
-         WHERE video_id = ? AND status = 'error'`,
-        [videoId]
-    );
-
-    if (videoRows.length === 0) {
-        return false; // Not found or not in error state
-    }
-
-    const { processing_job_id: oldJobId } = videoRows[0];
-
-    // Reset the processing_queue row back to queued (brings it to the back of the queue)
-    const [result] = await pool.execute(
-        `UPDATE processing_queue
-         SET status = 'queued',
-             job_id = NULL,
-             worker_key_id = NULL,
-             leased_at = NULL,
-             last_heartbeat = NULL,
-             pending_until = NULL,
-             progress = 0,
-             error_message = NULL,
-             error_at = NULL,
-             cleared = 0,
-             created_at = NOW()
-         WHERE video_id = ? AND status = 'error'`,
-        [videoId]
-    );
-
-    if (result.affectedRows === 0) {
-        return false;
-    }
-
-    // Reset the video status and clear encryption key
-    await pool.execute(
-        `UPDATE videos
-         SET status = 'queued',
-             processing_progress = 0,
-             processing_error = NULL,
-             processing_job_id = NULL,
-             encryption_key = NULL
-         WHERE video_id = ?`,
-        [videoId]
-    );
-    await videoCache.invalidate(videoId);
-    if (oldJobId) await transcodeCache.clearJob(oldJobId);
-    await queueCache.markHasWork();
-
+    const result = await posterLifecycle.withVideo(videoId, async (db, video, jobs) => {
+        if (video.status !== 'error' || jobs.length !== 1 || jobs[0].status !== 'error') return null;
+        const job = jobs[0];
+        await posterLifecycle.resetPoster(db, video, 'transcode_retry');
+        await db.execute(`UPDATE processing_queue SET status='queued',job_id=NULL,worker_key_id=NULL,
+            leased_at=NULL,last_heartbeat=NULL,pending_until=NULL,progress=0,error_message=NULL,error_at=NULL,
+            cleared=0,created_at=NOW() WHERE task_id=?`, [job.task_id]);
+        await db.execute(`UPDATE videos SET status='queued',processing_progress=0,processing_error=NULL,
+            processing_job_id=NULL,encryption_key=NULL WHERE video_id=?`, [video.video_id]);
+        return { videoId: video.video_id, jobId: job.job_id };
+    });
+    if (!result) return false;
+    await finishTaskEffects(result.videoId, result.jobId, true);
     return true;
 }
 
@@ -753,11 +617,16 @@ async function resetStaleTasks() {
     const now = Date.now();
     const staleTasks = [];
     for (const task of inFlight) {
-        const cached = await transcodeCache.getProgress(task.job_id);
-        // If cache is missing entirely (e.g. Redis restart), be conservative
-        // and skip — the worker's next heartbeat will repopulate via the
-        // recordHeartbeat fallback path.
-        if (!cached || !cached.last_heartbeat) continue;
+        const check = await readStaleHeartbeat(task.job_id);
+        if (!check.available) { if (!staleTimers.has(task.job_id)) startStaleTimer(task.job_id); continue; }
+        const cached = check.value;
+        // A miss is not immediate evidence of death. Arm a local no-heartbeat
+        // window if none survived restart; a healthy worker's next batch replaces
+        // it. This also recovers leases whose initial Redis write failed.
+        if (!cached || !cached.last_heartbeat) {
+            if (!staleTimers.has(task.job_id)) startStaleTimer(task.job_id);
+            continue;
+        }
         if (now - cached.last_heartbeat > STALE_TIMEOUT_MS) staleTasks.push(task);
     }
 
@@ -765,34 +634,10 @@ async function resetStaleTasks() {
 
     let resetCount = 0;
     for (const task of staleTasks) {
-        const [result] = await pool.execute(
-            `UPDATE processing_queue
-             SET status = 'queued', job_id = NULL, worker_key_id = NULL,
-                 leased_at = NULL, last_heartbeat = NULL, pending_until = NULL,
-                 progress = 0, error_message = NULL, error_at = NULL
-             WHERE job_id = ? AND status IN ('leased', 'processing')`,
-            [task.job_id]
-        );
-
-        if (result.affectedRows === 0) continue; // Job state changed concurrently.
-
-        resetCount++;
-        clearStaleTimer(task.job_id);
-        console.log(`Stale poll: reset job ${task.job_id} (video ${task.video_id})`);
-
-        // Reset video status and clear encryption key
-        await pool.execute(
-            `UPDATE videos
-             SET status = 'queued', processing_progress = 0,
-                 processing_error = NULL, processing_job_id = NULL, encryption_key = NULL
-             WHERE video_id = ? AND status IN ('worker_downloading', 'processing', 'worker_uploading')`,
-            [task.video_id]
-        );
-        await videoCache.invalidate(task.video_id);
-        await transcodeCache.clearJob(task.job_id);
+        // resetJob rechecks freshness after acquiring the SQL locks.
+        if (await resetJob(task.job_id, { source: 'stale_task' })) resetCount++;
     }
 
-    if (resetCount > 0) await queueCache.markHasWork();
     return resetCount;
 }
 
@@ -812,62 +657,73 @@ async function getTaskByJobId(jobId) {
 // Partial R2 output from the aborted job stays under
 // `{hashed_video_id}/{job_id}/` — the requeue picks up a new job_id on next
 // lease and writes to a fresh subdirectory. Orphans get swept at
-// video-delete time via the hash-prefix entry in pending_deletes.
-async function abortAndRequeue(jobId) {
-    clearStaleTimer(jobId);
-    const pool = getPool();
+// video-delete time via the hash-prefix entry in pending_deletes. Posters are
+// retired separately in the same reset transaction.
+async function abortAndRequeue(jobId, workerKeyId = null) {
+    if (!isWorkerKeyId(workerKeyId)) return false;
+    return resetJob(jobId, { workerKeyId });
+}
 
-    const [taskRows] = await pool.execute(
-        `SELECT pq.video_id, pq.job_id
-         FROM processing_queue pq
-         WHERE pq.job_id = ?`,
-        [jobId]
-    );
-
-    if (taskRows.length === 0) {
-        return false;
-    }
-
-    const { video_id, job_id } = taskRows[0];
-
-    // Reset processing_queue row back to queued
-    await pool.execute(
-        `UPDATE processing_queue
-         SET status = 'queued',
-             job_id = NULL,
-             worker_key_id = NULL,
-             leased_at = NULL,
-             last_heartbeat = NULL,
-             pending_until = NULL,
-             progress = 0,
-             error_message = NULL,
-             error_at = NULL
-         WHERE job_id = ? AND status IN ('leased', 'processing', 'aborted')`,
-        [jobId]
-    );
-
-    // Reset video status back to queued and clear encryption key
-    await pool.execute(
-        `UPDATE videos
-         SET status = 'queued',
-             processing_progress = 0,
-             processing_error = NULL,
-             processing_job_id = NULL,
-             encryption_key = NULL
-         WHERE video_id = ?`,
-        [video_id]
-    );
-    await videoCache.invalidate(video_id);
-    await transcodeCache.clearJob(job_id);
-    await queueCache.markHasWork();
-
+// Replacement commits source/attempt state, poster retirement, old-output
+// cleanup and the upload-session receipt together. No R2 request occurs here.
+async function replaceVideoSource(session, actualSize, receiptOnly = false) {
+    const result = await posterLifecycle.withVideo(session.video_id, async (db, video, jobs) => {
+        const [[upload]] = await db.execute('SELECT * FROM upload_sessions WHERE upload_id=? FOR UPDATE', [session.upload_id]);
+        if (!upload || Number(upload.video_id) !== Number(video.video_id)
+            || upload.object_key !== session.object_key || !['completing', 'completed'].includes(upload.status)) return null;
+        if (upload.status === 'completed') return { videoId: video.video_id, oldJobs: [], replayed: true };
+        if (receiptOnly) return null;
+        const deletion = require('./deletionService');
+        const sourceDir = key => {
+            const match = /^source\/([A-Za-z0-9]{12})\/source\.[^/]+$/.exec(key || '');
+            if (!match) throw new Error('invalid_source_cleanup_target');
+            return `source/${match[1]}/`;
+        };
+        sourceDir(upload.object_key);
+        // Recover a response-lost pre-upgrade replacement without deleting its
+        // own accepted source. New replacements have the receipt in this commit.
+        if (video.r2_source_key === upload.object_key) {
+            if (!jobs.length && video.status === 'queued') await db.execute('INSERT INTO processing_queue(video_id) VALUES(?)', [video.video_id]);
+            await db.execute("UPDATE upload_sessions SET status='completed',completed_at=NOW() WHERE upload_id=?", [upload.upload_id]);
+            return { videoId: video.video_id, oldJobs: [], replayed: true };
+        }
+        if (video.r2_source_key) await deletion.enqueuePrefix(sourceDir(video.r2_source_key), { connection: db, source: 'video_replace' });
+        if (video.processing_job_id) {
+            if (!/^[A-Za-z0-9]{64}$/.test(video.hashed_video_id) || !/^[A-Za-z0-9_-]{1,64}$/.test(video.processing_job_id)) throw new Error('invalid_output_cleanup_target');
+            const active = jobs.some(job => posterLifecycle.ACTIVE.has(job.status))
+                || ['worker_downloading', 'processing', 'worker_uploading'].includes(video.status);
+            await deletion.enqueuePrefix(`${video.hashed_video_id}/${video.processing_job_id}/`, {
+                connection: db, source: 'video_replace', execute_at: new Date(Date.now() + (active ? 120000 : 0)),
+            });
+        }
+        await posterLifecycle.resetPoster(db, video, 'video_replace');
+        await db.execute('DELETE FROM processing_queue WHERE video_id=?', [video.video_id]);
+        await db.execute(`UPDATE videos SET r2_source_key=?,original_filename=?,file_size_bytes=?,
+            status='queued',processing_job_id=NULL,encryption_key=NULL,processing_progress=0,
+            processing_error=NULL,duration_seconds=NULL,video_type='cmaf' WHERE video_id=?`,
+        [upload.object_key, upload.original_filename, actualSize, video.video_id]);
+        await db.execute('INSERT INTO processing_queue(video_id) VALUES(?)', [video.video_id]);
+        await db.execute('DELETE FROM watch_progress WHERE video_id=?', [video.video_id]);
+        await db.execute("UPDATE upload_sessions SET status='completed',completed_at=NOW() WHERE upload_id=?", [upload.upload_id]);
+        return { videoId: video.video_id, oldJobs: jobs.map(job => job.job_id).filter(Boolean), replayed: false };
+    });
+    if (!result) return false;
+    for (const oldJob of result.oldJobs) clearStaleTimer(oldJob);
+    const effects = [() => videoCache.invalidate(result.videoId), () => queueCache.markHasWork(),
+        ...result.oldJobs.map(oldJob => () => transcodeCache.clearJob(oldJob))];
+    if (!result.replayed) effects.push(() => require('./cache/watchProgressCache').clearForVideo(result.videoId));
+    const settled = await Promise.allSettled(effects.map(run => Promise.resolve().then(run)));
+    const failed = settled.find(value => value.status === 'rejected');
+    if (failed) throw failed.reason;
     return true;
 }
 
 module.exports = {
     createTask,
+    replaceVideoSource,
     updateTaskStatus,
     completeTask,
+    confirmPosterReady: posterLifecycle.confirmPosterReady,
     reportError,
     resetStaleTasks,
     getTaskByJobId,

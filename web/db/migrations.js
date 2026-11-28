@@ -1213,6 +1213,10 @@ async function runMigrations({ strict = false } = {}) {
                 id: '053_sso_account_status',
                 up: async () => require('./ssoAccountStatusMigration').migrateSsoAccountStatus(pool),
             },
+            {
+                id: '054_video_poster_state',
+                up: async () => require('./posterStateMigration').migratePosterState(pool),
+            },
         ];
 
         for (const migration of migrations) {

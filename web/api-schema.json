@@ -226,7 +226,7 @@
           "courses"
         ],
         "operationId": "getCourseDetail",
-        "summary": "Course detail plus a paginated, sortable list of its videos. Access requires permissions.allCourseAccess or enrollment in the course; each video with has_poster gets a per-file HMAC posterToken minted for R2.",
+        "summary": "Course detail plus a paginated sortable video list. Existing course-access checks apply. Each row includes authoritative has_poster; posterPath and exact per-file posterToken are supplied only for confirmed uploaded posters.",
         "security": [
           {
             "sessionCookie": []
@@ -276,7 +276,7 @@
         ],
         "responses": {
           "200": {
-            "description": "{ course, videos: [...with posterToken], r2PublicDomain, pagination: { page, totalPages, total, limit } }"
+            "description": "{ course, videos: [...with has_poster, posterPath, posterToken], r2PublicDomain, pagination: { page, totalPages, total, limit } }"
           },
           "401": {
             "description": "Not authenticated (no valid sid session).",
@@ -345,7 +345,7 @@
         ],
         "responses": {
           "200": {
-            "description": "{ video, videoPath, videoType, resumePosition, hmacToken, r2PublicDomain, tokenValiditySeconds, posterToken }"
+            "description": "{ video, videoPath, videoType, resumePosition, hmacToken, r2PublicDomain, tokenValiditySeconds, has_poster, posterPath, posterToken }"
           },
           "401": {
             "description": "Not authenticated (no valid sid session).",
@@ -959,7 +959,7 @@
           "admin-courses"
         ],
         "operationId": "adminListCourseVideos",
-        "summary": "Paginated video list for a course (fit-to-height paging, per-video poster HMAC tokens). Requires uploadVideo OR changeVideo (checkAnyPermission).",
+        "summary": "Paginated video list for a course (fit-to-height paging, per-video poster HMAC tokens). Requires uploadVideo OR changeVideo (checkAnyPermission). Rows include has_poster and the confirmed generation posterPath; tokens are never inferred from progress.",
         "security": [
           {
             "sessionCookie": []
@@ -5095,7 +5095,8 @@
                 "properties": {
                   "jobs": {
                     "type": "array",
-                    "description": "Array of { jobId, status, stage?, progress?, errorMessage? } status records."
+                    "description": "Array of { jobId, status, stage?, progress?, errorMessage? } status records.",
+                    "maxItems": 256
                   }
                 },
                 "additionalProperties": false,
@@ -5149,7 +5150,7 @@
           "worker"
         ],
         "operationId": "workerTasksComplete",
-        "summary": "Mark a single transcode job complete. Records optional duration and poster flag; 204 on success, 404 if the jobId is unknown.",
+        "summary": "Complete the current owned transcode job. Records optional duration and supports older workers reporting the uploaded poster at completion; does not revive cancelled or failed jobs.",
         "security": [
           {
             "workerBearer": []
@@ -5172,7 +5173,7 @@
                   },
                   "hasPoster": {
                     "type": "boolean",
-                    "description": "Whether a poster image was produced; only strict true counts."
+                    "description": "Legacy completion confirmation that the poster PUT succeeded. New workers acknowledge poster-ready independently before completion."
                   }
                 },
                 "additionalProperties": false,
@@ -5230,13 +5231,94 @@
         }
       }
     },
+    "/api/worker/tasks/poster-ready": {
+      "post": {
+        "tags": [
+          "worker"
+        ],
+        "operationId": "workerPosterReady",
+        "summary": "Confirm that the current worker successfully uploaded the current job poster. Idempotent for the same confirmed generation; stale, cancelled, replaced, unknown or differently owned jobs return 404.",
+        "security": [
+          {
+            "workerBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "jobId": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9]{12}$",
+                    "minLength": 12,
+                    "maxLength": 12
+                  }
+                },
+                "required": [
+                  "jobId"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Poster readiness committed and cached video metadata invalidated; no body."
+          },
+          "400": {
+            "description": "jobId is required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid/expired bearer token or IP mismatch.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Current owned job no longer accepts this acknowledgement.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unable to confirm readiness or invalidate cached metadata; safe to retry the same acknowledgement.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/worker/tasks/upload-urls": {
       "post": {
         "tags": [
           "worker"
         ],
         "operationId": "workerTasksUploadUrls",
-        "summary": "Generate presigned PUT URLs for a job's HLS output filenames. 404 if the task/job is unknown.",
+        "summary": "Generate presigned PUT URLs for job output files. poster.jpg is checked against the current owned lease and uses an immutable job-specific key; issuing a URL does not mark it ready.",
         "security": [
           {
             "workerBearer": []

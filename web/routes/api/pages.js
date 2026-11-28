@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { posterMetadata } = require('../../services/posterMetadata');
 const { requireAuth } = require('../../middleware/auth');
 const { getPool, idBuf } = require('../../config/database');
 const { getUserById } = require('../../services/userService');
@@ -125,22 +126,9 @@ router.get('/courses/:courseId', requireAuth, async (req, res) => {
         );
         await require('../../services/cache/transcodeProgressCache').applyLiveOverlayToVideos(videos);
 
-        // Per-video poster signing. The course list page swaps the
-        // play-icon for a thumbnail when a video has has_poster=1, but the
-        // R2 URL needs a per-file HMAC token to clear the WAF rule's
-        // file-scope branch (the prefix-scope token only signs the manifest
-        // path region, not the .jpg sitting at the per-course poster key).
-        // We mint one token per row up front so the client doesn't have to
-        // refresh per-image — the validity matches the playback token.
-        //
-        // The poster path is `/posters/{course_id}/{video_id}.jpg` — stable
-        // across re-encodes so a replacement video overwrites in place, and
-        // course delete sweeps the entire `posters/{course_id}/` prefix in
-        // one go. The client reconstructs the full URL from courseId +
-        // video_id + this token, so we no longer ship posterPath.
-        //
-        // Mint only when has_poster=1; otherwise the client falls back to
-        // the play-icon glyph without ever touching R2.
+        // Only confirmed uploaded posters receive an exact per-file HMAC.
+        // The worker's readiness acknowledgement invalidates cached metadata;
+        // list responses never infer existence from transcode progress.
         const publicDomain = process.env.R2_PUBLIC_DOMAIN || '';
         const posterVideos = await Promise.all(videos.map(async (v) => {
             const out = {
@@ -154,12 +142,7 @@ router.get('/courses/:courseId', requireAuth, async (req, res) => {
                 status: v.status,
                 processing_progress: v.processing_progress,
             };
-            if (v.has_poster) {
-                const posterPath = `/posters/${v.course_id}/${v.video_id}.jpg`;
-                const posterToken = await generateFileToken(posterPath);
-                out.posterToken = posterToken || '';
-            }
-            return out;
+            return { ...out, ...await posterMetadata(v, generateFileToken) };
         }));
 
         res.json({
@@ -221,18 +204,9 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
         const hmacToken = await generateToken(basePath);
         const tokenValiditySeconds = await getTokenValiditySeconds();
 
-        // Per-file poster token for Media Session artwork (iOS Dynamic
-        // Island, Android notification shade). Only minted when the video
-        // actually has a poster; the watch page just omits the artwork
-        // entry from MediaMetadata when this comes back null/empty.
-        // Path is `/posters/{course_id}/{video_id}.jpg` — the client
-        // reconstructs the URL from the values it already has on
-        // res.json.video below, so we don't ship posterPath.
-        let posterToken = null;
-        if (video.has_poster) {
-            const posterPath = `/posters/${video.course_id}/${video.video_id}.jpg`;
-            posterToken = await generateFileToken(posterPath);
-        }
+        // Media Session artwork uses the same confirmed, generation-scoped
+        // path as the course lists; existing posters retain their legacy path.
+        const poster = await posterMetadata(video, generateFileToken);
 
         // Resume position rules:
         //   1. Videos shorter than 120s always restart from the beginning —
@@ -289,7 +263,7 @@ router.get('/watch/:videoId', requireAuth, async (req, res) => {
             hmacToken: hmacToken || '',
             r2PublicDomain: publicDomain || '',
             tokenValiditySeconds,
-            posterToken: posterToken || '',
+            ...poster,
         });
     } catch (err) {
         console.error('API watch error:', err);

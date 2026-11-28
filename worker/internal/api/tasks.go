@@ -117,12 +117,36 @@ func LeaseTasks(ctx context.Context, videoIDs []int) ([]LeaseResult, error) {
 	return out.Results, nil
 }
 
-// ReportStatus sends a batched status report. Returns per-job acks so the worker
-// can drop jobs the server no longer recognises (ack:false).
+// The server bounds status work per RPC. Active jobs plus queued terminal
+// reports can exceed that bound even when the usual active count is small.
+const statusBatchLimit = 256
+
+// ReportStatus sends bounded batches using the caller's original context and
+// deadline. Acks preserve batch/response order. On any error no partial result
+// is returned, matching the existing caller's whole-report error handling.
 func ReportStatus(ctx context.Context, jobs []JobStatus) ([]JobAck, error) {
 	if len(jobs) == 0 {
 		return nil, nil
 	}
+	var acks []JobAck
+	for offset := 0; offset < len(jobs); offset += statusBatchLimit {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		end := offset + statusBatchLimit
+		if end > len(jobs) {
+			end = len(jobs)
+		}
+		batch, err := reportStatusBatch(ctx, jobs[offset:end])
+		if err != nil {
+			return nil, err
+		}
+		acks = append(acks, batch...)
+	}
+	return acks, nil
+}
+
+func reportStatusBatch(ctx context.Context, jobs []JobStatus) ([]JobAck, error) {
 	body := map[string]interface{}{"jobs": jobs}
 	resp, err := doRequest(ctx, http.MethodPost, "/api/worker/tasks/status", body)
 	if err != nil {
@@ -145,10 +169,10 @@ var completeRetryDelays = []time.Duration{0, 1 * time.Second, 2 * time.Second, 3
 
 // CompletePayload is the JSON body of POST /api/worker/tasks/complete.
 //
-// HasPoster signals that the worker wrote a poster.jpg into the job output
-// dir and the upload sweep included it. The server flips videos.has_poster
-// on the back of this so the course list page knows to mint a per-file
-// signed URL. Omitted when false — the server defaults to 0.
+// HasPoster signals that the worker generated and successfully uploaded the
+// poster and acknowledged readiness, independently of the final media sweep.
+// The completion field remains for compatibility; the readiness endpoint has
+// already published the poster before the rest of the video is ready.
 type CompletePayload struct {
 	DurationSeconds float64 `json:"durationSeconds,omitempty"`
 	HasPoster       bool    `json:"hasPoster,omitempty"`

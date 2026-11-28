@@ -20,7 +20,7 @@ async function loadFromDb(videoId) {
     const [rows] = await pool.execute(
         `SELECT video_id, course_id, title, description, module_number, lecture_date,
                 hashed_video_id, duration_seconds, status, processing_job_id,
-                video_type, original_filename, has_poster
+                video_type, original_filename, has_poster, poster_path
          FROM videos WHERE video_id = ?`,
         [videoId]
     );
